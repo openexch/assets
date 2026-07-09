@@ -20,13 +20,23 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     private final List<AssetsEngineEvent> events = new ArrayList<>();
 
     @Override
-    public void onHoldAck(long orderId, long userId, int assetId, long amount) {
-        events.add(new AssetsEngineEvent.HoldAck(orderId, userId, assetId, amount));
+    public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
+        events.add(new AssetsEngineEvent.DepositAck(correlationId, userId, assetId, amount, newAvailable));
     }
 
     @Override
-    public void onHoldReject(long orderId, long userId, int assetId, long amount, RejectReason reason) {
-        events.add(new AssetsEngineEvent.HoldReject(orderId, userId, assetId, amount, reason));
+    public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
+        events.add(new AssetsEngineEvent.WithdrawAck(correlationId, userId, assetId, amount, newAvailable));
+    }
+
+    @Override
+    public void onHoldAck(long correlationId, long orderId, long userId, int assetId, long amount) {
+        events.add(new AssetsEngineEvent.HoldAck(correlationId, orderId, userId, assetId, amount));
+    }
+
+    @Override
+    public void onHoldReject(long correlationId, long orderId, long userId, int assetId, long amount, RejectReason reason) {
+        events.add(new AssetsEngineEvent.HoldReject(correlationId, orderId, userId, assetId, amount, reason));
     }
 
     @Override
@@ -40,12 +50,32 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     }
 
     @Override
-    public void onWithdrawReject(long userId, int assetId, long amount, RejectReason reason) {
-        events.add(new AssetsEngineEvent.WithdrawReject(userId, assetId, amount, reason));
+    public void onWithdrawReject(long correlationId, long userId, int assetId, long amount, RejectReason reason) {
+        events.add(new AssetsEngineEvent.WithdrawReject(correlationId, userId, assetId, amount, reason));
+    }
+
+    @Override
+    public void onBalanceSnapshotEnd(long correlationId, int entryCount) {
+        events.add(new AssetsEngineEvent.BalanceSnapshotEnd(correlationId, entryCount));
+    }
+
+    @Override
+    public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) {
+        events.add(new AssetsEngineEvent.HoldSnapshotEntry(orderId, userId, assetId, remaining));
+    }
+
+    @Override
+    public void onHoldSnapshotEnd(long correlationId, int entryCount) {
+        events.add(new AssetsEngineEvent.HoldSnapshotEnd(correlationId, entryCount));
     }
 
     public List<AssetsEngineEvent> events() {
         return Collections.unmodifiableList(events);
+    }
+
+    /** Clear the captured stream — for tests that assert only a later phase's output (e.g. a query answer). */
+    public void reset() {
+        events.clear();
     }
 
     /** Render the full captured stream to canonical text, one event per line (trailing newline). */

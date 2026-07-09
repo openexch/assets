@@ -209,10 +209,15 @@ public class ReplayRecoveryTest {
     }
 
     private static final AssetsEventSink NOOP = new AssetsEventSink() {
-        @Override public void onHoldAck(long orderId, long userId, int assetId, long amount) { }
-        @Override public void onHoldReject(long orderId, long userId, int assetId, long amount, RejectReason reason) { }
+        @Override public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable) { }
+        @Override public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable) { }
+        @Override public void onHoldAck(long correlationId, long orderId, long userId, int assetId, long amount) { }
+        @Override public void onHoldReject(long correlationId, long orderId, long userId, int assetId, long amount, RejectReason reason) { }
         @Override public void onBalanceUpdate(long userId, int assetId, long available, long locked) { }
         @Override public void onSettlementApplied(long tradeId, long buyerUserId, long sellerUserId) { }
-        @Override public void onWithdrawReject(long userId, int assetId, long amount, RejectReason reason) { }
+        @Override public void onWithdrawReject(long correlationId, long userId, int assetId, long amount, RejectReason reason) { }
+        @Override public void onBalanceSnapshotEnd(long correlationId, int entryCount) { }
+        @Override public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) { }
+        @Override public void onHoldSnapshotEnd(long correlationId, int entryCount) { }
     };
 }

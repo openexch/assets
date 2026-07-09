@@ -46,10 +46,12 @@ public class ClusterBootSmokeTest {
 
     private static final int PORT_BASE = 19300; // disjoint from ME (9000-9299) and reserved AE (9300)
     private static final long USER = 4242L;
+    private static final long HOLD_CORR = 0xC0FFEEL; // client correlationId echoed on the HoldAck
 
     /** Captures decoded egress messages on the client's poll thread. */
     private static final class CapturingEgress implements EgressListener {
         final AtomicInteger holdAcks = new AtomicInteger();
+        final AtomicLong lastHoldAckCorr = new AtomicLong(-1);
         final AtomicLong lastLocked = new AtomicLong(-1);
         final AtomicLong lastAvail = new AtomicLong(-1);
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
@@ -65,7 +67,9 @@ public class ClusterBootSmokeTest {
             header.wrap(buffer, offset);
             switch (header.templateId()) {
                 case HoldAckDecoder.TEMPLATE_ID:
+                    // v2 HoldAck: correlationId is the first field, ahead of orderId.
                     holdAck.wrapAndApplyHeader(buffer, offset, header);
+                    lastHoldAckCorr.set(holdAck.correlationId());
                     holdAcks.incrementAndGet();
                     break;
                 case BalanceUpdateDecoder.TEMPLATE_ID:
@@ -122,9 +126,9 @@ public class ClusterBootSmokeTest {
                             hosts, PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
                     .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10)));
 
-            // DEPOSIT 1000 USD, then HOLD 600 USD for order 1.
+            // DEPOSIT 1000 USD, then HOLD 600 USD for order 1 (carrying a correlationId to echo).
             offer(client, encodeDeposit(USER, Asset.USD.id(), FixedPoint.fromDouble(1000.0)));
-            offer(client, encodeHold(1L, USER, Asset.USD.id(), FixedPoint.fromDouble(600.0)));
+            offer(client, encodeHold(HOLD_CORR, 1L, USER, Asset.USD.id(), FixedPoint.fromDouble(600.0)));
 
             // Poll egress until we've seen the HoldAck + the post-hold BalanceUpdate (locked=600), or time out.
             final long expectLocked = FixedPoint.fromDouble(600.0);
@@ -139,6 +143,7 @@ public class ClusterBootSmokeTest {
             }
 
             assertTrue("expected a HoldAck egress", egress.holdAcks.get() >= 1);
+            assertEquals("HoldAck echoes the request correlationId", HOLD_CORR, egress.lastHoldAckCorr.get());
             assertEquals("post-hold locked balance", expectLocked, egress.lastLocked.get());
             assertEquals("post-hold available balance", FixedPoint.fromDouble(400.0), egress.lastAvail.get());
         } finally {
@@ -157,13 +162,14 @@ public class ClusterBootSmokeTest {
     private final HoldEncoder holdEnc = new HoldEncoder();
 
     private int encodeDeposit(long userId, int assetId, long amount) {
-        depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc).userId(userId).assetId(assetId).amount(amount);
+        depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
+                .correlationId(0L).userId(userId).assetId(assetId).amount(amount);
         return MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength();
     }
 
-    private int encodeHold(long orderId, long userId, int assetId, long amount) {
+    private int encodeHold(long correlationId, long orderId, long userId, int assetId, long amount) {
         holdEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
-                .orderId(orderId).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId).amount(amount);
         return MessageHeaderEncoder.ENCODED_LENGTH + holdEnc.encodedLength();
     }
 

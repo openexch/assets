@@ -32,6 +32,11 @@ public final class Account {
         void visit(long orderId, int assetId, long remaining);
     }
 
+    /** Visitor for iterating non-zero balances (snapshot queries). Not on the hot path. */
+    public interface BalanceVisitor {
+        void visit(int assetId, long available, long locked);
+    }
+
     private static final int ASSETS = Asset.count();
 
     private final long userId;
@@ -97,14 +102,50 @@ public final class Account {
     // ---- holds ----
 
     /**
-     * Reserve {@code amount} of {@code assetId} for {@code orderId} (available -> locked). Rejects a
-     * non-positive amount or an overdraft. Precondition: {@code orderId} is unique (the matching
-     * engine allocates monotonic order ids); a duplicate would overwrite the prior hold reference.
+     * Reserve {@code amount} of {@code assetId} for {@code orderId} (available -> locked).
+     *
+     * <p><b>Create vs. top-up.</b> If no hold exists for {@code orderId} this creates one (the common
+     * case: the matching engine allocates monotonic order ids). If a hold for {@code orderId} <em>already
+     * exists</em> this is an atomic <b>top-up</b> that adds {@code amount} to the existing reservation:
+     * this is how an <em>amend</em> that raises an order's reserved value is expressed — the OMS places
+     * the amend's hold <b>delta</b> under the same {@code orderId}. (Blind client retries of a hold are
+     * banned client-side, so a duplicate {@code orderId} is always a genuine incremental reservation,
+     * never an accidental double-debit.)</p>
+     *
+     * <p>This top-up contract exists to close a real corruption bug: the previous behaviour overwrote the
+     * hold reference on a duplicate {@code orderId} while still debiting available, silently leaking the
+     * first hold's residual and breaking the {@code locked == Σ remaining} invariant.</p>
+     *
+     * <p><b>Rejections mutate nothing:</b></p>
+     * <ul>
+     *   <li>non-positive {@code amount} -> {@link RejectReason#INVALID_AMOUNT};</li>
+     *   <li>top-up whose {@code assetId} differs from the existing hold's asset ->
+     *       {@link RejectReason#INVALID_AMOUNT} (a hold reserves exactly one asset);</li>
+     *   <li>{@code available < amount} (create or top-up) -> {@link RejectReason#INSUFFICIENT_FUNDS}.</li>
+     * </ul>
+     *
+     * <p>On accept (create or top-up): {@code available -= amount; locked += amount; remaining += amount}
+     * — so {@code locked == Σ remaining} is preserved on every path.</p>
      */
     public RejectReason hold(long orderId, int assetId, long amount) {
         if (amount <= 0) {
             return RejectReason.INVALID_AMOUNT;
         }
+        Hold existing = holds.get(orderId);
+        if (existing != null) {
+            // Top-up an existing reservation (amend delta). A hold reserves exactly one asset.
+            if (existing.assetId() != assetId) {
+                return RejectReason.INVALID_AMOUNT; // cross-asset top-up is illegal — mutate nothing
+            }
+            if (bal[2 * assetId] < amount) {
+                return RejectReason.INSUFFICIENT_FUNDS; // overdraft — mutate nothing
+            }
+            bal[2 * assetId] -= amount;
+            bal[2 * assetId + 1] += amount;
+            existing.topUp(amount);
+            return RejectReason.NONE;
+        }
+        // Create a fresh hold.
         if (bal[2 * assetId] < amount) {
             return RejectReason.INSUFFICIENT_FUNDS;
         }
@@ -197,6 +238,20 @@ public final class Account {
     /** Visit every open hold (serialize / invariant checks). Boxes the key — not hot-path (snapshot only). */
     public void forEachHold(HoldVisitor v) {
         holds.forEach((orderId, h) -> v.visit(orderId, h.assetId(), h.remaining()));
+    }
+
+    /**
+     * Visit every asset with a non-zero available or locked balance, in ascending assetId order
+     * (the dense array's natural, deterministic order). Snapshot-query use only — not hot-path.
+     */
+    public void forEachNonZeroBalance(BalanceVisitor v) {
+        for (int assetId = 0; assetId < ASSETS; assetId++) {
+            long available = bal[2 * assetId];
+            long locked = bal[2 * assetId + 1];
+            if (available != 0L || locked != 0L) {
+                v.visit(assetId, available, locked);
+            }
+        }
     }
 
     private Hold acquireHold() {

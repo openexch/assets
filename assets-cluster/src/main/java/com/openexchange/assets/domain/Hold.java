@@ -36,4 +36,13 @@ public final class Hold {
     void drawDown(long amount) {
         remaining -= amount;
     }
+
+    /**
+     * Increase the outstanding reservation by {@code amount} — an amend's hold <em>delta</em> placed
+     * under the same order. Caller (the owning {@link Account}) guarantees the available balance was
+     * already debited by {@code amount}, so {@code locked == Σ remaining} is preserved.
+     */
+    void topUp(long amount) {
+        remaining += amount;
+    }
 }

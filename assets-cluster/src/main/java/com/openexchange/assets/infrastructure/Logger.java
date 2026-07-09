@@ -22,6 +22,10 @@ public final class Logger {
         System.out.println("[INFO ] " + name + " - " + fmt(format, args));
     }
 
+    public void warn(String format, Object... args) {
+        System.out.println("[WARN ] " + name + " - " + fmt(format, args));
+    }
+
     public void error(String format, Object... args) {
         System.err.println("[ERROR] " + name + " - " + fmt(format, args));
     }
