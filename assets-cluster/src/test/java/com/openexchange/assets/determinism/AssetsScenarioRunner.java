@@ -6,6 +6,7 @@ import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
+import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
 import com.openexchange.assets.domain.commands.SettleCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
@@ -50,6 +51,8 @@ public final class AssetsScenarioRunner {
     private long feedPosition = 0L;
     private final RecordingAssetsSink sink = new RecordingAssetsSink();
     private final LogicalClock clock = new LogicalClock();
+    // Pooled once and re-populated per INIT_HIGH_WATER call, mirroring the projector's pooled commands.
+    private final InitTradeHighWaterCommand initHighWaterCommand = new InitTradeHighWaterCommand();
 
     private AssetsScenarioRunner() {
         this.engine = new AssetsEngine();
@@ -125,6 +128,15 @@ public final class AssetsScenarioRunner {
             case "SETTLE":
                 engine.applyCommand(AssetsEngine.CMD_SETTLE, buildSettle(kv), clock.now());
                 break;
+            case "INIT_HIGH_WATER":
+                // Cutover primer (CMD_INIT_HIGH_WATER): seed the settlement high-water + consume position
+                // on a virgin ledger. Positional args: <tradeId> <consumePosition>. A strict no-op (no
+                // egress) on any non-virgin ledger, so a refusal leaves the stream unchanged.
+                initHighWaterCommand.reset();
+                initHighWaterCommand.setTradeId(Long.parseLong(tokens[1]));
+                initHighWaterCommand.setConsumePosition(Long.parseLong(tokens[2]));
+                engine.applyCommand(AssetsEngine.CMD_INIT_HIGH_WATER, initHighWaterCommand, clock.now());
+                break;
             case "TRADE":
                 // A TradeExecution from the ME recorded stream, fed through the settlement projector.
                 projector.onTrade(++feedPosition, reqLong(kv, "tradeId"), reqInt(kv, "market"),
@@ -135,6 +147,11 @@ public final class AssetsScenarioRunner {
             case "TERMINAL":
                 // A terminal OrderStatus from the ME recorded stream -> release the order's residual hold.
                 projector.onTerminal(++feedPosition, reqLong(kv, "order"), reqLong(kv, "u"), clock.now());
+                break;
+            case "QUERY_FEED":
+                // Read-only feed-position query: emit the journal consume position + settlement high-water
+                // through the sink (a FEEDPOS line). Positional arg: <correlationId>.
+                engine.reportFeedPosition(Long.parseLong(tokens[1]));
                 break;
             case "SNAPSHOT":
                 snapshotRoundTrip();

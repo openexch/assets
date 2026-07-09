@@ -1,0 +1,11 @@
+# Cutover primer: INIT_HIGH_WATER seeds the settlement high-water + consume position, but ONLY on a
+# virgin ledger (no accounts, both scalars 0). A first QUERY_FEED reads 0/0; priming the virgin ledger
+# takes (5000/777); after a deposit the ledger is no longer virgin, so a second INIT is REFUSED (strict
+# no-op, no egress) — proven by the final QUERY_FEED being byte-identical to the primed one.
+CLOCK 1000
+QUERY_FEED 1
+INIT_HIGH_WATER 5000 777
+QUERY_FEED 2
+DEPOSIT u=100 asset=0 amt=1000.0
+INIT_HIGH_WATER 9999 999
+QUERY_FEED 3

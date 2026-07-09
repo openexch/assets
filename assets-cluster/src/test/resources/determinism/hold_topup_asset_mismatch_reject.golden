@@ -1,0 +1,7 @@
+DEPOSITACK corr=0 u=100 asset=1 amt=100000000 newAvail=100000000
+BALANCE u=100 asset=1 avail=100000000 locked=0
+DEPOSITACK corr=0 u=100 asset=0 amt=100000000000 newAvail=100000000000
+BALANCE u=100 asset=0 avail=100000000000 locked=0
+HOLDACK corr=0 order=1 u=100 asset=1 amt=100000000
+BALANCE u=100 asset=1 avail=0 locked=100000000
+HOLDREJECT corr=0 order=1 u=100 asset=0 amt=10000000000 reason=INVALID_AMOUNT

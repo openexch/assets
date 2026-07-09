@@ -1,0 +1,7 @@
+# A top-up that exceeds the REMAINING available (600 held of 1000, so only 400 is left; a 500 top-up
+# overdraws) is rejected. The reject mutates nothing — no BALANCE line follows, and the original 600
+# hold is intact.
+CLOCK 1000
+DEPOSIT u=100 asset=0 amt=1000.0
+HOLD order=1 u=100 asset=0 amt=600.0
+HOLD order=1 u=100 asset=0 amt=500.0

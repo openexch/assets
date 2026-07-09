@@ -1,0 +1,8 @@
+# A hold reserves exactly one asset. Topping up an existing BTC hold with a USD delta under the same
+# orderId is illegal — rejected INVALID_AMOUNT even though the USD is available (the asset-mismatch guard
+# runs before the funds check). Nothing moves: the BTC hold and the USD balance are untouched.
+CLOCK 1000
+DEPOSIT u=100 asset=1 amt=1.0
+DEPOSIT u=100 asset=0 amt=1000.0
+HOLD order=1 u=100 asset=1 amt=1.0
+HOLD order=1 u=100 asset=0 amt=100.0

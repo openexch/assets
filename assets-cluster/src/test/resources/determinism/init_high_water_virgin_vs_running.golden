@@ -1,0 +1,5 @@
+FEEDPOS corr=1 consumePos=0 lastTradeId=0
+FEEDPOS corr=2 consumePos=777 lastTradeId=5000
+DEPOSITACK corr=0 u=100 asset=0 amt=100000000000 newAvail=100000000000
+BALANCE u=100 asset=0 avail=100000000000 locked=0
+FEEDPOS corr=3 consumePos=777 lastTradeId=5000

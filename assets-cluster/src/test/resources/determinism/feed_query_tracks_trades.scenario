@@ -1,0 +1,13 @@
+# QUERY_FEED tracks the projector's progress through the ME recorded stream. After one TRADE the query
+# reads consumePos=1 (the runner's monotonic feedPosition) and lastTradeId=1 (the settlement high-water).
+# A TERMINAL advances the stream one more position, so the next query reads consumePos=2 with the
+# high-water unchanged — a residual release is not a trade.
+CLOCK 1000
+DEPOSIT u=100 asset=1 amt=1.0
+DEPOSIT u=200 asset=0 amt=60000.0
+HOLD order=1 u=100 asset=1 amt=1.0
+HOLD order=2 u=200 asset=0 amt=60000.0
+TRADE tradeId=1 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=1.0 takerBuy=1
+QUERY_FEED 42
+TERMINAL order=2 u=200
+QUERY_FEED 43
