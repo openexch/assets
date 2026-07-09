@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * cutover primer: refused (no-op) unless the ledger is virgin (lastAppliedTradeId==0 and no accounts)
  */
 @SuppressWarnings("all")
-public final class WithdrawEncoder
+public final class InitTradeHighWaterEncoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 16;
+    public static final int TEMPLATE_ID = 30;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawEncoder parentMessage = this;
+    private final InitTradeHighWaterEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class WithdrawEncoder
         return offset;
     }
 
-    public WithdrawEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public InitTradeHighWaterEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class WithdrawEncoder
         return this;
     }
 
-    public WithdrawEncoder wrapAndApplyHeader(
+    public InitTradeHighWaterEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -97,27 +97,27 @@ public final class WithdrawEncoder
         this.limit = limit;
     }
 
-    public static int correlationIdId()
+    public static int tradeIdId()
     {
         return 1;
     }
 
-    public static int correlationIdSinceVersion()
+    public static int tradeIdSinceVersion()
     {
         return 0;
     }
 
-    public static int correlationIdEncodingOffset()
+    public static int tradeIdEncodingOffset()
     {
         return 0;
     }
 
-    public static int correlationIdEncodingLength()
+    public static int tradeIdEncodingLength()
     {
         return 8;
     }
 
-    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String tradeIdMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -127,49 +127,49 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static long correlationIdNullValue()
+    public static long tradeIdNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long correlationIdMinValue()
+    public static long tradeIdMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long correlationIdMaxValue()
+    public static long tradeIdMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder correlationId(final long value)
+    public InitTradeHighWaterEncoder tradeId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int userIdId()
+    public static int consumePositionId()
     {
         return 2;
     }
 
-    public static int userIdSinceVersion()
+    public static int consumePositionSinceVersion()
     {
         return 0;
     }
 
-    public static int userIdEncodingOffset()
+    public static int consumePositionEncodingOffset()
     {
         return 8;
     }
 
-    public static int userIdEncodingLength()
+    public static int consumePositionEncodingLength()
     {
         return 8;
     }
 
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String consumePositionMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -179,128 +179,24 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static long userIdNullValue()
+    public static long consumePositionNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long userIdMinValue()
+    public static long consumePositionMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long userIdMaxValue()
+    public static long consumePositionMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder userId(final long value)
+    public InitTradeHighWaterEncoder consumePosition(final long value)
     {
         buffer.putLong(offset + 8, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int assetIdId()
-    {
-        return 3;
-    }
-
-    public static int assetIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int assetIdEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int assetIdEncodingLength()
-    {
-        return 4;
-    }
-
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static int assetIdNullValue()
-    {
-        return -2147483648;
-    }
-
-    public static int assetIdMinValue()
-    {
-        return -2147483647;
-    }
-
-    public static int assetIdMaxValue()
-    {
-        return 2147483647;
-    }
-
-    public WithdrawEncoder assetId(final int value)
-    {
-        buffer.putInt(offset + 16, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int amountId()
-    {
-        return 4;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 20;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public WithdrawEncoder amount(final long value)
-    {
-        buffer.putLong(offset + 20, value, BYTE_ORDER);
         return this;
     }
 
@@ -322,7 +218,7 @@ public final class WithdrawEncoder
             return builder;
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final InitTradeHighWaterDecoder decoder = new InitTradeHighWaterDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

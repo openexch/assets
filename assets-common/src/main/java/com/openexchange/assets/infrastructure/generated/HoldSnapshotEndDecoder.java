@@ -5,19 +5,19 @@ import org.agrona.DirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * Terminates the HoldSnapshotEntry stream answering RequestHoldSnapshot
  */
 @SuppressWarnings("all")
-public final class WithdrawDecoder
+public final class HoldSnapshotEndDecoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 12;
+    public static final int TEMPLATE_ID = 20;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawDecoder parentMessage = this;
+    private final HoldSnapshotEndDecoder parentMessage = this;
     private DirectBuffer buffer;
     private int offset;
     private int limit;
@@ -59,7 +59,7 @@ public final class WithdrawDecoder
         return offset;
     }
 
-    public WithdrawDecoder wrap(
+    public HoldSnapshotEndDecoder wrap(
         final DirectBuffer buffer,
         final int offset,
         final int actingBlockLength,
@@ -77,7 +77,7 @@ public final class WithdrawDecoder
         return this;
     }
 
-    public WithdrawDecoder wrapAndApplyHeader(
+    public HoldSnapshotEndDecoder wrapAndApplyHeader(
         final DirectBuffer buffer,
         final int offset,
         final MessageHeaderDecoder headerDecoder)
@@ -97,7 +97,7 @@ public final class WithdrawDecoder
             headerDecoder.version());
     }
 
-    public WithdrawDecoder sbeRewind()
+    public HoldSnapshotEndDecoder sbeRewind()
     {
         return wrap(buffer, offset, actingBlockLength, actingVersion);
     }
@@ -183,78 +183,27 @@ public final class WithdrawDecoder
     }
 
 
-    public static int userIdId()
+    public static int entryCountId()
     {
         return 2;
     }
 
-    public static int userIdSinceVersion()
+    public static int entryCountSinceVersion()
     {
         return 0;
     }
 
-    public static int userIdEncodingOffset()
+    public static int entryCountEncodingOffset()
     {
         return 8;
     }
 
-    public static int userIdEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long userIdNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long userIdMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long userIdMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long userId()
-    {
-        return buffer.getLong(offset + 8, BYTE_ORDER);
-    }
-
-
-    public static int assetIdId()
-    {
-        return 3;
-    }
-
-    public static int assetIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int assetIdEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int assetIdEncodingLength()
+    public static int entryCountEncodingLength()
     {
         return 4;
     }
 
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String entryCountMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -264,75 +213,24 @@ public final class WithdrawDecoder
         return "";
     }
 
-    public static int assetIdNullValue()
+    public static int entryCountNullValue()
     {
         return -2147483648;
     }
 
-    public static int assetIdMinValue()
+    public static int entryCountMinValue()
     {
         return -2147483647;
     }
 
-    public static int assetIdMaxValue()
+    public static int entryCountMaxValue()
     {
         return 2147483647;
     }
 
-    public int assetId()
+    public int entryCount()
     {
-        return buffer.getInt(offset + 16, BYTE_ORDER);
-    }
-
-
-    public static int amountId()
-    {
-        return 4;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 20;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long amount()
-    {
-        return buffer.getLong(offset + 20, BYTE_ORDER);
+        return buffer.getInt(offset + 8, BYTE_ORDER);
     }
 
 
@@ -343,7 +241,7 @@ public final class WithdrawDecoder
             return "";
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final HoldSnapshotEndDecoder decoder = new HoldSnapshotEndDecoder();
         decoder.wrap(buffer, offset, actingBlockLength, actingVersion);
 
         return decoder.appendTo(new StringBuilder()).toString();
@@ -358,7 +256,7 @@ public final class WithdrawDecoder
 
         final int originalLimit = limit();
         limit(offset + actingBlockLength);
-        builder.append("[Withdraw](sbeTemplateId=");
+        builder.append("[HoldSnapshotEnd](sbeTemplateId=");
         builder.append(TEMPLATE_ID);
         builder.append("|sbeSchemaId=");
         builder.append(SCHEMA_ID);
@@ -380,21 +278,15 @@ public final class WithdrawDecoder
         builder.append("correlationId=");
         builder.append(this.correlationId());
         builder.append('|');
-        builder.append("userId=");
-        builder.append(this.userId());
-        builder.append('|');
-        builder.append("assetId=");
-        builder.append(this.assetId());
-        builder.append('|');
-        builder.append("amount=");
-        builder.append(this.amount());
+        builder.append("entryCount=");
+        builder.append(this.entryCount());
 
         limit(originalLimit);
 
         return builder;
     }
     
-    public WithdrawDecoder sbeSkip()
+    public HoldSnapshotEndDecoder sbeSkip()
     {
         sbeRewind();
 

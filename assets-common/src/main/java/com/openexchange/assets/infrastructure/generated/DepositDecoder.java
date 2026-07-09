@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class DepositDecoder
 {
-    public static final int BLOCK_LENGTH = 20;
+    public static final int BLOCK_LENGTH = 28;
     public static final int TEMPLATE_ID = 1;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 1;
-    public static final String SEMANTIC_VERSION = "0.1";
+    public static final int SCHEMA_VERSION = 2;
+    public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final DepositDecoder parentMessage = this;
@@ -132,9 +132,60 @@ public final class DepositDecoder
         this.limit = limit;
     }
 
-    public static int userIdId()
+    public static int correlationIdId()
     {
         return 1;
+    }
+
+    public static int correlationIdSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int correlationIdEncodingOffset()
+    {
+        return 0;
+    }
+
+    public static int correlationIdEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long correlationIdNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long correlationIdMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long correlationIdMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long correlationId()
+    {
+        return buffer.getLong(offset + 0, BYTE_ORDER);
+    }
+
+
+    public static int userIdId()
+    {
+        return 2;
     }
 
     public static int userIdSinceVersion()
@@ -144,7 +195,7 @@ public final class DepositDecoder
 
     public static int userIdEncodingOffset()
     {
-        return 0;
+        return 8;
     }
 
     public static int userIdEncodingLength()
@@ -179,13 +230,13 @@ public final class DepositDecoder
 
     public long userId()
     {
-        return buffer.getLong(offset + 0, BYTE_ORDER);
+        return buffer.getLong(offset + 8, BYTE_ORDER);
     }
 
 
     public static int assetIdId()
     {
-        return 2;
+        return 3;
     }
 
     public static int assetIdSinceVersion()
@@ -195,7 +246,7 @@ public final class DepositDecoder
 
     public static int assetIdEncodingOffset()
     {
-        return 8;
+        return 16;
     }
 
     public static int assetIdEncodingLength()
@@ -230,13 +281,13 @@ public final class DepositDecoder
 
     public int assetId()
     {
-        return buffer.getInt(offset + 8, BYTE_ORDER);
+        return buffer.getInt(offset + 16, BYTE_ORDER);
     }
 
 
     public static int amountId()
     {
-        return 3;
+        return 4;
     }
 
     public static int amountSinceVersion()
@@ -246,7 +297,7 @@ public final class DepositDecoder
 
     public static int amountEncodingOffset()
     {
-        return 12;
+        return 20;
     }
 
     public static int amountEncodingLength()
@@ -281,7 +332,7 @@ public final class DepositDecoder
 
     public long amount()
     {
-        return buffer.getLong(offset + 12, BYTE_ORDER);
+        return buffer.getLong(offset + 20, BYTE_ORDER);
     }
 
 
@@ -326,6 +377,9 @@ public final class DepositDecoder
         }
         builder.append(BLOCK_LENGTH);
         builder.append("):");
+        builder.append("correlationId=");
+        builder.append(this.correlationId());
+        builder.append('|');
         builder.append("userId=");
         builder.append(this.userId());
         builder.append('|');

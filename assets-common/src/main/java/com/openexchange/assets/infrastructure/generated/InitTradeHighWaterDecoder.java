@@ -5,19 +5,19 @@ import org.agrona.DirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * cutover primer: refused (no-op) unless the ledger is virgin (lastAppliedTradeId==0 and no accounts)
  */
 @SuppressWarnings("all")
-public final class WithdrawDecoder
+public final class InitTradeHighWaterDecoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 16;
+    public static final int TEMPLATE_ID = 30;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawDecoder parentMessage = this;
+    private final InitTradeHighWaterDecoder parentMessage = this;
     private DirectBuffer buffer;
     private int offset;
     private int limit;
@@ -59,7 +59,7 @@ public final class WithdrawDecoder
         return offset;
     }
 
-    public WithdrawDecoder wrap(
+    public InitTradeHighWaterDecoder wrap(
         final DirectBuffer buffer,
         final int offset,
         final int actingBlockLength,
@@ -77,7 +77,7 @@ public final class WithdrawDecoder
         return this;
     }
 
-    public WithdrawDecoder wrapAndApplyHeader(
+    public InitTradeHighWaterDecoder wrapAndApplyHeader(
         final DirectBuffer buffer,
         final int offset,
         final MessageHeaderDecoder headerDecoder)
@@ -97,7 +97,7 @@ public final class WithdrawDecoder
             headerDecoder.version());
     }
 
-    public WithdrawDecoder sbeRewind()
+    public InitTradeHighWaterDecoder sbeRewind()
     {
         return wrap(buffer, offset, actingBlockLength, actingVersion);
     }
@@ -132,27 +132,27 @@ public final class WithdrawDecoder
         this.limit = limit;
     }
 
-    public static int correlationIdId()
+    public static int tradeIdId()
     {
         return 1;
     }
 
-    public static int correlationIdSinceVersion()
+    public static int tradeIdSinceVersion()
     {
         return 0;
     }
 
-    public static int correlationIdEncodingOffset()
+    public static int tradeIdEncodingOffset()
     {
         return 0;
     }
 
-    public static int correlationIdEncodingLength()
+    public static int tradeIdEncodingLength()
     {
         return 8;
     }
 
-    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String tradeIdMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -162,48 +162,48 @@ public final class WithdrawDecoder
         return "";
     }
 
-    public static long correlationIdNullValue()
+    public static long tradeIdNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long correlationIdMinValue()
+    public static long tradeIdMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long correlationIdMaxValue()
+    public static long tradeIdMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public long correlationId()
+    public long tradeId()
     {
         return buffer.getLong(offset + 0, BYTE_ORDER);
     }
 
 
-    public static int userIdId()
+    public static int consumePositionId()
     {
         return 2;
     }
 
-    public static int userIdSinceVersion()
+    public static int consumePositionSinceVersion()
     {
         return 0;
     }
 
-    public static int userIdEncodingOffset()
+    public static int consumePositionEncodingOffset()
     {
         return 8;
     }
 
-    public static int userIdEncodingLength()
+    public static int consumePositionEncodingLength()
     {
         return 8;
     }
 
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String consumePositionMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -213,126 +213,24 @@ public final class WithdrawDecoder
         return "";
     }
 
-    public static long userIdNullValue()
+    public static long consumePositionNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long userIdMinValue()
+    public static long consumePositionMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long userIdMaxValue()
+    public static long consumePositionMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public long userId()
+    public long consumePosition()
     {
         return buffer.getLong(offset + 8, BYTE_ORDER);
-    }
-
-
-    public static int assetIdId()
-    {
-        return 3;
-    }
-
-    public static int assetIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int assetIdEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int assetIdEncodingLength()
-    {
-        return 4;
-    }
-
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static int assetIdNullValue()
-    {
-        return -2147483648;
-    }
-
-    public static int assetIdMinValue()
-    {
-        return -2147483647;
-    }
-
-    public static int assetIdMaxValue()
-    {
-        return 2147483647;
-    }
-
-    public int assetId()
-    {
-        return buffer.getInt(offset + 16, BYTE_ORDER);
-    }
-
-
-    public static int amountId()
-    {
-        return 4;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 20;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long amount()
-    {
-        return buffer.getLong(offset + 20, BYTE_ORDER);
     }
 
 
@@ -343,7 +241,7 @@ public final class WithdrawDecoder
             return "";
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final InitTradeHighWaterDecoder decoder = new InitTradeHighWaterDecoder();
         decoder.wrap(buffer, offset, actingBlockLength, actingVersion);
 
         return decoder.appendTo(new StringBuilder()).toString();
@@ -358,7 +256,7 @@ public final class WithdrawDecoder
 
         final int originalLimit = limit();
         limit(offset + actingBlockLength);
-        builder.append("[Withdraw](sbeTemplateId=");
+        builder.append("[InitTradeHighWater](sbeTemplateId=");
         builder.append(TEMPLATE_ID);
         builder.append("|sbeSchemaId=");
         builder.append(SCHEMA_ID);
@@ -377,24 +275,18 @@ public final class WithdrawDecoder
         }
         builder.append(BLOCK_LENGTH);
         builder.append("):");
-        builder.append("correlationId=");
-        builder.append(this.correlationId());
+        builder.append("tradeId=");
+        builder.append(this.tradeId());
         builder.append('|');
-        builder.append("userId=");
-        builder.append(this.userId());
-        builder.append('|');
-        builder.append("assetId=");
-        builder.append(this.assetId());
-        builder.append('|');
-        builder.append("amount=");
-        builder.append(this.amount());
+        builder.append("consumePosition=");
+        builder.append(this.consumePosition());
 
         limit(originalLimit);
 
         return builder;
     }
     
-    public WithdrawDecoder sbeSkip()
+    public InitTradeHighWaterDecoder sbeSkip()
     {
         sbeRewind();
 

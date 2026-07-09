@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * Terminates the BalanceUpdate stream answering RequestBalanceSnapshot
  */
 @SuppressWarnings("all")
-public final class WithdrawEncoder
+public final class BalanceSnapshotEndEncoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 12;
+    public static final int TEMPLATE_ID = 18;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawEncoder parentMessage = this;
+    private final BalanceSnapshotEndEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class WithdrawEncoder
         return offset;
     }
 
-    public WithdrawEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public BalanceSnapshotEndEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class WithdrawEncoder
         return this;
     }
 
-    public WithdrawEncoder wrapAndApplyHeader(
+    public BalanceSnapshotEndEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -142,86 +142,34 @@ public final class WithdrawEncoder
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder correlationId(final long value)
+    public BalanceSnapshotEndEncoder correlationId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int userIdId()
+    public static int entryCountId()
     {
         return 2;
     }
 
-    public static int userIdSinceVersion()
+    public static int entryCountSinceVersion()
     {
         return 0;
     }
 
-    public static int userIdEncodingOffset()
+    public static int entryCountEncodingOffset()
     {
         return 8;
     }
 
-    public static int userIdEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long userIdNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long userIdMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long userIdMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public WithdrawEncoder userId(final long value)
-    {
-        buffer.putLong(offset + 8, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int assetIdId()
-    {
-        return 3;
-    }
-
-    public static int assetIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int assetIdEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int assetIdEncodingLength()
+    public static int entryCountEncodingLength()
     {
         return 4;
     }
 
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String entryCountMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -231,76 +179,24 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static int assetIdNullValue()
+    public static int entryCountNullValue()
     {
         return -2147483648;
     }
 
-    public static int assetIdMinValue()
+    public static int entryCountMinValue()
     {
         return -2147483647;
     }
 
-    public static int assetIdMaxValue()
+    public static int entryCountMaxValue()
     {
         return 2147483647;
     }
 
-    public WithdrawEncoder assetId(final int value)
+    public BalanceSnapshotEndEncoder entryCount(final int value)
     {
-        buffer.putInt(offset + 16, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int amountId()
-    {
-        return 4;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 20;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public WithdrawEncoder amount(final long value)
-    {
-        buffer.putLong(offset + 20, value, BYTE_ORDER);
+        buffer.putInt(offset + 8, value, BYTE_ORDER);
         return this;
     }
 
@@ -322,7 +218,7 @@ public final class WithdrawEncoder
             return builder;
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final BalanceSnapshotEndDecoder decoder = new BalanceSnapshotEndDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

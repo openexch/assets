@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class HoldRejectDecoder
 {
-    public static final int BLOCK_LENGTH = 29;
+    public static final int BLOCK_LENGTH = 37;
     public static final int TEMPLATE_ID = 11;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 1;
-    public static final String SEMANTIC_VERSION = "0.1";
+    public static final int SCHEMA_VERSION = 2;
+    public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final HoldRejectDecoder parentMessage = this;
@@ -132,9 +132,60 @@ public final class HoldRejectDecoder
         this.limit = limit;
     }
 
-    public static int orderIdId()
+    public static int correlationIdId()
     {
         return 1;
+    }
+
+    public static int correlationIdSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int correlationIdEncodingOffset()
+    {
+        return 0;
+    }
+
+    public static int correlationIdEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long correlationIdNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long correlationIdMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long correlationIdMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long correlationId()
+    {
+        return buffer.getLong(offset + 0, BYTE_ORDER);
+    }
+
+
+    public static int orderIdId()
+    {
+        return 2;
     }
 
     public static int orderIdSinceVersion()
@@ -144,7 +195,7 @@ public final class HoldRejectDecoder
 
     public static int orderIdEncodingOffset()
     {
-        return 0;
+        return 8;
     }
 
     public static int orderIdEncodingLength()
@@ -179,13 +230,13 @@ public final class HoldRejectDecoder
 
     public long orderId()
     {
-        return buffer.getLong(offset + 0, BYTE_ORDER);
+        return buffer.getLong(offset + 8, BYTE_ORDER);
     }
 
 
     public static int userIdId()
     {
-        return 2;
+        return 3;
     }
 
     public static int userIdSinceVersion()
@@ -195,7 +246,7 @@ public final class HoldRejectDecoder
 
     public static int userIdEncodingOffset()
     {
-        return 8;
+        return 16;
     }
 
     public static int userIdEncodingLength()
@@ -230,13 +281,13 @@ public final class HoldRejectDecoder
 
     public long userId()
     {
-        return buffer.getLong(offset + 8, BYTE_ORDER);
+        return buffer.getLong(offset + 16, BYTE_ORDER);
     }
 
 
     public static int assetIdId()
     {
-        return 3;
+        return 4;
     }
 
     public static int assetIdSinceVersion()
@@ -246,7 +297,7 @@ public final class HoldRejectDecoder
 
     public static int assetIdEncodingOffset()
     {
-        return 16;
+        return 24;
     }
 
     public static int assetIdEncodingLength()
@@ -281,13 +332,13 @@ public final class HoldRejectDecoder
 
     public int assetId()
     {
-        return buffer.getInt(offset + 16, BYTE_ORDER);
+        return buffer.getInt(offset + 24, BYTE_ORDER);
     }
 
 
     public static int amountId()
     {
-        return 4;
+        return 5;
     }
 
     public static int amountSinceVersion()
@@ -297,7 +348,7 @@ public final class HoldRejectDecoder
 
     public static int amountEncodingOffset()
     {
-        return 20;
+        return 28;
     }
 
     public static int amountEncodingLength()
@@ -332,13 +383,13 @@ public final class HoldRejectDecoder
 
     public long amount()
     {
-        return buffer.getLong(offset + 20, BYTE_ORDER);
+        return buffer.getLong(offset + 28, BYTE_ORDER);
     }
 
 
     public static int reasonId()
     {
-        return 5;
+        return 6;
     }
 
     public static int reasonSinceVersion()
@@ -348,7 +399,7 @@ public final class HoldRejectDecoder
 
     public static int reasonEncodingOffset()
     {
-        return 28;
+        return 36;
     }
 
     public static int reasonEncodingLength()
@@ -368,12 +419,12 @@ public final class HoldRejectDecoder
 
     public short reasonRaw()
     {
-        return ((short)(buffer.getByte(offset + 28) & 0xFF));
+        return ((short)(buffer.getByte(offset + 36) & 0xFF));
     }
 
     public RejectReason reason()
     {
-        return RejectReason.get(((short)(buffer.getByte(offset + 28) & 0xFF)));
+        return RejectReason.get(((short)(buffer.getByte(offset + 36) & 0xFF)));
     }
 
 
@@ -418,6 +469,9 @@ public final class HoldRejectDecoder
         }
         builder.append(BLOCK_LENGTH);
         builder.append("):");
+        builder.append("correlationId=");
+        builder.append(this.correlationId());
+        builder.append('|');
         builder.append("orderId=");
         builder.append(this.orderId());
         builder.append('|');

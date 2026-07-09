@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * Answer to QueryFeedPosition: the ME journal cursor this AE has consumed
  */
 @SuppressWarnings("all")
-public final class WithdrawEncoder
+public final class FeedPositionReportEncoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 24;
+    public static final int TEMPLATE_ID = 17;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawEncoder parentMessage = this;
+    private final FeedPositionReportEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class WithdrawEncoder
         return offset;
     }
 
-    public WithdrawEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public FeedPositionReportEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class WithdrawEncoder
         return this;
     }
 
-    public WithdrawEncoder wrapAndApplyHeader(
+    public FeedPositionReportEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -142,34 +142,34 @@ public final class WithdrawEncoder
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder correlationId(final long value)
+    public FeedPositionReportEncoder correlationId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int userIdId()
+    public static int consumePositionId()
     {
         return 2;
     }
 
-    public static int userIdSinceVersion()
+    public static int consumePositionSinceVersion()
     {
         return 0;
     }
 
-    public static int userIdEncodingOffset()
+    public static int consumePositionEncodingOffset()
     {
         return 8;
     }
 
-    public static int userIdEncodingLength()
+    public static int consumePositionEncodingLength()
     {
         return 8;
     }
 
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String consumePositionMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -179,101 +179,49 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static long userIdNullValue()
+    public static long consumePositionNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long userIdMinValue()
+    public static long consumePositionMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long userIdMaxValue()
+    public static long consumePositionMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder userId(final long value)
+    public FeedPositionReportEncoder consumePosition(final long value)
     {
         buffer.putLong(offset + 8, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int assetIdId()
+    public static int lastAppliedTradeIdId()
     {
         return 3;
     }
 
-    public static int assetIdSinceVersion()
+    public static int lastAppliedTradeIdSinceVersion()
     {
         return 0;
     }
 
-    public static int assetIdEncodingOffset()
+    public static int lastAppliedTradeIdEncodingOffset()
     {
         return 16;
     }
 
-    public static int assetIdEncodingLength()
-    {
-        return 4;
-    }
-
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static int assetIdNullValue()
-    {
-        return -2147483648;
-    }
-
-    public static int assetIdMinValue()
-    {
-        return -2147483647;
-    }
-
-    public static int assetIdMaxValue()
-    {
-        return 2147483647;
-    }
-
-    public WithdrawEncoder assetId(final int value)
-    {
-        buffer.putInt(offset + 16, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int amountId()
-    {
-        return 4;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 20;
-    }
-
-    public static int amountEncodingLength()
+    public static int lastAppliedTradeIdEncodingLength()
     {
         return 8;
     }
 
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
+    public static String lastAppliedTradeIdMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -283,24 +231,24 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static long amountNullValue()
+    public static long lastAppliedTradeIdNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long amountMinValue()
+    public static long lastAppliedTradeIdMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long amountMaxValue()
+    public static long lastAppliedTradeIdMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder amount(final long value)
+    public FeedPositionReportEncoder lastAppliedTradeId(final long value)
     {
-        buffer.putLong(offset + 20, value, BYTE_ORDER);
+        buffer.putLong(offset + 16, value, BYTE_ORDER);
         return this;
     }
 
@@ -322,7 +270,7 @@ public final class WithdrawEncoder
             return builder;
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final FeedPositionReportDecoder decoder = new FeedPositionReportDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

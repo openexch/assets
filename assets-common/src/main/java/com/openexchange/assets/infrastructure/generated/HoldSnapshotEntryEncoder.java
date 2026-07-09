@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * One outstanding hold, streamed in answer to RequestHoldSnapshot
  */
 @SuppressWarnings("all")
-public final class WithdrawEncoder
+public final class HoldSnapshotEntryEncoder
 {
     public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int TEMPLATE_ID = 19;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawEncoder parentMessage = this;
+    private final HoldSnapshotEntryEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class WithdrawEncoder
         return offset;
     }
 
-    public WithdrawEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public HoldSnapshotEntryEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class WithdrawEncoder
         return this;
     }
 
-    public WithdrawEncoder wrapAndApplyHeader(
+    public HoldSnapshotEntryEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -97,27 +97,27 @@ public final class WithdrawEncoder
         this.limit = limit;
     }
 
-    public static int correlationIdId()
+    public static int orderIdId()
     {
         return 1;
     }
 
-    public static int correlationIdSinceVersion()
+    public static int orderIdSinceVersion()
     {
         return 0;
     }
 
-    public static int correlationIdEncodingOffset()
+    public static int orderIdEncodingOffset()
     {
         return 0;
     }
 
-    public static int correlationIdEncodingLength()
+    public static int orderIdEncodingLength()
     {
         return 8;
     }
 
-    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String orderIdMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -127,22 +127,22 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static long correlationIdNullValue()
+    public static long orderIdNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long correlationIdMinValue()
+    public static long orderIdMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long correlationIdMaxValue()
+    public static long orderIdMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder correlationId(final long value)
+    public HoldSnapshotEntryEncoder orderId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
@@ -194,7 +194,7 @@ public final class WithdrawEncoder
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder userId(final long value)
+    public HoldSnapshotEntryEncoder userId(final long value)
     {
         buffer.putLong(offset + 8, value, BYTE_ORDER);
         return this;
@@ -246,34 +246,34 @@ public final class WithdrawEncoder
         return 2147483647;
     }
 
-    public WithdrawEncoder assetId(final int value)
+    public HoldSnapshotEntryEncoder assetId(final int value)
     {
         buffer.putInt(offset + 16, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int amountId()
+    public static int remainingId()
     {
         return 4;
     }
 
-    public static int amountSinceVersion()
+    public static int remainingSinceVersion()
     {
         return 0;
     }
 
-    public static int amountEncodingOffset()
+    public static int remainingEncodingOffset()
     {
         return 20;
     }
 
-    public static int amountEncodingLength()
+    public static int remainingEncodingLength()
     {
         return 8;
     }
 
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
+    public static String remainingMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -283,22 +283,22 @@ public final class WithdrawEncoder
         return "";
     }
 
-    public static long amountNullValue()
+    public static long remainingNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long amountMinValue()
+    public static long remainingMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long amountMaxValue()
+    public static long remainingMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder amount(final long value)
+    public HoldSnapshotEntryEncoder remaining(final long value)
     {
         buffer.putLong(offset + 20, value, BYTE_ORDER);
         return this;
@@ -322,7 +322,7 @@ public final class WithdrawEncoder
             return builder;
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final HoldSnapshotEntryDecoder decoder = new HoldSnapshotEntryDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

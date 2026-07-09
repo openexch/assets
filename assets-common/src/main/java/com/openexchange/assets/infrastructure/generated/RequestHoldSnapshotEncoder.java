@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Release a hold's residual (locked -&gt; available). amount &lt; 0 releases all remaining.
+ * read-only: leader streams HoldSnapshotEntry per hold then HoldSnapshotEnd
  */
 @SuppressWarnings("all")
-public final class ReleaseEncoder
+public final class RequestHoldSnapshotEncoder
 {
-    public static final int BLOCK_LENGTH = 24;
-    public static final int TEMPLATE_ID = 4;
+    public static final int BLOCK_LENGTH = 8;
+    public static final int TEMPLATE_ID = 9;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final ReleaseEncoder parentMessage = this;
+    private final RequestHoldSnapshotEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class ReleaseEncoder
         return offset;
     }
 
-    public ReleaseEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public RequestHoldSnapshotEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class ReleaseEncoder
         return this;
     }
 
-    public ReleaseEncoder wrapAndApplyHeader(
+    public RequestHoldSnapshotEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -97,27 +97,27 @@ public final class ReleaseEncoder
         this.limit = limit;
     }
 
-    public static int orderIdId()
+    public static int correlationIdId()
     {
         return 1;
     }
 
-    public static int orderIdSinceVersion()
+    public static int correlationIdSinceVersion()
     {
         return 0;
     }
 
-    public static int orderIdEncodingOffset()
+    public static int correlationIdEncodingOffset()
     {
         return 0;
     }
 
-    public static int orderIdEncodingLength()
+    public static int correlationIdEncodingLength()
     {
         return 8;
     }
 
-    public static String orderIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -127,128 +127,24 @@ public final class ReleaseEncoder
         return "";
     }
 
-    public static long orderIdNullValue()
+    public static long correlationIdNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long orderIdMinValue()
+    public static long correlationIdMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long orderIdMaxValue()
+    public static long correlationIdMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public ReleaseEncoder orderId(final long value)
+    public RequestHoldSnapshotEncoder correlationId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int userIdId()
-    {
-        return 2;
-    }
-
-    public static int userIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int userIdEncodingOffset()
-    {
-        return 8;
-    }
-
-    public static int userIdEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long userIdNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long userIdMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long userIdMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public ReleaseEncoder userId(final long value)
-    {
-        buffer.putLong(offset + 8, value, BYTE_ORDER);
-        return this;
-    }
-
-
-    public static int amountId()
-    {
-        return 3;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public ReleaseEncoder amount(final long value)
-    {
-        buffer.putLong(offset + 16, value, BYTE_ORDER);
         return this;
     }
 
@@ -270,7 +166,7 @@ public final class ReleaseEncoder
             return builder;
         }
 
-        final ReleaseDecoder decoder = new ReleaseDecoder();
+        final RequestHoldSnapshotDecoder decoder = new RequestHoldSnapshotDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class SettleDecoder
 {
-    public static final int BLOCK_LENGTH = 61;
+    public static final int BLOCK_LENGTH = 69;
     public static final int TEMPLATE_ID = 5;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 1;
-    public static final String SEMANTIC_VERSION = "0.1";
+    public static final int SCHEMA_VERSION = 2;
+    public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final SettleDecoder parentMessage = this;
@@ -581,6 +581,57 @@ public final class SettleDecoder
     }
 
 
+    public static int journalPositionId()
+    {
+        return 10;
+    }
+
+    public static int journalPositionSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int journalPositionEncodingOffset()
+    {
+        return 61;
+    }
+
+    public static int journalPositionEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String journalPositionMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long journalPositionNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long journalPositionMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long journalPositionMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long journalPosition()
+    {
+        return buffer.getLong(offset + 61, BYTE_ORDER);
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -648,6 +699,9 @@ public final class SettleDecoder
         builder.append('|');
         builder.append("takerIsBuy=");
         builder.append(this.takerIsBuy());
+        builder.append('|');
+        builder.append("journalPosition=");
+        builder.append(this.journalPosition());
 
         limit(originalLimit);
 

@@ -2,8 +2,8 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="com.openexchange.assets.infrastructure.generated"
                    id="2"
-                   version="1"
-                   semanticVersion="0.1"
+                   version="2"
+                   semanticVersion="0.2"
                    description="Assets Engine money schema — balances, holds, settlement. All amounts are 8dp fixed-point int64."
 >
     <types>
@@ -35,22 +35,25 @@
     <!-- ============================ Ingress commands (client -> AE) ============================ -->
 
     <sbe:message name="Deposit" id="1" description="Credit available balance (external boundary)">
-        <field name="userId"  id="1" type="int64"/>
-        <field name="assetId" id="2" type="int32"/>
-        <field name="amount"  id="3" type="int64"/>
+        <field name="correlationId" id="1" type="int64" description="client-chosen id echoed on the ack; 0 = fire-and-forget"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="assetId"       id="3" type="int32"/>
+        <field name="amount"        id="4" type="int64"/>
     </sbe:message>
 
     <sbe:message name="Withdraw" id="2" description="Debit available balance (external boundary)">
-        <field name="userId"  id="1" type="int64"/>
-        <field name="assetId" id="2" type="int32"/>
-        <field name="amount"  id="3" type="int64"/>
+        <field name="correlationId" id="1" type="int64" description="client-chosen id echoed on the ack; 0 = fire-and-forget"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="assetId"       id="3" type="int32"/>
+        <field name="amount"        id="4" type="int64"/>
     </sbe:message>
 
     <sbe:message name="Hold" id="3" description="Reserve funds for an order (available -> locked)">
-        <field name="orderId" id="1" type="int64"/>
-        <field name="userId"  id="2" type="int64"/>
-        <field name="assetId" id="3" type="int32"/>
-        <field name="amount"  id="4" type="int64"/>
+        <field name="correlationId" id="1" type="int64" description="client-chosen id echoed on the ack; 0 = fire-and-forget"/>
+        <field name="orderId"       id="2" type="int64"/>
+        <field name="userId"        id="3" type="int64"/>
+        <field name="assetId"       id="4" type="int32"/>
+        <field name="amount"        id="5" type="int64"/>
     </sbe:message>
 
     <sbe:message name="Release" id="4" description="Release a hold's residual (locked -> available). amount &lt; 0 releases all remaining.">
@@ -69,23 +72,51 @@
         <field name="price"         id="7" type="int64"/>
         <field name="quantity"      id="8" type="int64"/>
         <field name="takerIsBuy"    id="9" type="BoolFlag"/>
+        <field name="journalPosition" id="10" type="int64" description="ME settlement-journal egressSeq of this trade; drives consumePosition; 0 = direct ingress (tests/tools)"/>
+    </sbe:message>
+
+    <sbe:message name="TerminalRelease" id="6" description="feed-forward from the ME journal: order reached terminal state; release the order's full residual hold; unknown/gone hold = no-op">
+        <field name="journalPosition" id="1" type="int64"/>
+        <field name="orderId"         id="2" type="int64"/>
+        <field name="userId"          id="3" type="int64"/>
+        <field name="timestamp"       id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="QueryFeedPosition" id="7" description="read-only: answered with FeedPositionReport; deterministic no-op on state">
+        <field name="correlationId" id="1" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="RequestBalanceSnapshot" id="8" description="read-only: leader streams BalanceUpdate per (user,asset) then BalanceSnapshotEnd">
+        <field name="correlationId" id="1" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="RequestHoldSnapshot" id="9" description="read-only: leader streams HoldSnapshotEntry per hold then HoldSnapshotEnd">
+        <field name="correlationId" id="1" type="int64"/>
+    </sbe:message>
+
+    <!-- Cutover primer, reserved in its own id range away from the day-to-day ingress traffic. -->
+    <sbe:message name="InitTradeHighWater" id="30" description="cutover primer: refused (no-op) unless the ledger is virgin (lastAppliedTradeId==0 and no accounts)">
+        <field name="tradeId"         id="1" type="int64"/>
+        <field name="consumePosition" id="2" type="int64"/>
     </sbe:message>
 
     <!-- ============================ Egress events (AE -> client) ============================ -->
 
     <sbe:message name="HoldAck" id="10" description="A hold was accepted">
-        <field name="orderId" id="1" type="int64"/>
-        <field name="userId"  id="2" type="int64"/>
-        <field name="assetId" id="3" type="int32"/>
-        <field name="amount"  id="4" type="int64"/>
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="orderId"       id="2" type="int64"/>
+        <field name="userId"        id="3" type="int64"/>
+        <field name="assetId"       id="4" type="int32"/>
+        <field name="amount"        id="5" type="int64"/>
     </sbe:message>
 
     <sbe:message name="HoldReject" id="11" description="A hold was rejected">
-        <field name="orderId" id="1" type="int64"/>
-        <field name="userId"  id="2" type="int64"/>
-        <field name="assetId" id="3" type="int32"/>
-        <field name="amount"  id="4" type="int64"/>
-        <field name="reason"  id="5" type="RejectReason"/>
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="orderId"       id="2" type="int64"/>
+        <field name="userId"        id="3" type="int64"/>
+        <field name="assetId"       id="4" type="int32"/>
+        <field name="amount"        id="5" type="int64"/>
+        <field name="reason"        id="6" type="RejectReason"/>
     </sbe:message>
 
     <sbe:message name="BalanceUpdate" id="12" description="A user's balance for one asset changed">
@@ -102,9 +133,49 @@
     </sbe:message>
 
     <sbe:message name="WithdrawReject" id="14" description="A withdrawal was rejected">
-        <field name="userId"  id="1" type="int64"/>
-        <field name="assetId" id="2" type="int32"/>
-        <field name="amount"  id="3" type="int64"/>
-        <field name="reason"  id="4" type="RejectReason"/>
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="assetId"       id="3" type="int32"/>
+        <field name="amount"        id="4" type="int64"/>
+        <field name="reason"        id="5" type="RejectReason"/>
+    </sbe:message>
+
+    <sbe:message name="DepositAck" id="15" description="A deposit was applied">
+        <field name="correlationId"  id="1" type="int64"/>
+        <field name="userId"         id="2" type="int64"/>
+        <field name="assetId"        id="3" type="int32"/>
+        <field name="amount"         id="4" type="int64"/>
+        <field name="newAvailable"   id="5" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="WithdrawAck" id="16" description="A withdrawal was applied">
+        <field name="correlationId"  id="1" type="int64"/>
+        <field name="userId"         id="2" type="int64"/>
+        <field name="assetId"        id="3" type="int32"/>
+        <field name="amount"         id="4" type="int64"/>
+        <field name="newAvailable"   id="5" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="FeedPositionReport" id="17" description="Answer to QueryFeedPosition: the ME journal cursor this AE has consumed">
+        <field name="correlationId"       id="1" type="int64"/>
+        <field name="consumePosition"     id="2" type="int64"/>
+        <field name="lastAppliedTradeId"  id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="BalanceSnapshotEnd" id="18" description="Terminates the BalanceUpdate stream answering RequestBalanceSnapshot">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="entryCount"    id="2" type="int32"/>
+    </sbe:message>
+
+    <sbe:message name="HoldSnapshotEntry" id="19" description="One outstanding hold, streamed in answer to RequestHoldSnapshot">
+        <field name="orderId"    id="1" type="int64"/>
+        <field name="userId"     id="2" type="int64"/>
+        <field name="assetId"    id="3" type="int32"/>
+        <field name="remaining"  id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="HoldSnapshotEnd" id="20" description="Terminates the HoldSnapshotEntry stream answering RequestHoldSnapshot">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="entryCount"    id="2" type="int32"/>
     </sbe:message>
 </sbe:messageSchema>

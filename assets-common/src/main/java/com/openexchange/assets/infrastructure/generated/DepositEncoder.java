@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class DepositEncoder
 {
-    public static final int BLOCK_LENGTH = 20;
+    public static final int BLOCK_LENGTH = 28;
     public static final int TEMPLATE_ID = 1;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 1;
-    public static final String SEMANTIC_VERSION = "0.1";
+    public static final int SCHEMA_VERSION = 2;
+    public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final DepositEncoder parentMessage = this;
@@ -97,9 +97,61 @@ public final class DepositEncoder
         this.limit = limit;
     }
 
-    public static int userIdId()
+    public static int correlationIdId()
     {
         return 1;
+    }
+
+    public static int correlationIdSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int correlationIdEncodingOffset()
+    {
+        return 0;
+    }
+
+    public static int correlationIdEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long correlationIdNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long correlationIdMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long correlationIdMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public DepositEncoder correlationId(final long value)
+    {
+        buffer.putLong(offset + 0, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int userIdId()
+    {
+        return 2;
     }
 
     public static int userIdSinceVersion()
@@ -109,7 +161,7 @@ public final class DepositEncoder
 
     public static int userIdEncodingOffset()
     {
-        return 0;
+        return 8;
     }
 
     public static int userIdEncodingLength()
@@ -144,14 +196,14 @@ public final class DepositEncoder
 
     public DepositEncoder userId(final long value)
     {
-        buffer.putLong(offset + 0, value, BYTE_ORDER);
+        buffer.putLong(offset + 8, value, BYTE_ORDER);
         return this;
     }
 
 
     public static int assetIdId()
     {
-        return 2;
+        return 3;
     }
 
     public static int assetIdSinceVersion()
@@ -161,7 +213,7 @@ public final class DepositEncoder
 
     public static int assetIdEncodingOffset()
     {
-        return 8;
+        return 16;
     }
 
     public static int assetIdEncodingLength()
@@ -196,14 +248,14 @@ public final class DepositEncoder
 
     public DepositEncoder assetId(final int value)
     {
-        buffer.putInt(offset + 8, value, BYTE_ORDER);
+        buffer.putInt(offset + 16, value, BYTE_ORDER);
         return this;
     }
 
 
     public static int amountId()
     {
-        return 3;
+        return 4;
     }
 
     public static int amountSinceVersion()
@@ -213,7 +265,7 @@ public final class DepositEncoder
 
     public static int amountEncodingOffset()
     {
-        return 12;
+        return 20;
     }
 
     public static int amountEncodingLength()
@@ -248,7 +300,7 @@ public final class DepositEncoder
 
     public DepositEncoder amount(final long value)
     {
-        buffer.putLong(offset + 12, value, BYTE_ORDER);
+        buffer.putLong(offset + 20, value, BYTE_ORDER);
         return this;
     }
 

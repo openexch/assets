@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * A deposit was applied
  */
 @SuppressWarnings("all")
-public final class WithdrawEncoder
+public final class DepositAckEncoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 36;
+    public static final int TEMPLATE_ID = 15;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
     public static final String SEMANTIC_VERSION = "0.2";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawEncoder parentMessage = this;
+    private final DepositAckEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class WithdrawEncoder
         return offset;
     }
 
-    public WithdrawEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public DepositAckEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class WithdrawEncoder
         return this;
     }
 
-    public WithdrawEncoder wrapAndApplyHeader(
+    public DepositAckEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -142,7 +142,7 @@ public final class WithdrawEncoder
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder correlationId(final long value)
+    public DepositAckEncoder correlationId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
@@ -194,7 +194,7 @@ public final class WithdrawEncoder
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder userId(final long value)
+    public DepositAckEncoder userId(final long value)
     {
         buffer.putLong(offset + 8, value, BYTE_ORDER);
         return this;
@@ -246,7 +246,7 @@ public final class WithdrawEncoder
         return 2147483647;
     }
 
-    public WithdrawEncoder assetId(final int value)
+    public DepositAckEncoder assetId(final int value)
     {
         buffer.putInt(offset + 16, value, BYTE_ORDER);
         return this;
@@ -298,9 +298,61 @@ public final class WithdrawEncoder
         return 9223372036854775807L;
     }
 
-    public WithdrawEncoder amount(final long value)
+    public DepositAckEncoder amount(final long value)
     {
         buffer.putLong(offset + 20, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int newAvailableId()
+    {
+        return 5;
+    }
+
+    public static int newAvailableSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int newAvailableEncodingOffset()
+    {
+        return 28;
+    }
+
+    public static int newAvailableEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String newAvailableMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long newAvailableNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long newAvailableMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long newAvailableMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public DepositAckEncoder newAvailable(final long value)
+    {
+        buffer.putLong(offset + 28, value, BYTE_ORDER);
         return this;
     }
 
@@ -322,7 +374,7 @@ public final class WithdrawEncoder
             return builder;
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final DepositAckDecoder decoder = new DepositAckDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);
