@@ -69,6 +69,11 @@ public final class RecordingAssetsSink implements AssetsEventSink {
         events.add(new AssetsEngineEvent.HoldSnapshotEnd(correlationId, entryCount));
     }
 
+    @Override
+    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId) {
+        events.add(new AssetsEngineEvent.FeedPositionReport(correlationId, consumePosition, lastAppliedTradeId));
+    }
+
     public List<AssetsEngineEvent> events() {
         return Collections.unmodifiableList(events);
     }

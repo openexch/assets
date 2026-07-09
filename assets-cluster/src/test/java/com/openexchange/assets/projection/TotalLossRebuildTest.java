@@ -221,5 +221,6 @@ public class TotalLossRebuildTest {
         @Override public void onBalanceSnapshotEnd(long correlationId, int entryCount) { }
         @Override public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) { }
         @Override public void onHoldSnapshotEnd(long correlationId, int entryCount) { }
+        @Override public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId) { }
     };
 }

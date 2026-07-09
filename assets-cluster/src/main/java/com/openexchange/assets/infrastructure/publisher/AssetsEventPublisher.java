@@ -6,6 +6,7 @@ import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
 import com.openexchange.assets.infrastructure.generated.DepositAckEncoder;
+import com.openexchange.assets.infrastructure.generated.FeedPositionReportEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldAckEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldRejectEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndEncoder;
@@ -47,6 +48,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final SettlementAppliedEncoder settlementAppliedEncoder = new SettlementAppliedEncoder();
     private final WithdrawRejectEncoder withdrawRejectEncoder = new WithdrawRejectEncoder();
     private final BalanceSnapshotEndEncoder balanceSnapshotEndEncoder = new BalanceSnapshotEndEncoder();
+    private final FeedPositionReportEncoder feedPositionReportEncoder = new FeedPositionReportEncoder();
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
@@ -123,6 +125,14 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         holdSnapshotEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).entryCount(entryCount);
         flush(holdSnapshotEndEncoder.encodedLength());
+    }
+
+    @Override
+    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId) {
+        feedPositionReportEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).consumePosition(consumePosition)
+                .lastAppliedTradeId(lastAppliedTradeId);
+        flush(feedPositionReportEncoder.encodedLength());
     }
 
     private void flush(int bodyLength) {

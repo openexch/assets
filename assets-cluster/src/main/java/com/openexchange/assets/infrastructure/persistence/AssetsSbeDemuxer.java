@@ -2,21 +2,23 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
+import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
-import com.openexchange.assets.domain.commands.SettleCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.DepositDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldDecoder;
 import com.openexchange.assets.infrastructure.generated.InitTradeHighWaterDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.QueryFeedPositionDecoder;
 import com.openexchange.assets.infrastructure.generated.ReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotDecoder;
 import com.openexchange.assets.infrastructure.generated.SettleDecoder;
+import com.openexchange.assets.infrastructure.generated.TerminalReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawDecoder;
 import org.agrona.DirectBuffer;
 
@@ -28,6 +30,7 @@ import org.agrona.DirectBuffer;
 public final class AssetsSbeDemuxer {
 
     private final AssetsEngine engine;
+    private final SettlementProjector projector;
     private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
 
     private final DepositDecoder depositDecoder = new DepositDecoder();
@@ -35,6 +38,8 @@ public final class AssetsSbeDemuxer {
     private final HoldDecoder holdDecoder = new HoldDecoder();
     private final ReleaseDecoder releaseDecoder = new ReleaseDecoder();
     private final SettleDecoder settleDecoder = new SettleDecoder();
+    private final TerminalReleaseDecoder terminalReleaseDecoder = new TerminalReleaseDecoder();
+    private final QueryFeedPositionDecoder queryFeedPositionDecoder = new QueryFeedPositionDecoder();
     private final InitTradeHighWaterDecoder initHighWaterDecoder = new InitTradeHighWaterDecoder();
     private final RequestBalanceSnapshotDecoder balanceSnapshotDecoder = new RequestBalanceSnapshotDecoder();
     private final RequestHoldSnapshotDecoder holdSnapshotDecoder = new RequestHoldSnapshotDecoder();
@@ -43,11 +48,11 @@ public final class AssetsSbeDemuxer {
     private final WithdrawCommand withdrawCommand = new WithdrawCommand();
     private final HoldCommand holdCommand = new HoldCommand();
     private final ReleaseCommand releaseCommand = new ReleaseCommand();
-    private final SettleCommand settleCommand = new SettleCommand();
     private final InitTradeHighWaterCommand initHighWaterCommand = new InitTradeHighWaterCommand();
 
-    public AssetsSbeDemuxer(AssetsEngine engine) {
+    public AssetsSbeDemuxer(AssetsEngine engine, SettlementProjector projector) {
         this.engine = engine;
+        this.projector = projector;
     }
 
     public void dispatch(final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
@@ -62,11 +67,11 @@ public final class AssetsSbeDemuxer {
             case HoldDecoder.TEMPLATE_ID:     handleHold(buffer, offset, timestamp); break;
             case ReleaseDecoder.TEMPLATE_ID:  handleRelease(buffer, offset, timestamp); break;
             case SettleDecoder.TEMPLATE_ID:   handleSettle(buffer, offset, timestamp); break;
+            case TerminalReleaseDecoder.TEMPLATE_ID:        handleTerminalRelease(buffer, offset, timestamp); break;
+            case QueryFeedPositionDecoder.TEMPLATE_ID:      handleQueryFeedPosition(buffer, offset); break;
             case InitTradeHighWaterDecoder.TEMPLATE_ID:     handleInitHighWater(buffer, offset, timestamp); break;
             case RequestBalanceSnapshotDecoder.TEMPLATE_ID: handleRequestBalanceSnapshot(buffer, offset); break;
             case RequestHoldSnapshotDecoder.TEMPLATE_ID:    handleRequestHoldSnapshot(buffer, offset); break;
-            // TerminalRelease (id 6) and QueryFeedPosition (id 7) are ingress messages wired by the
-            // separate settlement-feed / feed-position task — add their cases here, not in this change.
             default: break; // unknown message — ignore on the hot path
         }
     }
@@ -113,19 +118,41 @@ public final class AssetsSbeDemuxer {
         engine.applyCommand(AssetsEngine.CMD_RELEASE, releaseCommand, timestamp);
     }
 
+    /**
+     * All settles route through the {@link SettlementProjector} so the journal cursor
+     * (consumePosition) advances atomically with the money mutation. Direct ingress
+     * (tests/tools) carries journalPosition=0, which never advances the cursor.
+     */
     private void handleSettle(DirectBuffer buffer, int offset, long timestamp) {
         settleDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
-        settleCommand.reset();
-        settleCommand.setTradeId(settleDecoder.tradeId());
-        settleCommand.setMarketId(settleDecoder.marketId());
-        settleCommand.setTakerOrderId(settleDecoder.takerOrderId());
-        settleCommand.setTakerUserId(settleDecoder.takerUserId());
-        settleCommand.setMakerOrderId(settleDecoder.makerOrderId());
-        settleCommand.setMakerUserId(settleDecoder.makerUserId());
-        settleCommand.setPrice(settleDecoder.price());
-        settleCommand.setQuantity(settleDecoder.quantity());
-        settleCommand.setTakerIsBuy(settleDecoder.takerIsBuy() == BoolFlag.TRUE);
-        engine.applyCommand(AssetsEngine.CMD_SETTLE, settleCommand, timestamp);
+        projector.onTrade(
+                settleDecoder.journalPosition(),
+                settleDecoder.tradeId(),
+                settleDecoder.marketId(),
+                settleDecoder.takerOrderId(),
+                settleDecoder.takerUserId(),
+                settleDecoder.makerOrderId(),
+                settleDecoder.makerUserId(),
+                settleDecoder.price(),
+                settleDecoder.quantity(),
+                settleDecoder.takerIsBuy() == BoolFlag.TRUE,
+                timestamp);
+    }
+
+    /** Feed-forward terminal from the ME journal: release the order's full residual hold. */
+    private void handleTerminalRelease(DirectBuffer buffer, int offset, long timestamp) {
+        terminalReleaseDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        projector.onTerminal(
+                terminalReleaseDecoder.journalPosition(),
+                terminalReleaseDecoder.orderId(),
+                terminalReleaseDecoder.userId(),
+                timestamp);
+    }
+
+    /** Read-only: the engine answers with a FeedPositionReport through the sink. */
+    private void handleQueryFeedPosition(DirectBuffer buffer, int offset) {
+        queryFeedPositionDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        engine.reportFeedPosition(queryFeedPositionDecoder.correlationId());
     }
 
     private void handleInitHighWater(DirectBuffer buffer, int offset, long timestamp) {

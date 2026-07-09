@@ -58,4 +58,11 @@ public interface AssetsEventSink {
      * the {@code RequestHoldSnapshot} carrying this {@code correlationId}.
      */
     void onHoldSnapshotEnd(long correlationId, int entryCount);
+
+    /**
+     * Answers a {@code QueryFeedPosition}: how far into the ME settlement journal this ledger has
+     * applied ({@code consumePosition} = journal egressSeq watermark) and the settlement high-water
+     * ({@code lastAppliedTradeId}). The settlement bridge resumes the journal from these.
+     */
+    void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId);
 }

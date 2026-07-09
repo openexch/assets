@@ -2,6 +2,7 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
+import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
@@ -34,7 +35,11 @@ import org.agrona.concurrent.UnsafeBuffer;
 public final class AssetsClusteredService implements ClusteredService {
 
     private final AssetsEngine engine = new AssetsEngine();
-    private final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine);
+    // The projector owns the feed-forward translation (Settle/TerminalRelease -> money mutation +
+    // consumePosition advance). It wraps the same engine instance for the life of the service:
+    // loadSnapshot restores INTO that instance, so the projector needs no re-wiring on recovery.
+    private final SettlementProjector projector = new SettlementProjector(engine);
+    private final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, projector);
 
     private Cluster cluster;
     private IdleStrategy idleStrategy;

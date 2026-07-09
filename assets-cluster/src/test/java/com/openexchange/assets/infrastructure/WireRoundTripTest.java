@@ -2,6 +2,7 @@
 package com.openexchange.assets.infrastructure;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
+import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndDecoder;
@@ -19,7 +20,10 @@ import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotEncoder;
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotEncoder;
+import com.openexchange.assets.infrastructure.generated.FeedPositionReportDecoder;
+import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder;
 import com.openexchange.assets.infrastructure.generated.SettleEncoder;
+import com.openexchange.assets.infrastructure.generated.TerminalReleaseEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawEncoder;
@@ -58,6 +62,7 @@ public class WireRoundTripTest {
         private final BalanceSnapshotEndDecoder balSnapEnd = new BalanceSnapshotEndDecoder();
         private final HoldSnapshotEntryDecoder holdSnapEntry = new HoldSnapshotEntryDecoder();
         private final HoldSnapshotEndDecoder holdSnapEnd = new HoldSnapshotEndDecoder();
+        private final FeedPositionReportDecoder feedPos = new FeedPositionReportDecoder();
 
         @Override
         public void broadcast(MutableDirectBuffer buffer, int offset, int length) {
@@ -119,6 +124,11 @@ public class WireRoundTripTest {
                     lines.add(String.format("HOLDSNAPEND corr=%d count=%d",
                             holdSnapEnd.correlationId(), holdSnapEnd.entryCount()));
                     break;
+                case FeedPositionReportDecoder.TEMPLATE_ID:
+                    feedPos.wrapAndApplyHeader(buffer, offset, header);
+                    lines.add(String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d",
+                            feedPos.correlationId(), feedPos.consumePosition(), feedPos.lastAppliedTradeId()));
+                    break;
                 default:
                     lines.add("UNKNOWN template " + header.templateId());
             }
@@ -134,13 +144,15 @@ public class WireRoundTripTest {
     private final InitTradeHighWaterEncoder initEncoder = new InitTradeHighWaterEncoder();
     private final RequestBalanceSnapshotEncoder balSnapReqEncoder = new RequestBalanceSnapshotEncoder();
     private final RequestHoldSnapshotEncoder holdSnapReqEncoder = new RequestHoldSnapshotEncoder();
+    private final TerminalReleaseEncoder terminalReleaseEncoder = new TerminalReleaseEncoder();
+    private final QueryFeedPositionEncoder queryFeedPosEncoder = new QueryFeedPositionEncoder();
 
     @Test
     public void depositHoldSettleRoundTripThroughTheWire() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
         engine.setEventSink(new AssetsEventPublisher(egress));
-        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine);
+        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         // seller (100) deposits 1 BTC, buyer (200) deposits 60000 USD (correlationIds echoed on the acks)
         deposit(demuxer, 11, 100, Asset.BTC.id(), FixedPoint.fromDouble(1.0));
@@ -176,11 +188,49 @@ public class WireRoundTripTest {
     }
 
     @Test
+    public void feedPathAdvancesConsumePositionAndAnswersFeedQuery() {
+        AssetsEngine engine = new AssetsEngine();
+        CapturingEgress egress = new CapturingEgress();
+        engine.setEventSink(new AssetsEventPublisher(egress));
+        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
+
+        deposit(demuxer, 1, 100, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
+        deposit(demuxer, 2, 200, Asset.USD.id(), FixedPoint.fromDouble(120000.0));
+        hold(demuxer, 3, 1, 100, Asset.BTC.id(), FixedPoint.fromDouble(2.0));      // sell 2 BTC
+        hold(demuxer, 4, 2, 200, Asset.USD.id(), FixedPoint.fromDouble(120000.0)); // buy budget
+
+        // A feed-forward settle stamped with the ME journal position advances the cursor with the money.
+        settleAt(demuxer, 7_777L, 1, 1, 2, 200, 1, 100,
+                FixedPoint.fromDouble(60000.0), FixedPoint.fromDouble(1.0), true);
+        assertEquals(7_777L, engine.getConsumePosition());
+        assertEquals(1L, engine.getLastAppliedTradeId());
+
+        // Terminal for the half-consumed sell releases its residual (1 BTC) and advances further.
+        terminalRelease(demuxer, 7_900L, 1, 100);
+        assertEquals(7_900L, engine.getConsumePosition());
+        assertEquals(FixedPoint.fromDouble(1.0), engine.account(100).available(Asset.BTC.id()));
+        assertEquals(0L, engine.account(100).locked(Asset.BTC.id()));
+
+        // Terminal for an unknown order is a money no-op but still advances the cursor.
+        terminalRelease(demuxer, 8_000L, 999, 100);
+        assertEquals(8_000L, engine.getConsumePosition());
+
+        // An over-replayed (stale) position never regresses the cursor.
+        terminalRelease(demuxer, 7_500L, 998, 100);
+        assertEquals(8_000L, engine.getConsumePosition());
+
+        // The feed query answers cursor + settlement high-water, decoded back off the wire.
+        egress.lines.clear();
+        queryFeedPosition(demuxer, 42);
+        assertEquals(List.of("FEEDPOS corr=42 consumePos=8000 lastTradeId=1"), egress.lines);
+    }
+
+    @Test
     public void withdrawAckAndRejectRoundTrip() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
         engine.setEventSink(new AssetsEventPublisher(egress));
-        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine);
+        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         deposit(demuxer, 1, 300, Asset.USD.id(), FixedPoint.fromDouble(1000.0));
         withdraw(demuxer, 2, 300, Asset.USD.id(), FixedPoint.fromDouble(300.0));   // accepted
@@ -200,7 +250,7 @@ public class WireRoundTripTest {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
         engine.setEventSink(new AssetsEventPublisher(egress));
-        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine);
+        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         deposit(demuxer, 0, 100, Asset.USD.id(), FixedPoint.fromDouble(1000.0));
         deposit(demuxer, 0, 200, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
@@ -228,7 +278,7 @@ public class WireRoundTripTest {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
         engine.setEventSink(new AssetsEventPublisher(egress));
-        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine);
+        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         // Virgin ledger: the primer is accepted and seeds the scalars, emitting no egress.
         initTradeHighWater(demuxer, 500L, 12345L);
@@ -265,13 +315,31 @@ public class WireRoundTripTest {
 
     private void settle(AssetsSbeDemuxer demuxer, long tradeId, int marketId, long takerOrder, long takerUser,
                         long makerOrder, long makerUser, long price, long qty, boolean takerIsBuy) {
+        settleAt(demuxer, 0L, tradeId, marketId, takerOrder, takerUser, makerOrder, makerUser, price, qty, takerIsBuy);
+    }
+
+    private void settleAt(AssetsSbeDemuxer demuxer, long journalPosition, long tradeId, int marketId,
+                          long takerOrder, long takerUser, long makerOrder, long makerUser,
+                          long price, long qty, boolean takerIsBuy) {
         settleEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .tradeId(tradeId).marketId(marketId)
                 .takerOrderId(takerOrder).takerUserId(takerUser)
                 .makerOrderId(makerOrder).makerUserId(makerUser)
                 .price(price).quantity(qty)
-                .takerIsBuy(takerIsBuy ? BoolFlag.TRUE : BoolFlag.FALSE);
+                .takerIsBuy(takerIsBuy ? BoolFlag.TRUE : BoolFlag.FALSE)
+                .journalPosition(journalPosition);
         demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + settleEncoder.encodedLength(), 1000L);
+    }
+
+    private void terminalRelease(AssetsSbeDemuxer demuxer, long journalPosition, long orderId, long userId) {
+        terminalReleaseEncoder.wrapAndApplyHeader(ingress, 0, header)
+                .journalPosition(journalPosition).orderId(orderId).userId(userId).timestamp(1000L);
+        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + terminalReleaseEncoder.encodedLength(), 1000L);
+    }
+
+    private void queryFeedPosition(AssetsSbeDemuxer demuxer, long corr) {
+        queryFeedPosEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
+        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + queryFeedPosEncoder.encodedLength(), 1000L);
     }
 
     private void initTradeHighWater(AssetsSbeDemuxer demuxer, long tradeId, long consumePosition) {

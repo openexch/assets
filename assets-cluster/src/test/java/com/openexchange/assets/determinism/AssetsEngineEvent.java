@@ -13,7 +13,8 @@ public sealed interface AssetsEngineEvent
         permits AssetsEngineEvent.Balance, AssetsEngineEvent.DepositAck, AssetsEngineEvent.WithdrawAck,
                 AssetsEngineEvent.HoldAck, AssetsEngineEvent.HoldReject, AssetsEngineEvent.WithdrawReject,
                 AssetsEngineEvent.Settled, AssetsEngineEvent.BalanceSnapshotEnd,
-                AssetsEngineEvent.HoldSnapshotEntry, AssetsEngineEvent.HoldSnapshotEnd {
+                AssetsEngineEvent.HoldSnapshotEntry, AssetsEngineEvent.HoldSnapshotEnd,
+                AssetsEngineEvent.FeedPositionReport {
 
     String render();
 
@@ -95,6 +96,15 @@ public sealed interface AssetsEngineEvent
         @Override
         public String render() {
             return String.format("HOLDSNAPEND corr=%d count=%d", correlationId, entryCount);
+        }
+    }
+
+    record FeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId)
+            implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d",
+                    correlationId, consumePosition, lastAppliedTradeId);
         }
     }
 }

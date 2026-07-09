@@ -187,6 +187,14 @@ public final class AssetsEngine {
     // ---- read-only snapshot queries (leader answers; deterministic; no state mutation) ----
 
     /**
+     * Answer a {@code QueryFeedPosition}: emit the journal consume position + settlement high-water
+     * through the sink. Read-only; deterministic on every replica (egress is leader-gated downstream).
+     */
+    public void reportFeedPosition(long correlationId) {
+        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId);
+    }
+
+    /**
      * Stream one {@code onBalanceUpdate} per (user, asset) with a non-zero available or locked balance,
      * then an {@code onBalanceSnapshotEnd} carrying the entry count. Deterministic: accounts are visited
      * in ascending userId order and each account's assets in ascending assetId order, so the answer is a
