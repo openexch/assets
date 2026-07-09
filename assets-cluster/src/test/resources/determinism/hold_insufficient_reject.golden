@@ -1,0 +1,2 @@
+BALANCE u=100 asset=0 avail=50000000000 locked=0
+HOLDREJECT order=1 u=100 asset=0 amt=60000000000 reason=INSUFFICIENT_FUNDS

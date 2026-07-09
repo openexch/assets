@@ -1,0 +1,7 @@
+# A snapshot/restore between holds must be invisible; balances and holds carry across the restart.
+CLOCK 1000
+DEPOSIT u=100 asset=0 amt=1000.0
+HOLD order=1 u=100 asset=0 amt=400.0
+SNAPSHOT
+HOLD order=2 u=100 asset=0 amt=300.0
+RELEASE order=1 u=100

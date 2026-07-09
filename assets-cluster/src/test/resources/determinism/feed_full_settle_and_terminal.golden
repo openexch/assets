@@ -1,0 +1,13 @@
+BALANCE u=100 asset=1 avail=100000000 locked=0
+BALANCE u=200 asset=0 avail=6000000000000 locked=0
+HOLDACK order=1 u=100 asset=1 amt=100000000
+BALANCE u=100 asset=1 avail=0 locked=100000000
+HOLDACK order=2 u=200 asset=0 amt=6000000000000
+BALANCE u=200 asset=0 avail=0 locked=6000000000000
+BALANCE u=200 asset=0 avail=0 locked=0
+BALANCE u=200 asset=1 avail=100000000 locked=0
+BALANCE u=100 asset=1 avail=0 locked=0
+BALANCE u=100 asset=0 avail=6000000000000 locked=0
+SETTLED tradeId=1 buyer=200 seller=100
+BALANCE u=100 asset=1 avail=0 locked=0
+BALANCE u=200 asset=0 avail=0 locked=0

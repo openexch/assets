@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="com.openexchange.assets.infrastructure.generated"
+                   id="2"
+                   version="1"
+                   semanticVersion="0.1"
+                   description="Assets Engine money schema — balances, holds, settlement. All amounts are 8dp fixed-point int64."
+>
+    <types>
+        <composite name="messageHeader" description="Message identifiers and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <!-- Group size encoding for variable-length groups (batches, later phases). -->
+        <composite name="groupSizeEncoding" description="Repeating group dimensions">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <!-- Reason a money command was rejected (0=NONE on acks). -->
+        <enum name="RejectReason" encodingType="uint8">
+            <validValue name="NONE">0</validValue>
+            <validValue name="INSUFFICIENT_FUNDS">1</validValue>
+            <validValue name="INVALID_AMOUNT">2</validValue>
+            <validValue name="UNKNOWN_HOLD">3</validValue>
+        </enum>
+        <!-- Boolean-as-uint8 for taker side on a settlement (1 = taker is the buyer). -->
+        <enum name="BoolFlag" encodingType="uint8">
+            <validValue name="FALSE">0</validValue>
+            <validValue name="TRUE">1</validValue>
+        </enum>
+    </types>
+
+    <!-- ============================ Ingress commands (client -> AE) ============================ -->
+
+    <sbe:message name="Deposit" id="1" description="Credit available balance (external boundary)">
+        <field name="userId"  id="1" type="int64"/>
+        <field name="assetId" id="2" type="int32"/>
+        <field name="amount"  id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="Withdraw" id="2" description="Debit available balance (external boundary)">
+        <field name="userId"  id="1" type="int64"/>
+        <field name="assetId" id="2" type="int32"/>
+        <field name="amount"  id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="Hold" id="3" description="Reserve funds for an order (available -> locked)">
+        <field name="orderId" id="1" type="int64"/>
+        <field name="userId"  id="2" type="int64"/>
+        <field name="assetId" id="3" type="int32"/>
+        <field name="amount"  id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="Release" id="4" description="Release a hold's residual (locked -> available). amount &lt; 0 releases all remaining.">
+        <field name="orderId" id="1" type="int64"/>
+        <field name="userId"  id="2" type="int64"/>
+        <field name="amount"  id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="Settle" id="5" description="Apply a trade (feed-forward from the matching engine). Idempotent on tradeId.">
+        <field name="tradeId"       id="1" type="int64"/>
+        <field name="marketId"      id="2" type="int32"/>
+        <field name="takerOrderId"  id="3" type="int64"/>
+        <field name="takerUserId"   id="4" type="int64"/>
+        <field name="makerOrderId"  id="5" type="int64"/>
+        <field name="makerUserId"   id="6" type="int64"/>
+        <field name="price"         id="7" type="int64"/>
+        <field name="quantity"      id="8" type="int64"/>
+        <field name="takerIsBuy"    id="9" type="BoolFlag"/>
+    </sbe:message>
+
+    <!-- ============================ Egress events (AE -> client) ============================ -->
+
+    <sbe:message name="HoldAck" id="10" description="A hold was accepted">
+        <field name="orderId" id="1" type="int64"/>
+        <field name="userId"  id="2" type="int64"/>
+        <field name="assetId" id="3" type="int32"/>
+        <field name="amount"  id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="HoldReject" id="11" description="A hold was rejected">
+        <field name="orderId" id="1" type="int64"/>
+        <field name="userId"  id="2" type="int64"/>
+        <field name="assetId" id="3" type="int32"/>
+        <field name="amount"  id="4" type="int64"/>
+        <field name="reason"  id="5" type="RejectReason"/>
+    </sbe:message>
+
+    <sbe:message name="BalanceUpdate" id="12" description="A user's balance for one asset changed">
+        <field name="userId"    id="1" type="int64"/>
+        <field name="assetId"   id="2" type="int32"/>
+        <field name="available" id="3" type="int64"/>
+        <field name="locked"    id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="SettlementApplied" id="13" description="A trade was settled (idempotency confirmation)">
+        <field name="tradeId"       id="1" type="int64"/>
+        <field name="buyerUserId"   id="2" type="int64"/>
+        <field name="sellerUserId"  id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="WithdrawReject" id="14" description="A withdrawal was rejected">
+        <field name="userId"  id="1" type="int64"/>
+        <field name="assetId" id="2" type="int32"/>
+        <field name="amount"  id="3" type="int64"/>
+        <field name="reason"  id="4" type="RejectReason"/>
+    </sbe:message>
+</sbe:messageSchema>

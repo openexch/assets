@@ -1,0 +1,8 @@
+# Several users and assets: an ETH-USD trade alongside untouched balances.
+CLOCK 2000
+DEPOSIT u=100 asset=2 amt=10.0
+DEPOSIT u=200 asset=0 amt=40000.0
+DEPOSIT u=300 asset=1 amt=3.0
+HOLD order=1 u=100 asset=2 amt=10.0
+HOLD order=2 u=200 asset=0 amt=30000.0
+SETTLE tradeId=1 market=2 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=3000.0 qty=10.0 takerBuy=1

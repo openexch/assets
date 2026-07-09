@@ -1,0 +1,9 @@
+# ME feed: a full 1 BTC trade settles, then both orders terminate (residual holds are already 0).
+CLOCK 1000
+DEPOSIT u=100 asset=1 amt=1.0
+DEPOSIT u=200 asset=0 amt=60000.0
+HOLD order=1 u=100 asset=1 amt=1.0
+HOLD order=2 u=200 asset=0 amt=60000.0
+TRADE tradeId=1 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=1.0 takerBuy=1
+TERMINAL order=1 u=100
+TERMINAL order=2 u=200

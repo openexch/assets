@@ -1,0 +1,5 @@
+# A withdrawal within available succeeds; an over-withdrawal is rejected (no overdraft).
+CLOCK 1000
+DEPOSIT u=100 asset=0 amt=1000.0
+WITHDRAW u=100 asset=0 amt=300.0
+WITHDRAW u=100 asset=0 amt=800.0

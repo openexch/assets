@@ -1,0 +1,4 @@
+# A hold larger than available is rejected; the balance is unchanged (no overdraft).
+CLOCK 1000
+DEPOSIT u=100 asset=0 amt=500.0
+HOLD order=1 u=100 asset=0 amt=600.0

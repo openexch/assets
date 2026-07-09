@@ -1,0 +1,3 @@
+BALANCE u=100 asset=0 avail=100000000000 locked=0
+HOLDACK order=1 u=100 asset=0 amt=60000000000
+BALANCE u=100 asset=0 avail=40000000000 locked=60000000000
