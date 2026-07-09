@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.openexchange.assets</groupId>
+        <artifactId>assets</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>assets-bridge</artifactId>
+    <packaging>jar</packaging>
+    <name>Assets Settlement Bridge</name>
+    <description>Standalone agent: tails the matching engine's settlement journal and forwards trades
+        and terminal order statuses into the Assets Engine cluster as money-schema commands</description>
+
+    <dependencies>
+        <!-- Internal: money value objects + SBE wire codecs (Settle, TerminalRelease, ...) -->
+        <dependency>
+            <groupId>com.openexchange.assets</groupId>
+            <artifactId>assets-common</artifactId>
+        </dependency>
+
+        <!-- Cross-repo: match engine's settlement-journal codecs (JournalTrade, JournalTerminal).
+             Mirrors order-management's own use of com.match:match-common as its cluster-client
+             dependency on the match engine's shared kernel; see the root pom's dependencyManagement
+             comment for why this is the one assets module that reaches across repos. -->
+        <dependency>
+            <groupId>com.match</groupId>
+            <artifactId>match-common</artifactId>
+        </dependency>
+
+        <!-- Aeron (full: client to the ME journal archive + client to the AE cluster) -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-all</artifactId>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+            </plugin>
+            <!-- Uber JAR for the standalone bridge agent -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <finalName>assets-bridge</finalName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.openexchange.assets.bridge.BridgeMain</mainClass>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

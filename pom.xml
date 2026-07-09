@@ -24,6 +24,7 @@
     <modules>
         <module>assets-common</module>
         <module>assets-cluster</module>
+        <module>assets-bridge</module>
     </modules>
 
     <properties>
@@ -35,6 +36,9 @@
         <agrona.version>2.4.1</agrona.version>
         <sbe.version>1.38.1</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
+        <!-- match-engine repo (settlement-journal codecs consumed by assets-bridge); pinned to the
+             match-engine build the journal schema (id=3) shipped in. -->
+        <match.version>1.0</match.version>
         <!-- Default so surefire's ${argLine} resolves even before jacoco's prepare-agent sets it. -->
         <argLine></argLine>
     </properties>
@@ -46,6 +50,15 @@
                 <groupId>com.openexchange.assets</groupId>
                 <artifactId>assets-common</artifactId>
                 <version>${project.version}</version>
+            </dependency>
+
+            <!-- Cross-repo: match engine's shared kernel (settlement-journal SBE codecs, schema id=3),
+                 the same way order-management depends on com.match:match-common for its own cluster
+                 wire codecs. assets-bridge is the only assets module that pulls this in. -->
+            <dependency>
+                <groupId>com.match</groupId>
+                <artifactId>match-common</artifactId>
+                <version>${match.version}</version>
             </dependency>
 
             <!-- Aeron -->
