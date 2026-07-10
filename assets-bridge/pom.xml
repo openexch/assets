@@ -39,6 +39,13 @@
         </dependency>
 
         <!-- Testing -->
+        <!-- Test-scoped: the end-to-end bridge test boots a real in-process AE cluster. -->
+        <dependency>
+            <groupId>com.openexchange.assets</groupId>
+            <artifactId>assets-cluster</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>

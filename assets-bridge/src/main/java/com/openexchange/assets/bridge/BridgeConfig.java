@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+package com.openexchange.assets.bridge;
+
+import java.util.List;
+
+/**
+ * Env-driven bridge configuration. The bridge is stateless: everything here is connection
+ * shape, not position state (positions come from the AE's FeedPositionReport each epoch).
+ */
+public final class BridgeConfig {
+
+    /** ME journal archive control endpoints, first-healthy-wins (all three nodes journal identically). */
+    public final List<String> journalArchiveEndpoints;
+    /** AE cluster member addresses (CSV) + port base for the ingress endpoint math. */
+    public final List<String> aeClusterAddresses;
+    public final int aePortBase;
+    /** The bridge's own egress listen endpoint (must differ from the OMS client's 9393). */
+    public final String aeEgressEndpoint;
+    /** Latch HALT on a dense-tradeId gap (production default true; false = operator override). */
+    public final boolean haltOnGap;
+    public final long queryTimeoutMs;
+
+    public BridgeConfig(
+            final List<String> journalArchiveEndpoints,
+            final List<String> aeClusterAddresses,
+            final int aePortBase,
+            final String aeEgressEndpoint,
+            final boolean haltOnGap,
+            final long queryTimeoutMs) {
+        this.journalArchiveEndpoints = journalArchiveEndpoints;
+        this.aeClusterAddresses = aeClusterAddresses;
+        this.aePortBase = aePortBase;
+        this.aeEgressEndpoint = aeEgressEndpoint;
+        this.haltOnGap = haltOnGap;
+        this.queryTimeoutMs = queryTimeoutMs;
+    }
+
+    public static BridgeConfig fromEnv() {
+        return new BridgeConfig(
+                List.of(envOr("BRIDGE_ME_JOURNAL_ARCHIVES", "localhost:9010,localhost:9110,localhost:9210").split(",")),
+                List.of(envOr("BRIDGE_AE_CLUSTER_ADDRESSES", "127.0.0.1").split(",")),
+                Integer.parseInt(envOr("BRIDGE_AE_PORT_BASE", "9300")),
+                envOr("BRIDGE_AE_EGRESS_ENDPOINT", "127.0.0.1:9394"),
+                !"false".equalsIgnoreCase(envOr("BRIDGE_HALT_ON_GAP", "true")),
+                Long.parseLong(envOr("BRIDGE_QUERY_TIMEOUT_MS", "5000")));
+    }
+
+    private static String envOr(final String key, final String fallback) {
+        final String v = System.getenv(key);
+        return v == null || v.isBlank() ? fallback : v;
+    }
+}
