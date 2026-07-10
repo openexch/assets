@@ -37,6 +37,16 @@ public final class AeronCluster {
     public static final AtomicLong AERON_ERROR_COUNT = new AtomicLong();
     private static final AtomicBoolean FATAL_EXIT_STARTED = new AtomicBoolean();
 
+    /**
+     * Loud startup warning when the resolved cluster/archive state dir (the money ledger's snapshot +
+     * log, see {@link ClusterConfig#baseDir}) lands on a tmpfs mount: a power loss wipes it. This is
+     * distinct from the media-driver dir (term buffers), which is fine on tmpfs by design: see the
+     * comment at {@link ClusterConfig#create}.
+     */
+    static final String TMPFS_STATE_WARNING =
+            "ASSETS ENGINE STATE ON TMPFS: the money ledger will not survive power loss; "
+                    + "set BASE_DIR to a disk path for anything beyond dev";
+
     public AeronCluster() {
         final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
         final int portBase = getBasePort();
@@ -47,7 +57,11 @@ public final class AeronCluster {
         final ClusterConfig clusterConfig = ClusterConfig.create(nodeId, hostAddresses, hostAddresses, portBase,
                 new AssetsClusteredService());
 
-        clusterConfig.baseDir(getBaseDir(nodeId));
+        final File resolvedBaseDir = getBaseDir(nodeId);
+        clusterConfig.baseDir(resolvedBaseDir);
+        if (pathLooksEphemeral(resolvedBaseDir.getAbsolutePath())) {
+            log.warn(TMPFS_STATE_WARNING);
+        }
 
         final DriverMode driverMode = TransportConfig.driverMode();
 
@@ -154,6 +168,25 @@ public final class AeronCluster {
             return new File(System.getProperty("user.dir"), "ae-node" + nodeId);
         }
         return new File(baseDir);
+    }
+
+    /**
+     * True if {@code path} is (or is nested under) a well-known ephemeral/tmpfs mount ({@code /tmp} or
+     * {@code /dev/shm}). Matches on path-segment boundaries, so a sibling like {@code /tmpfoo} does
+     * <b>not</b> false-positive against {@code /tmp}. Pure and static so it is unit-testable without
+     * booting a node. Relative paths always return {@code false} (nothing to warn about until they are
+     * resolved against a cwd: callers should pass an absolute path, e.g. {@code File#getAbsolutePath()}).
+     */
+    static boolean pathLooksEphemeral(final String path) {
+        if (null == path || path.isEmpty()) {
+            return false;
+        }
+        String normalized = path;
+        while (normalized.length() > 1 && normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return "/tmp".equals(normalized) || normalized.startsWith("/tmp/")
+                || "/dev/shm".equals(normalized) || normalized.startsWith("/dev/shm/");
     }
 
     private static String getClusterAddresses() {

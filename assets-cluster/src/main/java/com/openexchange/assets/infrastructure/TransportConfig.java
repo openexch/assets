@@ -61,7 +61,12 @@ public final class TransportConfig {
                 : BackoffIdleStrategy::new;
     }
 
-    /** aeron.dir this process uses to reach its media driver (external mode / explicit override). */
+    /**
+     * aeron.dir this process uses to reach its media driver (external mode / explicit override).
+     * Term buffers here are ephemeral by design (transport-only state, not the money record); this
+     * defaulting onto tmpfs is intentional and does not need the durability warning that the
+     * cluster/archive state dir gets (see {@code AeronCluster.pathLooksEphemeral}).
+     */
     public static String aeronDir(final int nodeId) {
         return envOrProp("AERON_DIR", "aeron.driver.dir",
                 CommonContext.getAeronDirectoryName() + "-assets-" + nodeId + "-driver");

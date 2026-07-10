@@ -96,7 +96,14 @@ public final class ClusterConfig {
 
         final String clusterMembers = clusterMembers(startingMemberId, ingressHostnames, clusterHostnames, portBase);
 
+        // Media driver dir (term buffers / IPC counters): intentionally left on Aeron's OS default
+        // (typically /dev/shm), even in production. Term buffers are transport-only, ephemeral by
+        // design: losing them on restart is expected and harmless. Do NOT redirect this one to durable
+        // storage; it is NOT the money record.
         final String aeronDirName = CommonContext.getAeronDirectoryName() + "-assets-" + memberId + "-driver";
+        // Cluster/archive state dir (the money ledger's consensus snapshot + log, set via #baseDir):
+        // THIS is the thing that must survive a power loss. See AeronCluster.getBaseDir/BASE_DIR (env
+        // override) and AeronCluster.pathLooksEphemeral (the tmpfs startup warning).
         final File baseDir = new File(parentDir, "aeron-assets-" + memberId);
 
         final String ingressHostname = ingressHostnames.get(memberId - startingMemberId);
