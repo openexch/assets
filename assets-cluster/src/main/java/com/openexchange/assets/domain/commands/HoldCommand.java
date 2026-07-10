@@ -8,6 +8,7 @@ public final class HoldCommand {
     private long userId;
     private int assetId;
     private long amount;
+    private boolean omsManagedRelease;
 
     public void reset() {
         correlationId = 0L;
@@ -32,4 +33,12 @@ public final class HoldCommand {
 
     public long getAmount() { return amount; }
     public void setAmount(long amount) { this.amount = amount; }
+
+    public boolean isOmsManagedRelease() {
+        return omsManagedRelease;
+    }
+
+    public void setOmsManagedRelease(boolean omsManagedRelease) {
+        this.omsManagedRelease = omsManagedRelease;
+    }
 }

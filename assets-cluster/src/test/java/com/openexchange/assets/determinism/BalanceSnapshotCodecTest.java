@@ -93,7 +93,7 @@ public class BalanceSnapshotCodecTest {
                 assertEquals("locked user " + acc.userId() + " asset " + as, acc.locked(as), bacc.locked(as));
             }
             assertEquals("holdCount user " + acc.userId(), acc.holdCount(), bacc.holdCount());
-            acc.forEachHold((orderId, assetId, remaining) -> {
+            acc.forEachHold((orderId, assetId, remaining, omsManagedRelease) -> {
                 assertEquals("hold asset user " + acc.userId() + " order " + orderId, assetId, bacc.holdAssetId(orderId));
                 assertEquals("hold remaining user " + acc.userId() + " order " + orderId, remaining, bacc.holdRemaining(orderId));
             });

@@ -155,7 +155,7 @@ public class ConservationFuzzTest {
         // structural, per account
         e.forEachAccount(acc -> {
             long[] sumHold = new long[N];
-            acc.forEachHold((orderId, assetId, remaining) -> sumHold[assetId] += remaining);
+            acc.forEachHold((orderId, assetId, remaining, omsManagedRelease) -> sumHold[assetId] += remaining);
             for (int a = 0; a < N; a++) {
                 assertTrue("seed " + seed + " step " + step + ": available>=0 (u" + acc.userId() + " a" + a + ")",
                         acc.available(a) >= 0);

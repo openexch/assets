@@ -1,0 +1,13 @@
+# Iceberg-parent hold policy: slices share the PARENT's omsOrderId, so a slice FILLED arriving on
+# the feed (TERMINAL) must NOT release the parent's residual. The parent hold is placed with
+# omsManaged=1 -> the feed TERMINAL is suppressed (no release, no egress); a partial fill still
+# draws the hold down normally; the CLIENT release (the OMS at parent-terminal) releases the rest.
+CLOCK 1000
+DEPOSIT u=200 asset=0 amt=100000.0
+DEPOSIT u=100 asset=1 amt=2.0
+HOLD u=200 order=22 asset=0 amt=100000.0 omsManaged=1
+HOLD u=100 order=11 asset=1 amt=2.0
+TRADE tradeId=1 market=1 takerOrder=22 takerUser=200 makerOrder=11 makerUser=100 px=50000.0 qty=1.0 takerBuy=1
+TERMINAL order=22 u=200
+QUERY_FEED 7
+RELEASE order=22 u=200

@@ -14,14 +14,16 @@ public final class Hold {
 
     private int assetId;
     private long remaining;
+    private boolean omsManagedRelease;
 
     /** Package-private: only the owning {@link Account} constructs/pools these. */
     Hold() {
     }
 
-    void set(int assetId, long remaining) {
+    void set(int assetId, long remaining, boolean omsManagedRelease) {
         this.assetId = assetId;
         this.remaining = remaining;
+        this.omsManagedRelease = omsManagedRelease;
     }
 
     public int assetId() {
@@ -35,6 +37,11 @@ public final class Hold {
     /** Reduce the outstanding reservation by {@code amount}; caller guarantees {@code amount <= remaining}. */
     void drawDown(long amount) {
         remaining -= amount;
+    }
+
+    /** TRUE = the OMS owns this hold's terminal release; the feed's TerminalRelease must no-op. */
+    public boolean omsManagedRelease() {
+        return omsManagedRelease;
     }
 
     /**

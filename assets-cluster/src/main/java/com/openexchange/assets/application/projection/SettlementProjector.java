@@ -63,6 +63,7 @@ public final class SettlementProjector {
         releaseCommand.setOrderId(orderId);
         releaseCommand.setUserId(userId);
         releaseCommand.setAmount(-1L); // release the full residual reservation
+        releaseCommand.setFromFeed(true); // suppressed on omsManagedRelease holds (iceberg/stop parents)
         engine.applyCommand(AssetsEngine.CMD_RELEASE, releaseCommand, timestamp);
         advance(streamPosition);
     }

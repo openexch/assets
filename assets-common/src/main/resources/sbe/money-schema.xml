@@ -54,6 +54,7 @@
         <field name="userId"        id="3" type="int64"/>
         <field name="assetId"       id="4" type="int32"/>
         <field name="amount"        id="5" type="int64"/>
+        <field name="omsManagedRelease" id="6" type="BoolFlag" description="TRUE = the OMS owns this hold's terminal release (iceberg/stop PARENT holds: slices share the parent's omsOrderId, so a slice FILLED on the feed must not release the parent's residual); FALSE (default) = the feed's TerminalRelease releases normally"/>
     </sbe:message>
 
     <sbe:message name="Release" id="4" description="Release a hold's residual (locked -> available). amount &lt; 0 releases all remaining.">

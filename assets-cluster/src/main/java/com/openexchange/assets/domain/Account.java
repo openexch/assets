@@ -29,7 +29,7 @@ public final class Account {
 
     /** Visitor for iterating open holds (snapshotting). Not on the hot path. */
     public interface HoldVisitor {
-        void visit(long orderId, int assetId, long remaining);
+        void visit(long orderId, int assetId, long remaining, boolean omsManagedRelease);
     }
 
     /** Visitor for iterating non-zero balances (snapshot queries). Not on the hot path. */
@@ -74,6 +74,12 @@ public final class Account {
 
     public boolean hasHold(long orderId) {
         return holds.containsKey(orderId);
+    }
+
+    /** TRUE when this order's hold exists and the OMS owns its terminal release (feed must no-op). */
+    public boolean isOmsManagedRelease(long orderId) {
+        Hold h = holds.get(orderId);
+        return h != null && h.omsManagedRelease();
     }
 
     // ---- external boundary ----
@@ -128,6 +134,15 @@ public final class Account {
      * — so {@code locked == Σ remaining} is preserved on every path.</p>
      */
     public RejectReason hold(long orderId, int assetId, long amount) {
+        return hold(orderId, assetId, amount, false);
+    }
+
+    /**
+     * @param omsManagedRelease TRUE = the OMS owns this hold's terminal release (iceberg/stop
+     *        PARENT holds); the feed's TerminalRelease must no-op on it. Placement-time property:
+     *        a top-up keeps the ORIGINAL flag (an amend delta cannot change release ownership).
+     */
+    public RejectReason hold(long orderId, int assetId, long amount, boolean omsManagedRelease) {
         if (amount <= 0) {
             return RejectReason.INVALID_AMOUNT;
         }
@@ -152,7 +167,7 @@ public final class Account {
         bal[2 * assetId] -= amount;
         bal[2 * assetId + 1] += amount;
         Hold h = acquireHold();
-        h.set(assetId, amount);
+        h.set(assetId, amount, omsManagedRelease);
         holds.put(orderId, h);
         return RejectReason.NONE;
     }
@@ -250,9 +265,9 @@ public final class Account {
     }
 
     /** Restore a hold verbatim (deserialize). */
-    public void restoreHold(long orderId, int assetId, long remaining) {
+    public void restoreHold(long orderId, int assetId, long remaining, boolean omsManagedRelease) {
         Hold h = acquireHold();
-        h.set(assetId, remaining);
+        h.set(assetId, remaining, omsManagedRelease);
         holds.put(orderId, h);
     }
 
@@ -262,7 +277,7 @@ public final class Account {
 
     /** Visit every open hold (serialize / invariant checks). Boxes the key — not hot-path (snapshot only). */
     public void forEachHold(HoldVisitor v) {
-        holds.forEach((orderId, h) -> v.visit(orderId, h.assetId(), h.remaining()));
+        holds.forEach((orderId, h) -> v.visit(orderId, h.assetId(), h.remaining(), h.omsManagedRelease()));
     }
 
     /**

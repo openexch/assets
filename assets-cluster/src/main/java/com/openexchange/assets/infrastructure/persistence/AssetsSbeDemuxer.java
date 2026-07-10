@@ -106,6 +106,7 @@ public final class AssetsSbeDemuxer {
         holdCommand.setUserId(holdDecoder.userId());
         holdCommand.setAssetId(holdDecoder.assetId());
         holdCommand.setAmount(holdDecoder.amount());
+        holdCommand.setOmsManagedRelease(holdDecoder.omsManagedRelease() == BoolFlag.TRUE);
         engine.applyCommand(AssetsEngine.CMD_HOLD, holdCommand, timestamp);
     }
 

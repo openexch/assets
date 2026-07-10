@@ -130,7 +130,7 @@ public class ConservationInvariantTest {
     private static void assertStructural(AssetsEngine e, String ctx) {
         e.forEachAccount(acc -> {
             long[] sumHold = new long[N];
-            acc.forEachHold((orderId, assetId, remaining) -> sumHold[assetId] += remaining);
+            acc.forEachHold((orderId, assetId, remaining, omsManagedRelease) -> sumHold[assetId] += remaining);
             for (int a = 0; a < N; a++) {
                 assertTrue(ctx + ": available>=0 (user " + acc.userId() + " asset " + a + ")", acc.available(a) >= 0);
                 assertTrue(ctx + ": locked>=0 (user " + acc.userId() + " asset " + a + ")", acc.locked(a) >= 0);

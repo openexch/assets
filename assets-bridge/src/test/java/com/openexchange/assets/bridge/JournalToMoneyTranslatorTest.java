@@ -57,9 +57,9 @@ public class JournalToMoneyTranslatorTest {
 
         assertEquals(555L, settleDec.tradeId());
         assertEquals(3, settleDec.marketId());
-        assertEquals(11L, settleDec.takerOrderId());
+        assertEquals(500_011L, settleDec.takerOrderId());
         assertEquals(100L, settleDec.takerUserId());
-        assertEquals(22L, settleDec.makerOrderId());
+        assertEquals(500_022L, settleDec.makerOrderId());
         assertEquals(200L, settleDec.makerUserId());
         assertEquals(6_000_000L, settleDec.price());
         assertEquals(100_000L, settleDec.quantity());
@@ -80,9 +80,9 @@ public class JournalToMoneyTranslatorTest {
 
         assertEquals(556L, settleDec.tradeId());
         assertEquals(4, settleDec.marketId());
-        assertEquals(33L, settleDec.takerOrderId());
+        assertEquals(500_033L, settleDec.takerOrderId());
         assertEquals(300L, settleDec.takerUserId());
-        assertEquals(44L, settleDec.makerOrderId());
+        assertEquals(500_044L, settleDec.makerOrderId());
         assertEquals(400L, settleDec.makerUserId());
         assertEquals(7_500_000L, settleDec.price());
         assertEquals(250_000L, settleDec.quantity());
@@ -138,7 +138,7 @@ public class JournalToMoneyTranslatorTest {
         terminalReleaseDec.wrapAndApplyHeader(moneyBuf, 0, moneyHeaderDec);
 
         assertEquals(8_400L, terminalReleaseDec.journalPosition());
-        assertEquals(42L, terminalReleaseDec.orderId());
+        assertEquals(500_042L, terminalReleaseDec.orderId());
         assertEquals(900L, terminalReleaseDec.userId());
         assertEquals(111_222L, terminalReleaseDec.timestamp());
         assertEquals(MessageHeaderDecoder.ENCODED_LENGTH + TerminalReleaseDecoder.BLOCK_LENGTH, len);
@@ -211,7 +211,11 @@ public class JournalToMoneyTranslatorTest {
                 .price(price)
                 .quantity(quantity)
                 .takerIsBuy(takerIsBuy)
-                .timestamp(timestamp);
+                .timestamp(timestamp)
+                // Distinct from the cluster ids on purpose: the tests prove the OMS ids (the
+                // money key) are what reach the Settle, not the cluster ids.
+                .takerOmsOrderId(takerOrderId + 500_000L)
+                .makerOmsOrderId(makerOrderId + 500_000L);
     }
 
     private void writeJournalTerminal(long egressSeq, long orderId, long userId, int marketId,
@@ -222,6 +226,7 @@ public class JournalToMoneyTranslatorTest {
                 .userId(userId)
                 .marketId(marketId)
                 .status(status)
-                .timestamp(timestamp);
+                .timestamp(timestamp)
+                .omsOrderId(orderId + 500_000L);
     }
 }

@@ -183,6 +183,7 @@ public final class AssetsScenarioRunner {
         c.setUserId(reqLong(kv, "u"));
         c.setAssetId(reqInt(kv, "asset"));
         c.setAmount(reqAmount(kv, "amt"));
+        c.setOmsManagedRelease("1".equals(kv.get("omsManaged")));
         return c;
     }
 

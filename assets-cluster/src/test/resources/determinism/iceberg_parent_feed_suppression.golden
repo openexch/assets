@@ -1,0 +1,15 @@
+DEPOSITACK corr=0 u=200 asset=0 amt=10000000000000 newAvail=10000000000000
+BALANCE u=200 asset=0 avail=10000000000000 locked=0
+DEPOSITACK corr=0 u=100 asset=1 amt=200000000 newAvail=200000000
+BALANCE u=100 asset=1 avail=200000000 locked=0
+HOLDACK corr=0 order=22 u=200 asset=0 amt=10000000000000
+BALANCE u=200 asset=0 avail=0 locked=10000000000000
+HOLDACK corr=0 order=11 u=100 asset=1 amt=200000000
+BALANCE u=100 asset=1 avail=0 locked=200000000
+BALANCE u=200 asset=0 avail=0 locked=5000000000000
+BALANCE u=200 asset=1 avail=100000000 locked=0
+BALANCE u=100 asset=1 avail=0 locked=100000000
+BALANCE u=100 asset=0 avail=5000000000000 locked=0
+SETTLED tradeId=1 buyer=200 seller=100
+FEEDPOS corr=7 consumePos=2 lastTradeId=1
+BALANCE u=200 asset=0 avail=5000000000000 locked=0

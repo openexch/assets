@@ -68,9 +68,11 @@ public final class JournalToMoneyTranslator {
         settle.wrapAndApplyHeader(out, outOffset, moneyHeader)
                 .tradeId(journalTrade.tradeId())
                 .marketId(journalTrade.marketId())
-                .takerOrderId(journalTrade.takerOrderId())
+                // THE MONEY KEY: the AE holds are keyed by OMS order ids (placed before a
+                // cluster id exists), so settles must reference those, not the cluster ids.
+                .takerOrderId(journalTrade.takerOmsOrderId())
                 .takerUserId(journalTrade.takerUserId())
-                .makerOrderId(journalTrade.makerOrderId())
+                .makerOrderId(journalTrade.makerOmsOrderId())
                 .makerUserId(journalTrade.makerUserId())
                 .price(journalTrade.price())
                 .quantity(journalTrade.quantity())
@@ -95,7 +97,9 @@ public final class JournalToMoneyTranslator {
 
         terminalRelease.wrapAndApplyHeader(out, outOffset, moneyHeader)
                 .journalPosition(journalTerminal.egressSeq())
-                .orderId(journalTerminal.orderId())
+                // Money key (see translateTrade). Slice terminals carry the parent's omsOrderId;
+                // the AE suppresses the release on omsManagedRelease holds.
+                .orderId(journalTerminal.omsOrderId())
                 .userId(journalTerminal.userId())
                 .timestamp(journalTerminal.timestamp());
 

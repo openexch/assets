@@ -56,6 +56,8 @@ public final class AssetsEngine {
     private long consumePosition = 0L;
     /** Settle legs that could not draw fully from their hold (SettleFault emitted). Alarm target. */
     private long settleFaultCount = 0L;
+    /** Feed terminal releases suppressed on omsManagedRelease holds (iceberg/stop parents). */
+    private long suppressedFeedReleaseCount = 0L;
 
     // Reusable scratch for the rare, read-only snapshot queries (not the hot path). Sorting the entries
     // by userId makes a query's answer a pure function of *state* (not of insertion/replay history), so
@@ -110,7 +112,7 @@ public final class AssetsEngine {
 
     private void applyHold(HoldCommand c) {
         Account a = getOrCreateAccount(c.getUserId());
-        RejectReason r = a.hold(c.getOrderId(), c.getAssetId(), c.getAmount());
+        RejectReason r = a.hold(c.getOrderId(), c.getAssetId(), c.getAmount(), c.isOmsManagedRelease());
         if (r.accepted()) {
             sink.onHoldAck(c.getCorrelationId(), c.getOrderId(), c.getUserId(), c.getAssetId(), c.getAmount());
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
@@ -127,6 +129,13 @@ public final class AssetsEngine {
         int assetId = a.holdAssetId(c.getOrderId());
         if (assetId < 0) {
             return; // no such hold: idempotent no-op (already released / never held)
+        }
+        if (c.isFromFeed() && a.isOmsManagedRelease(c.getOrderId())) {
+            // Iceberg/stop PARENT hold: slices share the parent's omsOrderId, so a slice FILLED on
+            // the feed must not release the parent's residual. The OMS owns this hold's terminal
+            // (state listener releases at the PARENT's terminal; the reconciler is the backstop).
+            suppressedFeedReleaseCount++;
+            return;
         }
         a.release(c.getOrderId(), c.getAmount());
         sink.onBalanceUpdate(c.getUserId(), assetId, a.available(assetId), a.locked(assetId));
@@ -215,6 +224,11 @@ public final class AssetsEngine {
         return settleFaultCount;
     }
 
+    /** Feed terminal releases suppressed on omsManagedRelease holds since boot. */
+    public long getSuppressedFeedReleaseCount() {
+        return suppressedFeedReleaseCount;
+    }
+
     /**
      * Stream one {@code onBalanceUpdate} per (user, asset) with a non-zero available or locked balance,
      * then an {@code onBalanceSnapshotEnd} carrying the entry count. Deterministic: accounts are visited
@@ -252,7 +266,7 @@ public final class AssetsEngine {
         for (Account a : snapshotScratch) {
             final long userId = a.userId();
             holdRowScratch.clear();
-            a.forEachHold((orderId, assetId, remaining) ->
+            a.forEachHold((orderId, assetId, remaining, omsManagedRelease) ->
                     holdRowScratch.add(new HoldRow(orderId, assetId, remaining)));
             holdRowScratch.sort(Comparator.comparingLong(HoldRow::orderId));
             for (HoldRow h : holdRowScratch) {

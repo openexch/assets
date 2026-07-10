@@ -10,7 +10,7 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class HoldDecoder
 {
-    public static final int BLOCK_LENGTH = 36;
+    public static final int BLOCK_LENGTH = 37;
     public static final int TEMPLATE_ID = 3;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
@@ -387,6 +387,47 @@ public final class HoldDecoder
     }
 
 
+    public static int omsManagedReleaseId()
+    {
+        return 6;
+    }
+
+    public static int omsManagedReleaseSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int omsManagedReleaseEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int omsManagedReleaseEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String omsManagedReleaseMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public short omsManagedReleaseRaw()
+    {
+        return ((short)(buffer.getByte(offset + 36) & 0xFF));
+    }
+
+    public BoolFlag omsManagedRelease()
+    {
+        return BoolFlag.get(((short)(buffer.getByte(offset + 36) & 0xFF)));
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -442,6 +483,9 @@ public final class HoldDecoder
         builder.append('|');
         builder.append("amount=");
         builder.append(this.amount());
+        builder.append('|');
+        builder.append("omsManagedRelease=");
+        builder.append(this.omsManagedRelease());
 
         limit(originalLimit);
 

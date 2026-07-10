@@ -10,7 +10,7 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class HoldEncoder
 {
-    public static final int BLOCK_LENGTH = 36;
+    public static final int BLOCK_LENGTH = 37;
     public static final int TEMPLATE_ID = 3;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 2;
@@ -356,6 +356,42 @@ public final class HoldEncoder
         return this;
     }
 
+
+    public static int omsManagedReleaseId()
+    {
+        return 6;
+    }
+
+    public static int omsManagedReleaseSinceVersion()
+    {
+        return 0;
+    }
+
+    public static int omsManagedReleaseEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int omsManagedReleaseEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String omsManagedReleaseMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public HoldEncoder omsManagedRelease(final BoolFlag value)
+    {
+        buffer.putByte(offset + 36, (byte)value.value());
+        return this;
+    }
 
     public String toString()
     {

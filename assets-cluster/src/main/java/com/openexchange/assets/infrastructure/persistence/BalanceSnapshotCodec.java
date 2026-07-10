@@ -82,13 +82,15 @@ public final class BalanceSnapshotCodec {
             }
             dst.putInt(pos[0], account.holdCount());
             pos[0] += 4;
-            account.forEachHold((orderId, assetId, remaining) -> {
+            account.forEachHold((orderId, assetId, remaining, omsManagedRelease) -> {
                 dst.putLong(pos[0], orderId);
                 pos[0] += 8;
                 dst.putInt(pos[0], assetId);
                 pos[0] += 4;
                 dst.putLong(pos[0], remaining);
                 pos[0] += 8;
+                dst.putByte(pos[0], (byte) (omsManagedRelease ? 1 : 0));
+                pos[0] += 1;
             });
         });
 
@@ -137,7 +139,9 @@ public final class BalanceSnapshotCodec {
                 pos += 4;
                 final long remaining = src.getLong(pos);
                 pos += 8;
-                account.restoreHold(orderId, assetId, remaining);
+                final boolean omsManagedRelease = src.getByte(pos) != 0;
+                pos += 1;
+                account.restoreHold(orderId, assetId, remaining, omsManagedRelease);
             }
             holdTotal += numHolds;
         }

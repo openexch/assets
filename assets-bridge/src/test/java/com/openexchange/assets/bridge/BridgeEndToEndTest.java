@@ -242,10 +242,11 @@ public class BridgeEndToEndTest {
     private void journalTrade(long egressSeq, long tradeId, long price, long qty) {
         jTrade.wrapAndApplyHeader(jBuf, 0, journalHeaderEnc)
                 .egressSeq(egressSeq).tradeId(tradeId).marketId(1)
-                .takerOrderId(BUY_ORDER).takerUserId(BUYER)
-                .makerOrderId(SELL_ORDER).makerUserId(SELLER)
+                .takerOrderId(900_000 + BUY_ORDER).takerUserId(BUYER)   // cluster ids differ from
+                .makerOrderId(900_000 + SELL_ORDER).makerUserId(SELLER) // the OMS ids on purpose
                 .price(price).quantity(qty)
-                .takerIsBuy(BooleanType.TRUE).timestamp(egressSeq);
+                .takerIsBuy(BooleanType.TRUE).timestamp(egressSeq)
+                .takerOmsOrderId(BUY_ORDER).makerOmsOrderId(SELL_ORDER);
         offerJournal(com.match.infrastructure.journal.generated.MessageHeaderEncoder.ENCODED_LENGTH
                 + jTrade.encodedLength());
     }
@@ -253,7 +254,8 @@ public class BridgeEndToEndTest {
     private void journalTerminal(long egressSeq, long orderId, long userId) {
         jTerminal.wrapAndApplyHeader(jBuf, 0, journalHeaderEnc)
                 .egressSeq(egressSeq).orderId(orderId).userId(userId).marketId(1)
-                .status(TerminalStatus.FILLED).timestamp(egressSeq);
+                .status(TerminalStatus.FILLED).timestamp(egressSeq)
+                .omsOrderId(orderId);
         offerJournal(com.match.infrastructure.journal.generated.MessageHeaderEncoder.ENCODED_LENGTH
                 + jTerminal.encodedLength());
     }

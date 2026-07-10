@@ -9,6 +9,7 @@ public final class ReleaseCommand {
     private long orderId;
     private long userId;
     private long amount;
+    private boolean fromFeed;
 
     public void reset() {
         orderId = 0L;
@@ -24,4 +25,13 @@ public final class ReleaseCommand {
 
     public long getAmount() { return amount; }
     public void setAmount(long amount) { this.amount = amount; }
+
+    /** TRUE when this release is the feed's TerminalRelease (suppressed on omsManagedRelease holds). */
+    public boolean isFromFeed() {
+        return fromFeed;
+    }
+
+    public void setFromFeed(boolean fromFeed) {
+        this.fromFeed = fromFeed;
+    }
 }
