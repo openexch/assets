@@ -65,4 +65,13 @@ public interface AssetsEventSink {
      * ({@code lastAppliedTradeId}). The settlement bridge resumes the journal from these.
      */
     void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId);
+
+    /**
+     * EXCEPTIONAL: a settle leg could not draw fully from its order hold (reconciler race or a
+     * genuine breach). {@code drawnFromAvailable} was recovered from the payer's available;
+     * {@code uncovered} could not be moved at all (the counterparty was credited only what was
+     * debited, so conservation holds). MUST be alerted on.
+     */
+    void onSettleFault(long tradeId, long orderId, long userId, int assetId,
+                       long drawnFromAvailable, long uncovered);
 }

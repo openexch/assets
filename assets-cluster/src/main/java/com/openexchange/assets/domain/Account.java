@@ -22,7 +22,7 @@ import java.util.ArrayDeque;
  * engine drives all accounts from a single thread.</p>
  *
  * <p>Cross-account operations (settlement) are coordinated by {@link SettlementService}, which calls
- * this aggregate's {@code applyBuyFill}/{@code applySellFill} — the account still owns its own side of
+ * this aggregate's {@code settleDebit}/{@code settleCredit} — the account still owns its own side of
  * the mutation and its own invariants.</p>
  */
 public final class Account {
@@ -182,38 +182,63 @@ public final class Account {
     // ---- settlement (called by SettlementService; the account owns its own side) ----
 
     /**
-     * Apply the buyer's side of a fill: pay {@code quoteAmt} out of the buyer's locked quote (drawing
-     * the buyer's quote hold down) and receive {@code baseAmt} into available base.
-     * @throws IllegalStateException if the hold or locked balance cannot cover the payment (a
-     *         conservation breach that the matching engine's guarantees make impossible).
+     * Result of one settle debit — reusable holder (single engine thread), written by
+     * {@link #settleDebit}. A nonzero field means the hold could not fully cover the leg.
      */
-    public void applyBuyFill(long buyerOrderId, int quoteAsset, long quoteAmt, int baseAsset, long baseAmt) {
-        drawDownHold(buyerOrderId, quoteAsset, quoteAmt);
-        bal[2 * quoteAsset + 1] -= quoteAmt;   // pay from locked quote
-        bal[2 * baseAsset] += baseAmt;         // receive base into available
+    public static final class SettleDebitResult {
+        /** Recovered from the payer's available balance because the hold was short/missing. */
+        public long drawnFromAvailable;
+        /** Could not be moved at all (hold AND available exhausted) — a reportable breach. */
+        public long uncovered;
+
+        void reset() {
+            drawnFromAvailable = 0;
+            uncovered = 0;
+        }
+
+        public boolean faulted() {
+            return drawnFromAvailable != 0 || uncovered != 0;
+        }
     }
 
     /**
-     * Apply the seller's side of a fill: deliver {@code baseAmt} out of the seller's locked base
-     * (drawing the seller's base hold down) and receive {@code quoteAmt} into available quote.
+     * Debit {@code amount} of {@code assetId} for a settle leg, preferring the order's hold.
+     *
+     * <p>NORMAL path (the hold-gate guarantee): the whole amount comes out of the order's hold
+     * (locked). EXCEPTIONAL path — the hold is missing, short, or holds a different asset (e.g. an
+     * early orphan-release raced an in-flight fill): the shortfall is recovered from AVAILABLE,
+     * floored at zero, and anything still uncovered is reported in {@code out} — <b>never thrown</b>.
+     * A throw here would poison the replicated log and re-crash the service on every replay; a
+     * deterministic partial debit + a loud {@code SettleFault} event keeps the ledger live and the
+     * breach observable. Conservation stays intact because the caller credits the counterparty
+     * exactly what was debited: {@code amount - out.uncovered}.</p>
+     *
+     * @return the amount actually debited ({@code amount - out.uncovered})
      */
-    public void applySellFill(long sellerOrderId, int baseAsset, long baseAmt, int quoteAsset, long quoteAmt) {
-        drawDownHold(sellerOrderId, baseAsset, baseAmt);
-        bal[2 * baseAsset + 1] -= baseAmt;     // deliver from locked base
-        bal[2 * quoteAsset] += quoteAmt;       // receive quote into available
+    public long settleDebit(long orderId, int assetId, long amount, SettleDebitResult out) {
+        out.reset();
+        long fromHold = 0;
+        Hold h = holds.get(orderId);
+        if (h != null && h.assetId() == assetId) {
+            fromHold = Math.min(h.remaining(), amount);
+            // Defensive clamp: locked == Σ remaining structurally; never let locked go negative.
+            fromHold = Math.min(fromHold, bal[2 * assetId + 1]);
+            h.drawDown(fromHold);
+            bal[2 * assetId + 1] -= fromHold;
+        }
+        long shortfall = amount - fromHold;
+        if (shortfall > 0) {
+            long fromAvailable = Math.min(bal[2 * assetId], shortfall);
+            bal[2 * assetId] -= fromAvailable;
+            out.drawnFromAvailable = fromAvailable;
+            out.uncovered = shortfall - fromAvailable;
+        }
+        return amount - out.uncovered;
     }
 
-    private void drawDownHold(long orderId, int assetId, long amount) {
-        Hold h = holds.get(orderId);
-        if (h == null || h.assetId() != assetId || h.remaining() < amount || bal[2 * assetId + 1] < amount) {
-            // Money must never be created: refuse to draw more than is reserved/locked.
-            throw new IllegalStateException(
-                    "settlement would breach conservation: user=" + userId + " order=" + orderId
-                            + " asset=" + assetId + " draw=" + amount
-                            + " holdRemaining=" + (h == null ? -1 : h.remaining())
-                            + " locked=" + bal[2 * assetId + 1]);
-        }
-        h.drawDown(amount);
+    /** Credit a settle leg's proceeds into available. The amount is what the payer actually paid. */
+    public void settleCredit(int assetId, long amount) {
+        bal[2 * assetId] += amount;
     }
 
     // ---- snapshot support (infrastructure/persistence adapter reads/writes through these) ----

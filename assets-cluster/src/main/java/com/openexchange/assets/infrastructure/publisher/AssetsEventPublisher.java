@@ -12,6 +12,7 @@ import com.openexchange.assets.infrastructure.generated.HoldRejectEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
+import com.openexchange.assets.infrastructure.generated.SettleFaultEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawRejectEncoder;
@@ -49,6 +50,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final WithdrawRejectEncoder withdrawRejectEncoder = new WithdrawRejectEncoder();
     private final BalanceSnapshotEndEncoder balanceSnapshotEndEncoder = new BalanceSnapshotEndEncoder();
     private final FeedPositionReportEncoder feedPositionReportEncoder = new FeedPositionReportEncoder();
+    private final SettleFaultEncoder settleFaultEncoder = new SettleFaultEncoder();
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
@@ -133,6 +135,15 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .correlationId(correlationId).consumePosition(consumePosition)
                 .lastAppliedTradeId(lastAppliedTradeId);
         flush(feedPositionReportEncoder.encodedLength());
+    }
+
+    @Override
+    public void onSettleFault(long tradeId, long orderId, long userId, int assetId,
+                              long drawnFromAvailable, long uncovered) {
+        settleFaultEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .tradeId(tradeId).orderId(orderId).userId(userId).assetId(assetId)
+                .drawnFromAvailable(drawnFromAvailable).uncovered(uncovered);
+        flush(settleFaultEncoder.encodedLength());
     }
 
     private void flush(int bodyLength) {

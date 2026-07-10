@@ -174,6 +174,15 @@
         <field name="remaining"  id="4" type="int64"/>
     </sbe:message>
 
+    <sbe:message name="SettleFault" id="21" description="A settle leg could not draw fully from its order hold (reconciler race / invariant breach): drawnFromAvailable was recovered from the user's available balance; uncovered could not be moved at all -- the counterparty was credited only what was debited, so conservation holds; nonzero uncovered demands operator action. MUST alert on this event.">
+        <field name="tradeId"            id="1" type="int64"/>
+        <field name="orderId"            id="2" type="int64"/>
+        <field name="userId"             id="3" type="int64"/>
+        <field name="assetId"            id="4" type="int32"/>
+        <field name="drawnFromAvailable" id="5" type="int64"/>
+        <field name="uncovered"          id="6" type="int64"/>
+    </sbe:message>
+
     <sbe:message name="HoldSnapshotEnd" id="20" description="Terminates the HoldSnapshotEntry stream answering RequestHoldSnapshot">
         <field name="correlationId" id="1" type="int64"/>
         <field name="entryCount"    id="2" type="int32"/>

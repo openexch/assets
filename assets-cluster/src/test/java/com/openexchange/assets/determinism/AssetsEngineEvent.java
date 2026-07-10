@@ -14,7 +14,7 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.HoldAck, AssetsEngineEvent.HoldReject, AssetsEngineEvent.WithdrawReject,
                 AssetsEngineEvent.Settled, AssetsEngineEvent.BalanceSnapshotEnd,
                 AssetsEngineEvent.HoldSnapshotEntry, AssetsEngineEvent.HoldSnapshotEnd,
-                AssetsEngineEvent.FeedPositionReport {
+                AssetsEngineEvent.FeedPositionReport, AssetsEngineEvent.SettleFault {
 
     String render();
 
@@ -105,6 +105,15 @@ public sealed interface AssetsEngineEvent
         public String render() {
             return String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d",
                     correlationId, consumePosition, lastAppliedTradeId);
+        }
+    }
+
+    record SettleFault(long tradeId, long orderId, long userId, int assetId,
+                       long drawnFromAvailable, long uncovered) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("SETTLEFAULT trade=%d order=%d u=%d asset=%d fromAvail=%d uncovered=%d",
+                    tradeId, orderId, userId, assetId, drawnFromAvailable, uncovered);
         }
     }
 }

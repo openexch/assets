@@ -54,6 +54,8 @@ public final class AssetsEngine {
 
     private long lastAppliedTradeId = 0L;
     private long consumePosition = 0L;
+    /** Settle legs that could not draw fully from their hold (SettleFault emitted). Alarm target. */
+    private long settleFaultCount = 0L;
 
     // Reusable scratch for the rare, read-only snapshot queries (not the hot path). Sorting the entries
     // by userId makes a query's answer a pure function of *state* (not of insertion/replay history), so
@@ -154,6 +156,20 @@ public final class AssetsEngine {
         settlement.settle(buyer, seller, buyerOrder, sellerOrder, base, quote, baseAmt, quoteAmt);
         lastAppliedTradeId = c.getTradeId();
 
+        // Exceptional path: a leg that could not draw fully from its order hold. Emitted BEFORE the
+        // balance lines (the fault explains them). Deterministic, loud, never a throw — a throw here
+        // would re-crash the service on every log replay.
+        if (settlement.buyerLeg().faulted()) {
+            settleFaultCount++;
+            sink.onSettleFault(c.getTradeId(), buyerOrder, buyerUser, quote,
+                    settlement.buyerLeg().drawnFromAvailable, settlement.buyerLeg().uncovered);
+        }
+        if (settlement.sellerLeg().faulted()) {
+            settleFaultCount++;
+            sink.onSettleFault(c.getTradeId(), sellerOrder, sellerUser, base,
+                    settlement.sellerLeg().drawnFromAvailable, settlement.sellerLeg().uncovered);
+        }
+
         // Emit the four (user, asset) lines that changed, in a deterministic order.
         sink.onBalanceUpdate(buyerUser, quote, buyer.available(quote), buyer.locked(quote));
         sink.onBalanceUpdate(buyerUser, base, buyer.available(base), buyer.locked(base));
@@ -192,6 +208,11 @@ public final class AssetsEngine {
      */
     public void reportFeedPosition(long correlationId) {
         sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId);
+    }
+
+    /** Settle legs that faulted (drew from available / left an uncovered residue) since boot. */
+    public long getSettleFaultCount() {
+        return settleFaultCount;
     }
 
     /**

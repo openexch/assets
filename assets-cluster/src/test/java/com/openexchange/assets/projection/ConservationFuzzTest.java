@@ -237,5 +237,6 @@ public class ConservationFuzzTest {
         @Override public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) { }
         @Override public void onHoldSnapshotEnd(long correlationId, int entryCount) { }
         @Override public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId) { }
+        @Override public void onSettleFault(long tradeId, long orderId, long userId, int assetId, long drawnFromAvailable, long uncovered) { }
     };
 }

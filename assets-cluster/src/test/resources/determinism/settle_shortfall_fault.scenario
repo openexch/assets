@@ -1,0 +1,11 @@
+# EXCEPTIONAL settle path (reconciler race): the buyer's hold was released early, then the fill
+# arrives from the journal. The quote leg cannot draw from the (gone) hold: it draws the full
+# amount from AVAILABLE, emits SETTLEFAULT (fromAvail=60000e8, uncovered=0), and conservation
+# holds exactly (seller receives what the buyer actually paid). The seller's leg is normal.
+CLOCK 1000
+DEPOSIT u=200 asset=0 amt=100000.0
+DEPOSIT u=100 asset=1 amt=1.0
+HOLD u=200 order=22 asset=0 amt=60000.0
+HOLD u=100 order=11 asset=1 amt=1.0
+RELEASE order=22 u=200
+TRADE tradeId=1 market=1 takerOrder=22 takerUser=200 makerOrder=11 makerUser=100 px=60000.0 qty=1.0 takerBuy=1
