@@ -19,6 +19,14 @@ import java.io.IOException;
 public final class BridgeMain {
 
     public static void main(final String[] args) {
+        // Read-only ledger snapshot for the money-check guardrail: `java -jar assets-bridge.jar dump`.
+        // Kept in this one entry point so the shade jar stays single-main; AeDump owns its own
+        // media driver and exits when done (0 = JSON printed, 3 = snapshot timeout).
+        if (args.length > 0 && "dump".equals(args[0])) {
+            System.exit(AeDump.run(java.util.Arrays.copyOfRange(args, 1, args.length)));
+            return;
+        }
+
         final BridgeConfig config = BridgeConfig.fromEnv();
         final BridgeState state = new BridgeState();
 
