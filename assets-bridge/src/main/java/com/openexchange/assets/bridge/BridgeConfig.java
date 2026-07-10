@@ -19,6 +19,8 @@ public final class BridgeConfig {
     /** Latch HALT on a dense-tradeId gap (production default true; false = operator override). */
     public final boolean haltOnGap;
     public final long queryTimeoutMs;
+    /** Port for the /metrics + /health HTTP endpoint (0 = ephemeral, for tests). */
+    public final int metricsPort;
 
     public BridgeConfig(
             final List<String> journalArchiveEndpoints,
@@ -26,13 +28,15 @@ public final class BridgeConfig {
             final int aePortBase,
             final String aeEgressEndpoint,
             final boolean haltOnGap,
-            final long queryTimeoutMs) {
+            final long queryTimeoutMs,
+            final int metricsPort) {
         this.journalArchiveEndpoints = journalArchiveEndpoints;
         this.aeClusterAddresses = aeClusterAddresses;
         this.aePortBase = aePortBase;
         this.aeEgressEndpoint = aeEgressEndpoint;
         this.haltOnGap = haltOnGap;
         this.queryTimeoutMs = queryTimeoutMs;
+        this.metricsPort = metricsPort;
     }
 
     public static BridgeConfig fromEnv() {
@@ -42,7 +46,8 @@ public final class BridgeConfig {
                 Integer.parseInt(envOr("BRIDGE_AE_PORT_BASE", "9300")),
                 envOr("BRIDGE_AE_EGRESS_ENDPOINT", "127.0.0.1:9394"),
                 !"false".equalsIgnoreCase(envOr("BRIDGE_HALT_ON_GAP", "true")),
-                Long.parseLong(envOr("BRIDGE_QUERY_TIMEOUT_MS", "5000")));
+                Long.parseLong(envOr("BRIDGE_QUERY_TIMEOUT_MS", "5000")),
+                Integer.parseInt(envOr("BRIDGE_METRICS_PORT", "9600")));
     }
 
     private static String envOr(final String key, final String fallback) {
