@@ -6,6 +6,8 @@ import io.aeron.driver.ThreadingMode;
 import org.agrona.CloseHelper;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
+import java.io.IOException;
+
 /**
  * Settlement bridge entry point: ME settlement journal -> Assets Engine ingress.
  *
@@ -31,6 +33,13 @@ public final class BridgeMain {
         thread.setDaemon(false);
         thread.start();
 
+        final BridgeMetricsServer metricsServer = new BridgeMetricsServer(state);
+        try {
+            metricsServer.start(config.metricsPort);
+        } catch (IOException e) {
+            throw new RuntimeException("failed to start bridge metrics server on port " + config.metricsPort, e);
+        }
+
         final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             agent.stop();
@@ -39,6 +48,7 @@ public final class BridgeMain {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            metricsServer.stop();
             CloseHelper.quietClose(driver);
         }, "bridge-shutdown"));
         barrier.await();
