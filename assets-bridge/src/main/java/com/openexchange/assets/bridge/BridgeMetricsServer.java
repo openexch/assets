@@ -89,6 +89,13 @@ public final class BridgeMetricsServer {
         counter(sb, "bridge_gaps_detected_total",
                 "Dense tradeId gaps detected (a lost settlement) - MUST stay 0; alert on any increase",
                 state.gapsDetected);
+        counter(sb, "bridge_source_stalls_total",
+                "Journal-source stalls/losses detected and recovered by epoch restart - investigate if climbing",
+                state.sourceStalls);
+        gauge(sb, "bridge_source_backlog_bytes",
+                "Bytes recorded in the followed journal recording not yet delivered to the bridge; "
+                        + "sustained >0 while forwards are flat = the release path is behind",
+                state.sourceBacklogBytes);
         gauge(sb, "bridge_last_forwarded_trade_id", "Dense tradeId of the last trade forwarded",
                 state.lastForwardedTradeId);
         gauge(sb, "bridge_last_forwarded_egress_seq", "egressSeq of the last journal entry forwarded",

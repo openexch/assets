@@ -115,6 +115,20 @@ final class JournalSource implements AutoCloseable {
         return replay.poll(handler, limit);
     }
 
+    /**
+     * Current recorded position of an ACTIVE recording, or {@link AeronArchive#NULL_POSITION}
+     * once it has stopped. Doubles as an archive liveness probe: throws when the archive
+     * (the source node) is gone, which the caller turns into an epoch restart.
+     */
+    long recordingPosition(final long recordingId) {
+        return archive.getRecordingPosition(recordingId);
+    }
+
+    /** Final position of a stopped recording, or {@link AeronArchive#NULL_POSITION} while active. */
+    long stopPosition(final long recordingId) {
+        return archive.getStopPosition(recordingId);
+    }
+
     @Override
     public void close() {
         CloseHelper.quietClose(archive);
