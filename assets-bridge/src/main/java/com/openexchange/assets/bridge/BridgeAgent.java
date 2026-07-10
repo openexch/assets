@@ -5,6 +5,7 @@ import com.match.infrastructure.journal.generated.JournalTerminalDecoder;
 import com.match.infrastructure.journal.generated.JournalTradeDecoder;
 import com.match.infrastructure.journal.generated.MessageHeaderDecoder;
 import io.aeron.Subscription;
+import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.BackoffIdleStrategy;
@@ -24,12 +25,26 @@ import java.util.List;
  *
  * Every failure (AE session death, journal source death, purge race) tears down the epoch
  * and starts a new one. A HALT parks the bridge with metrics alive until an operator acts.
+ *
+ * Source death is detected three ways, because a dead source otherwise looks exactly like a
+ * quiet market: (1) a replay image that existed and vanished; (2) a replay that never
+ * connects within {@link #CONNECT_TIMEOUT_MS}; (3) a periodic archive probe — the recording
+ * stopped, or grew while the replay sat still, or the probe itself throws because the
+ * archive process is gone. All three end the epoch; the next epoch re-lists the recording
+ * chain and re-attaches (the 2026-07-10 incident: a node SIGKILL stopped the followed
+ * recording and the bridge idled at EOF for two hours reporting healthy).
  */
 public final class BridgeAgent implements Runnable {
 
     private static final int POLL_LIMIT = 32;
     private static final long ERROR_BACKOFF_MS = 1_000;
     private static final long STATUS_LOG_INTERVAL_MS = 10_000;
+    /** Cadence of the live-follow source-progress probe (also an archive liveness check). */
+    private static final long SOURCE_CHECK_INTERVAL_MS = 10_000;
+    /** A replay whose image never arrives is a dead source, not a slow start, past this. */
+    private static final long CONNECT_TIMEOUT_MS = 15_000;
+    /** Sentinel: no previous source-progress check this replay (never stall on the first probe). */
+    private static final long NO_PRIOR_CHECK = Long.MIN_VALUE;
 
     private final BridgeConfig config;
     private final String aeronDirectoryName;
@@ -86,6 +101,7 @@ public final class BridgeAgent implements Runnable {
                     pos.consumePosition(), pos.lastAppliedTradeId(), config.haltOnGap);
             state.epochConsumePosition = pos.consumePosition();
             state.epochLastAppliedTradeId = pos.lastAppliedTradeId();
+            state.sourceBacklogBytes = 0;
             state.epochs++;
             System.out.println("[BRIDGE] epoch " + state.epochs + ": AE at consumePosition="
                     + pos.consumePosition() + " lastAppliedTradeId=" + pos.lastAppliedTradeId());
@@ -114,35 +130,87 @@ public final class BridgeAgent implements Runnable {
             System.out.println("[BRIDGE] following recording " + recording.recordingId()
                     + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
             try (Subscription replay = source.openReplay(recording)) {
+                final boolean liveFollow = recording.isActive();
+                final long connectDeadlineMs = System.currentTimeMillis() + CONNECT_TIMEOUT_MS;
+                long nextSourceCheckMs = System.currentTimeMillis() + SOURCE_CHECK_INTERVAL_MS;
+                long consumedAtLastCheck = NO_PRIOR_CHECK;
+                boolean imageWasLive = false;
+                boolean followedRecordingEnded = false;
                 while (running && !state.halted) {
                     final int fragments = source.poll(replay, handler, POLL_LIMIT);
                     ae.duty();
                     maybeLogStatus();
+                    imageWasLive |= replay.imageCount() > 0;
                     if (fragments == 0) {
-                        if (!recording.isActive() && replayDrained(replay, recording)) {
+                        if (!liveFollow && replayDrained(replay, recording)) {
                             break; // stopped recording fully consumed -> next in chain
                         }
-                        if (replay.isClosed() || !replay.isConnected() && replay.imageCount() == 0
-                                && replayStarted(replay)) {
-                            // Live image lost (source node died / purge race): epoch restart re-lists.
-                            throw new IllegalStateException("journal replay image lost on recording "
+                        if (replay.isClosed() || (imageWasLive && replay.imageCount() == 0)) {
+                            // The image we HAD is gone (source node died / purge race):
+                            // epoch restart re-lists the chain and re-attaches.
+                            sourceStall("journal replay image lost on recording "
                                     + recording.recordingId());
+                        }
+                        if (!imageWasLive && System.currentTimeMillis() > connectDeadlineMs) {
+                            // Replay accepted but no image ever arrived: dead source, not slow start.
+                            sourceStall("journal replay never connected on recording "
+                                    + recording.recordingId() + " within " + CONNECT_TIMEOUT_MS + "ms");
+                        }
+                        if (liveFollow && System.currentTimeMillis() >= nextSourceCheckMs) {
+                            nextSourceCheckMs = System.currentTimeMillis() + SOURCE_CHECK_INTERVAL_MS;
+                            final long consumed = replay.imageCount() > 0
+                                    ? replay.imageAtIndex(0).position() : -1;
+                            // Throws when the archive itself is gone -> epoch restart. This is
+                            // what un-wedges a live-follow whose source process was killed.
+                            final long recPos = source.recordingPosition(recording.recordingId());
+                            if (recPos == AeronArchive.NULL_POSITION) {
+                                // Recording stopped under our live-follow (source restarted; its
+                                // successor recording isn't in this epoch's chain listing).
+                                final long stop = source.stopPosition(recording.recordingId());
+                                if (consumed >= stop) {
+                                    System.out.println("[BRIDGE] followed recording "
+                                            + recording.recordingId() + " stopped and is fully "
+                                            + "consumed — ending epoch to re-list the chain");
+                                    followedRecordingEnded = true;
+                                    break;
+                                }
+                                if (consumed == consumedAtLastCheck && consumedAtLastCheck != NO_PRIOR_CHECK) {
+                                    sourceStall("recording " + recording.recordingId()
+                                            + " stopped but replay is stuck at " + consumed
+                                            + " short of stop position " + stop);
+                                }
+                            } else {
+                                state.sourceBacklogBytes = Math.max(0, recPos - Math.max(consumed, 0));
+                                if (recPos > consumed && consumed == consumedAtLastCheck
+                                        && consumedAtLastCheck != NO_PRIOR_CHECK) {
+                                    sourceStall("replay stalled on recording " + recording.recordingId()
+                                            + ": recorded position " + recPos
+                                            + " but replay stuck at " + consumed);
+                                }
+                            }
+                            consumedAtLastCheck = consumed;
                         }
                         idle.idle();
                     } else {
                         idle.reset();
                     }
                 }
+                if (followedRecordingEnded) {
+                    break; // end the epoch: the next one re-lists and follows the successor
+                }
             }
             if (!running || state.halted) {
                 return;
             }
         }
+        // Chain exhausted without a live-follow in progress (source down or mid-restart):
+        // pause before the next epoch so we don't hot-loop re-reading the whole chain.
+        sleep(ERROR_BACKOFF_MS);
     }
 
-    private boolean replayStarted(final Subscription replay) {
-        // A live-follow that never connected yet is "starting", not "lost" — poll a while first.
-        return replay.imageCount() > 0 || replay.isClosed();
+    private void sourceStall(final String reason) {
+        state.sourceStalls++;
+        throw new IllegalStateException(reason);
     }
 
     private boolean replayDrained(final Subscription replay, final JournalSource.Recording recording) {

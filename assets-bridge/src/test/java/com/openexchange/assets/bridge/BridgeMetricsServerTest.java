@@ -50,6 +50,8 @@ public class BridgeMetricsServerTest {
         state.lastForwardedEgressSeq = 12_345;
         state.epochConsumePosition = 6_789;
         state.epochLastAppliedTradeId = 98;
+        state.sourceStalls = 2;
+        state.sourceBacklogBytes = 4_096;
 
         final HttpResponse<String> resp = send("/metrics");
         assertEquals(200, resp.statusCode());
@@ -72,6 +74,10 @@ public class BridgeMetricsServerTest {
         assertTrue(body.contains("bridge_last_forwarded_egress_seq 12345"));
         assertTrue(body.contains("bridge_epoch_consume_position 6789"));
         assertTrue(body.contains("bridge_epoch_last_applied_trade_id 98"));
+        assertTrue(body.contains("# TYPE bridge_source_stalls_total counter"));
+        assertTrue(body.contains("bridge_source_stalls_total 2"));
+        assertTrue(body.contains("# TYPE bridge_source_backlog_bytes gauge"));
+        assertTrue(body.contains("bridge_source_backlog_bytes 4096"));
     }
 
     @Test

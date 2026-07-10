@@ -203,7 +203,17 @@ public class BridgeEndToEndTest {
                 .threadingMode(ThreadingMode.SHARED)
                 .dirDeleteOnStart(true)
                 .dirDeleteOnShutdown(true));
-        journalArchive = Archive.launch(new Archive.Context()
+        journalArchive = launchJournalArchive();
+        journalWriterClient = connectJournalWriter();
+        journalPub = journalWriterClient.addRecordedExclusivePublication(
+                "aeron:ipc?term-length=64k", JournalSource.SETTLEMENT_JOURNAL_STREAM_ID);
+
+        fundingClient = new TestAeClient(new File(tmp, "ae-driver").getAbsolutePath(), "localhost:19495");
+    }
+
+    /** Same-dir, same-port archive: a relaunch recovers the catalog like a restarted node's does. */
+    private Archive launchJournalArchive() {
+        return Archive.launch(new Archive.Context()
                 .aeronDirectoryName(journalDriver.aeronDirectoryName())
                 .archiveDir(new File(tmp, "journal-archive"))
                 .controlChannel("aeron:udp?endpoint=localhost:" + JOURNAL_CONTROL_PORT)
@@ -214,15 +224,14 @@ public class BridgeEndToEndTest {
                 .threadingMode(ArchiveThreadingMode.SHARED)
                 .fileSyncLevel(0)
                 .segmentFileLength(1024 * 1024));
-        journalWriterClient = AeronArchive.connect(new AeronArchive.Context()
+    }
+
+    private AeronArchive connectJournalWriter() {
+        return AeronArchive.connect(new AeronArchive.Context()
                 .aeronDirectoryName(journalDriver.aeronDirectoryName())
                 .controlRequestChannel("aeron:udp?endpoint=localhost:" + JOURNAL_CONTROL_PORT)
                 .controlRequestStreamId(JournalSource.JOURNAL_ARCHIVE_CONTROL_STREAM_ID)
                 .controlResponseChannel("aeron:udp?endpoint=localhost:0"));
-        journalPub = journalWriterClient.addRecordedExclusivePublication(
-                "aeron:ipc?term-length=64k", JournalSource.SETTLEMENT_JOURNAL_STREAM_ID);
-
-        fundingClient = new TestAeClient(new File(tmp, "ae-driver").getAbsolutePath(), "localhost:19495");
     }
 
     @After
@@ -336,5 +345,76 @@ public class BridgeEndToEndTest {
         agent2.stop();
         t2.interrupt();
         t2.join(10_000);
+    }
+
+    /**
+     * The 2026-07-10 production incident, in miniature: the journal SOURCE dies mid-live-follow
+     * (node SIGKILL took its archive, its recording, and the replay publication with it), then
+     * comes back with a NEW recording. The old bridge idled at the dead recording's EOF forever,
+     * reporting healthy while holds piled up. The fixed bridge must detect the loss, restart its
+     * epoch, re-list the chain, and land the money written after the restart — one agent, no
+     * operator action.
+     */
+    @Test
+    public void bridgeRecoversWhenJournalSourceDiesMidLiveFollow() throws Exception {
+        fundingClient.deposit(SELLER, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
+        fundingClient.deposit(BUYER, Asset.USD.id(), FixedPoint.fromDouble(120000.0));
+        fundingClient.hold(SELL_ORDER, SELLER, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
+        fundingClient.hold(BUY_ORDER, BUYER, Asset.USD.id(), FixedPoint.fromDouble(120000.0));
+        fundingClient.await(fundingClient.holdAcks::get, 2, 10_000);
+
+        journalTrade(1_000L, 1L, FixedPoint.fromDouble(60000.0), FixedPoint.fromDouble(1.0));
+
+        // ONE agent for the whole test: recovery must not need a process restart.
+        final BridgeState state = new BridgeState();
+        final BridgeAgent agent = new BridgeAgent(bridgeConfig(), journalDriver.aeronDirectoryName(), state);
+        final Thread t = new Thread(agent, "bridge-e2e-source-restart");
+        t.start();
+
+        // Trade 1 settles; the bridge is now live-following the ACTIVE recording 0.
+        fundingClient.await(() -> fundingClient.balance(BUYER, Asset.BTC.id())[0],
+                FixedPoint.fromDouble(1.0), 15_000);
+        assertEquals(1L, state.forwardedTrades);
+
+        // Kill the journal source under the live-follow: publication, writer client and archive
+        // all die together, exactly as a node SIGKILL takes them (the shared test driver
+        // survives, standing in for the network path).
+        CloseHelper.quietCloseAll(journalPub, journalWriterClient, journalArchive);
+
+        // The "restarted node": same archive dir + port (catalog recovery stops recording 0),
+        // and a fresh recorded publication = recording 1, carrying the post-restart money.
+        journalArchive = launchJournalArchive();
+        journalWriterClient = connectJournalWriter();
+        journalPub = journalWriterClient.addRecordedExclusivePublication(
+                "aeron:ipc?term-length=64k", JournalSource.SETTLEMENT_JOURNAL_STREAM_ID);
+        journalTrade(2_000L, 2L, FixedPoint.fromDouble(60000.0), FixedPoint.fromDouble(1.0));
+        journalTerminal(2_100L, SELL_ORDER, SELLER);
+        journalTerminal(2_200L, BUY_ORDER, BUYER);
+
+        // The bridge must self-recover and land ONLY the new money. Generous deadline: detection
+        // (image loss or the 10s source probe) + epoch teardown + archive reconnect all fit well
+        // inside it; the OLD code fails this await by idling at recording 0's EOF forever.
+        fundingClient.await(() -> fundingClient.balance(BUYER, Asset.BTC.id())[0],
+                FixedPoint.fromDouble(2.0), 60_000);
+
+        // Exact final books — same invariants as the restart test: no double-settle, no losses.
+        assertEquals(FixedPoint.fromDouble(120000.0), fundingClient.balance(SELLER, Asset.USD.id())[0]);
+        assertEquals(0L, fundingClient.balance(SELLER, Asset.BTC.id())[0]);
+        assertEquals(0L, fundingClient.balance(SELLER, Asset.BTC.id())[1]);
+        assertEquals(FixedPoint.fromDouble(2.0), fundingClient.balance(BUYER, Asset.BTC.id())[0]);
+        assertEquals(0L, fundingClient.balance(BUYER, Asset.USD.id())[0]);
+        assertEquals(0L, fundingClient.balance(BUYER, Asset.USD.id())[1]);
+
+        // The recovery was a detected source loss + a fresh epoch, with a clean dense-id chain.
+        assertTrue("expected a detected source stall/loss, got stalls=" + state.sourceStalls
+                + " errors=" + state.errors, state.sourceStalls >= 1 || state.errors >= 1);
+        assertTrue("expected a recovery epoch, got epochs=" + state.epochs, state.epochs >= 2);
+        assertEquals(0L, state.gapsDetected);
+        assertEquals(2L, state.forwardedTrades);
+        assertEquals(2L, state.forwardedTerminals);
+
+        agent.stop();
+        t.interrupt();
+        t.join(10_000);
     }
 }
