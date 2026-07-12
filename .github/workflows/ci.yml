@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # assets-bridge depends on com.match:match-common (the ME settlement-journal
+      # SBE classes), the same way order-management does — install it from match main
+      # before the reactor build.
+      - name: Check out match (for match-common dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: openexch/match
+          ref: main
+          path: _match
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Install match-common into local Maven repo
+        run: mvn -B -f _match/pom.xml install -DskipTests -pl match-common -am
+
+      # verify runs the full gate: unit tests, the determinism corpus, and
+      # ClusterBootSmokeTest (boots a real in-process single-node AE cluster).
+      - name: Build and test
+        run: mvn -B clean verify
+
+  # Dependency CVEs + committed secrets, mirroring the match/oms security gate.
+  # Trivy covers both on a private repo without GitHub Advanced Security;
+  # triaged findings go in .trivyignore.
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy scan (dependencies + secrets)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
