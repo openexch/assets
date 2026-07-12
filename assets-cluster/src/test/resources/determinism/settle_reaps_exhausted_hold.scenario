@@ -1,0 +1,18 @@
+# Defense-in-depth: a hold exactly consumed by settles is reaped AT SETTLE TIME — no remaining=0
+# tombstone lingers waiting for a terminal release that may never arrive. Proof in-stream:
+#   1. two 0.5 BTC settles exactly consume both orders' holds;
+#   2. the subsequent RELEASEs find no hold -> silent idempotent no-ops (no BALANCE echo);
+#   3. SNAPSHOT round-trips the (smaller) hold-free state;
+#   4. re-HOLDing orderId=1 in a DIFFERENT asset is ACCEPTED as a fresh reservation — against a
+#      lingering tombstone (assetId=BTC) it would be rejected as a cross-asset top-up.
+CLOCK 1000
+DEPOSIT u=100 asset=1 amt=1.0
+DEPOSIT u=200 asset=0 amt=60000.0
+HOLD order=1 u=100 asset=1 amt=1.0
+HOLD order=2 u=200 asset=0 amt=60000.0
+SETTLE tradeId=1 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=0.5 takerBuy=1
+SETTLE tradeId=2 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=0.5 takerBuy=1
+RELEASE order=1 u=100
+RELEASE order=2 u=200
+SNAPSHOT
+HOLD order=1 u=100 asset=0 amt=1000.0

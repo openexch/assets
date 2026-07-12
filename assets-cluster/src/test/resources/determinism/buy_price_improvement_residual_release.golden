@@ -12,4 +12,3 @@ BALANCE u=100 asset=1 avail=0 locked=0
 BALANCE u=100 asset=0 avail=5900000000000 locked=0
 SETTLED tradeId=1 buyer=200 seller=100
 BALANCE u=200 asset=0 avail=100000000000 locked=0
-BALANCE u=100 asset=1 avail=0 locked=0

@@ -58,6 +58,8 @@ public final class AssetsEngine {
     private long settleFaultCount = 0L;
     /** Feed terminal releases suppressed on omsManagedRelease holds (iceberg/stop parents). */
     private long suppressedFeedReleaseCount = 0L;
+    /** Holds exhausted by a settle (remaining hit 0) and reaped at settle time — never tombstoned. */
+    private long exhaustedHoldsReaped = 0L;
 
     // Reusable scratch for the rare, read-only snapshot queries (not the hot path). Sorting the entries
     // by userId makes a query's answer a pure function of *state* (not of insertion/replay history), so
@@ -165,6 +167,16 @@ public final class AssetsEngine {
         settlement.settle(buyer, seller, buyerOrder, sellerOrder, base, quote, baseAmt, quoteAmt);
         lastAppliedTradeId = c.getTradeId();
 
+        // Defense-in-depth accounting: a leg whose settle exhausted its hold (remaining hit 0) had
+        // that hold removed at settle time — it never lingers as a tombstone awaiting a terminal
+        // release that may never arrive. Pure hold-map bookkeeping; balances are untouched.
+        if (settlement.buyerLeg().reapedExhaustedHold) {
+            exhaustedHoldsReaped++;
+        }
+        if (settlement.sellerLeg().reapedExhaustedHold) {
+            exhaustedHoldsReaped++;
+        }
+
         // Exceptional path: a leg that could not draw fully from its order hold. Emitted BEFORE the
         // balance lines (the fault explains them). Deterministic, loud, never a throw — a throw here
         // would re-crash the service on every log replay.
@@ -227,6 +239,11 @@ public final class AssetsEngine {
     /** Feed terminal releases suppressed on omsManagedRelease holds since boot. */
     public long getSuppressedFeedReleaseCount() {
         return suppressedFeedReleaseCount;
+    }
+
+    /** Holds exhausted by a settle (drawn to remaining=0) and reaped at settle time since boot. */
+    public long getExhaustedHoldsReaped() {
+        return exhaustedHoldsReaped;
     }
 
     /**

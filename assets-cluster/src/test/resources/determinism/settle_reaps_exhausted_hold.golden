@@ -6,8 +6,15 @@ HOLDACK corr=0 order=1 u=100 asset=1 amt=100000000
 BALANCE u=100 asset=1 avail=0 locked=100000000
 HOLDACK corr=0 order=2 u=200 asset=0 amt=6000000000000
 BALANCE u=200 asset=0 avail=0 locked=6000000000000
+BALANCE u=200 asset=0 avail=0 locked=3000000000000
+BALANCE u=200 asset=1 avail=50000000 locked=0
+BALANCE u=100 asset=1 avail=0 locked=50000000
+BALANCE u=100 asset=0 avail=3000000000000 locked=0
+SETTLED tradeId=1 buyer=200 seller=100
 BALANCE u=200 asset=0 avail=0 locked=0
 BALANCE u=200 asset=1 avail=100000000 locked=0
 BALANCE u=100 asset=1 avail=0 locked=0
 BALANCE u=100 asset=0 avail=6000000000000 locked=0
-SETTLED tradeId=1 buyer=200 seller=100
+SETTLED tradeId=2 buyer=200 seller=100
+HOLDACK corr=0 order=1 u=100 asset=0 amt=100000000000
+BALANCE u=100 asset=0 avail=5900000000000 locked=100000000000

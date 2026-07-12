@@ -205,10 +205,17 @@ public final class Account {
         public long drawnFromAvailable;
         /** Could not be moved at all (hold AND available exhausted) — a reportable breach. */
         public long uncovered;
+        /**
+         * TRUE when this debit left the order's hold with {@code remaining == 0} and it was therefore
+         * removed and recycled (mirroring {@link Account#release}). Normal-path bookkeeping, NOT a
+         * fault — {@link #faulted()} is unaffected.
+         */
+        public boolean reapedExhaustedHold;
 
         void reset() {
             drawnFromAvailable = 0;
             uncovered = 0;
+            reapedExhaustedHold = false;
         }
 
         public boolean faulted() {
@@ -228,6 +235,11 @@ public final class Account {
      * breach observable. Conservation stays intact because the caller credits the counterparty
      * exactly what was debited: {@code amount - out.uncovered}.</p>
      *
+     * <p>If the draw leaves the hold with {@code remaining == 0} the hold is removed and recycled,
+     * exactly mirroring {@link #release} — an exhausted hold never lingers as a tombstone waiting for
+     * a terminal release that may never arrive. Reported via {@code out.reapedExhaustedHold} (not a
+     * fault).</p>
+     *
      * @return the amount actually debited ({@code amount - out.uncovered})
      */
     public long settleDebit(long orderId, int assetId, long amount, SettleDebitResult out) {
@@ -240,6 +252,16 @@ public final class Account {
             fromHold = Math.min(fromHold, bal[2 * assetId + 1]);
             h.drawDown(fromHold);
             bal[2 * assetId + 1] -= fromHold;
+            if (h.remaining() == 0) {
+                // Exactly mirrors release(): an exhausted hold is removed and recycled, never left
+                // behind as a remaining=0 tombstone. Defense-in-depth — a fully-filled order whose
+                // TerminalRelease never arrives (e.g. the ME's missing maker terminal) must not leak
+                // its hold. Pure map bookkeeping: balances are untouched, and a later hold() with the
+                // same orderId is a fresh reservation, exactly as after a full release().
+                holds.remove(orderId);
+                recycle(h);
+                out.reapedExhaustedHold = true;
+            }
         }
         long shortfall = amount - fromHold;
         if (shortfall > 0) {

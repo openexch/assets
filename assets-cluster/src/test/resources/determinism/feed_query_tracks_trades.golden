@@ -12,5 +12,4 @@ BALANCE u=100 asset=1 avail=0 locked=0
 BALANCE u=100 asset=0 avail=6000000000000 locked=0
 SETTLED tradeId=1 buyer=200 seller=100
 FEEDPOS corr=42 consumePos=1 lastTradeId=1
-BALANCE u=200 asset=0 avail=0 locked=0
 FEEDPOS corr=43 consumePos=2 lastTradeId=1
