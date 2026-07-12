@@ -108,6 +108,64 @@ public class AccountTest {
     }
 
     @Test
+    public void settleDrawingHoldToExactlyZeroReapsTheHold() {
+        Account a = new Account(1);
+        a.deposit(USD, 1000);
+        a.hold(1L, USD, 600); // avail=400, locked=600
+        Account.SettleDebitResult out = new Account.SettleDebitResult();
+
+        // Two settles exactly consume the hold (300 + 300).
+        assertEquals(300, a.settleDebit(1L, USD, 300, out));
+        assertFalse("partial draw must NOT reap", out.reapedExhaustedHold);
+        assertTrue("residual hold must survive a partial draw", a.hasHold(1L));
+        assertEquals(300, a.holdRemaining(1L));
+
+        assertEquals(300, a.settleDebit(1L, USD, 300, out));
+        assertTrue("exact exhaustion must reap", out.reapedExhaustedHold);
+        assertFalse("reaping is bookkeeping, not a fault", out.faulted());
+        assertFalse("exhausted hold must be gone, not a remaining=0 tombstone", a.hasHold(1L));
+        assertEquals(0, a.holdCount());
+        assertEquals(0, a.locked(USD));
+        assertEquals(400, a.available(USD)); // settle debits locked only; available untouched
+    }
+
+    @Test
+    public void releaseAfterExhaustionReapIsAnIdempotentNoOp() {
+        Account a = new Account(1);
+        a.deposit(USD, 1000);
+        a.hold(1L, USD, 600);
+        Account.SettleDebitResult out = new Account.SettleDebitResult();
+        a.settleDebit(1L, USD, 600, out); // exhausts and reaps the hold
+
+        // The terminal release that arrives later must be a no-op (nothing to release, no mutation).
+        assertEquals("full-residual release after reap releases nothing", 0, a.release(1L, -1L));
+        assertEquals(400, a.available(USD));
+        assertEquals(0, a.locked(USD));
+        assertFalse(a.hasHold(1L));
+    }
+
+    @Test
+    public void holdAfterExhaustionReapCreatesAFreshHoldNotATopUp() {
+        Account a = new Account(1);
+        a.deposit(USD, 1000);
+        a.deposit(BTC, 100_000_000);
+        a.hold(1L, USD, 600);
+        Account.SettleDebitResult out = new Account.SettleDebitResult();
+        a.settleDebit(1L, USD, 600, out); // exhausts and reaps the hold
+
+        // Re-holding the same orderId is a FRESH reservation: in a DIFFERENT asset it must be
+        // ACCEPTED (against a lingering tombstone it would be rejected as a cross-asset top-up).
+        assertEquals(RejectReason.NONE, a.hold(1L, BTC, 40_000_000));
+        assertEquals(1, a.holdCount());
+        assertEquals(BTC, a.holdAssetId(1L));
+        assertEquals("fresh hold, not a top-up of stale state", 40_000_000, a.holdRemaining(1L));
+        assertEquals(60_000_000, a.available(BTC));
+        assertEquals(40_000_000, a.locked(BTC));
+        assertEquals(400, a.available(USD)); // USD side untouched by the fresh BTC hold
+        assertEquals(0, a.locked(USD));
+    }
+
+    @Test
     public void topUpKeepsLockedEqualToSumOfRemainingAcrossOrders() {
         Account a = new Account(1);
         a.deposit(USD, 1000);
