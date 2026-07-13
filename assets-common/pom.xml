@@ -63,6 +63,7 @@
                             <mainClass>uk.co.real_logic.sbe.SbeTool</mainClass>
                             <arguments>
                                 <argument>${project.basedir}/src/main/resources/sbe/money-schema.xml</argument>
+                                <argument>${project.basedir}/src/main/resources/sbe/money-journal-schema.xml</argument>
                             </arguments>
                             <systemProperties>
                                 <systemProperty>

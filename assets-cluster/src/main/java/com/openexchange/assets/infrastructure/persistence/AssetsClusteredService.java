@@ -48,6 +48,15 @@ public final class AssetsClusteredService implements ClusteredService {
     // Reusable egress staging buffer for the leader-only broadcast to client sessions.
     private final MutableDirectBuffer egressBuffer = new UnsafeBuffer(new byte[256]);
 
+    /**
+     * Arm the money journal on the engine (dark by default; see {@code MoneyJournalRuntime}). Must be
+     * called before the container launches so the deterministic service thread journals from the very
+     * first command, replayed or live.
+     */
+    public void setMoneyJournal(com.openexchange.assets.domain.MoneyJournalSink journalSink) {
+        engine.setMoneyJournal(journalSink);
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
