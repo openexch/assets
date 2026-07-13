@@ -65,6 +65,58 @@ public class BalanceSnapshotCodecTest {
     }
 
     @Test
+    public void journalSeqSurvivesRoundTrip() {
+        AssetsEngine orig = engineWithState();
+        orig.setJournalSeq(4242L);
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        int len = BalanceSnapshotCodec.serialize(orig, buf);
+        AssetsEngine restored = new AssetsEngine();
+        BalanceSnapshotCodec.Decoded d = BalanceSnapshotCodec.deserialize(buf, 0, len, restored);
+
+        assertEquals("journalSeq", 4242L, restored.getJournalSeq());
+        assertEquals("decoded journalSeq", 4242L, d.journalSeq);
+        assertEquals("bytesConsumed", len, d.bytesConsumed);
+    }
+
+    /** An old (v1, untagged) snapshot must load with journalSeq=0, never fail. */
+    @Test
+    public void oldFormatV1SnapshotLoadsWithJournalSeqZero() {
+        // Handcraft the documented v1 layout: no tag, no journalSeq, one account, no holds.
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        int p = 0;
+        buf.putLong(p, 7L);          // lastAppliedTradeId (v1's first long, always >= 0)
+        p += 8;
+        buf.putLong(p, 123456789L);  // consumePosition
+        p += 8;
+        buf.putInt(p, 1);            // numAccounts
+        p += 4;
+        buf.putLong(p, 100L);        // userId
+        p += 8;
+        buf.putInt(p, N);            // numAssets
+        p += 4;
+        for (int a = 0; a < N; a++) {
+            buf.putLong(p, a == 0 ? 5555L : 0L); // available
+            p += 8;
+            buf.putLong(p, 0L);                  // locked
+            p += 8;
+        }
+        buf.putInt(p, 0);            // numHolds
+        p += 4;
+
+        AssetsEngine restored = new AssetsEngine();
+        BalanceSnapshotCodec.Decoded d = BalanceSnapshotCodec.deserialize(buf, 0, p, restored);
+
+        assertEquals("journalSeq defaults to 0", 0L, restored.getJournalSeq());
+        assertEquals("decoded journalSeq", 0L, d.journalSeq);
+        assertEquals("lastAppliedTradeId", 7L, restored.getLastAppliedTradeId());
+        assertEquals("consumePosition", 123456789L, restored.getConsumePosition());
+        assertEquals("accountCount", 1, restored.accountCount());
+        assertEquals("available", 5555L, restored.account(100L).available(0));
+        assertEquals("bytesConsumed", p, d.bytesConsumed);
+    }
+
+    @Test
     public void deserializeHonoursNonZeroOffset() {
         AssetsEngine orig = engineWithState();
         ExpandableArrayBuffer src = new ExpandableArrayBuffer();
@@ -84,6 +136,7 @@ public class BalanceSnapshotCodecTest {
     private static void assertSameState(AssetsEngine a, AssetsEngine b) {
         assertEquals(a.getLastAppliedTradeId(), b.getLastAppliedTradeId());
         assertEquals(a.getConsumePosition(), b.getConsumePosition());
+        assertEquals(a.getJournalSeq(), b.getJournalSeq());
         assertEquals(a.accountCount(), b.accountCount());
         a.forEachAccount(acc -> {
             Account bacc = b.account(acc.userId());

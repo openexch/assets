@@ -30,4 +30,19 @@ public final class InfrastructureConstants {
 
     /** Session timeout. */
     public static final long SESSION_TIMEOUT_NS = 10_000_000_000L;
+
+    // ==================== MONEY JOURNAL ====================
+    // The money journal (dark unless AE_MONEY_JOURNAL_ENABLED=true) is a dedicated publication
+    // recorded by the node's OWN archive as a separate recording next to the consensus log: every
+    // APPLIED money movement (money-journal-schema.xml, schema id=3), appended on the deterministic
+    // service thread so all replicas produce byte-identical journal payloads. Substrate for the
+    // external projector (Part 2). Mirrors the ME settlement journal (stream 4001 on the ME's own
+    // driver); ids cannot collide across the two clusters (separate drivers) but stay disjoint
+    // anyway for greppability.
+
+    /** Aeron stream id the money journal is recorded/replayed on (node-local IPC). */
+    public static final int MONEY_JOURNAL_STREAM_ID = 4101;
+
+    /** Aeron IPC channel the money journal is published on. */
+    public static final String MONEY_JOURNAL_CHANNEL = "aeron:ipc?term-length=4m";
 }

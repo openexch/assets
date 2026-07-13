@@ -5,6 +5,7 @@ import com.openexchange.assets.domain.Account;
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.domain.Market;
+import com.openexchange.assets.domain.MoneyJournalSink;
 import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.domain.SettlementService;
 import com.openexchange.assets.domain.commands.DepositCommand;
@@ -35,6 +36,11 @@ import java.util.function.Consumer;
  *       no-op (cheaper and exactly correct versus an unbounded processed-set).</li>
  *   <li>{@code consumePosition} — how far into the matching engine's recorded trade stream this state
  *       reflects. Snapshotted atomically with balances so recovery has no skew. Inert until Phase 1.</li>
+ *   <li>{@code journalSeq}: the money journal's dense sequence (last assigned; 0 = nothing journaled).
+ *       Advances only while journaling is armed ({@link #setMoneyJournal}), one per emitted record,
+ *       and is snapshotted with the balances so a restart resumes the sequence without gaps or reuse.
+ *       Because it is replicated state, the journal flag must be set uniformly across the cluster
+ *       (same constraint as an engine-impl swap: roll all nodes with the same setting).</li>
  * </ul>
  */
 public final class AssetsEngine {
@@ -61,6 +67,16 @@ public final class AssetsEngine {
     /** Holds exhausted by a settle (remaining hit 0) and reaped at settle time — never tombstoned. */
     private long exhaustedHoldsReaped = 0L;
 
+    // Money journal (dark by default): a dead, perfectly-predicted branch per applied command when
+    // off; when armed, every APPLIED movement is emitted through the port with a dense journalSeq.
+    private MoneyJournalSink journal = MoneyJournalSink.NO_OP;
+    private boolean journalEnabled = false;
+    private long journalSeq = 0L;
+    // Opening-balance epoch rows (userId, assetId, available+locked total), captured from PRE-event
+    // state on the first journaled apply while journalSeq == 0 and emitted only if that apply
+    // succeeds. Used at most once per engine life; allocation here is off the steady-state path.
+    private final ArrayList<long[]> epochScratch = new ArrayList<>();
+
     // Reusable scratch for the rare, read-only snapshot queries (not the hot path). Sorting the entries
     // by userId makes a query's answer a pure function of *state* (not of insertion/replay history), so
     // it is reproducible and identical across replicas and across a snapshot restore.
@@ -72,23 +88,34 @@ public final class AssetsEngine {
     }
 
     /**
-     * Apply one command deterministically. {@code timestamp} is accepted for parity with the engine
-     * log (audit / future TTL on holds); Phase 0 balance events are logical and do not carry it, so
-     * output is trivially wall-clock independent.
+     * Arm (or, with {@code null}, disarm) money journaling. Must be set before the first command is
+     * applied and uniformly across the cluster: {@code journalSeq} is replicated state, so replicas
+     * disagreeing on whether it advances would diverge.
+     */
+    public void setMoneyJournal(MoneyJournalSink journalSink) {
+        this.journal = journalSink == null ? MoneyJournalSink.NO_OP : journalSink;
+        this.journalEnabled = journalSink != null;
+    }
+
+    /**
+     * Apply one command deterministically. {@code timestamp} is the cluster's deterministic log
+     * timestamp (ms): journaled movements carry it as {@code clusterTimeMs}; Phase 0 balance egress
+     * stays logical (does not carry it), so egress output is trivially wall-clock independent.
      */
     public void applyCommand(int type, Object command, long timestamp) {
         switch (type) {
-            case CMD_DEPOSIT:         applyDeposit((DepositCommand) command); break;
-            case CMD_WITHDRAW:        applyWithdraw((WithdrawCommand) command); break;
+            case CMD_DEPOSIT:         applyDeposit((DepositCommand) command, timestamp); break;
+            case CMD_WITHDRAW:        applyWithdraw((WithdrawCommand) command, timestamp); break;
             case CMD_HOLD:            applyHold((HoldCommand) command); break;
             case CMD_RELEASE:         applyRelease((ReleaseCommand) command); break;
-            case CMD_SETTLE:          applySettle((SettleCommand) command); break;
+            case CMD_SETTLE:          applySettle((SettleCommand) command, timestamp); break;
             case CMD_INIT_HIGH_WATER: applyInitHighWater((InitTradeHighWaterCommand) command); break;
             default: throw new IllegalArgumentException("unknown command type " + type);
         }
     }
 
-    private void applyDeposit(DepositCommand c) {
+    private void applyDeposit(DepositCommand c, long timestamp) {
+        captureOpeningEpochIfArmed();
         Account a = getOrCreateAccount(c.getUserId());
         RejectReason r = a.deposit(c.getAssetId(), c.getAmount());
         if (r.accepted()) {
@@ -96,17 +123,28 @@ public final class AssetsEngine {
             sink.onDepositAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
                     a.available(c.getAssetId()));
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
+            if (journalEnabled) {
+                emitOpeningEpochIfPending();
+                journal.onDeposit(++journalSeq, c.getUserId(), c.getAssetId(), c.getAmount(),
+                        a.available(c.getAssetId()) + a.locked(c.getAssetId()), timestamp);
+            }
         }
         // A rejected deposit (non-positive amount) is a client error with no money effect and no ack.
     }
 
-    private void applyWithdraw(WithdrawCommand c) {
+    private void applyWithdraw(WithdrawCommand c, long timestamp) {
+        captureOpeningEpochIfArmed();
         Account a = getOrCreateAccount(c.getUserId());
         RejectReason r = a.withdraw(c.getAssetId(), c.getAmount());
         if (r.accepted()) {
             sink.onWithdrawAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
                     a.available(c.getAssetId()));
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
+            if (journalEnabled) {
+                emitOpeningEpochIfPending();
+                journal.onWithdraw(++journalSeq, c.getUserId(), c.getAssetId(), c.getAmount(),
+                        a.available(c.getAssetId()) + a.locked(c.getAssetId()), timestamp);
+            }
         } else {
             sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(), r);
         }
@@ -143,10 +181,11 @@ public final class AssetsEngine {
         sink.onBalanceUpdate(c.getUserId(), assetId, a.available(assetId), a.locked(assetId));
     }
 
-    private void applySettle(SettleCommand c) {
+    private void applySettle(SettleCommand c, long timestamp) {
         if (c.getTradeId() <= lastAppliedTradeId) {
-            return; // already applied (monotonic, gap-free) — idempotent no-op
+            return; // already applied (monotonic, gap-free): idempotent no-op, journals nothing
         }
+        captureOpeningEpochIfArmed();
         Market m = Market.fromId(c.getMarketId());
         int base = m.baseAsset().id();
         int quote = m.quoteAsset().id();
@@ -197,6 +236,57 @@ public final class AssetsEngine {
         sink.onBalanceUpdate(sellerUser, base, seller.available(base), seller.locked(base));
         sink.onBalanceUpdate(sellerUser, quote, seller.available(quote), seller.locked(quote));
         sink.onSettlementApplied(c.getTradeId(), buyerUser, sellerUser);
+
+        if (journalEnabled) {
+            emitOpeningEpochIfPending();
+            journal.onSettle(++journalSeq, c.getTradeId(), c.getMarketId(), c.getPrice(), c.getQuantity(),
+                    buyerUser, sellerUser, c.isTakerIsBuy(),
+                    buyer.available(base) + buyer.locked(base), buyer.available(quote) + buyer.locked(quote),
+                    seller.available(base) + seller.locked(base), seller.available(quote) + seller.locked(quote),
+                    timestamp);
+        }
+    }
+
+    // ---- money journal (movements only; holds/releases never journal: they do not change totals) ----
+
+    /**
+     * Capture the opening-balance epoch from PRE-event state: one (userId, assetId, available+locked)
+     * row per nonzero total, in ascending (userId, assetId) order. Runs only while journaling is armed
+     * and nothing has been journaled yet ({@code journalSeq == 0}); rows are emitted by
+     * {@link #emitOpeningEpochIfPending} only if the triggering apply succeeds, so a reject or dedupe
+     * still journals nothing.
+     */
+    private void captureOpeningEpochIfArmed() {
+        if (!journalEnabled || journalSeq != 0L) {
+            return;
+        }
+        epochScratch.clear();
+        snapshotScratch.clear();
+        accounts.values().forEach(snapshotScratch::add);
+        snapshotScratch.sort(Comparator.comparingLong(Account::userId));
+        for (Account a : snapshotScratch) {
+            final long userId = a.userId();
+            // forEachNonZeroBalance visits assets in ascending id order (dense array): deterministic.
+            a.forEachNonZeroBalance((assetId, available, locked) ->
+                    epochScratch.add(new long[] {userId, assetId, available + locked}));
+        }
+        snapshotScratch.clear();
+    }
+
+    /**
+     * First journaled event only ({@code journalSeq == 0}): emit the captured epoch rows, each
+     * consuming a journalSeq, before the triggering event takes the next one. An empty capture
+     * (empty or all-zero ledger) emits nothing: the epoch is implicit.
+     */
+    private void emitOpeningEpochIfPending() {
+        if (journalSeq != 0L) {
+            return;
+        }
+        for (int i = 0; i < epochScratch.size(); i++) {
+            final long[] row = epochScratch.get(i);
+            journal.onOpeningBalance(++journalSeq, row[0], (int) row[1], row[2]);
+        }
+        epochScratch.clear();
     }
 
     /**
@@ -341,5 +431,15 @@ public final class AssetsEngine {
 
     public void setConsumePosition(long value) {
         this.consumePosition = value;
+    }
+
+    /** Last assigned money-journal sequence (dense, starts at 1; 0 = nothing journaled yet). */
+    public long getJournalSeq() {
+        return journalSeq;
+    }
+
+    /** Restore the journal sequence from a snapshot (recovery only). */
+    public void setJournalSeq(long value) {
+        this.journalSeq = value;
     }
 }

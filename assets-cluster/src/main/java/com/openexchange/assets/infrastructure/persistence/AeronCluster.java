@@ -54,8 +54,19 @@ public final class AeronCluster {
         final String hosts = getClusterAddresses();
 
         final List<String> hostAddresses = List.of(hosts.split(","));
+        final AssetsClusteredService assetsService = new AssetsClusteredService();
+
+        // Money journal (dark unless AE_MONEY_JOURNAL_ENABLED): the ring is armed on the engine NOW
+        // so the service thread journals from the first command; the writer thread starts inside the
+        // launch path once the media driver + archive are up.
+        final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime =
+                com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime.createIfEnabled(nodeId);
+        if (journalRuntime != null) {
+            assetsService.setMoneyJournal(journalRuntime.journal());
+        }
+
         final ClusterConfig clusterConfig = ClusterConfig.create(nodeId, hostAddresses, hostAddresses, portBase,
-                new AssetsClusteredService());
+                assetsService);
 
         final File resolvedBaseDir = getBaseDir(nodeId);
         clusterConfig.baseDir(resolvedBaseDir);
@@ -108,21 +119,29 @@ public final class AeronCluster {
                 nodeId, portBase, driverMode, TransportConfig.idleMode());
 
         if (driverMode == DriverMode.EXTERNAL) {
-            launchWithExternalDriver(clusterConfig, nodeId, barrier);
+            launchWithExternalDriver(clusterConfig, nodeId, barrier, journalRuntime);
         } else {
-            launchWithEmbeddedDriver(clusterConfig, barrier);
+            launchWithEmbeddedDriver(clusterConfig, barrier, journalRuntime);
         }
     }
 
     private static void launchWithExternalDriver(
-            final ClusterConfig clusterConfig, final int nodeId, final ShutdownSignalBarrier barrier) {
+            final ClusterConfig clusterConfig, final int nodeId, final ShutdownSignalBarrier barrier,
+            final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime) {
         final String aeronDir = TransportConfig.aeronDir(nodeId);
         log.info("Driver mode EXTERNAL: connecting to media driver at %s", aeronDir);
         TransportConfig.awaitExternalDriver(aeronDir, TransportConfig.EXTERNAL_DRIVER_TIMEOUT_MS);
         clusterConfig.aeronDirectoryName(aeronDir);
 
+        // The journal writer is an archive CLIENT recording on the node's own archive (no second
+        // archive): declared right after the Archive so it outlives the container (the ring keeps
+        // draining through service shutdown) but closes before the Archive stops recording.
         try (
                 Archive ignored = Archive.launch(clusterConfig.archiveContext());
+                com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime ignoredJournal =
+                        journalRuntime == null ? null
+                                : journalRuntime.start(clusterConfig.aeronArchiveContext().clone(),
+                                        clusterConfig.archiveContext().errorHandler());
                 ConsensusModule ignored1 = ConsensusModule.launch(
                         clusterConfig.consensusModuleContext().terminationHook(barrier::signal));
                 ClusteredServiceContainer ignored2 = ClusteredServiceContainer.launch(
@@ -135,7 +154,8 @@ public final class AeronCluster {
     }
 
     private static void launchWithEmbeddedDriver(
-            final ClusterConfig clusterConfig, final ShutdownSignalBarrier barrier) {
+            final ClusterConfig clusterConfig, final ShutdownSignalBarrier barrier,
+            final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime) {
         try (
                 ClusteredMediaDriver ignored = ClusteredMediaDriver.launch(
                         clusterConfig.mediaDriverContext()
@@ -153,6 +173,12 @@ public final class AeronCluster {
                                 .mtuLength(8192),
                         clusterConfig.archiveContext(),
                         clusterConfig.consensusModuleContext().terminationHook(barrier::signal));
+                // Journal writer is a driver/archive client: start only after ClusteredMediaDriver
+                // is up, and let it outlive the container so the ring drains through shutdown.
+                com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime ignoredJournal =
+                        journalRuntime == null ? null
+                                : journalRuntime.start(clusterConfig.aeronArchiveContext().clone(),
+                                        clusterConfig.archiveContext().errorHandler());
                 ClusteredServiceContainer ignored1 = ClusteredServiceContainer.launch(
                         clusterConfig.clusteredServiceContext().terminationHook(barrier::signal))) {
             barrier.await();

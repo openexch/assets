@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="com.openexchange.assets.infrastructure.journal.generated"
+                   id="3"
+                   version="1"
+                   semanticVersion="0.1"
+                   description="AE money journal schema: every APPLIED money movement (deposit, withdrawal, settle) plus the opening-balance epoch, appended on the deterministic service thread and recorded per node as a replayable Aeron Archive stream. journalSeq is dense (starts at 1, no gaps, no dupes) and is the FIRST field of every message so readers can extract it at a fixed offset. Amounts are 8dp fixed-point int64. balanceAfter fields are the (available + locked) TOTAL for that (user, asset): the journal has no hold visibility (a hold moves available to locked without changing the total), so totals are the only self-consistent balance representation. Rejects and no-op dedupes journal nothing. NO hold/release events by design."
+>
+    <types>
+        <composite name="messageHeader" description="Message identifiers and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <!-- Boolean-as-uint8 for taker side on a settle (1 = taker is the buyer). -->
+        <enum name="BoolFlag" encodingType="uint8">
+            <validValue name="FALSE">0</validValue>
+            <validValue name="TRUE">1</validValue>
+        </enum>
+    </types>
+
+    <sbe:message name="JournalOpeningBalance" id="1" description="Opening-balance epoch row: one per (user, asset) with a nonzero available+locked total at the instant journaling first engages on a non-empty ledger, emitted in ascending (userId, assetId) order BEFORE the first journaled movement. amount = available + locked total. On an empty ledger the epoch is implicit (the journal starts from nothing).">
+        <field name="journalSeq" id="1" type="int64"/>
+        <field name="userId"     id="2" type="int64"/>
+        <field name="assetId"    id="3" type="int32"/>
+        <field name="amount"     id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="JournalDeposit" id="2" description="An APPLIED deposit: amount credited to the user's available balance. balanceAfter = post-credit (available + locked) total. clusterTimeMs = deterministic cluster timestamp of the applying log entry.">
+        <field name="journalSeq"    id="1" type="int64"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="assetId"       id="3" type="int32"/>
+        <field name="amount"        id="4" type="int64"/>
+        <field name="balanceAfter"  id="5" type="int64"/>
+        <field name="clusterTimeMs" id="6" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="JournalWithdraw" id="3" description="An APPLIED withdrawal: amount debited from the user's available balance. balanceAfter = post-debit (available + locked) total. clusterTimeMs = deterministic cluster timestamp of the applying log entry.">
+        <field name="journalSeq"    id="1" type="int64"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="assetId"       id="3" type="int32"/>
+        <field name="amount"        id="4" type="int64"/>
+        <field name="balanceAfter"  id="5" type="int64"/>
+        <field name="clusterTimeMs" id="6" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="JournalSettle" id="4" description="An APPLIED settle (deduped re-deliveries journal nothing): one record per trade; the projector explodes it into per-leg rows. The four *After fields are post-settle (available + locked) totals and are AUTHORITATIVE: on a faulted leg (SettleFault on the money egress) the moved amount can be less than price*quantity, and the totals reflect what actually moved. clusterTimeMs = deterministic cluster timestamp of the applying log entry.">
+        <field name="journalSeq"       id="1"  type="int64"/>
+        <field name="tradeId"          id="2"  type="int64"/>
+        <field name="marketId"         id="3"  type="int32"/>
+        <field name="price"            id="4"  type="int64"/>
+        <field name="quantity"         id="5"  type="int64"/>
+        <field name="buyerUserId"      id="6"  type="int64"/>
+        <field name="sellerUserId"     id="7"  type="int64"/>
+        <field name="takerIsBuy"       id="8"  type="BoolFlag"/>
+        <field name="buyerBaseAfter"   id="9"  type="int64"/>
+        <field name="buyerQuoteAfter"  id="10" type="int64"/>
+        <field name="sellerBaseAfter"  id="11" type="int64"/>
+        <field name="sellerQuoteAfter" id="12" type="int64"/>
+        <field name="clusterTimeMs"    id="13" type="int64"/>
+    </sbe:message>
+</sbe:messageSchema>
