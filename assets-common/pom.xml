@@ -28,6 +28,16 @@
             <artifactId>aeron-client</artifactId>
         </dependency>
 
+        <!-- Full Aeron (archive client + subscription) for the shared ArchiveJournalSource follow
+             helper. Scoped provided: the helper only ever runs inside a daemon (settlement bridge,
+             money projector) that already ships aeron-all, so keeping it non-transitive preserves
+             assets-common's aeron-client-only footprint for library consumers (e.g. the OMS client). -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-all</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- SBE for code generation at build time -->
         <dependency>
             <groupId>uk.co.real-logic</groupId>

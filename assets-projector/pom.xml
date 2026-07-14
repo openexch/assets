@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.openexchange.assets</groupId>
+        <artifactId>assets</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>assets-projector</artifactId>
+    <packaging>jar</packaging>
+    <name>Assets Money Projector</name>
+    <description>Standalone agent: live-follows the AE money journal (Aeron Archive recording) and
+        idempotently projects every money movement into Postgres, resumable from the PG high-water</description>
+
+    <dependencies>
+        <!-- Internal: money-journal SBE schema + generated decoders + the shared ArchiveJournalSource
+             follow helper. Deliberately does NOT depend on assets-cluster (never connects to the AE). -->
+        <dependency>
+            <groupId>com.openexchange.assets</groupId>
+            <artifactId>assets-common</artifactId>
+        </dependency>
+
+        <!-- Aeron (full: embedded media driver + archive replay client for the journal recording) -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-all</artifactId>
+        </dependency>
+
+        <!-- Postgres: the projector's authoritative store. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+        </dependency>
+        <!-- HikariCP logs via slf4j; a simple binding keeps pool logs readable (and silences the
+             "no providers" warning) without pulling a full logging framework into the daemon. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+            </plugin>
+            <!-- Uber JAR for the standalone projector agent -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <finalName>assets-projector</finalName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.openexchange.assets.projector.ProjectorMain</mainClass>
+                                    <!-- Aeron/Agrona need these opens on JDK 17+; baking them into the
+                                         manifest lets `java -jar assets-projector.jar` run without
+                                         repeating the flags on the command line. -->
+                                    <manifestEntries>
+                                        <Add-Opens>java.base/jdk.internal.misc java.base/sun.nio.ch java.base/java.nio</Add-Opens>
+                                    </manifestEntries>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
