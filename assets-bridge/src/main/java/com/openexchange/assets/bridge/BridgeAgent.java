@@ -4,6 +4,7 @@ package com.openexchange.assets.bridge;
 import com.match.infrastructure.journal.generated.JournalTerminalDecoder;
 import com.match.infrastructure.journal.generated.JournalTradeDecoder;
 import com.match.infrastructure.journal.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.archive.ArchiveJournalSource;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
@@ -106,7 +107,7 @@ public final class BridgeAgent implements Runnable {
             System.out.println("[BRIDGE] epoch " + state.epochs + ": AE at consumePosition="
                     + pos.consumePosition() + " lastAppliedTradeId=" + pos.lastAppliedTradeId());
 
-            try (JournalSource source = JournalSource.connectFirstHealthy(config, aeronDirectoryName)) {
+            try (ArchiveJournalSource source = JournalSource.connectFirstHealthy(config, aeronDirectoryName)) {
                 state.journalSource = source.endpoint();
                 followChain(source, filter, ae);
             }
@@ -115,8 +116,8 @@ public final class BridgeAgent implements Runnable {
         }
     }
 
-    private void followChain(final JournalSource source, final BridgeFilter filter, final AeFeedClient ae) {
-        final List<JournalSource.Recording> chain = source.recordings();
+    private void followChain(final ArchiveJournalSource source, final BridgeFilter filter, final AeFeedClient ae) {
+        final List<ArchiveJournalSource.Recording> chain = source.recordings();
         if (chain.isEmpty()) {
             // Journal enabled but nothing recorded yet (or dark): wait and re-list next epoch.
             System.out.println("[BRIDGE] no journal recordings at " + source.endpoint() + " yet — waiting");
@@ -126,7 +127,7 @@ public final class BridgeAgent implements Runnable {
         final FragmentHandler handler = (buffer, offset, length, header) ->
                 onJournalEntry(buffer, offset, filter, ae);
 
-        for (final JournalSource.Recording recording : chain) {
+        for (final ArchiveJournalSource.Recording recording : chain) {
             System.out.println("[BRIDGE] following recording " + recording.recordingId()
                     + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
             try (Subscription replay = source.openReplay(recording)) {
@@ -213,7 +214,7 @@ public final class BridgeAgent implements Runnable {
         throw new IllegalStateException(reason);
     }
 
-    private boolean replayDrained(final Subscription replay, final JournalSource.Recording recording) {
+    private boolean replayDrained(final Subscription replay, final ArchiveJournalSource.Recording recording) {
         if (replay.imageCount() == 0) {
             return replay.isClosed(); // bounded replay closes its image at the bound
         }
