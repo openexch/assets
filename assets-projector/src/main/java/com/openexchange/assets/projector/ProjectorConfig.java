@@ -35,6 +35,12 @@ public final class ProjectorConfig {
     public final boolean haltOnGap;
     /** Port for the /metrics + /health HTTP endpoint (0 = ephemeral, for tests). */
     public final int metricsPort;
+    /**
+     * The projector's own routable host: where the REMOTE AE archive sends control responses +
+     * replay data. "localhost" only works co-resident with the AE; a cross-host projector MUST
+     * set PROJECTOR_LOCAL_HOST to its routable IP or the archive replay silently starves.
+     */
+    public final String localHost;
 
     public ProjectorConfig(
             final List<String> journalArchiveEndpoints,
@@ -43,7 +49,8 @@ public final class ProjectorConfig {
             final String postgresUser,
             final String postgresPassword,
             final boolean haltOnGap,
-            final int metricsPort) {
+            final int metricsPort,
+            final String localHost) {
         this.journalArchiveEndpoints = journalArchiveEndpoints;
         this.archiveControlStreamId = archiveControlStreamId;
         this.postgresUrl = postgresUrl;
@@ -51,6 +58,7 @@ public final class ProjectorConfig {
         this.postgresPassword = postgresPassword;
         this.haltOnGap = haltOnGap;
         this.metricsPort = metricsPort;
+        this.localHost = localHost;
     }
 
     public static ProjectorConfig fromEnv() {
@@ -64,7 +72,8 @@ public final class ProjectorConfig {
                 // a baked-in credential. Also accepts PROJECTOR_POSTGRES_PASSWORD_FILE (secret mount).
                 secretOr("PROJECTOR_POSTGRES_PASSWORD", ""),
                 !"false".equalsIgnoreCase(envOr("PROJECTOR_HALT_ON_GAP", "true")),
-                Integer.parseInt(envOr("PROJECTOR_METRICS_PORT", "9601")));
+                Integer.parseInt(envOr("PROJECTOR_METRICS_PORT", "9601")),
+                envOr("PROJECTOR_LOCAL_HOST", "localhost"));
     }
 
     private static String envOr(final String key, final String fallback) {

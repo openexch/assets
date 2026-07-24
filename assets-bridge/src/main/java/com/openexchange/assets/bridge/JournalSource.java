@@ -28,6 +28,7 @@ final class JournalSource {
                 SETTLEMENT_JOURNAL_STREAM_ID,
                 JOURNAL_CHANNEL_URI,
                 REPLAY_STREAM_ID,
-                aeronDirectoryName);
+                aeronDirectoryName,
+                config.localHost);
     }
 }

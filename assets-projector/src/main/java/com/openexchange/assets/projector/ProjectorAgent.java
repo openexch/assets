@@ -121,7 +121,8 @@ public final class ProjectorAgent implements Runnable {
                 ProjectorConfig.MONEY_JOURNAL_STREAM_ID,
                 ProjectorConfig.MONEY_JOURNAL_CHANNEL,
                 ProjectorConfig.REPLAY_STREAM_ID,
-                aeronDirectoryName)) {
+                aeronDirectoryName,
+                config.localHost)) {
             state.journalSource = source.endpoint();
             followChain(source);
         }
