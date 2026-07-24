@@ -38,15 +38,17 @@ public final class ArchiveJournalSource implements AutoCloseable {
     private final int journalStreamId;
     private final String channelUri;
     private final int replayStreamId;
+    private final String replayHost;
 
     private ArchiveJournalSource(final AeronArchive archive, final String endpoint,
                                  final int journalStreamId, final String channelUri,
-                                 final int replayStreamId) {
+                                 final int replayStreamId, final String replayHost) {
         this.archive = archive;
         this.endpoint = endpoint;
         this.journalStreamId = journalStreamId;
         this.channelUri = channelUri;
         this.replayStreamId = replayStreamId;
+        this.replayHost = replayHost;
     }
 
     /**
@@ -59,6 +61,12 @@ public final class ArchiveJournalSource implements AutoCloseable {
      * @param channelUri         the (stripped) channel the journal is recorded on
      * @param replayStreamId     the stream id to open the local replay subscription on
      * @param aeronDirectoryName the embedded media driver dir to connect the archive client through
+     * @param replayHost         the address the REMOTE archive should send control responses and
+     *                           replay data back to = THIS client's own routable host. "localhost"
+     *                           is correct only when the archive is co-resident; a cross-host
+     *                           deployment (settlement bridge on its own box) MUST pass its routable
+     *                           IP, else the archive publishes to its own loopback and this client
+     *                           receives nothing (control-response + replay both silently starve).
      */
     public static ArchiveJournalSource connectFirstHealthy(
             final List<String> archiveEndpoints,
@@ -66,7 +74,9 @@ public final class ArchiveJournalSource implements AutoCloseable {
             final int journalStreamId,
             final String channelUri,
             final int replayStreamId,
-            final String aeronDirectoryName) {
+            final String aeronDirectoryName,
+            final String replayHost) {
+        final String host = replayHost == null || replayHost.isBlank() ? "localhost" : replayHost.trim();
         Exception last = null;
         for (final String endpoint : archiveEndpoints) {
             try {
@@ -74,9 +84,9 @@ public final class ArchiveJournalSource implements AutoCloseable {
                         .aeronDirectoryName(aeronDirectoryName)
                         .controlRequestChannel("aeron:udp?endpoint=" + endpoint.trim())
                         .controlRequestStreamId(controlStreamId)
-                        .controlResponseChannel("aeron:udp?endpoint=localhost:0"));
+                        .controlResponseChannel("aeron:udp?endpoint=" + host + ":0"));
                 return new ArchiveJournalSource(archive, endpoint.trim(), journalStreamId,
-                        channelUri, replayStreamId);
+                        channelUri, replayStreamId, host);
             } catch (Exception e) {
                 last = e;
             }
@@ -113,7 +123,7 @@ public final class ArchiveJournalSource implements AutoCloseable {
                 : recording.stopPosition() - recording.startPosition();
 
         final Subscription sub = archive.context().aeron()
-                .addSubscription("aeron:udp?endpoint=localhost:0", replayStreamId);
+                .addSubscription("aeron:udp?endpoint=" + replayHost + ":0", replayStreamId);
         final long deadline = System.currentTimeMillis() + 10_000;
         String resolved;
         while ((resolved = sub.resolvedEndpoint()) == null) {

@@ -279,7 +279,7 @@ public class BridgeEndToEndTest {
         return new BridgeConfig(
                 List.of("localhost:" + JOURNAL_CONTROL_PORT),
                 List.of("localhost"), AE_PORT_BASE, "localhost:19494",
-                true, 10_000, 0);
+                "localhost", true, 10_000, 0);
     }
 
     @Test

@@ -83,8 +83,10 @@ public final class AeDump {
                     .aeronDirectoryName(driver.aeronDirectoryName())
                     .ingressChannel("aeron:udp?term-length=4m")
                     .ingressEndpoints(AeFeedClient.ingressEndpoints(config.aeClusterAddresses, config.aePortBase))
-                    // Ephemeral egress port: never collides with the bridge (9394) or OMS (9393) client.
-                    .egressChannel("aeron:udp?endpoint=127.0.0.1:0")
+                    // Ephemeral egress port (never collides with bridge 9394 / OMS 9393). Host is
+                    // config.localHost so a cross-host dump reaches the AE leader's egress reply;
+                    // "localhost" (co-resident default) is only correct when run ON an AE node.
+                    .egressChannel("aeron:udp?endpoint=" + config.localHost + ":0")
                     .egressListener(collector)
                     .errorHandler(t -> t.printStackTrace(System.err)));
 
