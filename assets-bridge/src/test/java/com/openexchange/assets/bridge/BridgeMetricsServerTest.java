@@ -81,6 +81,64 @@ public class BridgeMetricsServerTest {
     }
 
     @Test
+    public void metricsRendersLatencyHistogramsReplayGaugesAndAnomalyCounters() throws Exception {
+        state.settleForwardLatency.record(0);     // le=0.001
+        state.settleForwardLatency.record(3);     // le=0.005
+        state.settleForwardLatency.record(700);   // le=1.0
+        state.settleForwardLatency.record(5_000); // +Inf
+        state.settleAckLatency.record(12);        // le=0.025
+        state.replayRecordingPosition = 8_192;
+        state.replayConsumedPosition = 4_096;
+        state.settleForwardClockAnomalies = 7;
+        state.settleAckMapSkips = 1;
+
+        final HttpResponse<String> resp = send("/metrics");
+        assertEquals(200, resp.statusCode());
+        final String body = resp.body();
+
+        assertTrue(body.contains("# TYPE bridge_settle_forward_latency histogram"));
+        assertTrue(body.contains("# TYPE bridge_settle_ack_latency histogram"));
+
+        // Buckets are CUMULATIVE (le labels in seconds), sum is seconds as a double.
+        assertTrue(body.contains("bridge_settle_forward_latency_bucket{le=\"0.001\"} 1\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_bucket{le=\"0.002\"} 1\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_bucket{le=\"0.005\"} 2\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_bucket{le=\"0.25\"} 2\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_bucket{le=\"1.0\"} 3\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_bucket{le=\"+Inf\"} 4\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_sum 5.703\n"));
+        assertTrue(body.contains("bridge_settle_forward_latency_count 4\n"));
+        assertEquals(seriesValue(body, "bridge_settle_forward_latency_bucket{le=\"+Inf\"}"),
+                seriesValue(body, "bridge_settle_forward_latency_count"));
+
+        assertTrue(body.contains("bridge_settle_ack_latency_bucket{le=\"0.01\"} 0\n"));
+        assertTrue(body.contains("bridge_settle_ack_latency_bucket{le=\"0.025\"} 1\n"));
+        assertTrue(body.contains("bridge_settle_ack_latency_bucket{le=\"+Inf\"} 1\n"));
+        assertTrue(body.contains("bridge_settle_ack_latency_sum 0.012\n"));
+        assertTrue(body.contains("bridge_settle_ack_latency_count 1\n"));
+        assertEquals(seriesValue(body, "bridge_settle_ack_latency_bucket{le=\"+Inf\"}"),
+                seriesValue(body, "bridge_settle_ack_latency_count"));
+
+        assertTrue(body.contains("# TYPE bridge_replay_recording_position gauge"));
+        assertTrue(body.contains("bridge_replay_recording_position 8192"));
+        assertTrue(body.contains("# TYPE bridge_replay_consumed_position gauge"));
+        assertTrue(body.contains("bridge_replay_consumed_position 4096"));
+        assertTrue(body.contains("# TYPE bridge_settle_forward_clock_anomalies_total counter"));
+        assertTrue(body.contains("bridge_settle_forward_clock_anomalies_total 7"));
+        assertTrue(body.contains("# TYPE bridge_settle_ack_map_skips_total counter"));
+        assertTrue(body.contains("bridge_settle_ack_map_skips_total 1"));
+    }
+
+    private static String seriesValue(final String body, final String series) {
+        for (final String line : body.split("\n")) {
+            if (line.startsWith(series + " ")) {
+                return line.substring(line.lastIndexOf(' ') + 1);
+            }
+        }
+        throw new AssertionError("series not found: " + series);
+    }
+
+    @Test
     public void healthReports200WhenHealthyAnd503WhenHalted() throws Exception {
         state.connectedToAe = true;
 

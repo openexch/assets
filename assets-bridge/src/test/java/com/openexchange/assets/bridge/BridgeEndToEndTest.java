@@ -308,6 +308,10 @@ public class BridgeEndToEndTest {
         assertEquals(FixedPoint.fromDouble(60000.0), fundingClient.balance(SELLER, Asset.USD.id())[0]);
         assertEquals(1L, state1.forwardedTrades);
 
+        // The AE broadcasts SettlementApplied for the settle; the bridge's own egress session
+        // sees it and must close the ack-latency loop (offer-return -> ack observed).
+        fundingClient.await(() -> state1.settleAckLatency.count > 0 ? 1 : 0, 1, 10_000);
+
         // Kill the bridge mid-stream (stateless: no handoff, no checkpoint files).
         agent1.stop();
         t1.interrupt();
