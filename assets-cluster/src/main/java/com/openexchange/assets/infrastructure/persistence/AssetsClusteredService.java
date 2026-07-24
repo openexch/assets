@@ -83,9 +83,12 @@ public final class AssetsClusteredService implements ClusteredService {
     // run) can read them without touching this process. Updated only from the drain timer, never from
     // the money path. Null when the driver refused them: diagnostics must never stop a node booting.
     private static final int EGRESS_COUNTER_TYPE_ID = 1_000_101;
+    private static final long EGRESS_REPORT_INTERVAL_MS = 1_000;
+    private boolean countersAttempted;
     private Counter egressPendingBytes;
     private Counter egressBackPressured;
     private Counter egressPeakPendingBytes;
+    private long lastEgressReportMs;
 
     /**
      * Arm the money journal on the engine (dark by default; see {@code MoneyJournalRuntime}). Must be
@@ -102,13 +105,20 @@ public final class AssetsClusteredService implements ClusteredService {
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
         engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress));
-        allocateEgressCounters();
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
         }
     }
 
+    /**
+     * Allocated on first use, not in {@code onStart}: the member id is still -1 that early, and a
+     * counter labelled "member -1" is a counter nobody can attribute in a three-node run.
+     */
     private void allocateEgressCounters() {
+        if (countersAttempted) {
+            return;
+        }
+        countersAttempted = true;
         try {
             final int memberId = cluster.memberId();
             egressPendingBytes = cluster.aeron().addCounter(
@@ -123,6 +133,7 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void updateEgressCounters() {
+        allocateEgressCounters();
         if (egressPendingBytes == null) {
             return;
         }
@@ -138,6 +149,40 @@ public final class AssetsClusteredService implements ClusteredService {
         egressPendingBytes.setRelease(pending);
         egressBackPressured.setRelease(backPressured);
         egressPeakPendingBytes.setRelease(peak);
+    }
+
+    /**
+     * Name the consumer that is falling behind. Aggregate counters say egress is the limiter; they do
+     * not say <em>whose</em> egress, and the answer decides where the next fix goes (batching versus
+     * per-session filtering). The response channel carries the consumer's endpoint, which is the only
+     * identifier that means anything from outside. Off the money path, at most one line per second, and
+     * silent while every queue is empty.
+     */
+    private void reportEgressPressure(long nowMs) {
+        if (nowMs - lastEgressReportMs < EGRESS_REPORT_INTERVAL_MS) {
+            return;
+        }
+        boolean anyPending = false;
+        for (int i = 0; i < egressQueues.length; i++) {
+            if (!egressQueues[i].isEmpty()) {
+                anyPending = true;
+                break;
+            }
+        }
+        if (!anyPending) {
+            return;
+        }
+        lastEgressReportMs = nowMs;
+        final StringBuilder sb = new StringBuilder(96).append("EGRESS PRESSURE:");
+        for (int i = 0; i < egressQueues.length; i++) {
+            final SessionEgressQueue queue = egressQueues[i];
+            sb.append(" [session=").append(queue.sessionId())
+                    .append(" via=").append(queue.session().responseChannel())
+                    .append(" pending=").append(queue.pendingBytes())
+                    .append("B backPressured=").append(queue.backPressureCount())
+                    .append(']');
+        }
+        System.err.println(sb);
     }
 
     @Override
@@ -174,6 +219,7 @@ public final class AssetsClusteredService implements ClusteredService {
             drainTimerFires++;
             drainEgress();
             updateEgressCounters();
+            reportEgressPressure(timestamp);
             armDrainTimerIfNeeded();
         }
     }
@@ -284,6 +330,7 @@ public final class AssetsClusteredService implements ClusteredService {
         final long n = ++egressStallCount;
         if (n == 1 || n % 1000 == 0) {
             System.err.println("CRITICAL: assets egress queue full for session=" + queue.sessionId()
+                    + " via=" + queue.session().responseChannel()
                     + " (pending=" + queue.pendingBytes() + "B, backPressured="
                     + queue.backPressureCount() + ", stalls=" + n
                     + ") — blocking the engine until the consumer drains; nothing is dropped");
