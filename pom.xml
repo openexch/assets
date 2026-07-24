@@ -26,6 +26,7 @@
         <module>assets-cluster</module>
         <module>assets-bridge</module>
         <module>assets-projector</module>
+        <module>assets-loadgen</module>
     </modules>
 
     <properties>
@@ -44,6 +45,8 @@
         <!-- match-engine repo (settlement-journal codecs consumed by assets-bridge); pinned to the
              match-engine build the journal schema (id=3) shipped in. -->
         <match.version>1.0</match.version>
+        <!-- Benchmark loadgen histograms (assets-loadgen only; not in any engine hot path). -->
+        <hdrhistogram.version>2.2.2</hdrhistogram.version>
         <!-- Default so surefire's ${argLine} resolves even before jacoco's prepare-agent sets it. -->
         <argLine></argLine>
     </properties>
@@ -119,6 +122,13 @@
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-simple</artifactId>
                 <version>${slf4j.version}</version>
+            </dependency>
+
+            <!-- Benchmark histograms (assets-loadgen) -->
+            <dependency>
+                <groupId>org.hdrhistogram</groupId>
+                <artifactId>HdrHistogram</artifactId>
+                <version>${hdrhistogram.version}</version>
             </dependency>
 
             <!-- Testing -->
