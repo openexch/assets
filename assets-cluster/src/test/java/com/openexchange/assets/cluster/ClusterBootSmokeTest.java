@@ -92,7 +92,8 @@ public class ClusterBootSmokeTest {
         final File baseDir = new File(tmp, "node0");
 
         final List<String> hosts = List.of("localhost");
-        final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, new AssetsClusteredService());
+        final AssetsClusteredService service = new AssetsClusteredService();
+        final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
         cfg.idleStrategySupplier(BackoffIdleStrategy::new); // never busy-spin
@@ -146,6 +147,22 @@ public class ClusterBootSmokeTest {
             assertEquals("HoldAck echoes the request correlationId", HOLD_CORR, egress.lastHoldAckCorr.get());
             assertEquals("post-hold locked balance", expectLocked, egress.lastLocked.get());
             assertEquals("post-hold available balance", FixedPoint.fromDouble(400.0), egress.lastAvail.get());
+
+            // Egress now leaves through a queue drained at the end of each onSessionMessage, with a
+            // fixed-id cluster timer as the idle-path belt: if a consumer unblocks after the last
+            // ingress message, only that timer gets the queued money events out. Prove the chain is
+            // armed and self-rescheduling with NO further ingress. A dead chain here is the match#25
+            // wedge, which stayed invisible until it cost an outage.
+            final long firesBefore = service.drainTimerFires();
+            final long idleDeadline = System.currentTimeMillis() + 5_000;
+            while (System.currentTimeMillis() < idleDeadline
+                    && service.drainTimerFires() < firesBefore + 3) {
+                client.pollEgress();
+                idle.idle();
+            }
+            assertTrue("idle-path drain timer must keep firing without ingress (was " + firesBefore
+                            + ", now " + service.drainTimerFires() + ")",
+                    service.drainTimerFires() >= firesBefore + 3);
         } finally {
             CloseHelper.quietClose(client);
             CloseHelper.quietClose(container);
