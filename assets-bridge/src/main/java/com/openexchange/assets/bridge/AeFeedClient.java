@@ -5,6 +5,7 @@ import com.openexchange.assets.infrastructure.generated.FeedPositionReportDecode
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder;
+import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
@@ -17,6 +18,7 @@ import org.agrona.concurrent.UnsafeBuffer;
 
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.LongConsumer;
 
 /**
  * The bridge's Assets-Engine session: offers translated Settle/TerminalRelease commands as
@@ -45,6 +47,7 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
 
     private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
     private final FeedPositionReportDecoder feedPositionDecoder = new FeedPositionReportDecoder();
+    private final SettlementAppliedDecoder settlementAppliedDecoder = new SettlementAppliedDecoder();
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
     private final QueryFeedPositionEncoder queryEncoder = new QueryFeedPositionEncoder();
     private final UnsafeBuffer queryBuffer = new UnsafeBuffer(new byte[64]);
@@ -52,6 +55,8 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     private long lastKeepAliveMs;
     private long awaitedCorrelationId;
     private FeedPosition capturedPosition;
+    /** Settlement-ack observer (tradeId); invoked on the polling thread — the bridge agent's. */
+    private LongConsumer onSettlementApplied;
 
     private AeFeedClient(final AeronCluster cluster) {
         this.cluster = cluster;
@@ -97,6 +102,11 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
         return sb.toString();
     }
 
+    /** Registers the SettlementApplied observer (called back with the tradeId; agent thread). */
+    void onSettlementApplied(final LongConsumer callback) {
+        this.onSettlementApplied = callback;
+    }
+
     @Override
     public void onMessage(final long clusterSessionId, final long timestamp,
                           final DirectBuffer buffer, final int offset, final int length, final Header header) {
@@ -106,6 +116,12 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
             if (feedPositionDecoder.correlationId() == awaitedCorrelationId) {
                 capturedPosition = new FeedPosition(
                         feedPositionDecoder.consumePosition(), feedPositionDecoder.lastAppliedTradeId());
+            }
+        } else if (headerDecoder.templateId() == SettlementAppliedDecoder.TEMPLATE_ID) {
+            final LongConsumer callback = onSettlementApplied;
+            if (callback != null) {
+                settlementAppliedDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                callback.accept(settlementAppliedDecoder.tradeId());
             }
         }
         // All other egress (acks, balance updates, snapshots) is for other consumers; ignore.

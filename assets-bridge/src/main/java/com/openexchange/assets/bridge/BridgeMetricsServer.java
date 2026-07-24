@@ -106,6 +106,31 @@ public final class BridgeMetricsServer {
         gauge(sb, "bridge_epoch_last_applied_trade_id",
                 "AE-reported last-applied tradeId (T) as of the start of the current epoch",
                 state.epochLastAppliedTradeId);
+        gauge(sb, "bridge_replay_recording_position",
+                "Recorded position of the journal recording currently replayed/followed; "
+                        + "with bridge_replay_consumed_position this makes cold catch-up lag observable",
+                state.replayRecordingPosition);
+        gauge(sb, "bridge_replay_consumed_position",
+                "Replay position the bridge has consumed of the current recording "
+                        + "(lag bytes = recording position - consumed position)",
+                state.replayConsumedPosition);
+        counter(sb, "bridge_settle_forward_clock_anomalies_total",
+                "Journal trade timestamps rejected as garbage (<= 0 or in the future of the bridge "
+                        + "clock); the forward-latency sample was skipped instead of recorded",
+                state.settleForwardClockAnomalies);
+        counter(sb, "bridge_settle_ack_map_skips_total",
+                "Settle-ack tracking inserts skipped because the in-flight map hit its bound "
+                        + "(bounded memory beats perfect ack coverage)",
+                state.settleAckMapSkips);
+        histogram(sb, "bridge_settle_forward_latency",
+                "Seconds from the journal trade timestamp (written by the ME leader's clock) to the "
+                        + "bridge's blocking offer returning. CROSS-HOST CLOCKS: supporting evidence "
+                        + "only, ms resolution - not a single-clock measurement",
+                state.settleForwardLatency);
+        histogram(sb, "bridge_settle_ack_latency",
+                "Seconds from the bridge's blocking offer returning to the SettlementApplied egress "
+                        + "for that tradeId being observed (single host: bridge clock only)",
+                state.settleAckLatency);
         return sb.toString();
     }
 
@@ -122,5 +147,39 @@ public final class BridgeMetricsServer {
         sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
         sb.append("# TYPE ").append(name).append(' ').append(type).append('\n');
         sb.append(name).append(' ').append(value).append('\n');
+    }
+
+    /** {@code le} labels in SECONDS (Prometheus duration convention), derived from the ms bounds. */
+    private static final String[] BUCKET_LE_SECONDS = bucketLeSeconds();
+
+    private static String[] bucketLeSeconds() {
+        final long[] uppersMs = BridgeState.LatencyHistogram.BUCKET_UPPER_MS;
+        final String[] labels = new String[uppersMs.length];
+        for (int i = 0; i < uppersMs.length; i++) {
+            labels[i] = Double.toString(uppersMs[i] / 1000.0);
+        }
+        return labels;
+    }
+
+    /**
+     * Prometheus text-format histogram: cumulative {@code _bucket{le="..."}} lines (le in
+     * seconds), {@code _sum} in seconds, {@code _count}. {@code _count} is derived from the
+     * bucket total so {@code le="+Inf"} always equals {@code _count}, even if the agent
+     * thread records a sample mid-render.
+     */
+    private static void histogram(final StringBuilder sb, final String name, final String help,
+                                  final BridgeState.LatencyHistogram histogram) {
+        sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        sb.append("# TYPE ").append(name).append(" histogram\n");
+        long cumulative = 0;
+        for (int i = 0; i < BUCKET_LE_SECONDS.length; i++) {
+            cumulative += histogram.buckets.get(i);
+            sb.append(name).append("_bucket{le=\"").append(BUCKET_LE_SECONDS[i]).append("\"} ")
+                    .append(cumulative).append('\n');
+        }
+        cumulative += histogram.buckets.get(BUCKET_LE_SECONDS.length);
+        sb.append(name).append("_bucket{le=\"+Inf\"} ").append(cumulative).append('\n');
+        sb.append(name).append("_sum ").append(histogram.sumMs / 1000.0).append('\n');
+        sb.append(name).append("_count ").append(cumulative).append('\n');
     }
 }

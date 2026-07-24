@@ -9,6 +9,7 @@ import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.DirectBuffer;
+import org.agrona.collections.Long2LongHashMap;
 import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -46,6 +47,10 @@ public final class BridgeAgent implements Runnable {
     private static final long CONNECT_TIMEOUT_MS = 15_000;
     /** Sentinel: no previous source-progress check this replay (never stall on the first probe). */
     private static final long NO_PRIOR_CHECK = Long.MIN_VALUE;
+    /** Bound on the settle-ack in-flight map: bounded memory beats perfect ack coverage. */
+    private static final int IN_FLIGHT_SETTLE_CAP = 1_000_000;
+    /** Missing-value sentinel for the in-flight map (a nanoTime can never plausibly be this). */
+    private static final long NO_OFFER_TIME = Long.MIN_VALUE;
 
     private final BridgeConfig config;
     private final String aeronDirectoryName;
@@ -56,6 +61,12 @@ public final class BridgeAgent implements Runnable {
     private final JournalTerminalDecoder terminalDecoder = new JournalTerminalDecoder();
     private final UnsafeBuffer outBuffer = new UnsafeBuffer(new byte[256]);
     private final IdleStrategy idle = new BackoffIdleStrategy();
+    /**
+     * Settle offers awaiting their SettlementApplied egress ack: tradeId -> offer-return
+     * nanoTime. Agent-thread-only (egress is polled on this same thread), bounded at
+     * {@link #IN_FLIGHT_SETTLE_CAP}. Purely observability — never gates forwarding.
+     */
+    private final Long2LongHashMap inFlightSettles = new Long2LongHashMap(NO_OFFER_TIME);
 
     private volatile boolean running = true;
     private long lastStatusLogMs;
@@ -95,7 +106,12 @@ public final class BridgeAgent implements Runnable {
     }
 
     private void runEpoch() {
+        // Acks for settles offered on a previous epoch's session can never arrive (the AE
+        // broadcasts SettlementApplied at apply time, only to sessions connected then) —
+        // drop the stale in-flight entries rather than let them accumulate to the cap.
+        inFlightSettles.clear();
         try (AeFeedClient ae = AeFeedClient.connect(config, aeronDirectoryName)) {
+            ae.onSettlementApplied(this::onSettlementAck);
             state.connectedToAe = true;
             final AeFeedClient.FeedPosition pos = ae.queryFeedPosition(config.queryTimeoutMs);
             final BridgeFilter filter = new BridgeFilter(
@@ -132,6 +148,11 @@ public final class BridgeAgent implements Runnable {
                     + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
             try (Subscription replay = source.openReplay(recording)) {
                 final boolean liveFollow = recording.isActive();
+                // Replay-progress gauges: a stopped recording's recorded position is its stop
+                // position (bounded cold catch-up lag = recording - consumed); an active one
+                // starts at its start position and is raised by the probe / consumed floor.
+                state.replayConsumedPosition = recording.startPosition();
+                state.replayRecordingPosition = liveFollow ? recording.startPosition() : recording.stopPosition();
                 final long connectDeadlineMs = System.currentTimeMillis() + CONNECT_TIMEOUT_MS;
                 long nextSourceCheckMs = System.currentTimeMillis() + SOURCE_CHECK_INTERVAL_MS;
                 long consumedAtLastCheck = NO_PRIOR_CHECK;
@@ -142,6 +163,15 @@ public final class BridgeAgent implements Runnable {
                     ae.duty();
                     maybeLogStatus();
                     imageWasLive |= replay.imageCount() > 0;
+                    if (replay.imageCount() > 0) {
+                        final long consumedNow = replay.imageAtIndex(0).position();
+                        state.replayConsumedPosition = consumedNow;
+                        if (consumedNow > state.replayRecordingPosition) {
+                            // Consumed bytes were necessarily recorded: keeps the recorded-position
+                            // gauge from lagging below consumed between live-follow probes.
+                            state.replayRecordingPosition = consumedNow;
+                        }
+                    }
                     if (fragments == 0) {
                         if (!liveFollow && replayDrained(replay, recording)) {
                             break; // stopped recording fully consumed -> next in chain
@@ -168,6 +198,7 @@ public final class BridgeAgent implements Runnable {
                                 // Recording stopped under our live-follow (source restarted; its
                                 // successor recording isn't in this epoch's chain listing).
                                 final long stop = source.stopPosition(recording.recordingId());
+                                state.replayRecordingPosition = stop;
                                 if (consumed >= stop) {
                                     System.out.println("[BRIDGE] followed recording "
                                             + recording.recordingId() + " stopped and is fully "
@@ -181,6 +212,7 @@ public final class BridgeAgent implements Runnable {
                                             + " short of stop position " + stop);
                                 }
                             } else {
+                                state.replayRecordingPosition = recPos;
                                 state.sourceBacklogBytes = Math.max(0, recPos - Math.max(consumed, 0));
                                 if (recPos > consumed && consumed == consumedAtLastCheck
                                         && consumedAtLastCheck != NO_PRIOR_CHECK) {
@@ -235,6 +267,8 @@ public final class BridgeAgent implements Runnable {
                 case FORWARD -> {
                     final int length = translator.translateTrade(buffer, offset, outBuffer, 0);
                     ae.offerBlocking(outBuffer, length);
+                    recordSettleForwardLatency(tradeDecoder.timestamp());
+                    trackInFlightSettle(tradeDecoder.tradeId());
                     state.forwardedTrades++;
                     state.lastForwardedTradeId = tradeDecoder.tradeId();
                     state.lastForwardedEgressSeq = tradeDecoder.egressSeq();
@@ -257,6 +291,40 @@ public final class BridgeAgent implements Runnable {
                 case SKIP -> state.skippedEntries++;
                 case HALT -> { /* latched by a prior trade gap; terminals just stop flowing */ }
             }
+        }
+    }
+
+    /**
+     * Forward-latency sample: journal trade timestamp (epoch ms, written by the ME leader's
+     * clock) -> this host's clock at offer-return. CROSS-HOST clocks, so a non-positive or
+     * future timestamp is possible garbage: count the anomaly, never record it.
+     */
+    private void recordSettleForwardLatency(final long journalTimestampMs) {
+        final long nowMs = System.currentTimeMillis();
+        if (journalTimestampMs <= 0 || journalTimestampMs > nowMs) {
+            state.settleForwardClockAnomalies++;
+            return;
+        }
+        state.settleForwardLatency.record(nowMs - journalTimestampMs);
+    }
+
+    /** Arm the ack-latency clock for a just-offered settle; skip (counted) when at the cap. */
+    private void trackInFlightSettle(final long tradeId) {
+        if (inFlightSettles.size() >= IN_FLIGHT_SETTLE_CAP) {
+            state.settleAckMapSkips++;
+            return;
+        }
+        inFlightSettles.put(tradeId, System.nanoTime());
+    }
+
+    /**
+     * SettlementApplied egress observed (same thread: egress is polled by this agent).
+     * Unknown tradeIds are acks for settles offered before a restart — ignore them.
+     */
+    private void onSettlementAck(final long tradeId) {
+        final long offerReturnNanos = inFlightSettles.remove(tradeId);
+        if (offerReturnNanos != NO_OFFER_TIME) {
+            state.settleAckLatency.record((System.nanoTime() - offerReturnNanos) / 1_000_000);
         }
     }
 
