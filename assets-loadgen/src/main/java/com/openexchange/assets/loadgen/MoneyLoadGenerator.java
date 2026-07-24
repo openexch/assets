@@ -87,6 +87,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final double limitRatio;
     private final int sampleShift;          // order->settled lifecycle sampling: 1 in 2^shift
     private final Path outDir;
+    private final int genId;        // cok-uretici kosumda kimlik: id uzayi, RNG ve kullanici araligi ayrilir
     private final boolean prefund;
     private final long prefundUsdFp;
     private final long prefundBtcFp;
@@ -180,7 +181,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
     private long measureStartNs;
     private boolean measuring;
-    private final Random rand = new Random(42); // fixed seed: reproducible order stream
+    private final Random rand; // seed per generator: reproducible AND distinct streams
 
     /**
      * omsOrderId base: epoch-millis shifted so CONSECUTIVE RUNS against the same (not
@@ -188,7 +189,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
      * with a previous run's leftovers (dry-run 2: 34k hold rejects + garbage SettleFaults).
      * ~2^20 ids per ms of headroom; stays far below 2^63.
      */
-    private final long orderIdBase = System.currentTimeMillis() << 20;
+    private final long userBase;
+    private final long orderIdBase;
 
     private MoneyLoadGenerator(final String[] args) {
         this.rate = intArg(args, "--rate", 10_000);
@@ -200,6 +202,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         this.limitRatio = doubleArg(args, "--limit-ratio", 0.40);
         this.sampleShift = intArg(args, "--sample-shift", 6); // 1/64 lifecycle sampling
         this.outDir = Path.of(strArg(args, "--out", "results"));
+        this.genId = intArg(args, "--gen-id", 0);
+        this.userBase = (long) this.genId * this.users;
+        this.rand = new Random(42 + this.genId);
+        this.orderIdBase = (System.currentTimeMillis() + this.genId) << 20;
         this.prefund = !hasFlag(args, "--no-prefund");
         this.prefundUsdFp = fp(doubleArg(args, "--prefund-usd", 50_000_000_000.0)); // $50B/user
         this.prefundBtcFp = fp(doubleArg(args, "--prefund-btc", 10_000_000.0));     // 10M BTC/user
@@ -272,8 +278,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 users, prefundUsdFp / FP_SCALE, prefundBtcFp / FP_SCALE);
         final int expected = users * 2;
         for (int u = 0; u < users; u++) {
-            sendDeposit(PREFUND_CORR_BASE + u * 2L, u, ASSET_USD, prefundUsdFp);
-            sendDeposit(PREFUND_CORR_BASE + u * 2L + 1, u, ASSET_BTC, prefundBtcFp);
+            final long uid = userBase + u;
+            sendDeposit(PREFUND_CORR_BASE + uid * 2L, uid, ASSET_USD, prefundUsdFp);
+            sendDeposit(PREFUND_CORR_BASE + uid * 2L + 1, uid, ASSET_BTC, prefundBtcFp);
         }
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         while (depositAcks < expected) {
@@ -351,7 +358,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         final Pending p = pool.isEmpty() ? new Pending() : pool.pop();
         p.omsOrderId = omsOrderId;
         p.scheduledNs = scheduledNs;
-        p.userId = seq % users;
+        p.userId = userBase + (seq % users);
         p.isLimit = rand.nextDouble() < limitRatio;
         p.isBid = rand.nextDouble() < bidBias;
         p.orderSent = false;
@@ -726,6 +733,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                   --ae-port-base N    default 9300
                   --egress-host H     advertised egress address (default: routed source addr)
                   --out DIR           hgrm output dir (default results)
+                  --gen-id N          generator identity for multi-generator runs (default 0):
+                                      separates order-id space, RNG stream and user range
                   --no-prefund        skip the deposit phase
                   --prefund-usd F     USD per user (default 5e10)
                   --prefund-btc F     BTC per user (default 1e7)""");
