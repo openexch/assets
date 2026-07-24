@@ -6,7 +6,7 @@ import com.match.infrastructure.generated.OrderStatusBatchDecoder;
 import com.match.infrastructure.generated.OrderStatusUpdateDecoder;
 import com.match.infrastructure.generated.OrderType;
 import com.match.infrastructure.generated.TradeExecutionBatchDecoder;
-import com.match.infrastructure.generated.TradeExecutionDecoder;
+import com.openexchange.assets.domain.FixedPoint;
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
@@ -64,7 +64,15 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private static final int ASSET_USD = 0;
     private static final int ASSET_BTC = 1;
     private static final double MID_PRICE = 120_000.0;
-    private static final double MARKET_BUY_BUDGET_PRICE = 120_000.0;
+    /**
+     * Market-BUY budget price: must clear the WORST possible crossing (asks go up to
+     * mid*(1+0.01) in this scenario). The hold equals the budget, and the engine caps the
+     * fill cost at the budget, so budget >= worst ask price makes a settle shortfall
+     * impossible. Dry-run 2026-07-24 proved budget==mid faults ~13% of trades (AE's D5
+     * shortfall hardening absorbed them - conservation held - but a benchmark run must be
+     * fault-free to be publishable).
+     */
+    private static final double MARKET_BUY_BUDGET_PRICE = MID_PRICE * 1.02;
 
     private static final long PREFUND_CORR_BASE = 1L << 62;
     private static final int OFFER_RETRIES = 10;
@@ -96,7 +104,6 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final CreateOrderEncoder createOrderEnc = new CreateOrderEncoder();
     private final OrderStatusUpdateDecoder statusDec = new OrderStatusUpdateDecoder();
     private final OrderStatusBatchDecoder statusBatchDec = new OrderStatusBatchDecoder();
-    private final TradeExecutionDecoder tradeDec = new TradeExecutionDecoder();
     private final TradeExecutionBatchDecoder tradeBatchDec = new TradeExecutionBatchDecoder();
 
     private final com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder aeHeaderEnc =
@@ -144,8 +151,15 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final Long2ObjectHashMap<Pending> pending = new Long2ObjectHashMap<>();
     /** sampled orders awaiting their first settle: omsOrderId -> scheduledNs. */
     private final Long2LongHashMap sampledOrders = new Long2LongHashMap(-1);
-    /** tradeId -> first-seen-on-ME-egress ns. Removed on SettlementApplied. */
+    /** tradeId -> first-seen-on-ME-egress ns. Removed when its settle is observed. */
     private final Long2LongHashMap tradeSeenNs = new Long2LongHashMap(-1);
+    /**
+     * tradeId -> SettlementApplied-seen ns for settles that arrived BEFORE the ME egress
+     * trade observation. Dry-run finding: the settlement path (journal -> bridge -> AE,
+     * ~1.5ms) is usually FASTER than the ME market-data egress batch flush (~20ms), so the
+     * settle routinely wins the race; the join must work in both directions.
+     */
+    private final Long2LongHashMap settleSeenNs = new Long2LongHashMap(-1);
     /** tradeId -> scheduledNs of a SAMPLED parent order (taker preferred). */
     private final Long2LongHashMap tradeToSampledOrder = new Long2LongHashMap(-1);
     private static final int TRADE_MAP_CAP = 4_000_000;
@@ -153,18 +167,28 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     // ---- histograms (ns) ----
     private final Histogram holdAckHist = newHist();
     private final Histogram orderAckHist = newHist();
-    private final Histogram tradeToSettledHist = newHist();
+    private final Histogram tradeToSettledHist = newHist();   // trade observed first (settle lag)
+    private final Histogram settleLeadHist = newHist();       // settle observed first (its lead)
     private final Histogram orderToSettledHist = newHist();
     private static Histogram newHist() { return new Histogram(TimeUnit.MINUTES.toNanos(2), 3); }
 
     // ---- counters ----
     private long holdsSent, holdAcks, holdRejects, ordersSent, orderSendFailures,
             firstStatuses, tradesSeen, settlesSeen, settleFaults, depositAcks,
-            meBackpressure, aeBackpressure, tradeMapSkips, lateSettles, scheduleBacklogMax;
+            meBackpressure, aeBackpressure, tradeMapSkips, settleLedJoins, tradeLedJoins,
+            scheduleBacklogMax;
 
     private long measureStartNs;
     private boolean measuring;
     private final Random rand = new Random(42); // fixed seed: reproducible order stream
+
+    /**
+     * omsOrderId base: epoch-millis shifted so CONSECUTIVE RUNS against the same (not
+     * re-genesis'd) clusters can never collide ids - a collision merges this run's holds
+     * with a previous run's leftovers (dry-run 2: 34k hold rejects + garbage SettleFaults).
+     * ~2^20 ids per ms of headroom; stays far below 2^63.
+     */
+    private final long orderIdBase = System.currentTimeMillis() << 20;
 
     private MoneyLoadGenerator(final String[] args) {
         this.rate = intArg(args, "--rate", 10_000);
@@ -302,7 +326,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 final long backlog = (now - nextScheduledNs) / nanosPerOrder;
                 if (backlog > scheduleBacklogMax) scheduleBacklogMax = backlog;
                 if (pending.size() < window) {
-                    startLifecycle(++orderSeq, nextScheduledNs);
+                    ++orderSeq;
+                    startLifecycle(orderIdBase + orderSeq, orderSeq, nextScheduledNs);
                     nextScheduledNs += nanosPerOrder;
                 }
                 // window full: keep polling; the slot stays owed and is sent as soon as
@@ -322,15 +347,15 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         report(startNs);
     }
 
-    private void startLifecycle(final long omsOrderId, final long scheduledNs) {
+    private void startLifecycle(final long omsOrderId, final long seq, final long scheduledNs) {
         final Pending p = pool.isEmpty() ? new Pending() : pool.pop();
         p.omsOrderId = omsOrderId;
         p.scheduledNs = scheduledNs;
-        p.userId = omsOrderId % users;
+        p.userId = seq % users;
         p.isLimit = rand.nextDouble() < limitRatio;
         p.isBid = rand.nextDouble() < bidBias;
         p.orderSent = false;
-        p.sampled = (omsOrderId & ((1L << sampleShift) - 1)) == 0;
+        p.sampled = (seq & ((1L << sampleShift) - 1)) == 0;
 
         final double spread = 0.002 + rand.nextDouble() * 0.008;
         final double price = p.isBid ? MID_PRICE * (1.0 - spread) : MID_PRICE * (1.0 + spread);
@@ -339,7 +364,12 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
         p.priceFp = p.isLimit ? fp(tickPrice) : 0L;
         p.qtyFp = fp(qty);
-        p.totalPriceFp = p.isLimit ? fp(tickPrice * qty)
+        // LIMIT: compute the notional with the AE's OWN FixedPoint.multiply (truncating),
+        // NOT double math - the settle draws exactly multiply(price, qty) per fill
+        // (AssetsEngine quote leg), and a double-rounded hold is 1 unit short ~13% of the
+        // time (dry-run 3: 8026 deterministic SettleFaults, all uncovered=0).
+        // Truncation sums safely across partial fills (floor(a)+floor(b) <= floor(a+b)).
+        p.totalPriceFp = p.isLimit ? FixedPoint.multiply(p.priceFp, p.qtyFp)
                 : (p.isBid ? fp(MARKET_BUY_BUDGET_PRICE * qty) : 0L);
         if (p.isBid) {
             p.holdAssetId = ASSET_USD;
@@ -396,6 +426,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         if (offerWithRetry(me, meBuffer, len, false)) {
             ordersSent++;
             p.orderSent = true;
+            // Lifecycle sampling is armed at SEND time: market orders trade at the engine
+            // before their first status reaches us (egress batching), so arming at
+            // first-status missed nearly all taker lifecycles (dry-run n=2).
+            if (p.sampled) sampledOrders.put(p.omsOrderId, p.scheduledNs);
         } else {
             // The hold is placed but the order will never exist: release it so the run
             // ends with clean conservation instead of a leaked lock.
@@ -408,27 +442,42 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
     }
 
-    /** First ME status for the order: ack latency; sampled orders stay tracked for settle. */
+    /** First ME status for the order: ack latency, lifecycle slot freed. */
     private void onFirstStatus(final long omsOrderId) {
         final Pending p = pending.get(omsOrderId);
         if (p == null || !p.orderSent) return;
         firstStatuses++;
         if (measuring) orderAckHist.recordValue(clamp(System.nanoTime() - p.scheduledNs));
-        if (p.sampled) sampledOrders.put(omsOrderId, p.scheduledNs);
         pending.remove(omsOrderId);
         pool.push(p);
     }
 
     private void onTrade(final long tradeId, final long takerOmsOrderId, final long makerOmsOrderId) {
-        tradesSeen++;
         final long now = System.nanoTime();
-        if (tradeSeenNs.size() < TRADE_MAP_CAP) tradeSeenNs.put(tradeId, now); else tradeMapSkips++;
+        // Bidirectional join. If the settle already arrived (usual case: journal->bridge->AE
+        // beats the ME egress batch flush), close the pair now and record the settle's LEAD.
+        final long settleAt = settleSeenNs.remove(tradeId);
+        if (settleAt != -1) {
+            tradesSeen++;
+            settleLedJoins++; // pair closed here; the SETTLE had led
+            if (measuring) settleLeadHist.recordValue(clamp(now - settleAt));
+        } else if (tradeSeenNs.get(tradeId) == -1) {
+            tradesSeen++;
+            if (tradeSeenNs.size() < TRADE_MAP_CAP) tradeSeenNs.put(tradeId, now); else tradeMapSkips++;
+        } else {
+            return; // duplicate observation of an already-mapped trade
+        }
         // A sampled order's lifecycle closes at its FIRST fill's settle; remove so the
         // sampled map only holds not-yet-filled sampled orders (bounded).
         long sampledScheduled = sampledOrders.remove(takerOmsOrderId);
         if (sampledScheduled == -1) sampledScheduled = sampledOrders.remove(makerOmsOrderId);
-        if (sampledScheduled != -1 && tradeToSampledOrder.size() < TRADE_MAP_CAP) {
-            tradeToSampledOrder.put(tradeId, sampledScheduled);
+        if (sampledScheduled != -1) {
+            if (settleAt != -1) {
+                // settle already observed: lifecycle closes here
+                if (measuring) orderToSettledHist.recordValue(clamp(now - sampledScheduled));
+            } else if (tradeToSampledOrder.size() < TRADE_MAP_CAP) {
+                tradeToSampledOrder.put(tradeId, sampledScheduled);
+            }
         }
     }
 
@@ -437,9 +486,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         final long now = System.nanoTime();
         final long seen = tradeSeenNs.remove(tradeId);
         if (seen != -1) {
+            tradeLedJoins++; // pair closed here; the TRADE observation had led
             if (measuring) tradeToSettledHist.recordValue(clamp(now - seen));
-        } else {
-            lateSettles++; // settle for a trade we never mapped (pre-warmup or map-skip)
+        } else if (settleSeenNs.size() < TRADE_MAP_CAP) {
+            settleSeenNs.put(tradeId, now); // settle first; trade observation will close it
         }
         final long scheduled = tradeToSampledOrder.remove(tradeId);
         if (scheduled != -1 && measuring) orderToSettledHist.recordValue(clamp(now - scheduled));
@@ -468,10 +518,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                         onFirstStatus(o.omsOrderId());
                     }
                 }
-                case TradeExecutionDecoder.TEMPLATE_ID -> {
-                    tradeDec.wrap(buffer, body, actingBlockLength, actingVersion);
-                    onTrade(tradeDec.tradeId(), tradeDec.takerOmsOrderId(), tradeDec.makerOmsOrderId());
-                }
+                // TradeExecution singles (id 4) are deliberately IGNORED: the same trades also
+                // arrive on the reliable TradeExecutionBatch stream (dry-run showed exactly 2x
+                // observations), and consuming one stream keeps the tradeId join dedupe-free.
                 case TradeExecutionBatchDecoder.TEMPLATE_ID -> {
                     tradeBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
                     for (final TradeExecutionBatchDecoder.TradesDecoder t : tradeBatchDec.trades()) {
@@ -498,6 +547,11 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 onHoldAck(holdAckDec.correlationId());
             } else if (templateId == holdRejectDec.sbeTemplateId()) {
                 holdRejectDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                if (holdRejects < 5) {
+                    System.err.printf("HOLD REJECT: orderId=%d userId=%d asset=%d amount=%d reason=%s%n",
+                            holdRejectDec.orderId(), holdRejectDec.userId(), holdRejectDec.assetId(),
+                            holdRejectDec.amount(), holdRejectDec.reason());
+                }
                 onHoldReject(holdRejectDec.correlationId());
             } else if (templateId == settleDec.sbeTemplateId()) {
                 settleDec.wrap(buffer, body, actingBlockLength, actingVersion);
@@ -506,10 +560,12 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 settleFaultDec.wrap(buffer, body, actingBlockLength, actingVersion);
                 settleFaults++;
                 if (settleFaults <= 5) {
-                    System.err.printf("SETTLE FAULT: tradeId=%d orderId=%d userId=%d uncovered=%d "
+                    System.err.printf("SETTLE FAULT: tradeId=%d orderId=%d userId=%d "
+                                    + "drawnFromAvailable=%d uncovered=%d "
                                     + "(pre-fund/hold sizing bug - run is INVALID)%n",
                             settleFaultDec.tradeId(), settleFaultDec.orderId(),
-                            settleFaultDec.userId(), settleFaultDec.uncovered());
+                            settleFaultDec.userId(), settleFaultDec.drawnFromAvailable(),
+                            settleFaultDec.uncovered());
                 }
             } else if (templateId == depositAckDec.sbeTemplateId()) {
                 depositAckDec.wrap(buffer, body, actingBlockLength, actingVersion);
@@ -574,13 +630,16 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 holdsSent, holdAcks, holdRejects, ordersSent, orderSendFailures);
         out.printf("first-statuses %d | trades seen %d | settles seen %d | SETTLE FAULTS %d%n",
                 firstStatuses, tradesSeen, settlesSeen, settleFaults);
-        out.printf("backpressure me/ae %d/%d | trade-map skips %d | late settles %d | max schedule backlog %d%n",
-                meBackpressure, aeBackpressure, tradeMapSkips, lateSettles, scheduleBacklogMax);
-        out.printf("unsettled mapped trades at exit: %d | pending lifecycles: %d%n",
-                tradeSeenNs.size(), pending.size());
+        out.printf("backpressure me/ae %d/%d | trade-map skips %d | max schedule backlog %d%n",
+                meBackpressure, aeBackpressure, tradeMapSkips, scheduleBacklogMax);
+        out.printf("join direction: settle-led %d / trade-led %d (settle-led = settlement path "
+                        + "beat the ME egress batch flush)%n", settleLedJoins, tradeLedJoins);
+        out.printf("unpaired at exit: trades %d / settles %d | pending lifecycles: %d%n",
+                tradeSeenNs.size(), settleSeenNs.size(), pending.size());
         printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
         printHist(out, "order lifecycle start->first ME status", orderAckHist);
-        printHist(out, "trade seen (ME egress)->settled (AE egress)", tradeToSettledHist);
+        printHist(out, "trade obs->settled (trade-led pairs)", tradeToSettledHist);
+        printHist(out, "settle lead over trade obs (settle-led)", settleLeadHist);
         printHist(out, "scheduled send->settled (sampled 1/" + (1 << sampleShift) + ")", orderToSettledHist);
         if (settleFaults > 0) {
             out.println("!! RUN INVALID: settle faults observed - fix pre-fund/hold sizing before publishing");
@@ -590,6 +649,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             writeHgrm("hold-ack", holdAckHist);
             writeHgrm("order-ack", orderAckHist);
             writeHgrm("trade-to-settled", tradeToSettledHist);
+            writeHgrm("settle-lead", settleLeadHist);
             writeHgrm("order-to-settled", orderToSettledHist);
             out.println("hgrm files written to " + outDir.toAbsolutePath());
         } catch (final Exception e) {
