@@ -14,7 +14,6 @@ import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -74,7 +73,7 @@ public final class BridgeAgent implements Runnable {
 
     /** How far up the chain an epoch may skip after an earlier one drained the head. */
     private final ChainResumeMemo resumeMemo = new ChainResumeMemo();
-    /** Forward count at epoch start: any advance invalidates the memo for good. */
+    /** Forward count at epoch start: an advance seals the memo at what it has proven. */
     private long forwardsAtEpochStart;
 
     public BridgeAgent(final BridgeConfig config, final String aeronDirectoryName, final BridgeState state) {
