@@ -14,6 +14,7 @@ import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -71,6 +72,11 @@ public final class BridgeAgent implements Runnable {
     private volatile boolean running = true;
     private long lastStatusLogMs;
 
+    /** How far up the chain an epoch may skip after an earlier one drained the head. */
+    private final ChainResumeMemo resumeMemo = new ChainResumeMemo();
+    /** Forward count at epoch start: any advance invalidates the memo for good. */
+    private long forwardsAtEpochStart;
+
     public BridgeAgent(final BridgeConfig config, final String aeronDirectoryName, final BridgeState state) {
         this.config = config;
         this.aeronDirectoryName = aeronDirectoryName;
@@ -120,19 +126,21 @@ public final class BridgeAgent implements Runnable {
             state.epochLastAppliedTradeId = pos.lastAppliedTradeId();
             state.sourceBacklogBytes = 0;
             state.epochs++;
+            forwardsAtEpochStart = forwardCount();
             System.out.println("[BRIDGE] epoch " + state.epochs + ": AE at consumePosition="
                     + pos.consumePosition() + " lastAppliedTradeId=" + pos.lastAppliedTradeId());
 
             try (ArchiveJournalSource source = JournalSource.connectFirstHealthy(config, aeronDirectoryName)) {
                 state.journalSource = source.endpoint();
-                followChain(source, filter, ae);
+                followChain(source, filter, ae, pos);
             }
         } finally {
             state.connectedToAe = false;
         }
     }
 
-    private void followChain(final ArchiveJournalSource source, final BridgeFilter filter, final AeFeedClient ae) {
+    private void followChain(final ArchiveJournalSource source, final BridgeFilter filter,
+                            final AeFeedClient ae, final AeFeedClient.FeedPosition sync) {
         final List<ArchiveJournalSource.Recording> chain = source.recordings();
         if (chain.isEmpty()) {
             // Journal enabled but nothing recorded yet (or dark): wait and re-list next epoch.
@@ -140,10 +148,20 @@ public final class BridgeAgent implements Runnable {
             sleep(ERROR_BACKOFF_MS);
             return;
         }
+        final int startIndex = resumeMemo.resumeIndex(
+                chain, sync.consumePosition(), sync.lastAppliedTradeId());
+        if (startIndex > 0) {
+            System.out.println("[BRIDGE] resuming the chain at recording "
+                    + chain.get(startIndex).recordingId() + ": recordings "
+                    + chain.get(0).recordingId() + ".." + chain.get(startIndex - 1).recordingId()
+                    + " were already drained at this same sync point and forwarded nothing");
+        }
         final FragmentHandler handler = (buffer, offset, length, header) ->
                 onJournalEntry(buffer, offset, filter, ae);
 
-        for (final ArchiveJournalSource.Recording recording : chain) {
+        for (int i = startIndex; i < chain.size(); i++) {
+            final ArchiveJournalSource.Recording recording = chain.get(i);
+            boolean fullyDrained = false;
             System.out.println("[BRIDGE] following recording " + recording.recordingId()
                     + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
             try (Subscription replay = source.openReplay(recording)) {
@@ -174,6 +192,7 @@ public final class BridgeAgent implements Runnable {
                     }
                     if (fragments == 0) {
                         if (!liveFollow && replayDrained(replay, recording)) {
+                            fullyDrained = true;
                             break; // stopped recording fully consumed -> next in chain
                         }
                         if (replay.isClosed() || (imageWasLive && replay.imageCount() == 0)) {
@@ -232,6 +251,9 @@ public final class BridgeAgent implements Runnable {
                     break; // end the epoch: the next one re-lists and follows the successor
                 }
             }
+            if (fullyDrained) {
+                resumeMemo.noteDrained(chain, i, forwardCount() != forwardsAtEpochStart);
+            }
             if (!running || state.halted) {
                 return;
             }
@@ -239,6 +261,10 @@ public final class BridgeAgent implements Runnable {
         // Chain exhausted without a live-follow in progress (source down or mid-restart):
         // pause before the next epoch so we don't hot-loop re-reading the whole chain.
         sleep(ERROR_BACKOFF_MS);
+    }
+
+    private long forwardCount() {
+        return state.forwardedTrades + state.forwardedTerminals;
     }
 
     private void sourceStall(final String reason) {
