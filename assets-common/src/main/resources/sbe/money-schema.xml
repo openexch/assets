@@ -2,8 +2,8 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="com.openexchange.assets.infrastructure.generated"
                    id="2"
-                   version="2"
-                   semanticVersion="0.2"
+                   version="3"
+                   semanticVersion="0.3"
                    description="Assets Engine money schema — balances, holds, settlement. All amounts are 8dp fixed-point int64."
 >
     <types>
@@ -30,6 +30,17 @@
             <validValue name="FALSE">0</validValue>
             <validValue name="TRUE">1</validValue>
         </enum>
+        <!--
+          Egress subscription channels (assets#17 follow-up, "step 3"). A session declares which
+          classes of egress it wants; the default when a session never subscribes is ALL of them, so
+          an old client that has never heard of Subscribe keeps working exactly as before.
+        -->
+        <set name="EgressChannels" encodingType="uint32">
+            <choice name="acks"        description="responses to this client's own commands: hold/deposit/withdraw acks and rejects, feed position">0</choice>
+            <choice name="balances"    description="the BalanceUpdate firehose: one per changed (user, asset) line">1</choice>
+            <choice name="settlements" description="SettlementApplied and SettleFault">2</choice>
+            <choice name="snapshots"   description="balance/hold snapshot streams and their terminators">3</choice>
+        </set>
     </types>
 
     <!-- ============================ Ingress commands (client -> AE) ============================ -->
@@ -99,6 +110,11 @@
     <sbe:message name="InitTradeHighWater" id="30" description="cutover primer: refused (no-op) unless the ledger is virgin (lastAppliedTradeId==0 and no accounts)">
         <field name="tradeId"         id="1" type="int64"/>
         <field name="consumePosition" id="2" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="Subscribe" id="31" sinceVersion="3" description="Set this session's egress filter. Transport-level, NOT money state: it is never snapshotted, so a session that survives a leader change or a snapshot restore falls back to receiving everything (safe direction) and should re-subscribe.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="channels"      id="2" type="EgressChannels"/>
     </sbe:message>
 
     <!-- ============================ Egress events (AE -> client) ============================ -->

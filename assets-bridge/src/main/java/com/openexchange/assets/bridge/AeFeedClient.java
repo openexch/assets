@@ -50,6 +50,10 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     private final SettlementAppliedDecoder settlementAppliedDecoder = new SettlementAppliedDecoder();
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
     private final QueryFeedPositionEncoder queryEncoder = new QueryFeedPositionEncoder();
+    private final com.openexchange.assets.infrastructure.generated.SubscribeEncoder subscribeEncoder =
+            new com.openexchange.assets.infrastructure.generated.SubscribeEncoder();
+    private final org.agrona.concurrent.UnsafeBuffer subscribeBuffer =
+            new org.agrona.concurrent.UnsafeBuffer(new byte[64]);
     private final UnsafeBuffer queryBuffer = new UnsafeBuffer(new byte[64]);
 
     private long lastKeepAliveMs;
@@ -86,7 +90,29 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
                 .egressListener(holder));
         final AeFeedClient client = new AeFeedClient(cluster);
         holder.delegate = client;
+        client.subscribeToWhatWeActuallyRead();
         return client;
+    }
+
+    /**
+     * Narrow this session's egress to what the bridge actually consumes.
+     *
+     * <p>The bridge reads SettlementApplied (its settle acknowledgement) and FeedPositionReport (its
+     * resume point), and discards everything else — see {@link #onMessage}. Until subscriptions existed
+     * it still received the full BalanceUpdate firehose, roughly five frames per settle that it decoded
+     * and threw away. Under load that made this session, not the load generator, the one whose egress
+     * queue backed up to its ceiling and stalled the engine.</p>
+     *
+     * <p>Sent on every connect, including reconnects after an epoch restart: the subscription is
+     * transport state on the leader and is deliberately not snapshotted, so it must be re-declared
+     * rather than assumed. Losing it only costs traffic, never correctness.</p>
+     */
+    private void subscribeToWhatWeActuallyRead() {
+        subscribeEncoder.wrapAndApplyHeader(subscribeBuffer, 0, headerEncoder)
+                .correlationId(0L)
+                .channels().clear().acks(true).settlements(true);
+        offerBlocking(subscribeBuffer,
+                MessageHeaderEncoder.ENCODED_LENGTH + subscribeEncoder.encodedLength());
     }
 
     /** Cluster ingress endpoint list using the AE ClusterConfig port math (client port = base + n*100 + 2). */

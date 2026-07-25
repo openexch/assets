@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * cutover primer: refused (no-op) unless the ledger is virgin (lastAppliedTradeId==0 and no accounts)
+ * Set this session's egress filter. Transport-level, NOT money state: it is never snapshotted, so a session that survives a leader change or a snapshot restore falls back to receiving everything (safe direction) and should re-subscribe.
  */
 @SuppressWarnings("all")
-public final class InitTradeHighWaterEncoder
+public final class SubscribeEncoder
 {
-    public static final int BLOCK_LENGTH = 16;
-    public static final int TEMPLATE_ID = 30;
+    public static final int BLOCK_LENGTH = 12;
+    public static final int TEMPLATE_ID = 31;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 3;
     public static final String SEMANTIC_VERSION = "0.3";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final InitTradeHighWaterEncoder parentMessage = this;
+    private final SubscribeEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class InitTradeHighWaterEncoder
         return offset;
     }
 
-    public InitTradeHighWaterEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public SubscribeEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class InitTradeHighWaterEncoder
         return this;
     }
 
-    public InitTradeHighWaterEncoder wrapAndApplyHeader(
+    public SubscribeEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -97,27 +97,27 @@ public final class InitTradeHighWaterEncoder
         this.limit = limit;
     }
 
-    public static int tradeIdId()
+    public static int correlationIdId()
     {
         return 1;
     }
 
-    public static int tradeIdSinceVersion()
+    public static int correlationIdSinceVersion()
     {
         return 0;
     }
 
-    public static int tradeIdEncodingOffset()
+    public static int correlationIdEncodingOffset()
     {
         return 0;
     }
 
-    public static int tradeIdEncodingLength()
+    public static int correlationIdEncodingLength()
     {
         return 8;
     }
 
-    public static String tradeIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String correlationIdMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -127,49 +127,49 @@ public final class InitTradeHighWaterEncoder
         return "";
     }
 
-    public static long tradeIdNullValue()
+    public static long correlationIdNullValue()
     {
         return -9223372036854775808L;
     }
 
-    public static long tradeIdMinValue()
+    public static long correlationIdMinValue()
     {
         return -9223372036854775807L;
     }
 
-    public static long tradeIdMaxValue()
+    public static long correlationIdMaxValue()
     {
         return 9223372036854775807L;
     }
 
-    public InitTradeHighWaterEncoder tradeId(final long value)
+    public SubscribeEncoder correlationId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int consumePositionId()
+    public static int channelsId()
     {
         return 2;
     }
 
-    public static int consumePositionSinceVersion()
+    public static int channelsSinceVersion()
     {
         return 0;
     }
 
-    public static int consumePositionEncodingOffset()
+    public static int channelsEncodingOffset()
     {
         return 8;
     }
 
-    public static int consumePositionEncodingLength()
+    public static int channelsEncodingLength()
     {
-        return 8;
+        return 4;
     }
 
-    public static String consumePositionMetaAttribute(final MetaAttribute metaAttribute)
+    public static String channelsMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -179,27 +179,13 @@ public final class InitTradeHighWaterEncoder
         return "";
     }
 
-    public static long consumePositionNullValue()
-    {
-        return -9223372036854775808L;
-    }
+    private final EgressChannelsEncoder channels = new EgressChannelsEncoder();
 
-    public static long consumePositionMinValue()
+    public EgressChannelsEncoder channels()
     {
-        return -9223372036854775807L;
+        channels.wrap(buffer, offset + 8);
+        return channels;
     }
-
-    public static long consumePositionMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public InitTradeHighWaterEncoder consumePosition(final long value)
-    {
-        buffer.putLong(offset + 8, value, BYTE_ORDER);
-        return this;
-    }
-
 
     public String toString()
     {
@@ -218,7 +204,7 @@ public final class InitTradeHighWaterEncoder
             return builder;
         }
 
-        final InitTradeHighWaterDecoder decoder = new InitTradeHighWaterDecoder();
+        final SubscribeDecoder decoder = new SubscribeDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

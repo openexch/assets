@@ -51,6 +51,8 @@ public class WireRoundTripTest {
     /** Capturing egress: decodes each SBE message the publisher emits into a canonical line. */
     private static final class CapturingEgress implements AssetsEventPublisher.Egress {
         final List<String> lines = new ArrayList<>();
+        /** Channel each emitted frame was tagged with, parallel to {@link #lines}. */
+        final List<Integer> channels = new ArrayList<>();
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
         private final BalanceUpdateDecoder balance = new BalanceUpdateDecoder();
         private final DepositAckDecoder depositAck = new DepositAckDecoder();
@@ -65,7 +67,8 @@ public class WireRoundTripTest {
         private final FeedPositionReportDecoder feedPos = new FeedPositionReportDecoder();
 
         @Override
-        public void broadcast(MutableDirectBuffer buffer, int offset, int length) {
+        public void emit(MutableDirectBuffer buffer, int offset, int length, int channel) {
+            channels.add(channel);
             header.wrap(buffer, offset);
             switch (header.templateId()) {
                 case BalanceUpdateDecoder.TEMPLATE_ID:
@@ -355,5 +358,50 @@ public class WireRoundTripTest {
     private void requestHoldSnapshot(AssetsSbeDemuxer demuxer, long corr) {
         holdSnapReqEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
         demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdSnapReqEncoder.encodedLength(), 1000L);
+    }
+
+    /**
+     * Every egress message must be filed under the channel a subscriber would expect. This is not
+     * cosmetic: a frame filed under the wrong channel is silently dropped for any session that did not
+     * subscribe to that channel, which looks exactly like the engine never emitting it. A new message
+     * added without a channel decision would land here.
+     */
+    @Test
+    public void everyEventIsFiledUnderTheChannelSubscribersExpect() {
+        final CapturingEgress egress = new CapturingEgress();
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress);
+
+        p.onHoldAck(1, 2, 3, 0, 100);
+        assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldAck");
+        p.onHoldReject(1, 2, 3, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
+        assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldReject");
+        p.onDepositAck(1, 2, 0, 100, 100);
+        assertChannel(egress, AssetsEventPublisher.CH_ACKS, "DepositAck");
+        p.onWithdrawAck(1, 2, 0, 100, 0);
+        assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawAck");
+        p.onWithdrawReject(1, 2, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
+        assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawReject");
+        p.onFeedPositionReport(1, 42, 7);
+        assertChannel(egress, AssetsEventPublisher.CH_ACKS, "FeedPositionReport");
+
+        p.onBalanceUpdate(2, 0, 100, 0);
+        assertChannel(egress, AssetsEventPublisher.CH_BALANCES, "BalanceUpdate");
+
+        p.onSettlementApplied(9, 1, 2);
+        assertChannel(egress, AssetsEventPublisher.CH_SETTLEMENTS, "SettlementApplied");
+        p.onSettleFault(9, 1, 2, 0, 5, 5);
+        assertChannel(egress, AssetsEventPublisher.CH_SETTLEMENTS, "SettleFault");
+
+        p.onBalanceSnapshotEnd(1, 3);
+        assertChannel(egress, AssetsEventPublisher.CH_SNAPSHOTS, "BalanceSnapshotEnd");
+        p.onHoldSnapshotEntry(1, 2, 0, 50);
+        assertChannel(egress, AssetsEventPublisher.CH_SNAPSHOTS, "HoldSnapshotEntry");
+        p.onHoldSnapshotEnd(1, 1);
+        assertChannel(egress, AssetsEventPublisher.CH_SNAPSHOTS, "HoldSnapshotEnd");
+    }
+
+    private static void assertChannel(CapturingEgress egress, int expected, String what) {
+        assertEquals(what + " must be filed under channel " + expected,
+                Integer.valueOf(expected), egress.channels.get(egress.channels.size() - 1));
     }
 }
