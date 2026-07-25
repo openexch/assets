@@ -39,10 +39,13 @@ public final class SettlementService {
                        int baseAsset, int quoteAsset,
                        long baseAmt, long quoteAmt) {
         final long paidQuote = buyer.settleDebit(buyerOrderId, quoteAsset, quoteAmt, buyerLeg);
-        seller.settleCredit(quoteAsset, paidQuote);
+        // The credit can fall short only if the payee's balance for that asset has reached
+        // Long.MAX_VALUE. Recorded on the leg that carries the movement, so the engine reports it
+        // exactly like any other conservation breach instead of losing the amount silently.
+        buyerLeg.uncredited = seller.settleCredit(quoteAsset, paidQuote);
 
         final long deliveredBase = seller.settleDebit(sellerOrderId, baseAsset, baseAmt, sellerLeg);
-        buyer.settleCredit(baseAsset, deliveredBase);
+        sellerLeg.uncredited = buyer.settleCredit(baseAsset, deliveredBase);
     }
 
     /** The buyer-side (quote) leg result of the LAST settle — valid until the next call. */

@@ -1,0 +1,16 @@
+# assets#18: a deposit that would push available+locked past Long.MAX_VALUE is REJECTED and mutates
+# nothing.
+#
+# Before the fix it wrapped the balance NEGATIVE, silently: no exception, no fault event, no log line,
+# and the conservation checks still passed because the wrapped value was internally consistent. The
+# account then reported no funds and every subsequent hold on that asset was rejected
+# INSUFFICIENT_FUNDS. It was found by a benchmark that pre-funded the same accounts twice.
+#
+# Two things in the golden below carry the assertion:
+#   1. the second DEPOSIT emits NOTHING (a rejected deposit has no ack message and no balance line),
+#   2. the HOLD after it is ACCEPTED, which is only possible if the balance is still positive.
+CLOCK 1000
+DEPOSIT u=1 asset=0 amt=92233720368.0
+DEPOSIT u=1 asset=0 amt=92233720368.0
+HOLD u=1 order=1 asset=0 amt=1000.0
+RELEASE order=1 u=1

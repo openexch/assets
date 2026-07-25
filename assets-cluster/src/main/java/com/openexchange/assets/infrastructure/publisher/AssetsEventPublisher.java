@@ -156,6 +156,11 @@ public final class AssetsEventPublisher implements AssetsEventSink {
             case INSUFFICIENT_FUNDS: return com.openexchange.assets.infrastructure.generated.RejectReason.INSUFFICIENT_FUNDS;
             case INVALID_AMOUNT:     return com.openexchange.assets.infrastructure.generated.RejectReason.INVALID_AMOUNT;
             case UNKNOWN_HOLD:       return com.openexchange.assets.infrastructure.generated.RejectReason.UNKNOWN_HOLD;
+            // No wire value of its own yet, and it can only be produced by deposit, which emits no
+            // reject message at all. Mapped explicitly so it can never fall through to NONE: a
+            // rejection that decodes as "accepted" is exactly the silent-wrong-value class of bug
+            // this reason was added to close.
+            case BALANCE_OVERFLOW:   return com.openexchange.assets.infrastructure.generated.RejectReason.INVALID_AMOUNT;
             default:                 return com.openexchange.assets.infrastructure.generated.RejectReason.NONE;
         }
     }
