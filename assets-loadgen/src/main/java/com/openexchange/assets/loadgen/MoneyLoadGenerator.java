@@ -135,6 +135,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
     // ---- lifecycle tracking (duty thread only) ----
     private static final class Pending {
+        /** nanoTime at which the ME CreateOrder was actually offered — isolates the ME leg. */
+        long orderSentNs;
         long omsOrderId;
         long scheduledNs;
         long userId;
@@ -171,6 +173,13 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final Histogram holdAckHist = newHist();
     private final Histogram orderAckHist = newHist();
     private final Histogram tradeToSettledHist = newHist();   // trade observed first (settle lag)
+    /**
+     * ME order OFFER -> first ME status. Deliberately NOT charged from the scheduled slot: this is the
+     * matching engine's own round trip with the hold leg and any schedule backlog removed, which is the
+     * only way to tell a fixed structural cost from queueing. The coordinated-omission-safe lifecycle
+     * histogram above stays the headline number; this one is the diagnostic.
+     */
+    private final Histogram meLegHist = newHist();
     private final Histogram settleLeadHist = newHist();       // settle observed first (its lead)
     private final Histogram orderToSettledHist = newHist();
     private static Histogram newHist() { return new Histogram(TimeUnit.MINUTES.toNanos(2), 3); }
@@ -480,6 +489,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         if (offerWithRetry(me, meBuffer, len, false)) {
             ordersSent++;
             p.orderSent = true;
+            p.orderSentNs = System.nanoTime();
             // Lifecycle sampling is armed at SEND time: market orders trade at the engine
             // before their first status reaches us (egress batching), so arming at
             // first-status missed nearly all taker lifecycles (dry-run n=2).
@@ -501,7 +511,11 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         final Pending p = pending.get(omsOrderId);
         if (p == null || !p.orderSent) return;
         firstStatuses++;
-        if (measuring) orderAckHist.recordValue(clamp(System.nanoTime() - p.scheduledNs));
+        if (measuring) {
+            final long now = System.nanoTime();
+            orderAckHist.recordValue(clamp(now - p.scheduledNs));
+            meLegHist.recordValue(clamp(now - p.orderSentNs));
+        }
         pending.remove(omsOrderId);
         pool.push(p);
     }
@@ -727,6 +741,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 tradeSeenNs.size(), settleSeenNs.size(), pending.size());
         printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
         printHist(out, "order lifecycle start->first ME status", orderAckHist);
+        printHist(out, "  of which ME leg: order offer->first status", meLegHist);
         printHist(out, "trade obs->settled (trade-led pairs)", tradeToSettledHist);
         printHist(out, "settle lead over trade obs (settle-led)", settleLeadHist);
         printHist(out, "scheduled send->settled (sampled 1/" + (1 << sampleShift) + ")", orderToSettledHist);
@@ -737,6 +752,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             Files.createDirectories(outDir);
             writeHgrm("hold-ack", holdAckHist);
             writeHgrm("order-ack", orderAckHist);
+            writeHgrm("me-leg", meLegHist);
             writeHgrm("trade-to-settled", tradeToSettledHist);
             writeHgrm("settle-lead", settleLeadHist);
             writeHgrm("order-to-settled", orderToSettledHist);
