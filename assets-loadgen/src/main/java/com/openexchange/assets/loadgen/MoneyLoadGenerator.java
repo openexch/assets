@@ -88,6 +88,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final int sampleShift;          // order->settled lifecycle sampling: 1 in 2^shift
     private final Path outDir;
     private final int genId;        // cok-uretici kosumda kimlik: id uzayi, RNG ve kullanici araligi ayrilir
+    /** Substrate mode: hold + release against the AE alone, no ME, no journal, no bridge. */
+    private final boolean aeOnly;
     private final boolean prefund;
     private final long prefundUsdFp;
     private final long prefundBtcFp;
@@ -177,7 +179,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private long holdsSent, holdAcks, holdRejects, ordersSent, orderSendFailures,
             firstStatuses, tradesSeen, settlesSeen, settleFaults, depositAcks,
             meBackpressure, aeBackpressure, tradeMapSkips, settleLedJoins, tradeLedJoins,
-            scheduleBacklogMax;
+            scheduleBacklogMax, releasesSent;
 
     private long measureStartNs;
     private boolean measuring;
@@ -206,6 +208,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         this.userBase = (long) this.genId * this.users;
         this.rand = new Random(42 + this.genId);
         this.orderIdBase = (System.currentTimeMillis() + this.genId) << 20;
+        this.aeOnly = hasFlag(args, "--ae-only");
         this.prefund = !hasFlag(args, "--no-prefund");
         this.prefundUsdFp = fp(doubleArg(args, "--prefund-usd", 50_000_000_000.0)); // $50B/user
         this.prefundBtcFp = fp(doubleArg(args, "--prefund-btc", 10_000_000.0));     // 10M BTC/user
@@ -214,7 +217,12 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         final List<String> aeHosts = List.of(strArg(args, "--ae-hosts", "127.0.0.1").split(","));
         final int mePortBase = intArg(args, "--me-port-base", 9000);
         final int aePortBase = intArg(args, "--ae-port-base", 9300);
-        final String egressHost = resolveEgressHost(strArg(args, "--egress-host", null), meHosts.get(0));
+        // Probe toward the cluster we actually talk to. In --ae-only there is no ME, and probing
+        // toward its default 127.0.0.1 would resolve the advertised egress address to loopback:
+        // the AE leader would then publish egress into its own container and the run would sit at
+        // zero acks with nothing in any log (the match#151 class of bug).
+        final String egressHost = resolveEgressHost(strArg(args, "--egress-host", null),
+                aeOnly ? aeHosts.get(0) : meHosts.get(0));
 
         this.driver = MediaDriver.launch(new MediaDriver.Context()
                 .aeronDirectoryName("/dev/shm/aeron-moneyload-" + ProcessHandle.current().pid())
@@ -223,11 +231,30 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 .dirDeleteOnShutdown(true)
                 .errorHandler(t -> t.printStackTrace(System.err)));
 
-        System.out.printf("connecting ME %s (base %d) / AE %s (base %d), egressHost=%s%n",
-                meHosts, mePortBase, aeHosts, aePortBase, egressHost);
+        System.out.printf("connecting %sAE %s (base %d), egressHost=%s%n",
+                aeOnly ? "" : "ME " + meHosts + " (base " + mePortBase + ") / ",
+                aeHosts, aePortBase, egressHost);
 
-        this.me = connect(driver, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
-        this.ae = connect(driver, ingressEndpoints(aeHosts, aePortBase), egressHost, new AeEgress());
+        // AE-only never connects to the ME at all: an idle-but-connected cluster client still
+        // costs a session, a poll and a keep-alive, and the point of this mode is to measure the
+        // AE substrate with nothing else in the picture.
+        AeronCluster meClient = null;
+        AeronCluster aeClient = null;
+        try {
+            meClient = aeOnly ? null : connect(driver, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
+            aeClient = connect(driver, ingressEndpoints(aeHosts, aePortBase), egressHost, new AeEgress());
+        } catch (final RuntimeException e) {
+            // The embedded media driver's threads are NOT daemons. A failed connect used to leave
+            // them running with the constructor half-done, so close() never ran and the JVM never
+            // exited: the process sat there forever and an automated run hung instead of failing in
+            // the 10s connect timeout. Tear the driver down and let the exception surface.
+            org.agrona.CloseHelper.quietClose(aeClient);
+            org.agrona.CloseHelper.quietClose(meClient);
+            org.agrona.CloseHelper.quietClose(driver);
+            throw e;
+        }
+        this.me = meClient;
+        this.ae = aeClient;
     }
 
     /** {@code i=host:port} CSV; port = base + i*100 + 2 (client-facing offset, both clusters). */
@@ -345,7 +372,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
             if (now - lastKeepAliveNs > 250_000_000L) {
                 lastKeepAliveNs = now;
-                try { me.sendKeepAlive(); } catch (final Exception ignore) { }
+                if (me != null) try { me.sendKeepAlive(); } catch (final Exception ignore) { }
                 try { ae.sendKeepAlive(); } catch (final Exception ignore) { }
             }
         }
@@ -409,13 +436,33 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         if (p == null || p.orderSent) return;
         holdAcks++;
         if (measuring) holdAckHist.recordValue(clamp(System.nanoTime() - p.scheduledNs));
+        if (aeOnly) {
+            // AE-only: the HoldAck IS the measurement. Release the hold straight away so the
+            // engine's hold map stays bounded and the run ends with clean conservation, then
+            // close the lifecycle. No ME, no journal, no bridge in the loop.
+            releaseEnc.wrapAndApplyHeader(aeBuffer, 0, aeHeaderEnc)
+                    .orderId(p.omsOrderId).userId(p.userId).amount(-1L);
+            if (offerWithRetry(ae, aeBuffer, aeHeaderEnc.encodedLength() + releaseEnc.encodedLength(), true)) {
+                releasesSent++;
+            }
+            pending.remove(corrId);
+            pool.push(p);
+            return;
+        }
         sendMeOrder(p);
     }
 
     private void onHoldReject(final long corrId) {
         final Pending p = pending.remove(corrId);
+        if (p == null) {
+            // Not ours. AE egress is broadcast to every session, so a second generator's rejects
+            // land here too; counting them made two independent runs report the SAME reject total
+            // (observed: 4,255,423 on both sides of a 2-generator run). onHoldAck already guards
+            // this way, the reject path did not.
+            return;
+        }
         holdRejects++;
-        if (p != null) pool.push(p);
+        pool.push(p);
     }
 
     private void sendMeOrder(final Pending p) {
@@ -585,7 +632,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     // ------------------------------------------------------------------ plumbing
 
     private void pollBoth() {
-        me.pollEgress();
+        if (me != null) me.pollEgress();
         ae.pollEgress();
     }
 
@@ -609,28 +656,63 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
     /** Post-send drain: give in-flight trades time to settle before the final report. */
     private void drain() {
-        System.out.println("send window closed, draining in-flight settles...");
+        System.out.println(aeOnly
+                ? "send window closed, draining in-flight hold acks..."
+                : "send window closed, draining in-flight settles...");
         final long grace = TimeUnit.SECONDS.toNanos(30);
         final long start = System.nanoTime();
-        long lastSettles = -1;
+        long lastProgress = -1;
         long lastChangeNs = start;
         while (System.nanoTime() - start < grace) {
             pollBoth();
-            if (settlesSeen != lastSettles) {
-                lastSettles = settlesSeen;
+            final long progress = aeOnly ? holdAcks : settlesSeen;
+            if (progress != lastProgress) {
+                lastProgress = progress;
                 lastChangeNs = System.nanoTime();
             } else if (System.nanoTime() - lastChangeNs > TimeUnit.SECONDS.toNanos(5)) {
-                break; // settles stable for 5s: pipeline is dry
+                break; // stable for 5s: pipeline is dry
             }
         }
     }
 
     private static long clamp(final long ns) { return Math.max(0, Math.min(ns, TimeUnit.MINUTES.toNanos(2) - 1)); }
 
+    /**
+     * AE substrate report. The headline is deliberately ACKED round trips per second, not offers:
+     * an offer only reaches the local driver's shared memory, while a HoldAck means the command was
+     * replicated, committed, applied and answered. Publishing the offer rate as throughput is the
+     * mistake this whole mode exists to avoid.
+     */
+    private void reportAeOnly(final PrintStream out, final double elapsedSec) {
+        final long committedCommands = holdAcks + releasesSent;
+        out.println("==== AE substrate report (hold + release, no ME / journal / bridge) ====");
+        out.printf("elapsed %.1fs (warmup %ds excluded from histograms)%n", elapsedSec, warmupSec);
+        out.printf("holds sent %d | ACKED %d | rejects %d | releases sent %d%n",
+                holdsSent, holdAcks, holdRejects, releasesSent);
+        out.printf("ae backpressure %d | max schedule backlog %d | pending at exit %d%n",
+                aeBackpressure, scheduleBacklogMax, pending.size());
+        out.printf("ACKED ROUND TRIPS  %.0f/s   (hold -> quorum commit -> apply -> egress)%n",
+                holdAcks / elapsedSec);
+        out.printf("COMMITTED COMMANDS %.0f/s   (holds + releases through the log)%n",
+                committedCommands / elapsedSec);
+        printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
+        try {
+            Files.createDirectories(outDir);
+            writeHgrm("ae-hold-ack", holdAckHist);
+            out.println("hgrm files written to " + outDir.toAbsolutePath());
+        } catch (final Exception e) {
+            out.println("WARN: could not write hgrm files: " + e);
+        }
+    }
+
     private void report(final long startNs) {
         final double elapsedSec = (System.nanoTime() - startNs) / 1e9;
         final PrintStream out = System.out;
         out.println();
+        if (aeOnly) {
+            reportAeOnly(out, elapsedSec);
+            return;
+        }
         out.println("==== money-path load report ====");
         out.printf("elapsed %.1fs (warmup %ds excluded from histograms)%n", elapsedSec, warmupSec);
         out.printf("holds sent %d | acks %d | rejects %d | orders sent %d | send-failures %d%n",
@@ -735,6 +817,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                   --out DIR           hgrm output dir (default results)
                   --gen-id N          generator identity for multi-generator runs (default 0):
                                       separates order-id space, RNG stream and user range
+                  --ae-only           AE substrate mode: hold + release only, NO ME/journal/bridge.
+                                      Reports ACKED round trips/s (committed), not offers.
                   --no-prefund        skip the deposit phase
                   --prefund-usd F     USD per user (default 5e10)
                   --prefund-btc F     BTC per user (default 1e7)""");
