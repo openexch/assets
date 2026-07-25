@@ -178,4 +178,90 @@ public class AccountTest {
         assertEquals(1000 - 600, a.available(USD));      // conservation
         assertTrue(a.locked(USD) == a.holdRemaining(1L) + a.holdRemaining(2L));
     }
+
+    // ---- assets#18: a credit must never wrap a balance into negative ----
+
+    @Test
+    public void depositThatWouldOverflowIsRejectedAndMutatesNothing() {
+        Account a = new Account(1);
+        assertEquals(RejectReason.NONE, a.deposit(USD, Long.MAX_VALUE - 10));
+
+        assertEquals("one unit past the ceiling must be refused",
+                RejectReason.BALANCE_OVERFLOW, a.deposit(USD, 11));
+        assertEquals("a rejected deposit mutates nothing", Long.MAX_VALUE - 10, a.available(USD));
+
+        assertEquals("landing exactly on the ceiling is legal",
+                RejectReason.NONE, a.deposit(USD, 10));
+        assertEquals(Long.MAX_VALUE, a.available(USD));
+
+        assertEquals(RejectReason.BALANCE_OVERFLOW, a.deposit(USD, 1));
+        assertTrue("the balance must never go negative", a.available(USD) > 0);
+    }
+
+    @Test
+    public void headroomCountsLockedNotJustAvailable() {
+        Account a = new Account(1);
+        a.deposit(USD, Long.MAX_VALUE);
+        a.hold(1L, USD, 400); // moves available -> locked; the TOTAL is what is full
+
+        assertEquals(Long.MAX_VALUE - 400, a.available(USD));
+        assertEquals(400, a.locked(USD));
+        assertEquals("locking funds does not create room to deposit more",
+                RejectReason.BALANCE_OVERFLOW, a.deposit(USD, 1));
+    }
+
+    @Test
+    public void internalMovesStayLegalAtTheCeiling() {
+        Account a = new Account(1);
+        a.deposit(USD, Long.MAX_VALUE);
+
+        // hold / release / settleDebit conserve available+locked, so a full account can still trade.
+        assertEquals(RejectReason.NONE, a.hold(1L, USD, 1000));
+        assertEquals(1000, a.locked(USD));
+        assertEquals(600, a.release(1L, 600));
+        assertEquals(400, a.locked(USD));
+
+        Account.SettleDebitResult out = new Account.SettleDebitResult();
+        assertEquals(400, a.settleDebit(1L, USD, 400, out));
+        assertFalse(out.faulted());
+        assertEquals("conservation held at the ceiling", Long.MAX_VALUE - 400, a.available(USD));
+    }
+
+    @Test
+    public void settleCreditReportsWhatItCouldNotCreditInsteadOfWrapping() {
+        Account a = new Account(1);
+        a.deposit(USD, Long.MAX_VALUE - 100);
+
+        assertEquals("what fits is credited silently", 0, a.settleCredit(USD, 100));
+        assertEquals(Long.MAX_VALUE, a.available(USD));
+
+        // A settle cannot be rejected: the trade already happened. It credits what fits and reports
+        // the rest, so the breach is visible instead of becoming a negative balance.
+        assertEquals("the excess is reported, not absorbed", 250, a.settleCredit(USD, 250));
+        assertEquals("balance is clamped, never wrapped", Long.MAX_VALUE, a.available(USD));
+    }
+
+    @Test
+    public void settlementServiceSurfacesAnOverflowingCreditAsALegFault() {
+        Account buyer = new Account(1);
+        Account seller = new Account(2);
+        buyer.deposit(USD, 1000);
+        buyer.hold(10L, USD, 1000);
+        seller.deposit(BTC, 5);
+        seller.hold(20L, BTC, 5);
+        seller.deposit(USD, Long.MAX_VALUE); // seller cannot receive another unit of USD
+
+        SettlementService s = new SettlementService();
+        s.settle(buyer, seller, 10L, 20L, BTC, USD, 5, 1000);
+
+        assertEquals("the buyer paid in full", 0, buyer.locked(USD));
+        assertEquals("the seller could not receive any of it", 1000, s.buyerLeg().uncredited);
+        assertTrue("an uncreditable leg is a fault", s.buyerLeg().faulted());
+        assertFalse("but not a DEBIT fault — the payer was fine", s.buyerLeg().debitFaulted());
+        assertEquals("seller's USD is clamped, not wrapped", Long.MAX_VALUE, seller.available(USD));
+
+        // The base leg was ordinary.
+        assertEquals(0, s.sellerLeg().uncredited);
+        assertEquals(5, buyer.available(BTC));
+    }
 }

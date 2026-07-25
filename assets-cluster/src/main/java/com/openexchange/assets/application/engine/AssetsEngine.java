@@ -219,15 +219,29 @@ public final class AssetsEngine {
         // Exceptional path: a leg that could not draw fully from its order hold. Emitted BEFORE the
         // balance lines (the fault explains them). Deterministic, loud, never a throw — a throw here
         // would re-crash the service on every log replay.
-        if (settlement.buyerLeg().faulted()) {
+        if (settlement.buyerLeg().debitFaulted()) {
             settleFaultCount++;
             sink.onSettleFault(c.getTradeId(), buyerOrder, buyerUser, quote,
                     settlement.buyerLeg().drawnFromAvailable, settlement.buyerLeg().uncovered);
         }
-        if (settlement.sellerLeg().faulted()) {
+        if (settlement.sellerLeg().debitFaulted()) {
             settleFaultCount++;
             sink.onSettleFault(c.getTradeId(), sellerOrder, sellerUser, base,
                     settlement.sellerLeg().drawnFromAvailable, settlement.sellerLeg().uncovered);
+        }
+        // The other half of a conservation breach: the PAYEE could not receive, because that asset's
+        // total for their account has reached Long.MAX_VALUE (assets#18). Attributed to the party who
+        // could not receive and reported in `uncovered`, which the message already defines as "could
+        // not be moved". A dedicated wire field belongs with the next schema change, not here.
+        if (settlement.buyerLeg().uncredited != 0) {
+            settleFaultCount++;
+            sink.onSettleFault(c.getTradeId(), sellerOrder, sellerUser, quote,
+                    0L, settlement.buyerLeg().uncredited);
+        }
+        if (settlement.sellerLeg().uncredited != 0) {
+            settleFaultCount++;
+            sink.onSettleFault(c.getTradeId(), buyerOrder, buyerUser, base,
+                    0L, settlement.sellerLeg().uncredited);
         }
 
         // Emit the four (user, asset) lines that changed, in a deterministic order.

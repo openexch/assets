@@ -84,10 +84,27 @@ public final class Account {
 
     // ---- external boundary ----
 
-    /** Credit available balance. Rejects a non-positive amount; never creates a hold. */
+    /**
+     * Room left before {@code available + locked} would exceed {@link Long#MAX_VALUE} for this asset.
+     *
+     * <p>This is the headroom every credit must respect. It cannot itself overflow while the
+     * no-overflow invariant holds: {@code available + locked <= MAX} implies
+     * {@code MAX - available >= locked}, so the subtraction stays non-negative.</p>
+     */
+    private long headroom(int assetId) {
+        return Long.MAX_VALUE - bal[2 * assetId] - bal[2 * assetId + 1];
+    }
+
+    /**
+     * Credit available balance. Rejects a non-positive amount, or one that would overflow the
+     * asset's total; never creates a hold.
+     */
     public RejectReason deposit(int assetId, long amount) {
         if (amount <= 0) {
             return RejectReason.INVALID_AMOUNT;
+        }
+        if (amount > headroom(assetId)) {
+            return RejectReason.BALANCE_OVERFLOW; // mutate nothing — a wrap here is silent corruption
         }
         bal[2 * assetId] += amount;
         return RejectReason.NONE;
@@ -206,6 +223,13 @@ public final class Account {
         /** Could not be moved at all (hold AND available exhausted) — a reportable breach. */
         public long uncovered;
         /**
+         * Amount the COUNTERPARTY of this leg could not receive, because crediting it would have
+         * overflowed their balance for that asset. Set by {@link SettlementService}, not by
+         * {@link Account#settleDebit}, since it belongs to the other side of the same leg. Also a
+         * conservation breach, and reported the same way.
+         */
+        public long uncredited;
+        /**
          * TRUE when this debit left the order's hold with {@code remaining == 0} and it was therefore
          * removed and recycled (mirroring {@link Account#release}). Normal-path bookkeeping, NOT a
          * fault — {@link #faulted()} is unaffected.
@@ -215,11 +239,18 @@ public final class Account {
         void reset() {
             drawnFromAvailable = 0;
             uncovered = 0;
+            uncredited = 0;
             reapedExhaustedHold = false;
         }
 
-        public boolean faulted() {
+        /** The PAYER side fell short: the hold could not cover the leg. */
+        public boolean debitFaulted() {
             return drawnFromAvailable != 0 || uncovered != 0;
+        }
+
+        /** Either side of this leg breached conservation. */
+        public boolean faulted() {
+            return debitFaulted() || uncredited != 0;
         }
     }
 
@@ -273,9 +304,22 @@ public final class Account {
         return amount - out.uncovered;
     }
 
-    /** Credit a settle leg's proceeds into available. The amount is what the payer actually paid. */
-    public void settleCredit(int assetId, long amount) {
-        bal[2 * assetId] += amount;
+    /**
+     * Credit a settle leg's proceeds into available. The amount is what the payer actually paid.
+     *
+     * <p>A settle cannot be rejected — the trade already happened — so an overflow is handled the same
+     * way {@link #settleDebit} handles an uncoverable debit: credit what fits, report the rest, never
+     * throw. A throw would poison the replicated log and re-crash the service on every replay, and a
+     * silent wrap would turn the payee's balance negative with nothing recorded anywhere.</p>
+     *
+     * @return the amount that could NOT be credited — normally 0, nonzero only when this asset's total
+     *         for this account has reached {@link Long#MAX_VALUE}, which the engine reports as a
+     *         {@code SettleFault}
+     */
+    public long settleCredit(int assetId, long amount) {
+        final long credited = Math.min(amount, headroom(assetId));
+        bal[2 * assetId] += credited;
+        return amount - credited;
     }
 
     // ---- snapshot support (infrastructure/persistence adapter reads/writes through these) ----
