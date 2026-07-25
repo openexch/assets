@@ -5,19 +5,19 @@ import org.agrona.DirectBuffer;
 
 
 /**
- * A hold was accepted
+ * Set this session's egress filter. Transport-level, NOT money state: it is never snapshotted, so a session that survives a leader change or a snapshot restore falls back to receiving everything (safe direction) and should re-subscribe.
  */
 @SuppressWarnings("all")
-public final class HoldAckDecoder
+public final class SubscribeDecoder
 {
-    public static final int BLOCK_LENGTH = 36;
-    public static final int TEMPLATE_ID = 10;
+    public static final int BLOCK_LENGTH = 12;
+    public static final int TEMPLATE_ID = 31;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 3;
     public static final String SEMANTIC_VERSION = "0.3";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final HoldAckDecoder parentMessage = this;
+    private final SubscribeDecoder parentMessage = this;
     private DirectBuffer buffer;
     private int offset;
     private int limit;
@@ -59,7 +59,7 @@ public final class HoldAckDecoder
         return offset;
     }
 
-    public HoldAckDecoder wrap(
+    public SubscribeDecoder wrap(
         final DirectBuffer buffer,
         final int offset,
         final int actingBlockLength,
@@ -77,7 +77,7 @@ public final class HoldAckDecoder
         return this;
     }
 
-    public HoldAckDecoder wrapAndApplyHeader(
+    public SubscribeDecoder wrapAndApplyHeader(
         final DirectBuffer buffer,
         final int offset,
         final MessageHeaderDecoder headerDecoder)
@@ -97,7 +97,7 @@ public final class HoldAckDecoder
             headerDecoder.version());
     }
 
-    public HoldAckDecoder sbeRewind()
+    public SubscribeDecoder sbeRewind()
     {
         return wrap(buffer, offset, actingBlockLength, actingVersion);
     }
@@ -183,129 +183,27 @@ public final class HoldAckDecoder
     }
 
 
-    public static int orderIdId()
+    public static int channelsId()
     {
         return 2;
     }
 
-    public static int orderIdSinceVersion()
+    public static int channelsSinceVersion()
     {
         return 0;
     }
 
-    public static int orderIdEncodingOffset()
+    public static int channelsEncodingOffset()
     {
         return 8;
     }
 
-    public static int orderIdEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String orderIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long orderIdNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long orderIdMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long orderIdMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long orderId()
-    {
-        return buffer.getLong(offset + 8, BYTE_ORDER);
-    }
-
-
-    public static int userIdId()
-    {
-        return 3;
-    }
-
-    public static int userIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int userIdEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int userIdEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long userIdNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long userIdMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long userIdMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long userId()
-    {
-        return buffer.getLong(offset + 16, BYTE_ORDER);
-    }
-
-
-    public static int assetIdId()
+    public static int channelsEncodingLength()
     {
         return 4;
     }
 
-    public static int assetIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int assetIdEncodingOffset()
-    {
-        return 24;
-    }
-
-    public static int assetIdEncodingLength()
-    {
-        return 4;
-    }
-
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String channelsMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -315,77 +213,13 @@ public final class HoldAckDecoder
         return "";
     }
 
-    public static int assetIdNullValue()
+    private final EgressChannelsDecoder channels = new EgressChannelsDecoder();
+
+    public EgressChannelsDecoder channels()
     {
-        return -2147483648;
+        channels.wrap(buffer, offset + 8);
+        return channels;
     }
-
-    public static int assetIdMinValue()
-    {
-        return -2147483647;
-    }
-
-    public static int assetIdMaxValue()
-    {
-        return 2147483647;
-    }
-
-    public int assetId()
-    {
-        return buffer.getInt(offset + 24, BYTE_ORDER);
-    }
-
-
-    public static int amountId()
-    {
-        return 5;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 28;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long amount()
-    {
-        return buffer.getLong(offset + 28, BYTE_ORDER);
-    }
-
 
     public String toString()
     {
@@ -394,7 +228,7 @@ public final class HoldAckDecoder
             return "";
         }
 
-        final HoldAckDecoder decoder = new HoldAckDecoder();
+        final SubscribeDecoder decoder = new SubscribeDecoder();
         decoder.wrap(buffer, offset, actingBlockLength, actingVersion);
 
         return decoder.appendTo(new StringBuilder()).toString();
@@ -409,7 +243,7 @@ public final class HoldAckDecoder
 
         final int originalLimit = limit();
         limit(offset + actingBlockLength);
-        builder.append("[HoldAck](sbeTemplateId=");
+        builder.append("[Subscribe](sbeTemplateId=");
         builder.append(TEMPLATE_ID);
         builder.append("|sbeSchemaId=");
         builder.append(SCHEMA_ID);
@@ -431,24 +265,23 @@ public final class HoldAckDecoder
         builder.append("correlationId=");
         builder.append(this.correlationId());
         builder.append('|');
-        builder.append("orderId=");
-        builder.append(this.orderId());
-        builder.append('|');
-        builder.append("userId=");
-        builder.append(this.userId());
-        builder.append('|');
-        builder.append("assetId=");
-        builder.append(this.assetId());
-        builder.append('|');
-        builder.append("amount=");
-        builder.append(this.amount());
+        builder.append("channels=");
+        final EgressChannelsDecoder channels = this.channels();
+        if (null != channels)
+        {
+            channels.appendTo(builder);
+        }
+        else
+        {
+            builder.append("null");
+        }
 
         limit(originalLimit);
 
         return builder;
     }
     
-    public HoldAckDecoder sbeSkip()
+    public SubscribeDecoder sbeSkip()
     {
         sbeRewind();
 

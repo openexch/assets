@@ -51,6 +51,13 @@ public final class SessionEgressQueue {
 
     private long backPressureCount;
     private int peakPendingBytes;
+    /**
+     * Which egress channels this session wants. Defaults to everything, so a client that never sends
+     * Subscribe behaves exactly as it did before subscriptions existed. Transport state, never
+     * snapshotted: after a leader change or a snapshot restore it falls back to this default, which is
+     * the safe direction (more traffic, never missing traffic).
+     */
+    private int channelMask = AssetsEventPublisher.CH_ALL;
 
     public SessionEgressQueue(final ClientSession session) {
         this.session = session;
@@ -78,6 +85,29 @@ public final class SessionEgressQueue {
 
     public int peakPendingBytes() {
         return peakPendingBytes;
+    }
+
+    public int channelMask() {
+        return channelMask;
+    }
+
+    public boolean wants(final int channel) {
+        return (channelMask & channel) != 0;
+    }
+
+    /**
+     * A snapshot reply streams its entries as ordinary BalanceUpdate frames and then a terminator, so a
+     * session subscribed to SNAPSHOTS but not BALANCES would receive an entry COUNT with no entries: a
+     * silently wrong answer. Rather than let that be expressible, SNAPSHOTS implies BALANCES here.
+     * (The cleaner fix is a dedicated BalanceSnapshotEntry message, which belongs with the next schema
+     * change; until then this coupling is enforced rather than documented and hoped for.)
+     */
+    public void subscribe(final int channels) {
+        int mask = channels;
+        if ((mask & AssetsEventPublisher.CH_SNAPSHOTS) != 0) {
+            mask |= AssetsEventPublisher.CH_BALANCES;
+        }
+        this.channelMask = mask;
     }
 
     /**

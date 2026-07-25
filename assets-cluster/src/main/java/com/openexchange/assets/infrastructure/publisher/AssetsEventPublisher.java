@@ -32,8 +32,26 @@ public final class AssetsEventPublisher implements AssetsEventSink {
 
     /** The reliable egress transport (a positioned, flow-controlled channel — never lossy). */
     public interface Egress {
-        void broadcast(MutableDirectBuffer buffer, int offset, int length);
+        /**
+         * @param channel one of the {@code CH_*} constants — which class of egress this frame is, so the
+         *                transport can skip sessions that did not subscribe to it
+         */
+        void emit(MutableDirectBuffer buffer, int offset, int length, int channel);
     }
+
+    // Egress channels. These mirror the EgressChannels bit set in money-schema.xml and are the unit a
+    // session subscribes to. Classification lives here because this is the only class that knows which
+    // encoder it just used; the engine stays free of transport concepts.
+    /** Responses to the client's own commands: acks, rejects, feed position. */
+    public static final int CH_ACKS = 1;
+    /** The BalanceUpdate firehose: one frame per changed (user, asset) line. */
+    public static final int CH_BALANCES = 1 << 1;
+    /** SettlementApplied and SettleFault. */
+    public static final int CH_SETTLEMENTS = 1 << 2;
+    /** Snapshot streams and their terminators. */
+    public static final int CH_SNAPSHOTS = 1 << 3;
+    /** What a session gets when it never subscribes: everything, i.e. the pre-subscription behaviour. */
+    public static final int CH_ALL = CH_ACKS | CH_BALANCES | CH_SETTLEMENTS | CH_SNAPSHOTS;
 
     private static final int BUFFER_CAPACITY = 256;
 
@@ -62,21 +80,21 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
         depositAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable);
-        flush(depositAckEncoder.encodedLength());
+        flush(depositAckEncoder.encodedLength(), CH_ACKS);
     }
 
     @Override
     public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
         withdrawAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable);
-        flush(withdrawAckEncoder.encodedLength());
+        flush(withdrawAckEncoder.encodedLength(), CH_ACKS);
     }
 
     @Override
     public void onHoldAck(long correlationId, long orderId, long userId, int assetId, long amount) {
         holdAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId).amount(amount);
-        flush(holdAckEncoder.encodedLength());
+        flush(holdAckEncoder.encodedLength(), CH_ACKS);
     }
 
     @Override
@@ -84,49 +102,49 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         holdRejectEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId)
                 .amount(amount).reason(toSbe(reason));
-        flush(holdRejectEncoder.encodedLength());
+        flush(holdRejectEncoder.encodedLength(), CH_ACKS);
     }
 
     @Override
     public void onBalanceUpdate(long userId, int assetId, long available, long locked) {
         balanceUpdateEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .userId(userId).assetId(assetId).available(available).locked(locked);
-        flush(balanceUpdateEncoder.encodedLength());
+        flush(balanceUpdateEncoder.encodedLength(), CH_BALANCES);
     }
 
     @Override
     public void onSettlementApplied(long tradeId, long buyerUserId, long sellerUserId) {
         settlementAppliedEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .tradeId(tradeId).buyerUserId(buyerUserId).sellerUserId(sellerUserId);
-        flush(settlementAppliedEncoder.encodedLength());
+        flush(settlementAppliedEncoder.encodedLength(), CH_SETTLEMENTS);
     }
 
     @Override
     public void onWithdrawReject(long correlationId, long userId, int assetId, long amount, RejectReason reason) {
         withdrawRejectEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).reason(toSbe(reason));
-        flush(withdrawRejectEncoder.encodedLength());
+        flush(withdrawRejectEncoder.encodedLength(), CH_ACKS);
     }
 
     @Override
     public void onBalanceSnapshotEnd(long correlationId, int entryCount) {
         balanceSnapshotEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).entryCount(entryCount);
-        flush(balanceSnapshotEndEncoder.encodedLength());
+        flush(balanceSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS);
     }
 
     @Override
     public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) {
         holdSnapshotEntryEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .orderId(orderId).userId(userId).assetId(assetId).remaining(remaining);
-        flush(holdSnapshotEntryEncoder.encodedLength());
+        flush(holdSnapshotEntryEncoder.encodedLength(), CH_SNAPSHOTS);
     }
 
     @Override
     public void onHoldSnapshotEnd(long correlationId, int entryCount) {
         holdSnapshotEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).entryCount(entryCount);
-        flush(holdSnapshotEndEncoder.encodedLength());
+        flush(holdSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS);
     }
 
     @Override
@@ -134,7 +152,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         feedPositionReportEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).consumePosition(consumePosition)
                 .lastAppliedTradeId(lastAppliedTradeId);
-        flush(feedPositionReportEncoder.encodedLength());
+        flush(feedPositionReportEncoder.encodedLength(), CH_ACKS);
     }
 
     @Override
@@ -143,11 +161,11 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         settleFaultEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .tradeId(tradeId).orderId(orderId).userId(userId).assetId(assetId)
                 .drawnFromAvailable(drawnFromAvailable).uncovered(uncovered);
-        flush(settleFaultEncoder.encodedLength());
+        flush(settleFaultEncoder.encodedLength(), CH_SETTLEMENTS);
     }
 
-    private void flush(int bodyLength) {
-        egress.broadcast(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + bodyLength);
+    private void flush(int bodyLength, int channel) {
+        egress.emit(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + bodyLength, channel);
     }
 
     private static com.openexchange.assets.infrastructure.generated.RejectReason toSbe(RejectReason r) {

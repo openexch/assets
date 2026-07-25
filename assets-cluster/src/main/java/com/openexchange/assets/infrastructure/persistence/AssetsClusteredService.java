@@ -4,6 +4,9 @@ package com.openexchange.assets.infrastructure.persistence;
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
+import com.openexchange.assets.infrastructure.generated.EgressChannelsDecoder;
+import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.SubscribeDecoder;
 import com.openexchange.assets.infrastructure.publisher.SessionEgressQueue;
 import io.aeron.Counter;
 import io.aeron.ExclusivePublication;
@@ -74,6 +77,8 @@ public final class AssetsClusteredService implements ClusteredService {
     // (cluster.clientSessions() returns a JDK unmodifiable wrapper whose iterator() allocates).
     private final Long2ObjectHashMap<SessionEgressQueue> egressBySessionId = new Long2ObjectHashMap<>();
     private SessionEgressQueue[] egressQueues = new SessionEgressQueue[0];
+    private final MessageHeaderDecoder subscribeHeaderDecoder = new MessageHeaderDecoder();
+    private final SubscribeDecoder subscribeDecoder = new SubscribeDecoder();
     private boolean sessionsDirty = true;
     private boolean drainTimerArmed;
     private volatile long drainTimerFires;
@@ -204,9 +209,14 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public void onSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
                                  int offset, int length, Header header) {
-        // Deterministic on every replica: decode -> domain command -> engine mutation. The apply only
-        // queues its egress; the offers happen in the drain below, off the apply's critical section.
-        demuxer.dispatch(buffer, offset, length, timestamp);
+        // Subscribe is a TRANSPORT concern, not money state: it changes who receives egress, never what
+        // the ledger does. It is handled here and deliberately never reaches the engine, so the engine
+        // stays a pure deterministic state machine and the subscription never enters a snapshot.
+        if (!applyIfSubscribe(session, buffer, offset, length)) {
+            // Deterministic on every replica: decode -> domain command -> engine mutation. The apply only
+            // queues its egress; the offers happen in the drain below, off the apply's critical section.
+            demuxer.dispatch(buffer, offset, length, timestamp);
+        }
         drainEgress();
         armDrainTimerIfNeeded();
     }
@@ -305,7 +315,7 @@ public final class AssetsClusteredService implements ClusteredService {
      * never offer here, because an inline offer means a back-pressured consumer parks the whole
      * deterministic thread.
      */
-    private void enqueueEgress(MutableDirectBuffer buffer, int offset, int length) {
+    private void enqueueEgress(MutableDirectBuffer buffer, int offset, int length, int channel) {
         if (!isLeader || cluster == null) {
             return; // followers replicate state but do not emit client egress
         }
@@ -313,10 +323,44 @@ public final class AssetsClusteredService implements ClusteredService {
         final SessionEgressQueue[] queues = egressQueues;
         for (int i = 0; i < queues.length; i++) {
             final SessionEgressQueue queue = queues[i];
+            if (!queue.wants(channel)) {
+                continue; // this session did not subscribe to this class of egress
+            }
             if (!queue.append(buffer, offset, length)) {
                 appendAfterFreeingSpace(queue, buffer, offset, length);
             }
         }
+    }
+
+    /**
+     * Handle a Subscribe message if that is what this is.
+     *
+     * @return true when the message was a Subscribe and must NOT be dispatched to the engine
+     */
+    private boolean applyIfSubscribe(ClientSession session, DirectBuffer buffer, int offset, int length) {
+        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
+            return false;
+        }
+        subscribeHeaderDecoder.wrap(buffer, offset);
+        if (subscribeHeaderDecoder.templateId() != SubscribeDecoder.TEMPLATE_ID
+                || subscribeHeaderDecoder.schemaId() != SubscribeDecoder.SCHEMA_ID) {
+            return false;
+        }
+        subscribeDecoder.wrapAndApplyHeader(buffer, offset, subscribeHeaderDecoder);
+        final EgressChannelsDecoder channels = subscribeDecoder.channels();
+        int mask = 0;
+        if (channels.acks())        mask |= AssetsEventPublisher.CH_ACKS;
+        if (channels.balances())    mask |= AssetsEventPublisher.CH_BALANCES;
+        if (channels.settlements()) mask |= AssetsEventPublisher.CH_SETTLEMENTS;
+        if (channels.snapshots())   mask |= AssetsEventPublisher.CH_SNAPSHOTS;
+        if (isLeader && cluster != null) {
+            refreshSessionsIfNeeded();
+            final SessionEgressQueue queue = egressBySessionId.get(session.id());
+            if (queue != null) {
+                queue.subscribe(mask);
+            }
+        }
+        return true;
     }
 
     /**

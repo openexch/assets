@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.cluster;
 
+import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.infrastructure.publisher.SessionEgressQueue;
 import io.aeron.DirectBufferVector;
 import io.aeron.Publication;
@@ -247,5 +248,51 @@ public class SessionEgressQueueTest {
         assertTrue(queue.isEmpty());
         queue.drainAll();
         assertEquals(0, session.delivered().length);
+    }
+
+    // ---- step 3: per-session subscription ----
+
+    @Test
+    public void anUnsubscribedSessionWantsEverything() {
+        final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
+        assertTrue("default must be the pre-subscription behaviour", q.wants(AssetsEventPublisher.CH_ACKS));
+        assertTrue(q.wants(AssetsEventPublisher.CH_BALANCES));
+        assertTrue(q.wants(AssetsEventPublisher.CH_SETTLEMENTS));
+        assertTrue(q.wants(AssetsEventPublisher.CH_SNAPSHOTS));
+    }
+
+    @Test
+    public void subscribingNarrowsToExactlyWhatWasAskedFor() {
+        final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
+        q.subscribe(AssetsEventPublisher.CH_ACKS | AssetsEventPublisher.CH_SETTLEMENTS);
+
+        assertTrue(q.wants(AssetsEventPublisher.CH_ACKS));
+        assertTrue(q.wants(AssetsEventPublisher.CH_SETTLEMENTS));
+        assertFalse("this is the firehose the bridge was drowning in",
+                q.wants(AssetsEventPublisher.CH_BALANCES));
+        assertFalse(q.wants(AssetsEventPublisher.CH_SNAPSHOTS));
+    }
+
+    @Test
+    public void snapshotsImplyBalancesBecauseEntriesRideOnBalanceUpdates() {
+        final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
+        q.subscribe(AssetsEventPublisher.CH_SNAPSHOTS);
+
+        // A balance snapshot streams its entries as BalanceUpdate frames and then a terminator carrying
+        // the entry COUNT. Subscribing to snapshots without balances would deliver the count with no
+        // entries: a silently wrong answer. That combination must not be expressible.
+        assertTrue(q.wants(AssetsEventPublisher.CH_SNAPSHOTS));
+        assertTrue("snapshots must drag balances in with them",
+                q.wants(AssetsEventPublisher.CH_BALANCES));
+    }
+
+    @Test
+    public void subscribingToNothingIsHonoured() {
+        final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
+        q.subscribe(0);
+        assertFalse(q.wants(AssetsEventPublisher.CH_ACKS));
+        assertFalse(q.wants(AssetsEventPublisher.CH_BALANCES));
+        assertFalse(q.wants(AssetsEventPublisher.CH_SETTLEMENTS));
+        assertFalse(q.wants(AssetsEventPublisher.CH_SNAPSHOTS));
     }
 }
