@@ -47,6 +47,39 @@ import java.util.List;
  */
 public final class ArchiveHousekeeping {
 
+    /** Named so a leftover positional argument can never be read as a position. */
+    private static final String WATERMARK_FLAG = "--watermark=";
+
+    /**
+     * Extract {@code --watermark=N}, or {@link Long#MAX_VALUE} when absent.
+     *
+     * <p>Positional arguments are ignored outright, never guessed at: see the
+     * class docs on why reading the legacy {@code "2"} as a position would
+     * rebuild the outage.
+     */
+    static long watermarkFrom(final String[] args) {
+        for (int i = 2; i < args.length; i++) {
+            if (!args[i].startsWith(WATERMARK_FLAG)) {
+                continue;
+            }
+            final String value = args[i].substring(WATERMARK_FLAG.length());
+            try {
+                final long parsed = Long.parseLong(value);
+                if (parsed < 0) {
+                    System.err.println("[AE-HOUSEKEEPING] negative watermark " + parsed
+                            + " ignored; purging to the latest snapshot instead");
+                    return Long.MAX_VALUE;
+                }
+                return parsed;
+            } catch (final NumberFormatException e) {
+                System.err.println("[AE-HOUSEKEEPING] FAILED: unparseable "
+                        + WATERMARK_FLAG + "value: " + value);
+                System.exit(2);
+            }
+        }
+        return Long.MAX_VALUE;
+    }
+
     /** Outcome of a housekeeping run, for reporting and assertions. */
     public static final class Result {
         public final long logRecordingId;
@@ -90,6 +123,26 @@ public final class ArchiveHousekeeping {
      * @return what was reclaimed
      */
     public static Result purgeBelowLatestSnapshot(final File clusterDir, final AeronArchive archive) {
+        return purgeBelow(clusterDir, archive, Long.MAX_VALUE);
+    }
+
+    /**
+     * Purge whole log segments below {@code watermark}, never above the latest
+     * valid snapshot.
+     *
+     * <p>The watermark is the caller's answer to "what has every consumer already
+     * passed?" - the slowest live member, the backup, and the position durably
+     * stored in S3. The snapshot bound stays because recovery on THIS node needs
+     * everything above it; the watermark bounds it further for everyone else.
+     *
+     * <p>Passing {@link Long#MAX_VALUE} means "no external constraint", which is
+     * the pre-watermark behaviour and what the deprecated entry point above
+     * still asks for.
+     *
+     * @param watermark lowest position any consumer still needs
+     */
+    public static Result purgeBelow(final File clusterDir, final AeronArchive archive,
+                                    final long watermark) {
         final List<RecordingLog.Entry> snapshotEntries = new ArrayList<>();
         final long logRecordingId;
         try (RecordingLog recordingLog = new RecordingLog(clusterDir, false)) {
@@ -135,9 +188,20 @@ public final class ArchiveHousekeeping {
                 .toList();
         final long latestSnapshotPosition = groupPositions.get(0);
 
-        // Purge whole log segments below the latest snapshot position.
+        // The purge point is the LOWER of what this node needs (its newest
+        // snapshot) and what every other consumer has already passed. Ignoring
+        // the second is how housekeeping strands a member that was behind
+        // (match#35) and how it can delete log that S3 has not stored yet.
+        final long purgePosition = Math.min(latestSnapshotPosition, watermark);
+        if (purgePosition < latestSnapshotPosition) {
+            System.out.println("[AE-HOUSEKEEPING] Watermark holds the purge at " + purgePosition
+                    + " (snapshot is at " + latestSnapshotPosition + "): a consumer has not"
+                    + " passed it yet. Reclaiming less on purpose.");
+        }
+
+        // Purge whole log segments below the purge position.
         final long newStartPosition = AeronArchive.segmentFileBasePosition(
-                startPosition, latestSnapshotPosition, (int) descriptor[2], (int) descriptor[1]);
+                startPosition, purgePosition, (int) descriptor[2], (int) descriptor[1]);
 
         long segmentsPurged = 0;
         if (newStartPosition > startPosition) {
@@ -146,10 +210,11 @@ public final class ArchiveHousekeeping {
                     + "recordingId=" + logRecordingId
                     + " startPosition " + startPosition + " -> " + newStartPosition
                     + " (" + (newStartPosition - startPosition) + " bytes reclaimed, "
-                    + "snapshot at " + latestSnapshotPosition + ")");
+                    + "purge point " + purgePosition
+                    + ", snapshot at " + latestSnapshotPosition + ")");
         } else {
-            System.out.println("[AE-HOUSEKEEPING] No whole log segment below snapshot position "
-                    + latestSnapshotPosition + " (startPosition=" + startPosition
+            System.out.println("[AE-HOUSEKEEPING] No whole log segment below purge position "
+                    + purgePosition + " (startPosition=" + startPosition
                     + ", segmentFileLength=" + descriptor[1] + ") — nothing purged. "
                     + "Smaller segmentFileLength reclaims sooner.");
         }
@@ -179,11 +244,26 @@ public final class ArchiveHousekeeping {
 
     /**
      * CLI entry point, invoked per node by the admin gateway after a successful
-     * snapshot. The trailing argument is accepted and ignored for call-site
-     * compatibility with the matching engine's tool (the admin passes the same
-     * argv shape to both).
+     * snapshot.
      *
-     * Usage: ArchiveHousekeeping &lt;clusterDir&gt; &lt;aeronDir&gt; [ignored]
+     * <p>The retention WATERMARK - the lowest position any consumer still needs,
+     * computed by the gateway from the slowest live member, the backup, and what
+     * is durably in S3 - arrives as a NAMED argument, {@code --watermark=N}.
+     *
+     * <p>Named rather than positional for a reason that nearly shipped as a bug:
+     * the historical call site passes a bare {@code "2"} in this slot (a long
+     * dead {@code snapshotsToKeep}), and {@code "2"} parses perfectly well as a
+     * position. Read positionally it would mean "purge nothing", the log would
+     * grow unbounded, and the disk would fill - the exact 2026-07-25 outage,
+     * reintroduced by an argument nobody changed. A named flag cannot be
+     * confused with a leftover.
+     *
+     * <p>Absent, the purge falls back to the latest snapshot alone, which is the
+     * pre-watermark behaviour. Falling back rather than refusing is deliberate:
+     * an operator running this by hand against a filling disk must not be
+     * blocked by an argument they do not have.
+     *
+     * Usage: ArchiveHousekeeping &lt;clusterDir&gt; &lt;aeronDir&gt; [--watermark=N] [ignored]
      */
     public static void main(final String[] args) {
         if (args.length < 2) {
@@ -193,13 +273,15 @@ public final class ArchiveHousekeeping {
         final File clusterDir = new File(args[0]);
         final String aeronDir = args[1];
 
+        final long watermark = watermarkFrom(args);
+
         try (AeronArchive archive = AeronArchive.connect(
                 new AeronArchive.Context()
                         .controlRequestChannel("aeron:ipc?term-length=16m")
                         .controlResponseChannel("aeron:ipc?term-length=16m")
                         .aeronDirectoryName(aeronDir))) {
 
-            final Result result = purgeBelowLatestSnapshot(clusterDir, archive);
+            final Result result = purgeBelow(clusterDir, archive, watermark);
             System.out.println("[AE-HOUSEKEEPING] Done: " + result);
             if (result.errors > 0) {
                 System.exit(1);
