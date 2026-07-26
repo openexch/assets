@@ -34,6 +34,7 @@
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <!-- Pinned identical to the match engine so the two Aeron clusters share a substrate. -->
+        <cluster-kit.version>0.1.0-SNAPSHOT</cluster-kit.version>
         <aeron.version>1.51.0</aeron.version>
         <agrona.version>2.4.1</agrona.version>
         <sbe.version>1.38.1</sbe.version>
@@ -70,6 +71,13 @@
             </dependency>
 
             <!-- Aeron -->
+            <!-- The cluster machinery both engines run on. One copy, so a fix
+                 lands in both places or neither; see openexch/cluster-kit. -->
+            <dependency>
+                <groupId>com.openexchange</groupId>
+                <artifactId>cluster-kit</artifactId>
+                <version>${cluster-kit.version}</version>
+            </dependency>
             <dependency>
                 <groupId>io.aeron</groupId>
                 <artifactId>aeron-all</artifactId>

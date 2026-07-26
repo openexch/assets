@@ -12,6 +12,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -38,7 +41,9 @@ jobs:
       # verify runs the full gate: unit tests, the determinism corpus, and
       # ClusterBootSmokeTest (boots a real in-process single-node AE cluster).
       - name: Build and test
-        run: mvn -B clean verify
+        run: mvn -B -s .mvn-settings.xml clean verify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Dependency CVEs + committed secrets, mirroring the match/oms security gate.
   # Trivy covers both on a private repo without GitHub Advanced Security;
