@@ -12,6 +12,7 @@ import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
+import com.openexchange.assets.domain.commands.SetMoneyJournalCommand;
 import com.openexchange.assets.domain.commands.SettleCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.Logger;
@@ -37,10 +38,11 @@ import java.util.function.Consumer;
  *   <li>{@code consumePosition} — how far into the matching engine's recorded trade stream this state
  *       reflects. Snapshotted atomically with balances so recovery has no skew. Inert until Phase 1.</li>
  *   <li>{@code journalSeq}: the money journal's dense sequence (last assigned; 0 = nothing journaled).
- *       Advances only while journaling is armed ({@link #setMoneyJournal}), one per emitted record,
+ *       Advances only while journaling is armed (CMD_SET_MONEY_JOURNAL), one per emitted record,
  *       and is snapshotted with the balances so a restart resumes the sequence without gaps or reuse.
- *       Because it is replicated state, the journal flag must be set uniformly across the cluster
- *       (same constraint as an engine-impl swap: roll all nodes with the same setting).</li>
+ *       Because it is replicated state, its gate travels through the log rather than a node's
+ *       environment: replicas cannot disagree about whether it advances, and a replayed log advances
+ *       it exactly where the original did.</li>
  * </ul>
  */
 public final class AssetsEngine {
@@ -51,6 +53,7 @@ public final class AssetsEngine {
     public static final int CMD_RELEASE = 3;
     public static final int CMD_SETTLE = 4;
     public static final int CMD_INIT_HIGH_WATER = 5;
+    public static final int CMD_SET_MONEY_JOURNAL = 6;
 
     private static final Logger LOG = Logger.getLogger(AssetsEngine.class);
 
@@ -69,6 +72,13 @@ public final class AssetsEngine {
 
     // Money journal (dark by default): a dead, perfectly-predicted branch per applied command when
     // off; when armed, every APPLIED movement is emitted through the port with a dense journalSeq.
+    //
+    // The two halves are deliberately separate. `journalEnabled` is REPLICATED state, flipped only by
+    // CMD_SET_MONEY_JOURNAL arriving through the log and carried in the snapshot, because it gates
+    // journalSeq, which is itself replicated. `journal` is the NODE-LOCAL sink: where this particular
+    // node writes its records. A node whose sink is a no-op still advances journalSeq when the log says
+    // journaling is on — it just writes nothing — so a node that cannot journal falls behind on records
+    // without ever diverging on state.
     private MoneyJournalSink journal = MoneyJournalSink.NO_OP;
     private boolean journalEnabled = false;
     private long journalSeq = 0L;
@@ -77,24 +87,33 @@ public final class AssetsEngine {
     // succeeds. Used at most once per engine life; allocation here is off the steady-state path.
     private final ArrayList<long[]> epochScratch = new ArrayList<>();
 
-    // Reusable scratch for the rare, read-only snapshot queries (not the hot path). Sorting the entries
-    // by userId makes a query's answer a pure function of *state* (not of insertion/replay history), so
-    // it is reproducible and identical across replicas and across a snapshot restore.
+    // Reusable scratch behind forEachAccountByUserId (rare paths: snapshot + read-only queries, never
+    // the money path). Sorting by userId makes those traversals a pure function of *state* rather than
+    // of insertion/replay history, so they reproduce identically across replicas and across a restore.
     private final ArrayList<Account> snapshotScratch = new ArrayList<>();
-    private final ArrayList<HoldRow> holdRowScratch = new ArrayList<>();
+    private boolean orderedTraversalActive;
 
     public void setEventSink(AssetsEventSink sink) {
         this.sink = sink;
     }
 
     /**
-     * Arm (or, with {@code null}, disarm) money journaling. Must be set before the first command is
-     * applied and uniformly across the cluster: {@code journalSeq} is replicated state, so replicas
-     * disagreeing on whether it advances would diverge.
+     * Wire this node's journal sink — where its records are written. Node-local: it does NOT decide
+     * whether journaling happens, which is replicated state driven by {@link #CMD_SET_MONEY_JOURNAL}.
+     * Safe to call at any time and on every node regardless of the cluster's journal setting.
      */
-    public void setMoneyJournal(MoneyJournalSink journalSink) {
+    public void setMoneyJournalSink(MoneyJournalSink journalSink) {
         this.journal = journalSink == null ? MoneyJournalSink.NO_OP : journalSink;
-        this.journalEnabled = journalSink != null;
+    }
+
+    /** Whether the cluster's money journal is armed (replicated; snapshotted). */
+    public boolean isMoneyJournalEnabled() {
+        return journalEnabled;
+    }
+
+    /** Restore the journal setting from a snapshot (recovery only). */
+    public void setMoneyJournalEnabled(boolean enabled) {
+        this.journalEnabled = enabled;
     }
 
     /**
@@ -110,6 +129,7 @@ public final class AssetsEngine {
             case CMD_RELEASE:         applyRelease((ReleaseCommand) command); break;
             case CMD_SETTLE:          applySettle((SettleCommand) command, timestamp); break;
             case CMD_INIT_HIGH_WATER: applyInitHighWater((InitTradeHighWaterCommand) command); break;
+            case CMD_SET_MONEY_JOURNAL: applySetMoneyJournal((SetMoneyJournalCommand) command); break;
             default: throw new IllegalArgumentException("unknown command type " + type);
         }
     }
@@ -275,16 +295,12 @@ public final class AssetsEngine {
             return;
         }
         epochScratch.clear();
-        snapshotScratch.clear();
-        accounts.values().forEach(snapshotScratch::add);
-        snapshotScratch.sort(Comparator.comparingLong(Account::userId));
-        for (Account a : snapshotScratch) {
+        forEachAccountByUserId(a -> {
             final long userId = a.userId();
             // forEachNonZeroBalance visits assets in ascending id order (dense array): deterministic.
             a.forEachNonZeroBalance((assetId, available, locked) ->
                     epochScratch.add(new long[] {userId, assetId, available + locked}));
-        }
-        snapshotScratch.clear();
+        });
     }
 
     /**
@@ -325,6 +341,28 @@ public final class AssetsEngine {
                 c.getTradeId(), c.getConsumePosition());
     }
 
+    /**
+     * Arm or disarm the money journal cluster-wide. Applied from the log, so every replica flips at the
+     * same position and a replay flips there too — the property that lets a bundle reproduce the ledger
+     * it captured rather than a ledger that merely resembles it.
+     *
+     * <p>Idempotent, emits no egress, and never touches {@code journalSeq}: re-arming a journal that has
+     * already written resumes at its high-water, so sequences are neither reused nor gapped across an
+     * off/on cycle. Logged at WARN with the value, like the other rare operator-driven primer
+     * ({@link #applyInitHighWater}), since the absence of this line is how an operator learns their
+     * command never reached the log.</p>
+     */
+    private void applySetMoneyJournal(SetMoneyJournalCommand c) {
+        if (journalEnabled == c.isEnabled()) {
+            LOG.warn("SetMoneyJournal: already %s (journalSeq=%d) — no change",
+                    journalEnabled ? "ENABLED" : "DISABLED", journalSeq);
+            return;
+        }
+        journalEnabled = c.isEnabled();
+        LOG.warn("SetMoneyJournal APPLIED: money journal %s (journalSeq=%d, correlationId=%d)",
+                journalEnabled ? "ENABLED" : "DISABLED", journalSeq, c.getCorrelationId());
+    }
+
     // ---- read-only snapshot queries (leader answers; deterministic; no state mutation) ----
 
     /**
@@ -332,7 +370,7 @@ public final class AssetsEngine {
      * through the sink. Read-only; deterministic on every replica (egress is leader-gated downstream).
      */
     public void reportFeedPosition(long correlationId) {
-        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId);
+        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled);
     }
 
     /** Settle legs that faulted (drew from available / left an uncovered residue) since boot. */
@@ -358,19 +396,15 @@ public final class AssetsEngine {
      * high-water change.
      */
     public void requestBalanceSnapshot(long correlationId) {
-        snapshotScratch.clear();
-        accounts.values().forEach(snapshotScratch::add);
-        snapshotScratch.sort(Comparator.comparingLong(Account::userId));
         final int[] entryCount = {0}; // mutable holder so the visitor lambda can tally (rare query, off hot path)
-        for (Account a : snapshotScratch) {
+        forEachAccountByUserId(a -> {
             final long userId = a.userId();
             // forEachNonZeroBalance visits assets in ascending id order (dense array) — deterministic.
             a.forEachNonZeroBalance((assetId, available, locked) -> {
                 sink.onBalanceUpdate(userId, assetId, available, locked);
                 entryCount[0]++;
             });
-        }
-        snapshotScratch.clear();
+        });
         sink.onBalanceSnapshotEnd(correlationId, entryCount[0]);
     }
 
@@ -380,28 +414,15 @@ public final class AssetsEngine {
      * so the answer is a pure function of state. Read-only.
      */
     public void requestHoldSnapshot(long correlationId) {
-        snapshotScratch.clear();
-        accounts.values().forEach(snapshotScratch::add);
-        snapshotScratch.sort(Comparator.comparingLong(Account::userId));
-        int entryCount = 0;
-        for (Account a : snapshotScratch) {
+        final int[] entryCount = {0};
+        forEachAccountByUserId(a -> {
             final long userId = a.userId();
-            holdRowScratch.clear();
-            a.forEachHold((orderId, assetId, remaining, omsManagedRelease) ->
-                    holdRowScratch.add(new HoldRow(orderId, assetId, remaining)));
-            holdRowScratch.sort(Comparator.comparingLong(HoldRow::orderId));
-            for (HoldRow h : holdRowScratch) {
-                sink.onHoldSnapshotEntry(h.orderId(), userId, h.assetId(), h.remaining());
-                entryCount++;
-            }
-        }
-        holdRowScratch.clear();
-        snapshotScratch.clear();
-        sink.onHoldSnapshotEnd(correlationId, entryCount);
-    }
-
-    /** A collected hold row, sorted by orderId within an account for a deterministic snapshot order. */
-    private record HoldRow(long orderId, int assetId, long remaining) {
+            a.forEachHoldByOrderId((orderId, assetId, remaining, omsManagedRelease) -> {
+                sink.onHoldSnapshotEntry(orderId, userId, assetId, remaining);
+                entryCount[0]++;
+            });
+        });
+        sink.onHoldSnapshotEnd(correlationId, entryCount[0]);
     }
 
     // ---- account access ----
@@ -426,9 +447,43 @@ public final class AssetsEngine {
         return accounts.size();
     }
 
-    /** Visit every account (serialize / invariant checks). */
+    /**
+     * Visit every account in hash-table order. Use only where the result is order-insensitive (sums,
+     * invariant checks): the order depends on the order users were first touched, not on state, so two
+     * ledgers holding identical balances can traverse differently. Anything durable or client-visible
+     * must use {@link #forEachAccountByUserId}.
+     */
     public void forEachAccount(Consumer<Account> visitor) {
         accounts.values().forEach(visitor);
+    }
+
+    /**
+     * Visit every account in ascending {@code userId} order, so the traversal is a pure function of
+     * state rather than of replay history. The single ordering primitive: the snapshot codec and every
+     * client-facing query go through this, because each place that sorted for itself was one more place
+     * to forget to — and the place that forgot was the durable one.
+     *
+     * <p>One shared scratch, so it is not reentrant. Enforced rather than documented: a visitor that
+     * started a second ordered traversal would clear the list being walked and silently drop accounts
+     * from a snapshot, which is precisely the kind of quiet wrong answer this method exists to prevent.</p>
+     */
+    public void forEachAccountByUserId(Consumer<Account> visitor) {
+        if (orderedTraversalActive) {
+            throw new IllegalStateException(
+                    "nested forEachAccountByUserId: the ordered traversal shares one scratch list");
+        }
+        orderedTraversalActive = true;
+        try {
+            snapshotScratch.clear();
+            accounts.values().forEach(snapshotScratch::add);
+            snapshotScratch.sort(Comparator.comparingLong(Account::userId));
+            for (int i = 0; i < snapshotScratch.size(); i++) {
+                visitor.accept(snapshotScratch.get(i));
+            }
+        } finally {
+            snapshotScratch.clear();
+            orderedTraversalActive = false;
+        }
     }
 
     public long getLastAppliedTradeId() {

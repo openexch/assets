@@ -56,14 +56,13 @@ public final class AeronCluster {
         final List<String> hostAddresses = List.of(hosts.split(","));
         final AssetsClusteredService assetsService = new AssetsClusteredService();
 
-        // Money journal (dark unless AE_MONEY_JOURNAL_ENABLED): the ring is armed on the engine NOW
-        // so the service thread journals from the first command; the writer thread starts inside the
-        // launch path once the media driver + archive are up.
+        // Money journal: the ring is wired onto the engine NOW so the service thread can journal from
+        // the first command, replayed or live. Whether it DOES is the cluster's replicated setting,
+        // restored from the snapshot or set by a SetMoneyJournal command — never this node's config.
+        // The writer thread starts inside the launch path once the media driver + archive are up.
         final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime =
-                com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime.createIfEnabled(nodeId);
-        if (journalRuntime != null) {
-            assetsService.setMoneyJournal(journalRuntime.journal());
-        }
+                com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime.create(nodeId);
+        assetsService.setMoneyJournalSink(journalRuntime.journal());
 
         final ClusterConfig clusterConfig = ClusterConfig.create(nodeId, hostAddresses, hostAddresses, portBase,
                 assetsService);

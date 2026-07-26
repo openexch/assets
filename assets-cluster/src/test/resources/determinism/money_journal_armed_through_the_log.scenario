@@ -1,0 +1,41 @@
+# Arming the money journal is a COMMAND, not a node setting.
+#
+# journalSeq is replicated, snapshotted state, so whatever gates it has to be in the log too. It used
+# to be an environment variable, which meant two replicas could disagree about whether the sequence
+# advanced, and a replayed log would produce a different ledger than the one it recorded.
+#
+# What this pins: the ledger is pre-funded while the journal is dark, armed mid-stream, and disarmed
+# again. SnapshotReplayEquivalenceTest splices a restore at every position in here, so the setting has
+# to survive a snapshot taken on either side of each flip.
+
+CLOCK 1000
+
+# --- dark: this history exists only as the opening epoch, once the journal is armed ---
+DEPOSIT u=100 asset=1 amt=1.0
+DEPOSIT u=200 asset=0 amt=60000.0
+DEPOSIT u=100 asset=0 amt=5.0
+
+SET_JOURNAL 1
+
+# Holds change no totals, so they journal nothing and do not trigger the epoch.
+HOLD order=1 u=100 asset=1 amt=1.0
+HOLD order=2 u=200 asset=0 amt=60000.0
+
+# First journaled movement: the epoch precedes it.
+DEPOSIT u=300 asset=0 amt=100.0
+SETTLE tradeId=1 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=1.0 takerBuy=1
+WITHDRAW u=200 asset=1 amt=0.4
+
+# --- disarmed again: movements keep happening, the sequence stops ---
+SET_JOURNAL 0
+DEPOSIT u=400 asset=0 amt=250.0
+WITHDRAW u=400 asset=0 amt=50.0
+
+# --- re-armed: resumes at the existing high-water, no reuse and no gap, and no second epoch ---
+SET_JOURNAL 1
+DEPOSIT u=500 asset=0 amt=10.0
+
+# Setting it to what it already is must change nothing.
+SET_JOURNAL 1
+
+QUERY_FEED 1

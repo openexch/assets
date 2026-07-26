@@ -2,8 +2,8 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="com.openexchange.assets.infrastructure.generated"
                    id="2"
-                   version="3"
-                   semanticVersion="0.3"
+                   version="4"
+                   semanticVersion="0.4"
                    description="Assets Engine money schema — balances, holds, settlement. All amounts are 8dp fixed-point int64."
 >
     <types>
@@ -112,6 +112,11 @@
         <field name="consumePosition" id="2" type="int64"/>
     </sbe:message>
 
+    <sbe:message name="SetMoneyJournal" id="32" sinceVersion="4" description="Arm or disarm the money journal. This is REPLICATED STATE, not node configuration: journalSeq is snapshotted, so whether it advances has to be a property of the log rather than of a node's environment. Sent through the log, every replica flips at the same position, and a replay of that log flips there too -- which is what makes a bundle reproduce the ledger it captured. Whether a given node also WRITES its journal to disk is a separate, node-local matter.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="enabled"       id="2" type="BoolFlag"/>
+    </sbe:message>
+
     <sbe:message name="Subscribe" id="31" sinceVersion="3" description="Set this session's egress filter. Transport-level, NOT money state: it is never snapshotted, so a session that survives a leader change or a snapshot restore falls back to receiving everything (safe direction) and should re-subscribe.">
         <field name="correlationId" id="1" type="int64"/>
         <field name="channels"      id="2" type="EgressChannels"/>
@@ -177,6 +182,10 @@
         <field name="correlationId"       id="1" type="int64"/>
         <field name="consumePosition"     id="2" type="int64"/>
         <field name="lastAppliedTradeId"  id="3" type="int64"/>
+        <!-- Appended in v4 (SBE-compatible: a v3 reader stops at the old block length). Without it a
+             SetMoneyJournal command has no observable effect, and an operator would be left grepping
+             three nodes' logs to find out whether the money journal is armed. -->
+        <field name="journalEnabled"      id="4" type="BoolFlag" sinceVersion="4"/>
     </sbe:message>
 
     <sbe:message name="BalanceSnapshotEnd" id="18" description="Terminates the BalanceUpdate stream answering RequestBalanceSnapshot">

@@ -96,12 +96,13 @@ public final class AssetsClusteredService implements ClusteredService {
     private long lastEgressReportMs;
 
     /**
-     * Arm the money journal on the engine (dark by default; see {@code MoneyJournalRuntime}). Must be
-     * called before the container launches so the deterministic service thread journals from the very
-     * first command, replayed or live.
+     * Wire this node's money-journal sink onto the engine. Must be called before the container launches
+     * so the deterministic service thread can journal from the very first command, replayed or live.
+     * Wiring the sink does not arm journaling: that is replicated state, restored from the snapshot or
+     * set by a SetMoneyJournal command through the log.
      */
-    public void setMoneyJournal(com.openexchange.assets.domain.MoneyJournalSink journalSink) {
-        engine.setMoneyJournal(journalSink);
+    public void setMoneyJournalSink(com.openexchange.assets.domain.MoneyJournalSink journalSink) {
+        engine.setMoneyJournalSink(journalSink);
     }
 
     @Override

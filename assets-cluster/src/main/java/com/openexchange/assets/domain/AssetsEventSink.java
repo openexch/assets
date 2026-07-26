@@ -64,7 +64,8 @@ public interface AssetsEventSink {
      * applied ({@code consumePosition} = journal egressSeq watermark) and the settlement high-water
      * ({@code lastAppliedTradeId}). The settlement bridge resumes the journal from these.
      */
-    void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId);
+    void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId,
+                              boolean journalEnabled);
 
     /**
      * EXCEPTIONAL: a settle leg could not draw fully from its order hold (reconciler race or a

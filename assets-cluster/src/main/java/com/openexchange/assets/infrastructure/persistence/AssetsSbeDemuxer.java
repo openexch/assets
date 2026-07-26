@@ -7,6 +7,7 @@ import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
+import com.openexchange.assets.domain.commands.SetMoneyJournalCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.DepositDecoder;
@@ -17,6 +18,7 @@ import com.openexchange.assets.infrastructure.generated.QueryFeedPositionDecoder
 import com.openexchange.assets.infrastructure.generated.ReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotDecoder;
+import com.openexchange.assets.infrastructure.generated.SetMoneyJournalDecoder;
 import com.openexchange.assets.infrastructure.generated.SettleDecoder;
 import com.openexchange.assets.infrastructure.generated.TerminalReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawDecoder;
@@ -41,6 +43,7 @@ public final class AssetsSbeDemuxer {
     private final TerminalReleaseDecoder terminalReleaseDecoder = new TerminalReleaseDecoder();
     private final QueryFeedPositionDecoder queryFeedPositionDecoder = new QueryFeedPositionDecoder();
     private final InitTradeHighWaterDecoder initHighWaterDecoder = new InitTradeHighWaterDecoder();
+    private final SetMoneyJournalDecoder setMoneyJournalDecoder = new SetMoneyJournalDecoder();
     private final RequestBalanceSnapshotDecoder balanceSnapshotDecoder = new RequestBalanceSnapshotDecoder();
     private final RequestHoldSnapshotDecoder holdSnapshotDecoder = new RequestHoldSnapshotDecoder();
 
@@ -49,6 +52,7 @@ public final class AssetsSbeDemuxer {
     private final HoldCommand holdCommand = new HoldCommand();
     private final ReleaseCommand releaseCommand = new ReleaseCommand();
     private final InitTradeHighWaterCommand initHighWaterCommand = new InitTradeHighWaterCommand();
+    private final SetMoneyJournalCommand setMoneyJournalCommand = new SetMoneyJournalCommand();
 
     public AssetsSbeDemuxer(AssetsEngine engine, SettlementProjector projector) {
         this.engine = engine;
@@ -72,6 +76,7 @@ public final class AssetsSbeDemuxer {
             case InitTradeHighWaterDecoder.TEMPLATE_ID:     handleInitHighWater(buffer, offset, timestamp); break;
             case RequestBalanceSnapshotDecoder.TEMPLATE_ID: handleRequestBalanceSnapshot(buffer, offset); break;
             case RequestHoldSnapshotDecoder.TEMPLATE_ID:    handleRequestHoldSnapshot(buffer, offset); break;
+            case SetMoneyJournalDecoder.TEMPLATE_ID:        handleSetMoneyJournal(buffer, offset, timestamp); break;
             default: break; // unknown message — ignore on the hot path
         }
     }
@@ -162,6 +167,19 @@ public final class AssetsSbeDemuxer {
         initHighWaterCommand.setTradeId(initHighWaterDecoder.tradeId());
         initHighWaterCommand.setConsumePosition(initHighWaterDecoder.consumePosition());
         engine.applyCommand(AssetsEngine.CMD_INIT_HIGH_WATER, initHighWaterCommand, timestamp);
+    }
+
+    /**
+     * Arm/disarm the money journal cluster-wide. A COMMAND, not a query: it is applied on every replica
+     * from the log, which is what keeps journalSeq (replicated, snapshotted) identical everywhere and
+     * makes a replayed log arm the journal exactly where the original did.
+     */
+    private void handleSetMoneyJournal(DirectBuffer buffer, int offset, long timestamp) {
+        setMoneyJournalDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        setMoneyJournalCommand.reset();
+        setMoneyJournalCommand.setCorrelationId(setMoneyJournalDecoder.correlationId());
+        setMoneyJournalCommand.setEnabled(setMoneyJournalDecoder.enabled() == BoolFlag.TRUE);
+        engine.applyCommand(AssetsEngine.CMD_SET_MONEY_JOURNAL, setMoneyJournalCommand, timestamp);
     }
 
     // Read-only queries: no domain command, no timestamp; the engine streams the answer via the sink.

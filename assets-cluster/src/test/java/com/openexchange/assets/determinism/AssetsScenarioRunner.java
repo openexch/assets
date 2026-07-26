@@ -8,6 +8,7 @@ import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
+import com.openexchange.assets.domain.commands.SetMoneyJournalCommand;
 import com.openexchange.assets.domain.commands.SettleCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec;
@@ -39,6 +40,7 @@ import java.util.Map;
  *   HOLD     order=1 u=100 asset=0 amt=600.0
  *   RELEASE  order=1 u=100 [amt=..]        (no amt = release full residual)
  *   SETTLE   tradeId=1 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=0.5 takerBuy=1
+ *   SET_JOURNAL 1                          arm (1) / disarm (0) the money journal, via the log
  *   SNAPSHOT                               serialize -> restore into a fresh engine
  * </pre>
  * Amounts/prices (amt, px) are decimals converted to 8dp fixed-point; asset/market/order/user ids are
@@ -53,6 +55,7 @@ public final class AssetsScenarioRunner {
     private final LogicalClock clock = new LogicalClock();
     // Pooled once and re-populated per INIT_HIGH_WATER call, mirroring the projector's pooled commands.
     private final InitTradeHighWaterCommand initHighWaterCommand = new InitTradeHighWaterCommand();
+    private final SetMoneyJournalCommand setMoneyJournalCommand = new SetMoneyJournalCommand();
 
     private AssetsScenarioRunner() {
         this.engine = new AssetsEngine();
@@ -152,6 +155,13 @@ public final class AssetsScenarioRunner {
                 // Read-only feed-position query: emit the journal consume position + settlement high-water
                 // through the sink (a FEEDPOS line). Positional arg: <correlationId>.
                 engine.reportFeedPosition(Long.parseLong(tokens[1]));
+                break;
+            case "SET_JOURNAL":
+                // Arm/disarm the money journal through the log, exactly as production does. Replicated
+                // state: it rides the snapshot, so a restore mid-scenario must keep it.
+                setMoneyJournalCommand.reset();
+                setMoneyJournalCommand.setEnabled(Long.parseLong(tokens[1]) != 0);
+                engine.applyCommand(AssetsEngine.CMD_SET_MONEY_JOURNAL, setMoneyJournalCommand, clock.now());
                 break;
             case "SNAPSHOT":
                 snapshotRoundTrip();

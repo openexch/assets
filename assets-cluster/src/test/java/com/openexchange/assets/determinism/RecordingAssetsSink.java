@@ -70,8 +70,10 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     }
 
     @Override
-    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId) {
-        events.add(new AssetsEngineEvent.FeedPositionReport(correlationId, consumePosition, lastAppliedTradeId));
+    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId,
+                                     boolean journalEnabled) {
+        events.add(new AssetsEngineEvent.FeedPositionReport(
+                correlationId, consumePosition, lastAppliedTradeId, journalEnabled));
     }
 
     @Override

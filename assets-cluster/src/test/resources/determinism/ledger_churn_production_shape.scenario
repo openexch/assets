@@ -1,0 +1,314 @@
+# Production-shaped ledger churn — the scenario the byte-identity gate needs.
+#
+# Generated (see git history for the generator); edit by regenerating, not by hand.
+#
+# The hand-written scenarios each touch two or three accounts and never release enough holds to
+# resize a map. Real accounts do: they are first touched in whatever order they trade, and they
+# place and release hundreds of holds. Both of those make an engine's hash-table layout a function
+# of its HISTORY, so a node restored from a snapshot lays out differently from one that replayed
+# from genesis — identical ledger, different snapshot bytes. This scenario reproduces that shape so
+# SnapshotReplayEquivalenceTest actually bites.
+
+CLOCK 1000
+
+# --- 16 accounts, first touched in a scrambled order (not ascending userId) ---
+DEPOSIT u=11 asset=0 amt=1000000.0
+DEPOSIT u=11 asset=1 amt=10.0
+DEPOSIT u=48 asset=0 amt=1000000.0
+DEPOSIT u=48 asset=1 amt=10.0
+DEPOSIT u=85 asset=0 amt=1000000.0
+DEPOSIT u=85 asset=1 amt=10.0
+DEPOSIT u=21 asset=0 amt=1000000.0
+DEPOSIT u=21 asset=1 amt=10.0
+DEPOSIT u=58 asset=0 amt=1000000.0
+DEPOSIT u=58 asset=1 amt=10.0
+DEPOSIT u=95 asset=0 amt=1000000.0
+DEPOSIT u=95 asset=1 amt=10.0
+DEPOSIT u=31 asset=0 amt=1000000.0
+DEPOSIT u=31 asset=1 amt=10.0
+DEPOSIT u=68 asset=0 amt=1000000.0
+DEPOSIT u=68 asset=1 amt=10.0
+DEPOSIT u=4 asset=0 amt=1000000.0
+DEPOSIT u=4 asset=1 amt=10.0
+DEPOSIT u=41 asset=0 amt=1000000.0
+DEPOSIT u=41 asset=1 amt=10.0
+DEPOSIT u=78 asset=0 amt=1000000.0
+DEPOSIT u=78 asset=1 amt=10.0
+DEPOSIT u=14 asset=0 amt=1000000.0
+DEPOSIT u=14 asset=1 amt=10.0
+DEPOSIT u=51 asset=0 amt=1000000.0
+DEPOSIT u=51 asset=1 amt=10.0
+DEPOSIT u=88 asset=0 amt=1000000.0
+DEPOSIT u=88 asset=1 amt=10.0
+DEPOSIT u=24 asset=0 amt=1000000.0
+DEPOSIT u=24 asset=1 amt=10.0
+DEPOSIT u=61 asset=0 amt=1000000.0
+DEPOSIT u=61 asset=1 amt=10.0
+
+# --- churn: 40 holds per account, all but every 10th released ---
+# The map grows to hold 40 and keeps that capacity after the releases; an engine restored from the
+# snapshot rebuilds the same 4 holds into a small map. Same reservations, different table, and
+# therefore a different iteration order unless serialization imposes one.
+HOLD order=1001 u=11 asset=0 amt=100.0
+HOLD order=1002 u=11 asset=0 amt=100.0
+HOLD order=1003 u=11 asset=0 amt=100.0
+HOLD order=1004 u=11 asset=0 amt=100.0
+HOLD order=1005 u=11 asset=0 amt=100.0
+HOLD order=1006 u=11 asset=0 amt=100.0
+HOLD order=1007 u=11 asset=0 amt=100.0
+HOLD order=1008 u=11 asset=0 amt=100.0
+HOLD order=1009 u=11 asset=0 amt=100.0
+HOLD order=1010 u=11 asset=0 amt=100.0
+HOLD order=1011 u=11 asset=0 amt=100.0
+HOLD order=1012 u=11 asset=0 amt=100.0
+HOLD order=1013 u=11 asset=0 amt=100.0
+HOLD order=1014 u=11 asset=0 amt=100.0
+HOLD order=1015 u=11 asset=0 amt=100.0
+HOLD order=1016 u=11 asset=0 amt=100.0
+HOLD order=1017 u=11 asset=0 amt=100.0
+HOLD order=1018 u=11 asset=0 amt=100.0
+HOLD order=1019 u=11 asset=0 amt=100.0
+HOLD order=1020 u=11 asset=0 amt=100.0
+HOLD order=1021 u=11 asset=0 amt=100.0
+HOLD order=1022 u=11 asset=0 amt=100.0
+HOLD order=1023 u=11 asset=0 amt=100.0
+HOLD order=1024 u=11 asset=0 amt=100.0
+HOLD order=1025 u=11 asset=0 amt=100.0
+HOLD order=1026 u=11 asset=0 amt=100.0
+HOLD order=1027 u=11 asset=0 amt=100.0
+HOLD order=1028 u=11 asset=0 amt=100.0
+HOLD order=1029 u=11 asset=0 amt=100.0
+HOLD order=1030 u=11 asset=0 amt=100.0
+HOLD order=1031 u=11 asset=0 amt=100.0
+HOLD order=1032 u=11 asset=0 amt=100.0
+HOLD order=1033 u=11 asset=0 amt=100.0
+HOLD order=1034 u=11 asset=0 amt=100.0
+HOLD order=1035 u=11 asset=0 amt=100.0
+HOLD order=1036 u=11 asset=0 amt=100.0
+HOLD order=1037 u=11 asset=0 amt=100.0
+HOLD order=1038 u=11 asset=0 amt=100.0
+HOLD order=1039 u=11 asset=0 amt=100.0
+HOLD order=1040 u=11 asset=0 amt=100.0
+RELEASE order=1001 u=11
+RELEASE order=1002 u=11
+RELEASE order=1003 u=11
+RELEASE order=1004 u=11
+RELEASE order=1005 u=11
+RELEASE order=1006 u=11
+RELEASE order=1007 u=11
+RELEASE order=1008 u=11
+RELEASE order=1009 u=11
+RELEASE order=1011 u=11
+RELEASE order=1012 u=11
+RELEASE order=1013 u=11
+RELEASE order=1014 u=11
+RELEASE order=1015 u=11
+RELEASE order=1016 u=11
+RELEASE order=1017 u=11
+RELEASE order=1018 u=11
+RELEASE order=1019 u=11
+RELEASE order=1021 u=11
+RELEASE order=1022 u=11
+RELEASE order=1023 u=11
+RELEASE order=1024 u=11
+RELEASE order=1025 u=11
+RELEASE order=1026 u=11
+RELEASE order=1027 u=11
+RELEASE order=1028 u=11
+RELEASE order=1029 u=11
+RELEASE order=1031 u=11
+RELEASE order=1032 u=11
+RELEASE order=1033 u=11
+RELEASE order=1034 u=11
+RELEASE order=1035 u=11
+RELEASE order=1036 u=11
+RELEASE order=1037 u=11
+RELEASE order=1038 u=11
+RELEASE order=1039 u=11
+HOLD order=1101 u=48 asset=0 amt=100.0
+HOLD order=1102 u=48 asset=0 amt=100.0
+HOLD order=1103 u=48 asset=0 amt=100.0
+HOLD order=1104 u=48 asset=0 amt=100.0
+HOLD order=1105 u=48 asset=0 amt=100.0
+HOLD order=1106 u=48 asset=0 amt=100.0
+HOLD order=1107 u=48 asset=0 amt=100.0
+HOLD order=1108 u=48 asset=0 amt=100.0
+HOLD order=1109 u=48 asset=0 amt=100.0
+HOLD order=1110 u=48 asset=0 amt=100.0
+HOLD order=1111 u=48 asset=0 amt=100.0
+HOLD order=1112 u=48 asset=0 amt=100.0
+HOLD order=1113 u=48 asset=0 amt=100.0
+HOLD order=1114 u=48 asset=0 amt=100.0
+HOLD order=1115 u=48 asset=0 amt=100.0
+HOLD order=1116 u=48 asset=0 amt=100.0
+HOLD order=1117 u=48 asset=0 amt=100.0
+HOLD order=1118 u=48 asset=0 amt=100.0
+HOLD order=1119 u=48 asset=0 amt=100.0
+HOLD order=1120 u=48 asset=0 amt=100.0
+HOLD order=1121 u=48 asset=0 amt=100.0
+HOLD order=1122 u=48 asset=0 amt=100.0
+HOLD order=1123 u=48 asset=0 amt=100.0
+HOLD order=1124 u=48 asset=0 amt=100.0
+HOLD order=1125 u=48 asset=0 amt=100.0
+HOLD order=1126 u=48 asset=0 amt=100.0
+HOLD order=1127 u=48 asset=0 amt=100.0
+HOLD order=1128 u=48 asset=0 amt=100.0
+HOLD order=1129 u=48 asset=0 amt=100.0
+HOLD order=1130 u=48 asset=0 amt=100.0
+HOLD order=1131 u=48 asset=0 amt=100.0
+HOLD order=1132 u=48 asset=0 amt=100.0
+HOLD order=1133 u=48 asset=0 amt=100.0
+HOLD order=1134 u=48 asset=0 amt=100.0
+HOLD order=1135 u=48 asset=0 amt=100.0
+HOLD order=1136 u=48 asset=0 amt=100.0
+HOLD order=1137 u=48 asset=0 amt=100.0
+HOLD order=1138 u=48 asset=0 amt=100.0
+HOLD order=1139 u=48 asset=0 amt=100.0
+HOLD order=1140 u=48 asset=0 amt=100.0
+RELEASE order=1101 u=48
+RELEASE order=1102 u=48
+RELEASE order=1103 u=48
+RELEASE order=1104 u=48
+RELEASE order=1105 u=48
+RELEASE order=1106 u=48
+RELEASE order=1107 u=48
+RELEASE order=1108 u=48
+RELEASE order=1109 u=48
+RELEASE order=1111 u=48
+RELEASE order=1112 u=48
+RELEASE order=1113 u=48
+RELEASE order=1114 u=48
+RELEASE order=1115 u=48
+RELEASE order=1116 u=48
+RELEASE order=1117 u=48
+RELEASE order=1118 u=48
+RELEASE order=1119 u=48
+RELEASE order=1121 u=48
+RELEASE order=1122 u=48
+RELEASE order=1123 u=48
+RELEASE order=1124 u=48
+RELEASE order=1125 u=48
+RELEASE order=1126 u=48
+RELEASE order=1127 u=48
+RELEASE order=1128 u=48
+RELEASE order=1129 u=48
+RELEASE order=1131 u=48
+RELEASE order=1132 u=48
+RELEASE order=1133 u=48
+RELEASE order=1134 u=48
+RELEASE order=1135 u=48
+RELEASE order=1136 u=48
+RELEASE order=1137 u=48
+RELEASE order=1138 u=48
+RELEASE order=1139 u=48
+HOLD order=1201 u=85 asset=0 amt=100.0
+HOLD order=1202 u=85 asset=0 amt=100.0
+HOLD order=1203 u=85 asset=0 amt=100.0
+HOLD order=1204 u=85 asset=0 amt=100.0
+HOLD order=1205 u=85 asset=0 amt=100.0
+HOLD order=1206 u=85 asset=0 amt=100.0
+HOLD order=1207 u=85 asset=0 amt=100.0
+HOLD order=1208 u=85 asset=0 amt=100.0
+HOLD order=1209 u=85 asset=0 amt=100.0
+HOLD order=1210 u=85 asset=0 amt=100.0
+HOLD order=1211 u=85 asset=0 amt=100.0
+HOLD order=1212 u=85 asset=0 amt=100.0
+HOLD order=1213 u=85 asset=0 amt=100.0
+HOLD order=1214 u=85 asset=0 amt=100.0
+HOLD order=1215 u=85 asset=0 amt=100.0
+HOLD order=1216 u=85 asset=0 amt=100.0
+HOLD order=1217 u=85 asset=0 amt=100.0
+HOLD order=1218 u=85 asset=0 amt=100.0
+HOLD order=1219 u=85 asset=0 amt=100.0
+HOLD order=1220 u=85 asset=0 amt=100.0
+HOLD order=1221 u=85 asset=0 amt=100.0
+HOLD order=1222 u=85 asset=0 amt=100.0
+HOLD order=1223 u=85 asset=0 amt=100.0
+HOLD order=1224 u=85 asset=0 amt=100.0
+HOLD order=1225 u=85 asset=0 amt=100.0
+HOLD order=1226 u=85 asset=0 amt=100.0
+HOLD order=1227 u=85 asset=0 amt=100.0
+HOLD order=1228 u=85 asset=0 amt=100.0
+HOLD order=1229 u=85 asset=0 amt=100.0
+HOLD order=1230 u=85 asset=0 amt=100.0
+HOLD order=1231 u=85 asset=0 amt=100.0
+HOLD order=1232 u=85 asset=0 amt=100.0
+HOLD order=1233 u=85 asset=0 amt=100.0
+HOLD order=1234 u=85 asset=0 amt=100.0
+HOLD order=1235 u=85 asset=0 amt=100.0
+HOLD order=1236 u=85 asset=0 amt=100.0
+HOLD order=1237 u=85 asset=0 amt=100.0
+HOLD order=1238 u=85 asset=0 amt=100.0
+HOLD order=1239 u=85 asset=0 amt=100.0
+HOLD order=1240 u=85 asset=0 amt=100.0
+RELEASE order=1201 u=85
+RELEASE order=1202 u=85
+RELEASE order=1203 u=85
+RELEASE order=1204 u=85
+RELEASE order=1205 u=85
+RELEASE order=1206 u=85
+RELEASE order=1207 u=85
+RELEASE order=1208 u=85
+RELEASE order=1209 u=85
+RELEASE order=1211 u=85
+RELEASE order=1212 u=85
+RELEASE order=1213 u=85
+RELEASE order=1214 u=85
+RELEASE order=1215 u=85
+RELEASE order=1216 u=85
+RELEASE order=1217 u=85
+RELEASE order=1218 u=85
+RELEASE order=1219 u=85
+RELEASE order=1221 u=85
+RELEASE order=1222 u=85
+RELEASE order=1223 u=85
+RELEASE order=1224 u=85
+RELEASE order=1225 u=85
+RELEASE order=1226 u=85
+RELEASE order=1227 u=85
+RELEASE order=1228 u=85
+RELEASE order=1229 u=85
+RELEASE order=1231 u=85
+RELEASE order=1232 u=85
+RELEASE order=1233 u=85
+RELEASE order=1234 u=85
+RELEASE order=1235 u=85
+RELEASE order=1236 u=85
+RELEASE order=1237 u=85
+RELEASE order=1238 u=85
+RELEASE order=1239 u=85
+
+# --- quiet accounts: a single outstanding hold each ---
+HOLD order=2000 u=21 asset=0 amt=50.0
+HOLD order=2001 u=58 asset=0 amt=50.0
+HOLD order=2002 u=95 asset=0 amt=50.0
+HOLD order=2003 u=31 asset=0 amt=50.0
+HOLD order=2004 u=68 asset=0 amt=50.0
+HOLD order=2005 u=4 asset=0 amt=50.0
+HOLD order=2006 u=41 asset=0 amt=50.0
+HOLD order=2007 u=78 asset=0 amt=50.0
+HOLD order=2008 u=14 asset=0 amt=50.0
+HOLD order=2009 u=51 asset=0 amt=50.0
+HOLD order=2010 u=88 asset=0 amt=50.0
+HOLD order=2011 u=24 asset=0 amt=50.0
+HOLD order=2012 u=61 asset=0 amt=50.0
+
+# --- settlement, exact fills against the order's own hold (no faults) ---
+DEPOSIT u=9001 asset=0 amt=200000.0
+DEPOSIT u=9002 asset=1 amt=2.0
+HOLD order=7001 u=9002 asset=1 amt=1.0
+HOLD order=7002 u=9001 asset=0 amt=60000.0
+SETTLE tradeId=1 market=1 takerOrder=7002 takerUser=9001 makerOrder=7001 makerUser=9002 px=60000.0 qty=0.5 takerBuy=1
+RELEASE order=7001 u=9002
+RELEASE order=7002 u=9001
+
+DEPOSIT u=9003 asset=1 amt=5.0
+DEPOSIT u=9004 asset=0 amt=500000.0
+HOLD order=7003 u=9003 asset=1 amt=2.0
+HOLD order=7004 u=9004 asset=0 amt=120000.0
+SETTLE tradeId=2 market=1 takerOrder=7003 takerUser=9003 makerOrder=7004 makerUser=9004 px=60000.0 qty=2.0 takerBuy=0
+
+# --- a re-delivered trade must stay a no-op after all of the above ---
+SETTLE tradeId=2 market=1 takerOrder=7003 takerUser=9003 makerOrder=7004 makerUser=9004 px=60000.0 qty=2.0 takerBuy=0
+
+QUERY_FEED 1

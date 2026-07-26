@@ -341,9 +341,38 @@ public final class Account {
         return holds.size();
     }
 
-    /** Visit every open hold (serialize / invariant checks). Boxes the key — not hot-path (snapshot only). */
+    /**
+     * Visit every open hold in hash-table order. Boxes the key — not hot-path. Use only where the
+     * result is order-insensitive (sums, invariant checks): the order is a function of this account's
+     * hold HISTORY, not of its state, because the map keeps its grown capacity after removals and
+     * compacts on delete. Anything durable or client-visible must use {@link #forEachHoldByOrderId}.
+     */
     public void forEachHold(HoldVisitor v) {
         holds.forEach((orderId, h) -> v.visit(orderId, h.assetId(), h.remaining(), h.omsManagedRelease()));
+    }
+
+    /**
+     * Visit every open hold in ascending {@code orderId} order, so the traversal is a pure function of
+     * state. This is the one to use for the snapshot and for client-facing queries: a hold map that
+     * has seen releases iterates differently from one rebuilt by a restore, even when both hold exactly
+     * the same reservations, and a snapshot whose bytes depend on that cannot be compared across nodes.
+     *
+     * <p>Allocates one {@code long[]} per call. Snapshot/query paths only — never the money path — and
+     * strictly less than the per-hold garbage the sorted query paths used to make.</p>
+     */
+    public void forEachHoldByOrderId(HoldVisitor v) {
+        final int size = holds.size();
+        if (size == 0) {
+            return;
+        }
+        final long[] orderIds = new long[size];
+        final int[] n = {0};
+        holds.forEach((orderId, h) -> orderIds[n[0]++] = orderId);
+        java.util.Arrays.sort(orderIds);
+        for (int i = 0; i < orderIds.length; i++) {
+            final Hold h = holds.get(orderIds[i]);
+            v.visit(orderIds[i], h.assetId(), h.remaining(), h.omsManagedRelease());
+        }
     }
 
     /**

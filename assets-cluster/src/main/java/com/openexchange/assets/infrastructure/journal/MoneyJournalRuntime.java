@@ -19,11 +19,10 @@ import org.agrona.concurrent.BackoffIdleStrategy;
  * driver-independent parts (so the ring can be armed on the engine before launch), then
  * {@link #start} launches the writer thread once the node's media driver and archive are up.
  *
- * Env:
- *   AE_MONEY_JOURNAL_ENABLED - "true" to enable (default false = dark, zero behavior change).
- *                              MUST be set uniformly across the cluster: the engine's journalSeq is
- *                              replicated (snapshotted) state, so replicas disagreeing on whether
- *                              it advances would diverge. Roll all nodes with the same value.
+ * No env: journaling is armed by the replicated {@code SetMoneyJournal} command, because the engine's
+ * journalSeq is snapshotted state and a per-node environment variable could make two replicas disagree
+ * about whether it advances — and would make a replayed log produce a different ledger than the one it
+ * recorded. This class owns only the node-local half: the ring and the thread that drains it.
  */
 public final class MoneyJournalRuntime implements AutoCloseable {
 
@@ -42,12 +41,16 @@ public final class MoneyJournalRuntime implements AutoCloseable {
         this.journal = new MoneyJournal(RING_BYTES);
     }
 
-    /** @return the runtime, or null when AE_MONEY_JOURNAL_ENABLED is not "true" (journal dark). */
-    public static MoneyJournalRuntime createIfEnabled(final int nodeId) {
-        if (!"true".equalsIgnoreCase(System.getenv("AE_MONEY_JOURNAL_ENABLED"))) {
-            return null;
-        }
-        log.info("Money journal ENABLED: node=%d channel=%s stream=%d ring=%d",
+    /**
+     * Build this node's journal machinery. Always: whether journaling actually happens is decided by
+     * the cluster's replicated setting, not by this node, so the ring has to exist on every node ready
+     * to receive whatever the log asks for. The cost of standing by is one idle thread and the ring;
+     * the writer opens no recording until there is a record to write, so a cluster that never journals
+     * never creates an empty recording.
+     */
+    public static MoneyJournalRuntime create(final int nodeId) {
+        log.info("Money journal machinery ready: node=%d channel=%s stream=%d ring=%d "
+                        + "(armed by SetMoneyJournal through the log, not by this node)",
                 nodeId, InfrastructureConstants.MONEY_JOURNAL_CHANNEL,
                 InfrastructureConstants.MONEY_JOURNAL_STREAM_ID, RING_BYTES);
         return new MoneyJournalRuntime(nodeId);

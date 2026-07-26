@@ -99,12 +99,13 @@ public sealed interface AssetsEngineEvent
         }
     }
 
-    record FeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId)
+    record FeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId,
+                              boolean journalEnabled)
             implements AssetsEngineEvent {
         @Override
         public String render() {
-            return String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d",
-                    correlationId, consumePosition, lastAppliedTradeId);
+            return String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d journal=%s",
+                    correlationId, consumePosition, lastAppliedTradeId, journalEnabled ? "on" : "off");
         }
     }
 
