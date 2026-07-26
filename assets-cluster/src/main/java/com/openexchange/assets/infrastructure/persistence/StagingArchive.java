@@ -84,16 +84,19 @@ public final class StagingArchive implements AutoCloseable {
      * the cores the engines busy-spin on.
      *
      * @param stagingRoot directory holding {@code aeron/} and {@code archive/}
-     * @param controlPort loopback port for this archive's control channel; must
-     *                    not collide with a live cluster's port block
      */
-    public static StagingArchive launch(final File stagingRoot, final int controlPort) {
+    public static StagingArchive launch(final File stagingRoot) {
         final File aeronDir = new File(stagingRoot, "aeron");
         final File archiveDir = new File(stagingRoot, "archive");
         //noinspection ResultOfMethodCallIgnored
         archiveDir.mkdirs();
 
-        final String control = "aeron:udp?endpoint=localhost:" + controlPort;
+        // EPHEMERAL port. Nothing dials this archive: the client attaches over
+        // the IPC local channel below, and replication is initiated BY us TO the
+        // source. A fixed port would only create a collision to reason about
+        // between two clusters' captures, and "they never run at the same time"
+        // is an assumption that ages badly.
+        final String control = "aeron:udp?endpoint=localhost:0";
 
         final MediaDriver.Context driverContext = new MediaDriver.Context()
                 .aeronDirectoryName(aeronDir.getAbsolutePath())

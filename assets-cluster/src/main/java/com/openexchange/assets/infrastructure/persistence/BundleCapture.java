@@ -59,9 +59,6 @@ public final class BundleCapture {
     private static final DateTimeFormatter BUNDLE_STAMP =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss'Z'").withZone(ZoneOffset.UTC);
 
-    /** Loopback control port for the staging archive; outside every cluster's block. */
-    private static final int STAGING_CONTROL_PORT = 9700;
-
     /** Outcome of one capture, for the caller's log and the admin gateway's parser. */
     public static final class Result {
         public final boolean captured;
@@ -156,7 +153,7 @@ public final class BundleCapture {
         final long snapshotBytes;
         final List<Long> stagedSnapshotRecordings = new ArrayList<>();
 
-        try (StagingArchive staging = StagingArchive.launch(stagingRoot, STAGING_CONTROL_PORT)) {
+        try (StagingArchive staging = StagingArchive.launch(stagingRoot)) {
             // Snapshot recordings are COMPLETE, so they replicate whole. There is one
             // per service plus one for the consensus module; a restore needs all of them.
             for (final RecordingLog.Entry entry : selection.snapshotEntries) {
