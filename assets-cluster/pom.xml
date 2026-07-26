@@ -15,6 +15,12 @@
     <name>Assets Cluster</name>
     <description>Assets Engine: domain money model, deterministic engine, Aeron cluster service</description>
 
+    <properties>
+        <!-- Overridden by the build with the short git sha. See the shade plugin's
+             Build-Sha manifest entry for why this is never guessed. -->
+        <buildSha>unknown</buildSha>
+    </properties>
+
     <dependencies>
         <!-- Internal: shared kernel (value objects + SBE codecs) -->
         <dependency>
@@ -63,6 +69,17 @@
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.openexchange.assets.Main</mainClass>
+                                    <manifestEntries>
+                                        <!-- Stamped so a bundle can name the binary that
+                                             produced it. A snapshot serialized by one build
+                                             may not deserialize in another, so without this
+                                             an archived bundle is decorative. Pass the short
+                                             git sha as the buildSha property; the default is
+                                             deliberately the literal "unknown" rather than a
+                                             guess, so a bundle without provenance says so
+                                             instead of implying it. -->
+                                        <Build-Sha>${buildSha}</Build-Sha>
+                                    </manifestEntries>
                                 </transformer>
                             </transformers>
                             <filters>
