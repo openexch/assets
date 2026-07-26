@@ -381,7 +381,7 @@ public class WireRoundTripTest {
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawAck");
         p.onWithdrawReject(1, 2, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawReject");
-        p.onFeedPositionReport(1, 42, 7);
+        p.onFeedPositionReport(1, 42, 7, true);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "FeedPositionReport");
 
         p.onBalanceUpdate(2, 0, 100, 0);

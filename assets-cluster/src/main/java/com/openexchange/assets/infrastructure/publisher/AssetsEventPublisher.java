@@ -5,6 +5,7 @@ import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
+import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.DepositAckEncoder;
 import com.openexchange.assets.infrastructure.generated.FeedPositionReportEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldAckEncoder;
@@ -148,10 +149,12 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     }
 
     @Override
-    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId) {
+    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId,
+                                     boolean journalEnabled) {
         feedPositionReportEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).consumePosition(consumePosition)
-                .lastAppliedTradeId(lastAppliedTradeId);
+                .lastAppliedTradeId(lastAppliedTradeId)
+                .journalEnabled(journalEnabled ? BoolFlag.TRUE : BoolFlag.FALSE);
         flush(feedPositionReportEncoder.encodedLength(), CH_ACKS);
     }
 

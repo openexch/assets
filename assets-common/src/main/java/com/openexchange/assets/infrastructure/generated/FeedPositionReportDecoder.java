@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class FeedPositionReportDecoder
 {
-    public static final int BLOCK_LENGTH = 24;
+    public static final int BLOCK_LENGTH = 25;
     public static final int TEMPLATE_ID = 17;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 3;
-    public static final String SEMANTIC_VERSION = "0.3";
+    public static final int SCHEMA_VERSION = 4;
+    public static final String SEMANTIC_VERSION = "0.4";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final FeedPositionReportDecoder parentMessage = this;
@@ -285,6 +285,57 @@ public final class FeedPositionReportDecoder
     }
 
 
+    public static int journalEnabledId()
+    {
+        return 4;
+    }
+
+    public static int journalEnabledSinceVersion()
+    {
+        return 4;
+    }
+
+    public static int journalEnabledEncodingOffset()
+    {
+        return 24;
+    }
+
+    public static int journalEnabledEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String journalEnabledMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public short journalEnabledRaw()
+    {
+        if (parentMessage.actingVersion < 4)
+        {
+            return (short)255;
+        }
+
+        return ((short)(buffer.getByte(offset + 24) & 0xFF));
+    }
+
+    public BoolFlag journalEnabled()
+    {
+        if (parentMessage.actingVersion < 4)
+        {
+            return BoolFlag.NULL_VAL;
+        }
+
+        return BoolFlag.get(((short)(buffer.getByte(offset + 24) & 0xFF)));
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -334,6 +385,9 @@ public final class FeedPositionReportDecoder
         builder.append('|');
         builder.append("lastAppliedTradeId=");
         builder.append(this.lastAppliedTradeId());
+        builder.append('|');
+        builder.append("journalEnabled=");
+        builder.append(this.journalEnabled());
 
         limit(originalLimit);
 

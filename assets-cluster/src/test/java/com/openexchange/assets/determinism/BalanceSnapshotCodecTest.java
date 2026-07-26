@@ -11,6 +11,7 @@ import org.junit.Test;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 
 /**
@@ -77,6 +78,67 @@ public class BalanceSnapshotCodecTest {
         assertEquals("journalSeq", 4242L, restored.getJournalSeq());
         assertEquals("decoded journalSeq", 4242L, d.journalSeq);
         assertEquals("bytesConsumed", len, d.bytesConsumed);
+    }
+
+    /**
+     * The journal setting is replicated state, so it has to ride the snapshot. Miss this and a node
+     * recovering from a snapshot silently stops advancing journalSeq while its peers keep going.
+     */
+    @Test
+    public void journalEnabledSurvivesRoundTrip() {
+        for (final boolean enabled : new boolean[] {true, false}) {
+            AssetsEngine orig = engineWithState();
+            orig.setMoneyJournalEnabled(enabled);
+
+            ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+            int len = BalanceSnapshotCodec.serialize(orig, buf);
+            AssetsEngine restored = new AssetsEngine();
+            BalanceSnapshotCodec.deserialize(buf, 0, len, restored);
+
+            assertEquals("journalEnabled=" + enabled, enabled, restored.isMoneyJournalEnabled());
+        }
+    }
+
+    /**
+     * A pre-v3 snapshot predates the flag entirely: it must restore DISARMED, keeping its journalSeq so
+     * a later re-arm resumes rather than reusing sequences. Reading the environment to fill the gap in
+     * would make a restore depend on where it ran, which is the defect v3 removes.
+     */
+    @Test
+    public void preV3SnapshotRestoresDisarmedAndKeepsJournalSeq() {
+        // Handcraft the documented v2 layout: tag, scalars, one account, no holds.
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        int p = 0;
+        buf.putLong(p, -2L);         // LAYOUT_V2_TAG
+        p += 8;
+        buf.putLong(p, 7L);          // lastAppliedTradeId
+        p += 8;
+        buf.putLong(p, 123456789L);  // consumePosition
+        p += 8;
+        buf.putLong(p, 99L);         // journalSeq
+        p += 8;
+        buf.putInt(p, 1);            // numAccounts
+        p += 4;
+        buf.putLong(p, 100L);        // userId
+        p += 8;
+        buf.putInt(p, N);            // numAssets
+        p += 4;
+        for (int a = 0; a < N; a++) {
+            buf.putLong(p, a == 0 ? 5555L : 0L);
+            p += 8;
+            buf.putLong(p, 0L);
+            p += 8;
+        }
+        buf.putInt(p, 0);            // numHolds
+        p += 4;
+
+        AssetsEngine restored = new AssetsEngine();
+        BalanceSnapshotCodec.Decoded d = BalanceSnapshotCodec.deserialize(buf, 0, p, restored);
+
+        assertFalse("pre-v3 restores disarmed", restored.isMoneyJournalEnabled());
+        assertEquals("journalSeq is kept so a re-arm resumes", 99L, restored.getJournalSeq());
+        assertEquals("available", 5555L, restored.account(100L).available(0));
+        assertEquals("bytesConsumed", p, d.bytesConsumed);
     }
 
     /** An old (v1, untagged) snapshot must load with journalSeq=0, never fail. */

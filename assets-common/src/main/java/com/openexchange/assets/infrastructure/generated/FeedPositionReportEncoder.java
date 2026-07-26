@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class FeedPositionReportEncoder
 {
-    public static final int BLOCK_LENGTH = 24;
+    public static final int BLOCK_LENGTH = 25;
     public static final int TEMPLATE_ID = 17;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 3;
-    public static final String SEMANTIC_VERSION = "0.3";
+    public static final int SCHEMA_VERSION = 4;
+    public static final String SEMANTIC_VERSION = "0.4";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final FeedPositionReportEncoder parentMessage = this;
@@ -252,6 +252,42 @@ public final class FeedPositionReportEncoder
         return this;
     }
 
+
+    public static int journalEnabledId()
+    {
+        return 4;
+    }
+
+    public static int journalEnabledSinceVersion()
+    {
+        return 4;
+    }
+
+    public static int journalEnabledEncodingOffset()
+    {
+        return 24;
+    }
+
+    public static int journalEnabledEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String journalEnabledMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public FeedPositionReportEncoder journalEnabled(final BoolFlag value)
+    {
+        buffer.putByte(offset + 24, (byte)value.value());
+        return this;
+    }
 
     public String toString()
     {

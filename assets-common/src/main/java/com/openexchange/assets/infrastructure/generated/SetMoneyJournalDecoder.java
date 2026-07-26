@@ -5,19 +5,19 @@ import org.agrona.DirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * Arm or disarm the money journal. This is REPLICATED STATE, not node configuration: journalSeq is snapshotted, so whether it advances has to be a property of the log rather than of a node's environment. Sent through the log, every replica flips at the same position, and a replay of that log flips there too -- which is what makes a bundle reproduce the ledger it captured. Whether a given node also WRITES its journal to disk is a separate, node-local matter.
  */
 @SuppressWarnings("all")
-public final class WithdrawDecoder
+public final class SetMoneyJournalDecoder
 {
-    public static final int BLOCK_LENGTH = 28;
-    public static final int TEMPLATE_ID = 2;
+    public static final int BLOCK_LENGTH = 9;
+    public static final int TEMPLATE_ID = 32;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 4;
     public static final String SEMANTIC_VERSION = "0.4";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final WithdrawDecoder parentMessage = this;
+    private final SetMoneyJournalDecoder parentMessage = this;
     private DirectBuffer buffer;
     private int offset;
     private int limit;
@@ -59,7 +59,7 @@ public final class WithdrawDecoder
         return offset;
     }
 
-    public WithdrawDecoder wrap(
+    public SetMoneyJournalDecoder wrap(
         final DirectBuffer buffer,
         final int offset,
         final int actingBlockLength,
@@ -77,7 +77,7 @@ public final class WithdrawDecoder
         return this;
     }
 
-    public WithdrawDecoder wrapAndApplyHeader(
+    public SetMoneyJournalDecoder wrapAndApplyHeader(
         final DirectBuffer buffer,
         final int offset,
         final MessageHeaderDecoder headerDecoder)
@@ -97,7 +97,7 @@ public final class WithdrawDecoder
             headerDecoder.version());
     }
 
-    public WithdrawDecoder sbeRewind()
+    public SetMoneyJournalDecoder sbeRewind()
     {
         return wrap(buffer, offset, actingBlockLength, actingVersion);
     }
@@ -183,27 +183,27 @@ public final class WithdrawDecoder
     }
 
 
-    public static int userIdId()
+    public static int enabledId()
     {
         return 2;
     }
 
-    public static int userIdSinceVersion()
+    public static int enabledSinceVersion()
     {
         return 0;
     }
 
-    public static int userIdEncodingOffset()
+    public static int enabledEncodingOffset()
     {
         return 8;
     }
 
-    public static int userIdEncodingLength()
+    public static int enabledEncodingLength()
     {
-        return 8;
+        return 1;
     }
 
-    public static String userIdMetaAttribute(final MetaAttribute metaAttribute)
+    public static String enabledMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -213,126 +213,14 @@ public final class WithdrawDecoder
         return "";
     }
 
-    public static long userIdNullValue()
+    public short enabledRaw()
     {
-        return -9223372036854775808L;
+        return ((short)(buffer.getByte(offset + 8) & 0xFF));
     }
 
-    public static long userIdMinValue()
+    public BoolFlag enabled()
     {
-        return -9223372036854775807L;
-    }
-
-    public static long userIdMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long userId()
-    {
-        return buffer.getLong(offset + 8, BYTE_ORDER);
-    }
-
-
-    public static int assetIdId()
-    {
-        return 3;
-    }
-
-    public static int assetIdSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int assetIdEncodingOffset()
-    {
-        return 16;
-    }
-
-    public static int assetIdEncodingLength()
-    {
-        return 4;
-    }
-
-    public static String assetIdMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static int assetIdNullValue()
-    {
-        return -2147483648;
-    }
-
-    public static int assetIdMinValue()
-    {
-        return -2147483647;
-    }
-
-    public static int assetIdMaxValue()
-    {
-        return 2147483647;
-    }
-
-    public int assetId()
-    {
-        return buffer.getInt(offset + 16, BYTE_ORDER);
-    }
-
-
-    public static int amountId()
-    {
-        return 4;
-    }
-
-    public static int amountSinceVersion()
-    {
-        return 0;
-    }
-
-    public static int amountEncodingOffset()
-    {
-        return 20;
-    }
-
-    public static int amountEncodingLength()
-    {
-        return 8;
-    }
-
-    public static String amountMetaAttribute(final MetaAttribute metaAttribute)
-    {
-        if (MetaAttribute.PRESENCE == metaAttribute)
-        {
-            return "required";
-        }
-
-        return "";
-    }
-
-    public static long amountNullValue()
-    {
-        return -9223372036854775808L;
-    }
-
-    public static long amountMinValue()
-    {
-        return -9223372036854775807L;
-    }
-
-    public static long amountMaxValue()
-    {
-        return 9223372036854775807L;
-    }
-
-    public long amount()
-    {
-        return buffer.getLong(offset + 20, BYTE_ORDER);
+        return BoolFlag.get(((short)(buffer.getByte(offset + 8) & 0xFF)));
     }
 
 
@@ -343,7 +231,7 @@ public final class WithdrawDecoder
             return "";
         }
 
-        final WithdrawDecoder decoder = new WithdrawDecoder();
+        final SetMoneyJournalDecoder decoder = new SetMoneyJournalDecoder();
         decoder.wrap(buffer, offset, actingBlockLength, actingVersion);
 
         return decoder.appendTo(new StringBuilder()).toString();
@@ -358,7 +246,7 @@ public final class WithdrawDecoder
 
         final int originalLimit = limit();
         limit(offset + actingBlockLength);
-        builder.append("[Withdraw](sbeTemplateId=");
+        builder.append("[SetMoneyJournal](sbeTemplateId=");
         builder.append(TEMPLATE_ID);
         builder.append("|sbeSchemaId=");
         builder.append(SCHEMA_ID);
@@ -380,21 +268,15 @@ public final class WithdrawDecoder
         builder.append("correlationId=");
         builder.append(this.correlationId());
         builder.append('|');
-        builder.append("userId=");
-        builder.append(this.userId());
-        builder.append('|');
-        builder.append("assetId=");
-        builder.append(this.assetId());
-        builder.append('|');
-        builder.append("amount=");
-        builder.append(this.amount());
+        builder.append("enabled=");
+        builder.append(this.enabled());
 
         limit(originalLimit);
 
         return builder;
     }
     
-    public WithdrawDecoder sbeSkip()
+    public SetMoneyJournalDecoder sbeSkip()
     {
         sbeRewind();
 

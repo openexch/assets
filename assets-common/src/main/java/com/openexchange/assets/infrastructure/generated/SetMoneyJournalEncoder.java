@@ -5,19 +5,19 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Terminates the BalanceUpdate stream answering RequestBalanceSnapshot
+ * Arm or disarm the money journal. This is REPLICATED STATE, not node configuration: journalSeq is snapshotted, so whether it advances has to be a property of the log rather than of a node's environment. Sent through the log, every replica flips at the same position, and a replay of that log flips there too -- which is what makes a bundle reproduce the ledger it captured. Whether a given node also WRITES its journal to disk is a separate, node-local matter.
  */
 @SuppressWarnings("all")
-public final class BalanceSnapshotEndEncoder
+public final class SetMoneyJournalEncoder
 {
-    public static final int BLOCK_LENGTH = 12;
-    public static final int TEMPLATE_ID = 18;
+    public static final int BLOCK_LENGTH = 9;
+    public static final int TEMPLATE_ID = 32;
     public static final int SCHEMA_ID = 2;
     public static final int SCHEMA_VERSION = 4;
     public static final String SEMANTIC_VERSION = "0.4";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
-    private final BalanceSnapshotEndEncoder parentMessage = this;
+    private final SetMoneyJournalEncoder parentMessage = this;
     private MutableDirectBuffer buffer;
     private int offset;
     private int limit;
@@ -57,7 +57,7 @@ public final class BalanceSnapshotEndEncoder
         return offset;
     }
 
-    public BalanceSnapshotEndEncoder wrap(final MutableDirectBuffer buffer, final int offset)
+    public SetMoneyJournalEncoder wrap(final MutableDirectBuffer buffer, final int offset)
     {
         if (buffer != this.buffer)
         {
@@ -69,7 +69,7 @@ public final class BalanceSnapshotEndEncoder
         return this;
     }
 
-    public BalanceSnapshotEndEncoder wrapAndApplyHeader(
+    public SetMoneyJournalEncoder wrapAndApplyHeader(
         final MutableDirectBuffer buffer, final int offset, final MessageHeaderEncoder headerEncoder)
     {
         headerEncoder
@@ -142,34 +142,34 @@ public final class BalanceSnapshotEndEncoder
         return 9223372036854775807L;
     }
 
-    public BalanceSnapshotEndEncoder correlationId(final long value)
+    public SetMoneyJournalEncoder correlationId(final long value)
     {
         buffer.putLong(offset + 0, value, BYTE_ORDER);
         return this;
     }
 
 
-    public static int entryCountId()
+    public static int enabledId()
     {
         return 2;
     }
 
-    public static int entryCountSinceVersion()
+    public static int enabledSinceVersion()
     {
         return 0;
     }
 
-    public static int entryCountEncodingOffset()
+    public static int enabledEncodingOffset()
     {
         return 8;
     }
 
-    public static int entryCountEncodingLength()
+    public static int enabledEncodingLength()
     {
-        return 4;
+        return 1;
     }
 
-    public static String entryCountMetaAttribute(final MetaAttribute metaAttribute)
+    public static String enabledMetaAttribute(final MetaAttribute metaAttribute)
     {
         if (MetaAttribute.PRESENCE == metaAttribute)
         {
@@ -179,27 +179,11 @@ public final class BalanceSnapshotEndEncoder
         return "";
     }
 
-    public static int entryCountNullValue()
+    public SetMoneyJournalEncoder enabled(final BoolFlag value)
     {
-        return -2147483648;
-    }
-
-    public static int entryCountMinValue()
-    {
-        return -2147483647;
-    }
-
-    public static int entryCountMaxValue()
-    {
-        return 2147483647;
-    }
-
-    public BalanceSnapshotEndEncoder entryCount(final int value)
-    {
-        buffer.putInt(offset + 8, value, BYTE_ORDER);
+        buffer.putByte(offset + 8, (byte)value.value());
         return this;
     }
-
 
     public String toString()
     {
@@ -218,7 +202,7 @@ public final class BalanceSnapshotEndEncoder
             return builder;
         }
 
-        final BalanceSnapshotEndDecoder decoder = new BalanceSnapshotEndDecoder();
+        final SetMoneyJournalDecoder decoder = new SetMoneyJournalDecoder();
         decoder.wrap(buffer, offset, BLOCK_LENGTH, SCHEMA_VERSION);
 
         return decoder.appendTo(builder);

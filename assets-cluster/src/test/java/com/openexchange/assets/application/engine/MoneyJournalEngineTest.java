@@ -8,6 +8,7 @@ import com.openexchange.assets.domain.MoneyJournalSink;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
+import com.openexchange.assets.domain.commands.SetMoneyJournalCommand;
 import com.openexchange.assets.domain.commands.SettleCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import org.junit.Test;
@@ -85,6 +86,19 @@ public class MoneyJournalEngineTest {
         engine = new AssetsEngine();
         engine.setEventSink(new RecordingAssetsSink());
         journal = new RecordingJournal();
+        // The sink is node-local and always wired; arming is a replicated command (see armJournal).
+        engine.setMoneyJournalSink(journal);
+    }
+
+    /** Arm the journal the way production does: a command through the log, not a node setting. */
+    private void armJournal() {
+        setJournal(true);
+    }
+
+    private void setJournal(boolean enabled) {
+        final SetMoneyJournalCommand c = new SetMoneyJournalCommand();
+        c.setEnabled(enabled);
+        engine.applyCommand(AssetsEngine.CMD_SET_MONEY_JOURNAL, c, TS);
     }
 
     // ---- the approved scenario: epoch on a pre-funded ledger, then deposit -> settle -> withdraw ----
@@ -98,7 +112,7 @@ public class MoneyJournalEngineTest {
         deposit(100, USD, FixedPoint.fromDouble(5.0));
         assertEquals("dark engine journals nothing", 0L, engine.getJournalSeq());
 
-        engine.setMoneyJournal(journal);
+        armJournal();
 
         // Holds journal nothing and do not trigger the epoch (they do not change totals).
         hold(1L, 100, BTC, FixedPoint.fromDouble(1.0));
@@ -134,7 +148,7 @@ public class MoneyJournalEngineTest {
     @Test
     public void emptyLedgerEpochIsImplicit() {
         newEngine();
-        engine.setMoneyJournal(journal);
+        armJournal();
         deposit(1, USD, FixedPoint.fromDouble(10.0));
         assertEquals(List.of(
                 "DEPOSIT seq=1 u=1 asset=0 amt=" + FixedPoint.fromDouble(10.0)
@@ -148,7 +162,7 @@ public class MoneyJournalEngineTest {
     @Test
     public void rejectsJournalNothingAndConsumeNoSeq() {
         newEngine();
-        engine.setMoneyJournal(journal);
+        armJournal();
         withdraw(1, USD, FixedPoint.fromDouble(1.0)); // overdraft reject: not even the epoch
         deposit(1, USD, -5L); // invalid amount reject
         assertEquals(0, journal.lines.size());
@@ -163,7 +177,7 @@ public class MoneyJournalEngineTest {
     @Test
     public void dedupedSettleJournalsNothingAndConsumesNoSeq() {
         newEngine();
-        engine.setMoneyJournal(journal);
+        armJournal();
         deposit(100, BTC, FixedPoint.fromDouble(1.0));
         deposit(200, USD, FixedPoint.fromDouble(60000.0));
         hold(1L, 100, BTC, FixedPoint.fromDouble(1.0));
@@ -184,7 +198,7 @@ public class MoneyJournalEngineTest {
     public void holdAndReleaseJournalNothing() {
         newEngine();
         deposit(7, USD, FixedPoint.fromDouble(50.0));
-        engine.setMoneyJournal(journal);
+        armJournal();
         hold(9L, 7, USD, FixedPoint.fromDouble(20.0));
         release(9L, 7);
         assertEquals(0, journal.lines.size());

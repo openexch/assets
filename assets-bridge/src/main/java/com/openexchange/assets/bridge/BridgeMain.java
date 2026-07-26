@@ -26,6 +26,13 @@ public final class BridgeMain {
             System.exit(AeDump.run(java.util.Arrays.copyOfRange(args, 1, args.length)));
             return;
         }
+        // Arm/disarm the money journal: `java -jar assets-bridge.jar set-money-journal on|off`. The
+        // one WRITE tool here, and the only way to change that setting — it is replicated state, so it
+        // travels through the log rather than through a node's environment.
+        if (args.length > 0 && "set-money-journal".equals(args[0])) {
+            System.exit(AeSetMoneyJournal.run(java.util.Arrays.copyOfRange(args, 1, args.length)));
+            return;
+        }
 
         final BridgeConfig config = BridgeConfig.fromEnv();
         final BridgeState state = new BridgeState();

@@ -18,12 +18,13 @@ import org.agrona.MutableDirectBuffer;
  * with the balances they produced: recovery has no skew between "which trades are reflected" and
  * "the balances that reflect them", and the money journal resumes without gaps or reuse.</p>
  *
- * <p><b>BYTE FORMAT v2 (must remain stable; recovery depends on it):</b></p>
+ * <p><b>BYTE FORMAT v3 (must remain stable; recovery depends on it):</b></p>
  * <pre>
- *   [layoutTag          : long]   // LAYOUT_V2_TAG (-2)
+ *   [layoutTag          : long]   // LAYOUT_V3_TAG (-3)
  *   [lastAppliedTradeId : long]
  *   [consumePosition    : long]
  *   [journalSeq         : long]
+ *   [journalEnabled     : byte]   // v3+; whether the cluster's money journal is armed
  *   [numAccounts        : int]
  *   repeat numAccounts:
  *     [userId    : long]
@@ -36,8 +37,28 @@ import org.agrona.MutableDirectBuffer;
  * <p><b>Versioning.</b> The v1 layout had no tag: it began directly with {@code lastAppliedTradeId}
  * (and had no {@code journalSeq}). Trade ids are never negative, so a negative first long
  * unambiguously identifies a tagged layout: {@code first >= 0} decodes as v1 (with a WARN and
- * {@code journalSeq = 0}), {@code first == -2} decodes as v2, anything else fails loudly. Chosen over
- * a leading version byte because a byte cannot be distinguished from v1's untagged first long.</p>
+ * {@code journalSeq = 0}), {@code first == -2} decodes as v2, {@code first == -3} as v3, anything else
+ * fails loudly. Chosen over a leading version byte because a byte cannot be distinguished from v1's
+ * untagged first long.</p>
+ *
+ * <p><b>Restoring a pre-v3 snapshot leaves the money journal DISARMED</b>, and says so at WARN. Before
+ * v3 the setting lived in a node's environment and is simply not present in those bytes; guessing it —
+ * by reading the environment during a restore, say — would make recovery depend on where it ran, which
+ * is the whole class of defect v3 exists to remove. A cluster that was journaling before the upgrade
+ * resumes with one {@code SetMoneyJournal} command, and resumes at its existing {@code journalSeq}, so
+ * nothing is gapped or reused.</p>
+ *
+ * <p><b>CANONICAL ORDER (load-bearing).</b> Accounts are written in ascending {@code userId} and each
+ * account's holds in ascending {@code orderId}, so the bytes are a function of the engine's STATE and
+ * not of the history that produced it. Iterating the underlying hash maps instead would make the
+ * snapshot depend on the order users were first touched and on which holds had been released — so a
+ * node that replayed the log from genesis and a node that restored an earlier snapshot and replayed
+ * the tail would write different bytes for an identical ledger. That difference is harmless to the
+ * ledger but fatal to verification: comparing snapshots is how a bundle replay is checked, and a false
+ * divergence alarm on the money path is worse than no check at all.</p>
+ *
+ * <p>Order is a serialize-side property only: {@link #deserialize} reads whatever order it is given,
+ * so snapshots written before this was canonical still restore.</p>
  *
  * <p>All scalars use the buffer's native byte order (Agrona default).</p>
  */
@@ -47,6 +68,9 @@ public final class BalanceSnapshotCodec {
 
     /** v2 layout tag (negative: impossible as v1's leading lastAppliedTradeId). */
     static final long LAYOUT_V2_TAG = -2L;
+
+    /** v3 layout tag: v2 plus the replicated journalEnabled flag. */
+    static final long LAYOUT_V3_TAG = -3L;
 
     private BalanceSnapshotCodec() {
     }
@@ -80,7 +104,7 @@ public final class BalanceSnapshotCodec {
         final int assets = Asset.count();
         final int[] pos = {0};
 
-        dst.putLong(pos[0], LAYOUT_V2_TAG);
+        dst.putLong(pos[0], LAYOUT_V3_TAG);
         pos[0] += 8;
         dst.putLong(pos[0], engine.getLastAppliedTradeId());
         pos[0] += 8;
@@ -88,10 +112,13 @@ public final class BalanceSnapshotCodec {
         pos[0] += 8;
         dst.putLong(pos[0], engine.getJournalSeq());
         pos[0] += 8;
+        dst.putByte(pos[0], (byte) (engine.isMoneyJournalEnabled() ? 1 : 0));
+        pos[0] += 1;
         dst.putInt(pos[0], engine.accountCount());
         pos[0] += 4;
 
-        engine.forEachAccount(account -> {
+        // Accounts ascending by userId, holds ascending by orderId — see CANONICAL ORDER above.
+        engine.forEachAccountByUserId(account -> {
             dst.putLong(pos[0], account.userId());
             pos[0] += 8;
             dst.putInt(pos[0], assets);
@@ -104,7 +131,7 @@ public final class BalanceSnapshotCodec {
             }
             dst.putInt(pos[0], account.holdCount());
             pos[0] += 4;
-            account.forEachHold((orderId, assetId, remaining, omsManagedRelease) -> {
+            account.forEachHoldByOrderId((orderId, assetId, remaining, omsManagedRelease) -> {
                 dst.putLong(pos[0], orderId);
                 pos[0] += 8;
                 dst.putInt(pos[0], assetId);
@@ -132,6 +159,7 @@ public final class BalanceSnapshotCodec {
         final long lastAppliedTradeId;
         final long consumePosition;
         final long journalSeq;
+        final boolean journalEnabled;
         if (first >= 0) {
             LOG.warn("old-format (v1) balance snapshot: no journalSeq field, defaulting journalSeq=0");
             lastAppliedTradeId = first;
@@ -139,7 +167,8 @@ public final class BalanceSnapshotCodec {
             consumePosition = src.getLong(pos);
             pos += 8;
             journalSeq = 0L;
-        } else if (first == LAYOUT_V2_TAG) {
+            journalEnabled = false;
+        } else if (first == LAYOUT_V2_TAG || first == LAYOUT_V3_TAG) {
             pos += 8;
             lastAppliedTradeId = src.getLong(pos);
             pos += 8;
@@ -147,12 +176,23 @@ public final class BalanceSnapshotCodec {
             pos += 8;
             journalSeq = src.getLong(pos);
             pos += 8;
+            if (first == LAYOUT_V3_TAG) {
+                journalEnabled = src.getByte(pos) != 0;
+                pos += 1;
+            } else {
+                // Pre-v3: the setting was a node environment variable and is not in these bytes. Restore
+                // DISARMED and say so — see the class doc on why this is not guessed.
+                LOG.warn("pre-v3 balance snapshot: money journal restored DISARMED (journalSeq=%d kept); "
+                        + "send SetMoneyJournal to re-arm if this cluster was journaling", journalSeq);
+                journalEnabled = false;
+            }
         } else {
             throw new IllegalStateException("unknown balance snapshot layout tag: " + first);
         }
         engine.setLastAppliedTradeId(lastAppliedTradeId);
         engine.setConsumePosition(consumePosition);
         engine.setJournalSeq(journalSeq);
+        engine.setMoneyJournalEnabled(journalEnabled);
 
         final int numAccounts = src.getInt(pos);
         pos += 4;

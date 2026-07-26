@@ -74,6 +74,12 @@ public final class MoneyJournalWriterAgent implements Agent {
     @Override
     public int doWork() {
         if (publication == null) {
+            // Nothing to write yet: stay unconnected. Opening the recorded publication is what CREATES
+            // the recording, and a cluster whose journal is never armed must not accumulate an empty
+            // recording per boot — catalog entries survive a purge and outlive the segments they name.
+            if (ring.size() == 0) {
+                return 0;
+            }
             return tryConnect() ? 1 : 0;
         }
         final int drained = ring.read(this::onRingMessage, DRAIN_LIMIT);
