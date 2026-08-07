@@ -105,6 +105,15 @@ public final class AssetsClusteredService implements ClusteredService {
         engine.setMoneyJournalSink(journalSink);
     }
 
+    // What this node answers about ITSELF, for whatever supervises it. The
+    // money ledger has no external supervisor in the open deployment, so the
+    // orchestrator's two questions are answered here: kill me (/health), and
+    // may you move on to the next member (/ready). The second one is the one
+    // that costs quorum when it lies, so it is deliberately pessimistic.
+    private final com.openexchange.cluster.NodeReadiness readiness =
+            new com.openexchange.cluster.NodeReadiness();
+    private com.openexchange.cluster.NodeEndpoint nodeEndpoint;
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
@@ -114,6 +123,40 @@ public final class AssetsClusteredService implements ClusteredService {
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
         }
+        startNodeEndpoint();
+        // Started, not ready: the snapshot is loaded but the log replay may
+        // still be running. Readiness waits for the first live role change.
+        readiness.started();
+    }
+
+    /**
+     * The probe endpoint. A fixed port by default rather than one derived from
+     * the member id, because the member id is still -1 this early (see
+     * {@code allocateEgressCounters}) and a probe on the wrong port reads as a
+     * dead node.
+     */
+    private void startNodeEndpoint() {
+        try {
+            final String env = System.getenv("ASSETS_NODE_PORT");
+            final int port = env != null ? Integer.parseInt(env) : 9600;
+            nodeEndpoint = new com.openexchange.cluster.NodeEndpoint(readiness, null);
+            nodeEndpoint.start(port);
+        } catch (Exception e) {
+            // A probe endpoint must never be the reason the ledger does not start.
+            System.err.println("NODE: failed to start probe endpoint: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Called every duty cycle on every member, busy or idle: the only signal
+     * that separates a quiet market from a wedged agent thread. Nothing is
+     * offered from here, deliberately; see the note on {@code doBackgroundWork}
+     * above.
+     */
+    @Override
+    public int doBackgroundWork(final long nowNs) {
+        readiness.tick();
+        return 0;
     }
 
     /**
@@ -256,6 +299,9 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public void onRoleChange(Cluster.Role newRole) {
         this.isLeader = newRole == Cluster.Role.LEADER;
+        // A live role also means recovery is behind us; CANDIDATE withdraws
+        // readiness, which is exactly when a rolling restart has to wait.
+        readiness.roleChanged(newRole);
         // Anything still queued belongs to a leadership this node no longer holds: a demoted node
         // cannot offer, and consumers resynchronise through the snapshot-request messages.
         for (int i = 0; i < egressQueues.length; i++) {
@@ -270,6 +316,10 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTerminate(Cluster cluster) {
+        readiness.stopping();
+        if (nodeEndpoint != null) {
+            nodeEndpoint.stop();
+        }
         closeQuietly(egressPendingBytes);
         closeQuietly(egressBackPressured);
         closeQuietly(egressPeakPendingBytes);
