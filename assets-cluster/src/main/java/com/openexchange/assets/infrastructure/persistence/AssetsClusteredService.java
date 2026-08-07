@@ -114,6 +114,15 @@ public final class AssetsClusteredService implements ClusteredService {
             new com.openexchange.cluster.NodeReadiness();
     private com.openexchange.cluster.NodeEndpoint nodeEndpoint;
 
+    // What makes this cluster snapshot itself with no admin gateway running.
+    // The AE is the engine this was missing on: nothing ever triggered its
+    // snapshots, so its log grew from the day it shipped until /dev/shm was full
+    // and the money path stopped for seventeen hours (2026-07-25).
+    private final com.openexchange.cluster.SnapshotCadence snapshotCadence =
+            com.openexchange.cluster.SnapshotCadence.fromEnv();
+    // ...and what turns the snapshot into reclaimed disk on THIS node.
+    private com.openexchange.cluster.SnapshotLogPruner logPruner;
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
@@ -124,9 +133,54 @@ public final class AssetsClusteredService implements ClusteredService {
             loadSnapshot(snapshotImage);
         }
         startNodeEndpoint();
+        startDurability(cluster);
         // Started, not ready: the snapshot is loaded but the log replay may
         // still be running. Readiness waits for the first live role change.
         readiness.started();
+    }
+
+    /**
+     * Arm the snapshot rhythm and the log pruner.
+     *
+     * <p>Same wiring as the matching engine, deliberately: the code is one copy
+     * in cluster-kit and both engines call it the same way. A feature added to
+     * one engine's durability and not the other is how the AE ended up with no
+     * snapshot trigger at all.</p>
+     *
+     * <p>The cadence starts from {@code cluster.logPosition()}, which here is the
+     * recovery position - the last snapshot's position on a node that recovered
+     * from one, 0 at genesis. Starting from 0 on a recovered node would make it
+     * believe the whole log accumulated since its last snapshot.</p>
+     */
+    private void startDurability(final Cluster cluster) {
+        try {
+            final int clusterId = cluster.context().clusterId();
+            snapshotCadence.bind(
+                    () -> com.openexchange.cluster.SnapshotCadence.findControlToggle(
+                            cluster.aeron(), clusterId),
+                    cluster.logPosition(), System.nanoTime());
+
+            if (com.openexchange.cluster.SnapshotCadence.booleanFromEnv(
+                    "SNAPSHOT_PRUNE_ENABLED", "snapshot.prune.enabled", true)) {
+                logPruner = new com.openexchange.cluster.SnapshotLogPruner(
+                        cluster.context().clusterDir(),
+                        cluster.context().archiveContext().clone(),
+                        cluster.aeron().countersReader(),
+                        clusterId,
+                        readiness::ready);
+                logPruner.start();
+            } else {
+                System.out.println("[PRUNE] disabled by SNAPSHOT_PRUNE_ENABLED=false — "
+                        + "this node's cluster log will grow until something else purges it");
+            }
+        } catch (Exception e) {
+            // Loud, and NOT fatal: a node that cannot arm its own durability must
+            // still serve the ledger. But this is precisely the failure that was
+            // invisible for seventeen hours, so it is reported as what it is.
+            System.err.println("ASSETS CRITICAL: snapshot cadence/log pruner did not start — "
+                    + "this cluster will not snapshot or reclaim disk on its own: " + e);
+            e.printStackTrace();
+        }
     }
 
     /**
@@ -156,7 +210,9 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public int doBackgroundWork(final long nowNs) {
         readiness.tick();
-        return 0;
+        // At most once a second, and only on the leader: is the cluster due a
+        // snapshot? Everything past that gate is a long compare.
+        return snapshotCadence.tick(nowNs, isLeader, cluster.logPosition());
     }
 
     /**
@@ -286,6 +342,9 @@ public final class AssetsClusteredService implements ClusteredService {
         while (true) {
             final long result = snapshotPublication.offer(buffer, 0, length);
             if (result > 0) {
+                // The baseline for the next snapshot, on EVERY member and whoever
+                // asked for this one.
+                snapshotCadence.snapshotTaken(cluster.logPosition(), System.nanoTime());
                 return;
             }
             if (result == ExclusivePublication.CLOSED
@@ -302,6 +361,9 @@ public final class AssetsClusteredService implements ClusteredService {
         // A live role also means recovery is behind us; CANDIDATE withdraws
         // readiness, which is exactly when a rolling restart has to wait.
         readiness.roleChanged(newRole);
+        // A member that is no longer leader drops any snapshot request it was
+        // waiting on: the consensus module reads that toggle only while leading.
+        snapshotCadence.roleChanged(isLeader);
         // Anything still queued belongs to a leadership this node no longer holds: a demoted node
         // cannot offer, and consumers resynchronise through the snapshot-request messages.
         for (int i = 0; i < egressQueues.length; i++) {
@@ -317,6 +379,9 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public void onTerminate(Cluster cluster) {
         readiness.stopping();
+        if (logPruner != null) {
+            logPruner.stop();
+        }
         if (nodeEndpoint != null) {
             nodeEndpoint.stop();
         }
