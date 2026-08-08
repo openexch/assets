@@ -167,7 +167,13 @@ public final class AssetsClusteredService implements ClusteredService {
                         cluster.context().archiveContext().clone(),
                         cluster.aeron().countersReader(),
                         clusterId,
-                        readiness::ready);
+                        readiness::ready)
+                        // Same as the matching engine: computed on the leader after
+                        // every snapshot and logged, not yet applied to the purge.
+                        .reportWatermark(
+                                com.openexchange.cluster.ClusterMemberPositions.from(
+                                        cluster.aeron(), cluster.context()),
+                                () -> isLeader);
                 logPruner.start();
             } else {
                 System.out.println("[PRUNE] disabled by SNAPSHOT_PRUNE_ENABLED=false — "
