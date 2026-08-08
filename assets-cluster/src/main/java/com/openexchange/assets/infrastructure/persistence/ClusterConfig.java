@@ -42,12 +42,17 @@ import java.util.List;
  */
 public final class ClusterConfig {
 
-    public static final int PORTS_PER_NODE = 100;
-    public static final int ARCHIVE_CONTROL_PORT_OFFSET = 1;
-    public static final int CLIENT_FACING_PORT_OFFSET = 2;
-    public static final int MEMBER_FACING_PORT_OFFSET = 3;
-    public static final int LOG_PORT_OFFSET = 4;
-    public static final int TRANSFER_PORT_OFFSET = 5;
+    /** Ports per node when several members share a host; zero by default now (see ClusterPorts). */
+    public static final int PORTS_PER_NODE = com.openexchange.cluster.ClusterPorts.SHARED_HOST_STRIDE;
+    public static final int ARCHIVE_CONTROL_PORT_OFFSET =
+            com.openexchange.cluster.ClusterPorts.ARCHIVE_CONTROL_OFFSET;
+    public static final int CLIENT_FACING_PORT_OFFSET =
+            com.openexchange.cluster.ClusterPorts.CLIENT_FACING_OFFSET;
+    public static final int MEMBER_FACING_PORT_OFFSET =
+            com.openexchange.cluster.ClusterPorts.MEMBER_FACING_OFFSET;
+    public static final int LOG_PORT_OFFSET = com.openexchange.cluster.ClusterPorts.LOG_OFFSET;
+    public static final int TRANSFER_PORT_OFFSET =
+            com.openexchange.cluster.ClusterPorts.TRANSFER_OFFSET;
     public static final String ARCHIVE_SUB_DIR = "archive";
     public static final String CLUSTER_SUB_DIR = "cluster";
 
@@ -336,8 +341,13 @@ public final class ClusterConfig {
         return sb.toString();
     }
 
+    /**
+     * One copy of the arithmetic, in cluster-kit, because OMS and the settlement bridge derive
+     * these same numbers independently. By default every member listens on the SAME ports;
+     * {@code CLUSTER_PORT_STRIDE=100} restores the several-members-per-host layout.
+     */
     public static int calculatePort(final int nodeId, final int portBase, final int offset) {
-        return portBase + (nodeId * PORTS_PER_NODE) + offset;
+        return com.openexchange.cluster.ClusterPorts.port(nodeId, portBase, offset);
     }
 
     private static String udpChannel(final int nodeId, final String hostname, final int portBase) {

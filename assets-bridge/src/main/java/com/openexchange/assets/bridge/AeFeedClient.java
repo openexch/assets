@@ -123,7 +123,8 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
                 sb.append(',');
             }
             sb.append(i).append('=').append(addresses.get(i).trim()).append(':')
-                    .append(portBase + i * 100 + 2);
+                    .append(com.openexchange.cluster.ClusterPorts.port(
+                            i, portBase, com.openexchange.cluster.ClusterPorts.CLIENT_FACING_OFFSET));
         }
         return sb.toString();
     }
