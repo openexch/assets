@@ -38,6 +38,12 @@
         </dependency>
 
         <!-- Aeron (full: client to the ME journal archive + client to the AE cluster) -->
+        <!-- The cluster port arithmetic: one copy, shared with the engines and OMS. -->
+        <dependency>
+            <groupId>com.openexchange</groupId>
+            <artifactId>cluster-kit</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>io.aeron</groupId>
             <artifactId>aeron-all</artifactId>

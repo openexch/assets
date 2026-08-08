@@ -271,7 +271,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         final StringBuilder sb = new StringBuilder();
         for (int i = 0; i < hosts.size(); i++) {
             if (i > 0) sb.append(',');
-            sb.append(i).append('=').append(hosts.get(i).trim()).append(':').append(portBase + i * 100 + 2);
+            sb.append(i).append('=').append(hosts.get(i).trim()).append(':')
+                    .append(com.openexchange.cluster.ClusterPorts.port(
+                            i, portBase, com.openexchange.cluster.ClusterPorts.CLIENT_FACING_OFFSET));
         }
         return sb.toString();
     }
