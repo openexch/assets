@@ -95,6 +95,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final long prefundBtcFp;
 
     // ---- transport ----
+    /** Embedded media driver; null when {@code --aeron-dir} attaches to an external one. */
     private final MediaDriver driver;
     private final AeronCluster me;
     private final AeronCluster ae;
@@ -233,12 +234,18 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         final String egressHost = resolveEgressHost(strArg(args, "--egress-host", null),
                 aeOnly ? aeHosts.get(0) : meHosts.get(0));
 
-        this.driver = MediaDriver.launch(new MediaDriver.Context()
+        // --aeron-dir: attach to an EXTERNAL media driver (e.g. a pinned busy-spin aeronmd)
+        // instead of launching an embedded SHARED-mode one, so client-side driver noise stays
+        // out of the measurement. The external driver's lifecycle is not ours: driver stays
+        // null and close() only closes what this process started.
+        final String externalAeronDir = strArg(args, "--aeron-dir", null);
+        this.driver = externalAeronDir != null ? null : MediaDriver.launch(new MediaDriver.Context()
                 .aeronDirectoryName("/dev/shm/aeron-moneyload-" + ProcessHandle.current().pid())
                 .threadingMode(ThreadingMode.SHARED)
                 .dirDeleteOnStart(true)
                 .dirDeleteOnShutdown(true)
                 .errorHandler(t -> t.printStackTrace(System.err)));
+        final String aeronDir = driver != null ? driver.aeronDirectoryName() : externalAeronDir;
 
         System.out.printf("connecting %sAE %s (base %d), egressHost=%s%n",
                 aeOnly ? "" : "ME " + meHosts + " (base " + mePortBase + ") / ",
@@ -250,8 +257,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         AeronCluster meClient = null;
         AeronCluster aeClient = null;
         try {
-            meClient = aeOnly ? null : connect(driver, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
-            aeClient = connect(driver, ingressEndpoints(aeHosts, aePortBase), egressHost, new AeEgress());
+            meClient = aeOnly ? null : connect(aeronDir, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
+            aeClient = connect(aeronDir, ingressEndpoints(aeHosts, aePortBase), egressHost, new AeEgress());
         } catch (final RuntimeException e) {
             // The embedded media driver's threads are NOT daemons. A failed connect used to leave
             // them running with the constructor half-done, so close() never ran and the JVM never
@@ -297,11 +304,11 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         return "127.0.0.1";
     }
 
-    private static AeronCluster connect(final MediaDriver driver, final String ingressEndpoints,
+    private static AeronCluster connect(final String aeronDir, final String ingressEndpoints,
                                         final String egressHost, final EgressListener listener) {
         return AeronCluster.connect(new AeronCluster.Context()
                 .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10))
-                .aeronDirectoryName(driver.aeronDirectoryName())
+                .aeronDirectoryName(aeronDir)
                 .ingressChannel("aeron:udp?term-length=16m|mtu=8k")
                 .ingressEndpoints(ingressEndpoints)
                 .egressChannel("aeron:udp?endpoint=" + egressHost + ":0")
@@ -832,6 +839,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                   --me-port-base N    default 9000
                   --ae-port-base N    default 9300
                   --egress-host H     advertised egress address (default: routed source addr)
+                  --aeron-dir DIR     attach to an EXTERNAL media driver at DIR instead of
+                                      launching an embedded one (default: embedded driver
+                                      in /dev/shm/aeron-moneyload-<pid>)
                   --out DIR           hgrm output dir (default results)
                   --gen-id N          generator identity for multi-generator runs (default 0):
                                       separates order-id space, RNG stream and user range
