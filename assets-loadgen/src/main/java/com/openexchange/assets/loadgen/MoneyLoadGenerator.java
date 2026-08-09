@@ -26,8 +26,11 @@ import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -77,6 +80,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private static final long PREFUND_CORR_BASE = 1L << 62;
     private static final int OFFER_RETRIES = 10;
 
+    /** Egress channel names as in the {@code EgressChannels} bit set (money-schema.xml). */
+    private static final List<String> CHANNEL_NAMES = List.of("acks", "balances", "settlements", "snapshots");
+
     // ---- config ----
     private final int rate;
     private final int durationSec;          // measurement window, EXCLUDES warmup (unlike match-loadtest)
@@ -93,6 +99,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final boolean prefund;
     private final long prefundUsdFp;
     private final long prefundBtcFp;
+    /** AE egress channels to subscribe to after connect; null = flag absent: no Subscribe sent, full broadcast. */
+    private final Set<String> subscribeChannels;
 
     // ---- transport ----
     /** Embedded media driver; null when {@code --aeron-dir} attaches to an external one. */
@@ -120,6 +128,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             new com.openexchange.assets.infrastructure.generated.ReleaseEncoder();
     private final com.openexchange.assets.infrastructure.generated.DepositEncoder depositEnc =
             new com.openexchange.assets.infrastructure.generated.DepositEncoder();
+    private final com.openexchange.assets.infrastructure.generated.SubscribeEncoder subscribeEnc =
+            new com.openexchange.assets.infrastructure.generated.SubscribeEncoder();
     private final com.openexchange.assets.infrastructure.generated.HoldAckDecoder holdAckDec =
             new com.openexchange.assets.infrastructure.generated.HoldAckDecoder();
     private final com.openexchange.assets.infrastructure.generated.HoldRejectDecoder holdRejectDec =
@@ -222,6 +232,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         this.prefund = !hasFlag(args, "--no-prefund");
         this.prefundUsdFp = fp(doubleArg(args, "--prefund-usd", 50_000_000_000.0)); // $50B/user
         this.prefundBtcFp = fp(doubleArg(args, "--prefund-btc", 10_000_000.0));     // 10M BTC/user
+        this.subscribeChannels = parseChannels(args); // fail-fast: before any resource is launched
 
         final List<String> meHosts = List.of(strArg(args, "--me-hosts", "127.0.0.1").split(","));
         final List<String> aeHosts = List.of(strArg(args, "--ae-hosts", "127.0.0.1").split(","));
@@ -259,6 +270,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         try {
             meClient = aeOnly ? null : connect(aeronDir, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
             aeClient = connect(aeronDir, ingressEndpoints(aeHosts, aePortBase), egressHost, new AeEgress());
+            if (subscribeChannels != null) {
+                sendSubscribe(aeClient);
+                System.out.println("AE egress narrowed to: " + String.join(",", subscribeChannels));
+            }
         } catch (final RuntimeException e) {
             // The embedded media driver's threads are NOT daemons. A failed connect used to leave
             // them running with the constructor half-done, so close() never ran and the JVM never
@@ -314,6 +329,43 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 .egressChannel("aeron:udp?endpoint=" + egressHost + ":0")
                 .egressListener(listener)
                 .errorHandler(t -> t.printStackTrace(System.err)));
+    }
+
+    /**
+     * Narrow the AE session's egress to the channels named in {@code --subscribe}, mirroring the
+     * bridge's AeFeedClient. A session that never subscribes is broadcast EVERY channel
+     * (deliberate back-compat), so by default each generator session also pays for the
+     * BalanceUpdate firehose it decodes and discards. Transport state on the leader, never
+     * snapshotted; one message per connect is enough.
+     *
+     * <p>Fail fast on a terminal offer result or timeout instead of continuing: silently running
+     * unsubscribed would put the firehose cost back into the measurement, which is exactly what
+     * the flag exists to remove. Constructor context only — never reached from an egress
+     * callback, so polling between retries is safe here (unlike {@link #offerWithRetry}).</p>
+     */
+    private void sendSubscribe(final AeronCluster cluster) {
+        subscribeEnc.wrapAndApplyHeader(aeBuffer, 0, aeHeaderEnc)
+                .correlationId(0L)
+                .channels().clear()
+                .acks(subscribeChannels.contains("acks"))
+                .balances(subscribeChannels.contains("balances"))
+                .settlements(subscribeChannels.contains("settlements"))
+                .snapshots(subscribeChannels.contains("snapshots"));
+        final int len = aeHeaderEnc.encodedLength() + subscribeEnc.encodedLength();
+        final long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
+            final long result = cluster.offer(aeBuffer, 0, len);
+            if (result > 0) return;
+            if (result == Publication.CLOSED || result == Publication.NOT_CONNECTED
+                    || result == Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("Subscribe offer failed terminally: " + result);
+            }
+            if (System.nanoTime() > deadlineNs) {
+                throw new IllegalStateException("Subscribe not accepted within 10s (ingress backpressure)");
+            }
+            cluster.pollEgress();
+            Thread.onSpinWait();
+        }
     }
 
     // ------------------------------------------------------------------ pre-fund
@@ -648,7 +700,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 depositAckDec.wrap(buffer, body, actingBlockLength, actingVersion);
                 if (depositAckDec.correlationId() >= PREFUND_CORR_BASE) depositAcks++;
             }
-            // BalanceUpdate and snapshots: high-volume, ignored by design.
+            // BalanceUpdate and snapshots: high-volume, ignored by design
+            // (--subscribe acks,settlements stops them at the source instead).
         }
     }
 
@@ -822,6 +875,33 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         return false;
     }
 
+    /**
+     * {@code --subscribe} CSV -> channel-name set; null when the flag is absent (no Subscribe is
+     * sent and the session receives every egress channel — exactly the pre-flag behaviour).
+     * Unknown or missing names fail fast: a typo that silently fell back to the full firehose
+     * would invalidate the very measurement the flag exists to protect.
+     */
+    private static Set<String> parseChannels(final String[] args) {
+        final String csv = strArg(args, "--subscribe", null);
+        if (csv == null) {
+            if (hasFlag(args, "--subscribe")) {
+                throw new IllegalArgumentException("--subscribe requires a value: comma-separated"
+                        + " channels of " + String.join(", ", CHANNEL_NAMES));
+            }
+            return null;
+        }
+        final Set<String> channels = new LinkedHashSet<>();
+        for (final String raw : csv.split(",")) {
+            final String name = raw.trim().toLowerCase(Locale.ROOT);
+            if (!CHANNEL_NAMES.contains(name)) {
+                throw new IllegalArgumentException("--subscribe: unknown channel '" + raw.trim()
+                        + "', valid: " + String.join(", ", CHANNEL_NAMES));
+            }
+            channels.add(name);
+        }
+        return channels;
+    }
+
     public static void main(final String[] args) {
         if (hasFlag(args, "--help")) {
             System.out.println("""
@@ -842,6 +922,11 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                   --aeron-dir DIR     attach to an EXTERNAL media driver at DIR instead of
                                       launching an embedded one (default: embedded driver
                                       in /dev/shm/aeron-moneyload-<pid>)
+                  --subscribe CSV     subscribe the AE session to only these egress channels:
+                                      acks, balances, settlements, snapshots (case-insensitive).
+                                      Default: no Subscribe is sent and the AE broadcasts every
+                                      channel to this session. "acks,settlements" keeps every
+                                      loadgen counter live (BalanceUpdate is ignored by design)
                   --out DIR           hgrm output dir (default results)
                   --gen-id N          generator identity for multi-generator runs (default 0):
                                       separates order-id space, RNG stream and user range
