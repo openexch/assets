@@ -13,6 +13,7 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.Header;
 import org.HdrHistogram.Histogram;
+import org.HdrHistogram.SingleWriterRecorder;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableDirectByteBuffer;
 import org.agrona.collections.Long2LongHashMap;
@@ -24,6 +25,9 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -95,6 +99,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final int genId;        // cok-uretici kosumda kimlik: id uzayi, RNG ve kullanici araligi ayrilir
     /** Substrate mode: hold + release against the AE alone, no ME, no journal, no bridge. */
     private final boolean aeOnly;
+    /** Once per second, print one interval-only ILOG line per latency track. */
+    private final boolean intervalLog;
     private final boolean prefund;
     private final long prefundUsdFp;
     private final long prefundBtcFp;
@@ -182,20 +188,61 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final Long2LongHashMap tradeToSampledOrder = new Long2LongHashMap(-1);
     private static final int TRADE_MAP_CAP = 4_000_000;
 
-    // ---- histograms (ns) ----
-    private final Histogram holdAckHist = newHist();
-    private final Histogram orderAckHist = newHist();
-    private final Histogram tradeToSettledHist = newHist();   // trade observed first (settle lag)
+    // ---- latency tracks (ns) ----
+    /**
+     * The duty thread is the ONLY writer (recordValue, wait-free); the interval-log thread and the
+     * final report are the only readers, serialized by the synchronized flip methods. Cumulative
+     * keeps the newHist() bounds/digits, so the final report and hgrm output are unchanged.
+     */
+    private static final class Track {
+        final String name;
+        private final SingleWriterRecorder recorder = new SingleWriterRecorder(3);
+        private final Histogram cumulative = newHist();
+        private Histogram recycled;
+
+        Track(final String name) { this.name = name; }
+
+        void recordValue(final long v) { recorder.recordValue(v); }
+
+        /** Fold the interval since the last flip into cumulative; recycled IS that interval. */
+        private void flip() {
+            recycled = recorder.getIntervalHistogram(recycled);
+            cumulative.add(recycled);
+        }
+
+        synchronized Histogram cumulative() {
+            flip();
+            return cumulative;
+        }
+
+        synchronized void printIntervalLine(final PrintStream out, final String stampPrefix) {
+            flip();
+            out.printf(Locale.ROOT, "%strack=%s n=%d p50_ms=%.2f p99_ms=%.2f max_ms=%.2f%n",
+                    stampPrefix, name, recycled.getTotalCount(),
+                    recycled.getValueAtPercentile(50) / 1e6,
+                    recycled.getValueAtPercentile(99) / 1e6,
+                    recycled.getMaxValue() / 1e6);
+        }
+    }
+
+    private final Track holdAckHist = new Track("hold-ack");
+    private final Track orderAckHist = new Track("order-ack");
+    private final Track tradeToSettledHist = new Track("trade-to-settled");   // trade observed first (settle lag)
     /**
      * ME order OFFER -> first ME status. Deliberately NOT charged from the scheduled slot: this is the
      * matching engine's own round trip with the hold leg and any schedule backlog removed, which is the
      * only way to tell a fixed structural cost from queueing. The coordinated-omission-safe lifecycle
      * histogram above stays the headline number; this one is the diagnostic.
      */
-    private final Histogram meLegHist = newHist();
-    private final Histogram settleLeadHist = newHist();       // settle observed first (its lead)
-    private final Histogram orderToSettledHist = newHist();
+    private final Track meLegHist = new Track("me-leg");
+    private final Track settleLeadHist = new Track("settle-lead");            // settle observed first (its lead)
+    private final Track orderToSettledHist = new Track("order-to-settled");
+    /** ILOG emission order; names match the hgrm file names. */
+    private final Track[] tracks = {
+            holdAckHist, orderAckHist, meLegHist, tradeToSettledHist, settleLeadHist, orderToSettledHist };
     private static Histogram newHist() { return new Histogram(TimeUnit.MINUTES.toNanos(2), 3); }
+    private static final DateTimeFormatter ILOG_TS =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
 
     // ---- counters ----
     private long holdsSent, holdAcks, holdRejects, ordersSent, orderSendFailures,
@@ -231,6 +278,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         this.rand = new Random(42 + this.genId);
         this.orderIdBase = (System.currentTimeMillis() + this.genId) << 20;
         this.aeOnly = hasFlag(args, "--ae-only");
+        this.intervalLog = hasFlag(args, "--interval-log");
         this.prefund = !hasFlag(args, "--no-prefund");
         this.prefundUsdFp = fp(doubleArg(args, "--prefund-usd", 50_000_000_000.0)); // $50B/user
         this.prefundBtcFp = fp(doubleArg(args, "--prefund-btc", 10_000_000.0));     // 10M BTC/user
@@ -415,6 +463,23 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         System.out.printf("running: %d orders/s, warmup %ds, measured window %ds, window %d, users %d%n",
                 rate, warmupSec, durationSec, window, users);
 
+        // One shared stamp per tick, stamped at the interval's END. Warmup ticks print n=0
+        // (histograms only record inside the window) - a useful GC-ramp timebase.
+        Thread intervalLogger = null;
+        if (intervalLog) {
+            intervalLogger = new Thread(() -> {
+                while (true) {
+                    try { Thread.sleep(1_000); } catch (final InterruptedException e) { return; }
+                    final long epochMs = System.currentTimeMillis();
+                    final String stamp = "ILOG epoch_ms=" + epochMs
+                            + " ts=" + ILOG_TS.format(Instant.ofEpochMilli(epochMs)) + " ";
+                    for (final Track t : tracks) t.printIntervalLine(System.out, stamp);
+                }
+            }, "interval-log");
+            intervalLogger.setDaemon(true);
+            intervalLogger.start();
+        }
+
         while (true) {
             final long now = System.nanoTime();
 
@@ -450,6 +515,11 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
 
         drain();
+        if (intervalLogger != null) {
+            // Stop the reporter BEFORE the final report so ILOG lines never interleave it.
+            intervalLogger.interrupt();
+            try { intervalLogger.join(); } catch (final InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
         report(startNs);
     }
 
@@ -849,7 +919,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
     }
 
-    private static void printHist(final PrintStream out, final String name, final Histogram h) {
+    private static void printHist(final PrintStream out, final String name, final Track t) {
+        final Histogram h = t.cumulative();
         if (h.getTotalCount() == 0) {
             out.printf("%-45s  (no samples)%n", name);
             return;
@@ -865,9 +936,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         return ns < 1_000_000 ? String.format("%.1fus", ns / 1e3) : String.format("%.2fms", ns / 1e6);
     }
 
-    private void writeHgrm(final String name, final Histogram h) throws Exception {
+    private void writeHgrm(final String name, final Track t) throws Exception {
         try (PrintStream ps = new PrintStream(Files.newOutputStream(outDir.resolve(name + ".hgrm")))) {
-            h.outputPercentileDistribution(ps, 1000.0); // report in microseconds
+            t.cumulative().outputPercentileDistribution(ps, 1000.0); // report in microseconds
         }
     }
 
@@ -955,6 +1026,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                   --out DIR           hgrm output dir (default results)
                   --gen-id N          generator identity for multi-generator runs (default 0):
                                       separates order-id space, RNG stream and user range
+                  --interval-log      once per second, print one ILOG line per latency track:
+                                      that second's n/p50/p99/max in ms (default off)
                   --ae-only           AE substrate mode: hold + release only, NO ME/journal/bridge.
                                       Reports ACKED round trips/s (committed), not offers.
                   --no-prefund        skip the deposit phase
