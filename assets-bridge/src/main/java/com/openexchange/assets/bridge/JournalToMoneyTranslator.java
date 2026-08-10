@@ -8,6 +8,7 @@ import com.match.infrastructure.journal.generated.MessageHeaderDecoder;
 
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
+import com.openexchange.assets.infrastructure.generated.SettleBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.SettleEncoder;
 import com.openexchange.assets.infrastructure.generated.TerminalReleaseEncoder;
 
@@ -20,6 +21,12 @@ import org.agrona.MutableDirectBuffer;
  * equivalent Assets Engine money-schema command (Settle or TerminalRelease, {@code
  * com.openexchange.assets.infrastructure.generated}, schema id=2). Field-for-field, nothing more: no
  * I/O, no retry, no dedup, no ordering decision.
+ *
+ * <p><b>v5 batching.</b> {@link #stageTrade} accumulates the same field-for-field translation into a
+ * pending SettleBatch (up to {@link #TRADE_BATCH_CAP} entries, in staging order), and
+ * {@link #encodeStagedTrades} emits it as one frame. The translation per entry is bit-identical to
+ * {@link #translateTrade}; WHEN to flush (cap, an interleaved terminal, an empty poll, a halt) stays
+ * an agent-loop decision — this class still makes no ordering or I/O choices of its own.</p>
  *
  * <p>The bridge forwards journal messages in journal order — that ordering discipline lives in the
  * agent loop (a separate, lead-owned change), not here. Idempotency on the money side lives entirely in
@@ -43,6 +50,12 @@ import org.agrona.MutableDirectBuffer;
  */
 public final class JournalToMoneyTranslator {
 
+    /**
+     * Max trades per SettleBatch frame. Sized so one batch (~4.4 KB) stays a comfortable single
+     * cluster-ingress message while still collapsing a 64-message replay burst into one log entry.
+     */
+    public static final int TRADE_BATCH_CAP = 64;
+
     // Journal-side (match-common) decoders: reused flyweights, re-wrapped on every call.
     private final MessageHeaderDecoder journalHeader = new MessageHeaderDecoder();
     private final JournalTradeDecoder journalTrade = new JournalTradeDecoder();
@@ -51,7 +64,22 @@ public final class JournalToMoneyTranslator {
     // Money-side (assets-common) encoders: reused flyweights, re-wrapped on every call.
     private final MessageHeaderEncoder moneyHeader = new MessageHeaderEncoder();
     private final SettleEncoder settle = new SettleEncoder();
+    private final SettleBatchEncoder settleBatch = new SettleBatchEncoder();
     private final TerminalReleaseEncoder terminalRelease = new TerminalReleaseEncoder();
+
+    // Staged SettleBatch entries (column-major, preallocated: zero allocation after construction).
+    // Each column is one Settle field, in the exact translateTrade mapping.
+    private int stagedCount;
+    private final long[] stTradeId = new long[TRADE_BATCH_CAP];
+    private final int[] stMarketId = new int[TRADE_BATCH_CAP];
+    private final long[] stTakerOrderId = new long[TRADE_BATCH_CAP];
+    private final long[] stTakerUserId = new long[TRADE_BATCH_CAP];
+    private final long[] stMakerOrderId = new long[TRADE_BATCH_CAP];
+    private final long[] stMakerUserId = new long[TRADE_BATCH_CAP];
+    private final long[] stPrice = new long[TRADE_BATCH_CAP];
+    private final long[] stQuantity = new long[TRADE_BATCH_CAP];
+    private final boolean[] stTakerIsBuy = new boolean[TRADE_BATCH_CAP];
+    private final long[] stJournalPosition = new long[TRADE_BATCH_CAP];
 
     /**
      * Decodes a JournalTrade at {@code [offset, ...)} in {@code journalMsg} and encodes the equivalent
@@ -80,6 +108,76 @@ public final class JournalToMoneyTranslator {
                 .journalPosition(journalTrade.egressSeq());
 
         return moneyHeader.encodedLength() + settle.encodedLength();
+    }
+
+    /**
+     * Decodes a JournalTrade at {@code [offset, ...)} in {@code journalMsg} and stages it into the
+     * pending SettleBatch — the exact {@link #translateTrade} field mapping (OMS order ids, egressSeq
+     * as journalPosition), just deferred into one frame. The caller must flush at
+     * {@link #TRADE_BATCH_CAP} before staging further; staging past the cap throws rather than
+     * silently dropping a settlement.
+     */
+    public void stageTrade(DirectBuffer journalMsg, int offset) {
+        if (stagedCount == TRADE_BATCH_CAP) {
+            throw new IllegalStateException("SettleBatch staging past cap " + TRADE_BATCH_CAP
+                    + " — the agent must encodeStagedTrades() first");
+        }
+        journalHeader.wrap(journalMsg, offset);
+        journalTrade.wrap(journalMsg, offset + journalHeader.encodedLength(),
+                journalHeader.blockLength(), journalHeader.version());
+
+        final int i = stagedCount++;
+        stTradeId[i] = journalTrade.tradeId();
+        stMarketId[i] = journalTrade.marketId();
+        // THE MONEY KEY (see translateTrade): OMS order ids, not cluster ids.
+        stTakerOrderId[i] = journalTrade.takerOmsOrderId();
+        stTakerUserId[i] = journalTrade.takerUserId();
+        stMakerOrderId[i] = journalTrade.makerOmsOrderId();
+        stMakerUserId[i] = journalTrade.makerUserId();
+        stPrice[i] = journalTrade.price();
+        stQuantity[i] = journalTrade.quantity();
+        stTakerIsBuy[i] = journalTrade.takerIsBuy() == BooleanType.TRUE;
+        stJournalPosition[i] = journalTrade.egressSeq();
+    }
+
+    /** Number of trades currently staged for the next SettleBatch frame. */
+    public int stagedTradeCount() {
+        return stagedCount;
+    }
+
+    /** Drop any staged trades (epoch teardown: the stateless resume re-reads them from the journal). */
+    public void resetStagedTrades() {
+        stagedCount = 0;
+    }
+
+    /**
+     * Encodes the staged trades as one SettleBatch frame (money MessageHeader + body) at
+     * {@code outOffset} in {@code out}, entries in staging order, and clears the staging. Returns the
+     * encoded length; calling with nothing staged is a bug and throws.
+     */
+    public int encodeStagedTrades(MutableDirectBuffer out, int outOffset) {
+        final int count = stagedCount;
+        if (count == 0) {
+            throw new IllegalStateException("no trades staged");
+        }
+        final SettleBatchEncoder.SettlesEncoder g = settleBatch
+                .wrapAndApplyHeader(out, outOffset, moneyHeader)
+                .settlesCount(count);
+        for (int i = 0; i < count; i++) {
+            g.next()
+                    .tradeId(stTradeId[i])
+                    .marketId(stMarketId[i])
+                    .takerOrderId(stTakerOrderId[i])
+                    .takerUserId(stTakerUserId[i])
+                    .makerOrderId(stMakerOrderId[i])
+                    .makerUserId(stMakerUserId[i])
+                    .price(stPrice[i])
+                    .quantity(stQuantity[i])
+                    .takerIsBuy(stTakerIsBuy[i] ? BoolFlag.TRUE : BoolFlag.FALSE)
+                    .journalPosition(stJournalPosition[i]);
+        }
+        stagedCount = 0;
+        return moneyHeader.encodedLength() + settleBatch.encodedLength();
     }
 
     /**

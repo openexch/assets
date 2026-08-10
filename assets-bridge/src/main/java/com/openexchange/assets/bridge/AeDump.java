@@ -2,8 +2,10 @@
 package com.openexchange.assets.bridge;
 
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndDecoder;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder;
 import com.openexchange.assets.infrastructure.generated.FeedPositionReportDecoder;
+import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -160,8 +162,10 @@ public final class AeDump {
 
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
         private final BalanceUpdateDecoder balanceDec = new BalanceUpdateDecoder();
+        private final BalanceUpdateBatchDecoder balanceBatchDec = new BalanceUpdateBatchDecoder();
         private final BalanceSnapshotEndDecoder balanceEndDec = new BalanceSnapshotEndDecoder();
         private final HoldSnapshotEntryDecoder holdDec = new HoldSnapshotEntryDecoder();
+        private final HoldSnapshotBatchDecoder holdBatchDec = new HoldSnapshotBatchDecoder();
         private final HoldSnapshotEndDecoder holdEndDec = new HoldSnapshotEndDecoder();
         private final FeedPositionReportDecoder posDec = new FeedPositionReportDecoder();
 
@@ -199,6 +203,20 @@ public final class AeDump {
                             new long[]{uid, asset, balanceDec.available(), balanceDec.locked()});
                     break;
                 }
+                case BalanceUpdateBatchDecoder.TEMPLATE_ID: {
+                    // v5: the snapshot answer arrives as batch chunks; each entry is one BalanceUpdate.
+                    if (balancesEnd) {
+                        return;
+                    }
+                    balanceBatchDec.wrapAndApplyHeader(buffer, offset, header);
+                    for (final BalanceUpdateBatchDecoder.UpdatesDecoder u : balanceBatchDec.updates()) {
+                        final long uid = u.userId();
+                        final int asset = u.assetId();
+                        balances.put(balanceKey(uid, asset),
+                                new long[]{uid, asset, u.available(), u.locked()});
+                    }
+                    break;
+                }
                 case BalanceSnapshotEndDecoder.TEMPLATE_ID: {
                     balanceEndDec.wrapAndApplyHeader(buffer, offset, header);
                     if (balanceEndDec.correlationId() == balanceCorr) {
@@ -213,6 +231,18 @@ public final class AeDump {
                     holdDec.wrapAndApplyHeader(buffer, offset, header);
                     holds.put(holdDec.orderId(),
                             new long[]{holdDec.orderId(), holdDec.userId(), holdDec.assetId(), holdDec.remaining()});
+                    break;
+                }
+                case HoldSnapshotBatchDecoder.TEMPLATE_ID: {
+                    // v5: the hold snapshot arrives as batch chunks; each entry is one HoldSnapshotEntry.
+                    if (holdsEnd) {
+                        return;
+                    }
+                    holdBatchDec.wrapAndApplyHeader(buffer, offset, header);
+                    for (final HoldSnapshotBatchDecoder.HoldsDecoder h : holdBatchDec.holds()) {
+                        holds.put(h.orderId(),
+                                new long[]{h.orderId(), h.userId(), h.assetId(), h.remaining()});
+                    }
                     break;
                 }
                 case HoldSnapshotEndDecoder.TEMPLATE_ID: {

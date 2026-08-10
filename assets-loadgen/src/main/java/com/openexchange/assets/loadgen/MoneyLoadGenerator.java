@@ -3,7 +3,6 @@ package com.openexchange.assets.loadgen;
 import com.match.infrastructure.generated.CreateOrderEncoder;
 import com.match.infrastructure.generated.OrderSide;
 import com.match.infrastructure.generated.OrderStatusBatchDecoder;
-import com.match.infrastructure.generated.OrderStatusUpdateDecoder;
 import com.match.infrastructure.generated.OrderType;
 import com.match.infrastructure.generated.TradeExecutionBatchDecoder;
 import com.openexchange.assets.domain.FixedPoint;
@@ -114,7 +113,6 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final com.match.infrastructure.generated.MessageHeaderDecoder meHeaderDec =
             new com.match.infrastructure.generated.MessageHeaderDecoder();
     private final CreateOrderEncoder createOrderEnc = new CreateOrderEncoder();
-    private final OrderStatusUpdateDecoder statusDec = new OrderStatusUpdateDecoder();
     private final OrderStatusBatchDecoder statusBatchDec = new OrderStatusBatchDecoder();
     private final TradeExecutionBatchDecoder tradeBatchDec = new TradeExecutionBatchDecoder();
 
@@ -132,12 +130,16 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             new com.openexchange.assets.infrastructure.generated.SubscribeEncoder();
     private final com.openexchange.assets.infrastructure.generated.HoldAckDecoder holdAckDec =
             new com.openexchange.assets.infrastructure.generated.HoldAckDecoder();
+    private final com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder holdAckBatchDec =
+            new com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder();
     private final com.openexchange.assets.infrastructure.generated.HoldRejectDecoder holdRejectDec =
             new com.openexchange.assets.infrastructure.generated.HoldRejectDecoder();
     private final com.openexchange.assets.infrastructure.generated.DepositAckDecoder depositAckDec =
             new com.openexchange.assets.infrastructure.generated.DepositAckDecoder();
     private final com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder settleDec =
             new com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder();
+    private final com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchDecoder settleBatchDec =
+            new com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchDecoder();
     private final com.openexchange.assets.infrastructure.generated.SettleFaultDecoder settleFaultDec =
             new com.openexchange.assets.infrastructure.generated.SettleFaultDecoder();
 
@@ -500,12 +502,16 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
     }
 
-    /** HoldAck arrived: the gate opens, the ME order goes out (same duty thread). */
-    private void onHoldAck(final long corrId) {
+    /**
+     * HoldAck arrived: the gate opens, the ME order goes out (same duty thread). {@code nowNs} is
+     * captured ONCE at frame arrival — for a v5 HoldAckBatch every entry in the frame shares it,
+     * mirroring how the ME-side batch decoding treats a frame's arrival as its entries' t1.
+     */
+    private void onHoldAck(final long corrId, final long nowNs) {
         final Pending p = pending.get(corrId);
         if (p == null || p.orderSent) return;
         holdAcks++;
-        if (measuring) holdAckHist.recordValue(clamp(System.nanoTime() - p.scheduledNs));
+        if (measuring) holdAckHist.recordValue(clamp(nowNs - p.scheduledNs));
         if (aeOnly) {
             // AE-only: the HoldAck IS the measurement. Release the hold straight away so the
             // engine's hold map stays bounded and the run ends with clean conservation, then
@@ -538,9 +544,12 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private void sendMeOrder(final Pending p) {
         createOrderEnc.wrapAndApplyHeader(meBuffer, 0, meHeaderEnc);
         createOrderEnc.userId(p.userId);
-        createOrderEnc.price(p.priceFp);
+        // match order-schema v8 removed the separate totalPrice field: the MARKET-BUY spend budget
+        // now rides in `price` (LIMIT still carries its limit price; MARKET-SELL leaves it 0). The
+        // internal p.totalPriceFp still sizes the AE hold above (hold = notional) — only the wire
+        // moved. The value the ME reads for a market buy is byte-identical to the old totalPrice.
+        createOrderEnc.price(p.isLimit ? p.priceFp : (p.isBid ? p.totalPriceFp : 0L));
         createOrderEnc.quantity(p.qtyFp);
-        createOrderEnc.totalPrice(p.totalPriceFp);
         createOrderEnc.marketId(MARKET_ID);
         createOrderEnc.orderType(p.isLimit ? OrderType.LIMIT : OrderType.MARKET);
         createOrderEnc.orderSide(p.isBid ? OrderSide.BID : OrderSide.ASK);
@@ -610,18 +619,18 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
     }
 
-    private void onSettlementApplied(final long tradeId) {
+    /** {@code nowNs}: frame-arrival time, shared by every entry of a batch frame (see onHoldAck). */
+    private void onSettlementApplied(final long tradeId, final long nowNs) {
         settlesSeen++;
-        final long now = System.nanoTime();
         final long seen = tradeSeenNs.remove(tradeId);
         if (seen != -1) {
             tradeLedJoins++; // pair closed here; the TRADE observation had led
-            if (measuring) tradeToSettledHist.recordValue(clamp(now - seen));
+            if (measuring) tradeToSettledHist.recordValue(clamp(nowNs - seen));
         } else if (settleSeenNs.size() < TRADE_MAP_CAP) {
-            settleSeenNs.put(tradeId, now); // settle first; trade observation will close it
+            settleSeenNs.put(tradeId, nowNs); // settle first; trade observation will close it
         }
         final long scheduled = tradeToSampledOrder.remove(tradeId);
-        if (scheduled != -1 && measuring) orderToSettledHist.recordValue(clamp(now - scheduled));
+        if (scheduled != -1 && measuring) orderToSettledHist.recordValue(clamp(nowNs - scheduled));
     }
 
     // ------------------------------------------------------------------ egress adapters
@@ -637,10 +646,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             final int actingVersion = meHeaderDec.version();
             final int body = offset + meHeaderDec.encodedLength();
             switch (templateId) {
-                case OrderStatusUpdateDecoder.TEMPLATE_ID -> {
-                    statusDec.wrap(buffer, body, actingBlockLength, actingVersion);
-                    onFirstStatus(statusDec.omsOrderId());
-                }
+                // match order-schema v8 removed the single OrderStatusUpdate (id 5): the ME only
+                // ever emits OrderStatusBatch, so the first status arrives here (same omsOrderId).
                 case OrderStatusBatchDecoder.TEMPLATE_ID -> {
                     statusBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
                     for (final OrderStatusBatchDecoder.OrdersDecoder o : statusBatchDec.orders()) {
@@ -666,6 +673,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         public void onMessage(final long clusterSessionId, final long timestamp,
                               final DirectBuffer buffer, final int offset, final int length,
                               final Header header) {
+            // Single t1 per frame: every entry decoded out of this frame (batch or single) is stamped
+            // with the frame's arrival, exactly as the ME-side batch handling treats its frames.
+            final long nowNs = System.nanoTime();
             aeHeaderDec.wrap(buffer, offset);
             final int templateId = aeHeaderDec.templateId();
             final int actingBlockLength = aeHeaderDec.blockLength();
@@ -673,7 +683,14 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             final int body = offset + aeHeaderDec.encodedLength();
             if (templateId == holdAckDec.sbeTemplateId()) {
                 holdAckDec.wrap(buffer, body, actingBlockLength, actingVersion);
-                onHoldAck(holdAckDec.correlationId());
+                onHoldAck(holdAckDec.correlationId(), nowNs);
+            } else if (templateId == holdAckBatchDec.sbeTemplateId()) {
+                // v5 coalesced acks: identical per-entry semantics, one shared t1.
+                holdAckBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                for (final com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder.AcksDecoder a
+                        : holdAckBatchDec.acks()) {
+                    onHoldAck(a.correlationId(), nowNs);
+                }
             } else if (templateId == holdRejectDec.sbeTemplateId()) {
                 holdRejectDec.wrap(buffer, body, actingBlockLength, actingVersion);
                 if (holdRejects < 5) {
@@ -684,7 +701,14 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 onHoldReject(holdRejectDec.correlationId());
             } else if (templateId == settleDec.sbeTemplateId()) {
                 settleDec.wrap(buffer, body, actingBlockLength, actingVersion);
-                onSettlementApplied(settleDec.tradeId());
+                onSettlementApplied(settleDec.tradeId(), nowNs);
+            } else if (templateId == settleBatchDec.sbeTemplateId()) {
+                // v5 coalesced settlement acks: identical join/counter semantics, one shared t1.
+                settleBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                for (final com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchDecoder.SettlementsDecoder s
+                        : settleBatchDec.settlements()) {
+                    onSettlementApplied(s.tradeId(), nowNs);
+                }
             } else if (templateId == settleFaultDec.sbeTemplateId()) {
                 settleFaultDec.wrap(buffer, body, actingBlockLength, actingVersion);
                 settleFaults++;
@@ -700,8 +724,9 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 depositAckDec.wrap(buffer, body, actingBlockLength, actingVersion);
                 if (depositAckDec.correlationId() >= PREFUND_CORR_BASE) depositAcks++;
             }
-            // BalanceUpdate and snapshots: high-volume, ignored by design
-            // (--subscribe acks,settlements stops them at the source instead).
+            // BalanceUpdate / BalanceUpdateBatch and snapshots: high-volume, ignored by design —
+            // identical semantics to before v5 (--subscribe acks,settlements stops them at the
+            // source instead).
         }
     }
 

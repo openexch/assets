@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.cluster;
 
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
+import com.openexchange.assets.infrastructure.generated.DepositAckDecoder;
+import com.openexchange.assets.infrastructure.generated.DepositAckEncoder;
+import com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder;
+import com.openexchange.assets.infrastructure.generated.HoldAckEncoder;
+import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.infrastructure.publisher.SessionEgressQueue;
 import io.aeron.DirectBufferVector;
@@ -32,6 +40,8 @@ public class SessionEgressQueueTest {
     private static final class ScriptedSession implements ClientSession {
         private final long id;
         private final List<Integer> delivered = new ArrayList<>();
+        /** Full byte copies of every accepted frame, for the SBE batch-coalescing assertions. */
+        private final List<byte[]> deliveredFrames = new ArrayList<>();
         private long result = 1; // positive == delivered
         private int acceptsRemaining = Integer.MAX_VALUE;
 
@@ -94,6 +104,9 @@ public class SessionEgressQueueTest {
             }
             acceptsRemaining--;
             delivered.add(buffer.getInt(offset)); // frames are tagged with an int marker
+            final byte[] copy = new byte[length];
+            buffer.getBytes(offset, copy);
+            deliveredFrames.add(copy);
             return 1;
         }
 
@@ -294,5 +307,160 @@ public class SessionEgressQueueTest {
         assertFalse(q.wants(AssetsEventPublisher.CH_BALANCES));
         assertFalse(q.wants(AssetsEventPublisher.CH_SETTLEMENTS));
         assertFalse(q.wants(AssetsEventPublisher.CH_SNAPSHOTS));
+    }
+
+    // ---- v5: drain-side batch coalescing ----
+
+    private final MessageHeaderEncoder sbeHeader = new MessageHeaderEncoder();
+    private final BalanceUpdateEncoder balanceEnc = new BalanceUpdateEncoder();
+    private final HoldAckEncoder holdAckEnc = new HoldAckEncoder();
+    private final DepositAckEncoder depositAckEnc = new DepositAckEncoder();
+    private final MessageHeaderDecoder sbeHeaderDec = new MessageHeaderDecoder();
+    private final BalanceUpdateBatchDecoder balanceBatchDec = new BalanceUpdateBatchDecoder();
+    private final HoldAckBatchDecoder holdAckBatchDec = new HoldAckBatchDecoder();
+
+    private void appendBalanceUpdate(final SessionEgressQueue queue, final long userId,
+                                     final long available) {
+        balanceEnc.wrapAndApplyHeader(frame, 0, sbeHeader)
+                .userId(userId).assetId(0).available(available).locked(0);
+        assertTrue(queue.append(frame, 0,
+                MessageHeaderEncoder.ENCODED_LENGTH + balanceEnc.encodedLength()));
+    }
+
+    private void appendHoldAck(final SessionEgressQueue queue, final long correlationId) {
+        holdAckEnc.wrapAndApplyHeader(frame, 0, sbeHeader)
+                .correlationId(correlationId).orderId(1).userId(2).assetId(0).amount(100);
+        assertTrue(queue.append(frame, 0,
+                MessageHeaderEncoder.ENCODED_LENGTH + holdAckEnc.encodedLength()));
+    }
+
+    private void appendDepositAck(final SessionEgressQueue queue, final long correlationId) {
+        depositAckEnc.wrapAndApplyHeader(frame, 0, sbeHeader)
+                .correlationId(correlationId).userId(2).assetId(0).amount(100).newAvailable(100);
+        assertTrue(queue.append(frame, 0,
+                MessageHeaderEncoder.ENCODED_LENGTH + depositAckEnc.encodedLength()));
+    }
+
+    private int templateIdOf(final byte[] frameBytes) {
+        sbeHeaderDec.wrap(new UnsafeBuffer(frameBytes), 0);
+        return sbeHeaderDec.templateId();
+    }
+
+    /** Decode a delivered BalanceUpdateBatch frame to its (userId, available) entry pairs, in order. */
+    private long[][] decodeBalanceBatch(final byte[] frameBytes) {
+        final UnsafeBuffer buf = new UnsafeBuffer(frameBytes);
+        sbeHeaderDec.wrap(buf, 0);
+        assertEquals(BalanceUpdateBatchDecoder.TEMPLATE_ID, sbeHeaderDec.templateId());
+        balanceBatchDec.wrapAndApplyHeader(buf, 0, sbeHeaderDec);
+        final List<long[]> entries = new ArrayList<>();
+        for (final BalanceUpdateBatchDecoder.UpdatesDecoder u : balanceBatchDec.updates()) {
+            entries.add(new long[] {u.userId(), u.available()});
+        }
+        return entries.toArray(new long[0][]);
+    }
+
+    @Test
+    public void consecutiveSameTypeFramesCoalesceIntoOneBatchFrame() {
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        for (int i = 1; i <= 5; i++) {
+            appendBalanceUpdate(queue, i, i * 100L);
+        }
+
+        queue.drainAll();
+
+        assertEquals("five singles must leave as ONE batch frame", 1, session.deliveredFrames.size());
+        final long[][] entries = decodeBalanceBatch(session.deliveredFrames.get(0));
+        assertEquals(5, entries.length);
+        for (int i = 1; i <= 5; i++) {
+            assertEquals(i, entries[i - 1][0]);
+            assertEquals(i * 100L, entries[i - 1][1]);
+        }
+        assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    public void typeChangeFlushesTheOpenBatchAndPreservesCrossTypeOrder() {
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        appendBalanceUpdate(queue, 1, 100);
+        appendBalanceUpdate(queue, 2, 200);
+        appendHoldAck(queue, 77);
+        appendBalanceUpdate(queue, 3, 300);
+
+        queue.drainAll();
+
+        assertEquals(3, session.deliveredFrames.size());
+        assertEquals(BalanceUpdateBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(0)));
+        assertEquals(2, decodeBalanceBatch(session.deliveredFrames.get(0)).length);
+        assertEquals(HoldAckBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(1)));
+        assertEquals(BalanceUpdateBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(2)));
+        assertEquals(1, decodeBalanceBatch(session.deliveredFrames.get(2)).length);
+        assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    public void nonBatchableSinglesPassThroughUnmodifiedAndInOrder() {
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        appendBalanceUpdate(queue, 1, 100);
+        appendDepositAck(queue, 555);
+        appendBalanceUpdate(queue, 2, 200);
+
+        queue.drainAll();
+
+        assertEquals(3, session.deliveredFrames.size());
+        assertEquals(BalanceUpdateBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(0)));
+        // The single is byte-for-byte the frame that was queued — no re-encoding on the pass-through.
+        assertEquals(DepositAckDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(1)));
+        assertEquals(BalanceUpdateBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(2)));
+    }
+
+    @Test
+    public void aBatchFlushesAtTheCapAndTheRemainderFollows() {
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        final int total = SessionEgressQueue.BATCH_CAP + 2;
+        for (int i = 0; i < total; i++) {
+            appendBalanceUpdate(queue, i, i);
+        }
+
+        queue.drainAll();
+
+        assertEquals(2, session.deliveredFrames.size());
+        assertEquals(SessionEgressQueue.BATCH_CAP,
+                decodeBalanceBatch(session.deliveredFrames.get(0)).length);
+        final long[][] tail = decodeBalanceBatch(session.deliveredFrames.get(1));
+        assertEquals(2, tail.length);
+        assertEquals(SessionEgressQueue.BATCH_CAP, tail[0][0]);
+        assertEquals(SessionEgressQueue.BATCH_CAP + 1, tail[1][0]);
+        assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    public void backPressuredBatchParksAndRedeliversWithoutLossDupOrReorder() {
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        session.backPressureAfter(0);
+        appendBalanceUpdate(queue, 1, 100);
+        appendBalanceUpdate(queue, 2, 200);
+        appendHoldAck(queue, 88);
+
+        queue.drainAll();
+        assertEquals("nothing was deliverable", 0, session.deliveredFrames.size());
+        assertFalse("the coalesced-but-undelivered money is still pending", queue.isEmpty());
+        assertTrue("a refused batch counts as back-pressure", queue.backPressureCount() > 0);
+
+        session.allowAll();
+        queue.drainAll();
+
+        assertEquals(2, session.deliveredFrames.size());
+        final long[][] balances = decodeBalanceBatch(session.deliveredFrames.get(0));
+        assertEquals("the parked batch leaves first, intact", 2, balances.length);
+        assertEquals(1, balances[0][0]);
+        assertEquals(2, balances[1][0]);
+        assertEquals("the ack staged behind it follows, in order",
+                HoldAckBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(1)));
+        assertTrue(queue.isEmpty());
     }
 }

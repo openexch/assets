@@ -44,7 +44,10 @@ import java.util.concurrent.TimeUnit;
  * <p><b>Egress shape.</b> Apply writes encoded frames into a per-session {@link SessionEgressQueue};
  * {@link #drainEgress()} offers them in bulk at the end of every {@code onSessionMessage}. Under load
  * that is opportunistic batching (each drain sends whatever accumulated, so batches form by
- * themselves); at low rate the queue holds one command's events and latency is unchanged. A fixed-id
+ * themselves) — and since schema v5 the drain also COALESCES consecutive same-type high-rate events
+ * into one batch frame (see {@link SessionEgressQueue}), so a SettleBatch worth of ingress leaves as a
+ * handful of offers instead of hundreds; at low rate the queue holds one command's events and latency
+ * is unchanged. A fixed-id
  * cluster timer drains as well, purely as the idle-path liveness belt for "a consumer unblocked but no
  * further ingress arrived" — it is never the normal path, which is what keeps this from repeating the
  * matching engine's 20 ms flush-timer latency mistake. Offers cannot be moved off this thread: Aeron's

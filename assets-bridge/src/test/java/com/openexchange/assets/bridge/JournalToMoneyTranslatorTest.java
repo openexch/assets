@@ -9,6 +9,7 @@ import com.match.infrastructure.journal.generated.TerminalStatus;
 
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.SettleBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.SettleDecoder;
 import com.openexchange.assets.infrastructure.generated.TerminalReleaseDecoder;
 
@@ -100,6 +101,79 @@ public class JournalToMoneyTranslatorTest {
         moneyHeaderDec.wrap(moneyBuf, 0);
         settleDec.wrapAndApplyHeader(moneyBuf, 0, moneyHeaderDec);
         assertEquals(Long.MAX_VALUE - 1, settleDec.journalPosition());
+    }
+
+    // ---- JournalTrade staging -> SettleBatch (v5) ----
+
+    /**
+     * Two staged trades leave as one SettleBatch whose entries are, field for field, exactly what
+     * {@link JournalToMoneyTranslator#translateTrade} would have produced as singles — same OMS-id
+     * money key, same egressSeq-as-journalPosition — in staging order, and the staging clears.
+     */
+    @Test
+    public void stagedTradesEncodeAsOneSettleBatchFieldForFieldInOrder() {
+        final UnsafeBuffer batchBuf = new UnsafeBuffer(new byte[8192]);
+
+        writeJournalTrade(7_777L, 555L, 3, 11L, 100L, 22L, 200L,
+                6_000_000L, 100_000L, BooleanType.TRUE, 123_456_789L);
+        translator.stageTrade(journalBuf, 0);
+        writeJournalTrade(9_001L, 556L, 4, 33L, 300L, 44L, 400L,
+                7_500_000L, 250_000L, BooleanType.FALSE, 987_654_321L);
+        translator.stageTrade(journalBuf, 0);
+        assertEquals(2, translator.stagedTradeCount());
+
+        final int len = translator.encodeStagedTrades(batchBuf, 0);
+        assertEquals("staging clears on encode", 0, translator.stagedTradeCount());
+
+        moneyHeaderDec.wrap(batchBuf, 0);
+        assertEquals(SettleBatchDecoder.TEMPLATE_ID, moneyHeaderDec.templateId());
+        assertEquals(SettleBatchDecoder.SCHEMA_ID, moneyHeaderDec.schemaId());
+        final SettleBatchDecoder batch = new SettleBatchDecoder();
+        batch.wrapAndApplyHeader(batchBuf, 0, moneyHeaderDec);
+        final SettleBatchDecoder.SettlesDecoder settles = batch.settles();
+        assertEquals(2, settles.count());
+
+        settles.next();
+        assertEquals(555L, settles.tradeId());
+        assertEquals(3, settles.marketId());
+        assertEquals(500_011L, settles.takerOrderId());
+        assertEquals(100L, settles.takerUserId());
+        assertEquals(500_022L, settles.makerOrderId());
+        assertEquals(200L, settles.makerUserId());
+        assertEquals(6_000_000L, settles.price());
+        assertEquals(100_000L, settles.quantity());
+        assertEquals(BoolFlag.TRUE, settles.takerIsBuy());
+        assertEquals(7_777L, settles.journalPosition());
+
+        settles.next();
+        assertEquals(556L, settles.tradeId());
+        assertEquals(4, settles.marketId());
+        assertEquals(500_033L, settles.takerOrderId());
+        assertEquals(300L, settles.takerUserId());
+        assertEquals(500_044L, settles.makerOrderId());
+        assertEquals(400L, settles.makerUserId());
+        assertEquals(7_500_000L, settles.price());
+        assertEquals(250_000L, settles.quantity());
+        assertEquals(BoolFlag.FALSE, settles.takerIsBuy());
+        assertEquals(9_001L, settles.journalPosition());
+
+        assertEquals(moneyHeaderDec.encodedLength() + batch.encodedLength(), len);
+    }
+
+    @Test
+    public void stagingPastTheCapThrowsRatherThanDroppingASettlement() {
+        writeJournalTrade(1L, 1L, 1, 1L, 1L, 2L, 2L, 1L, 1L, BooleanType.TRUE, 1L);
+        for (int i = 0; i < JournalToMoneyTranslator.TRADE_BATCH_CAP; i++) {
+            translator.stageTrade(journalBuf, 0);
+        }
+        try {
+            translator.stageTrade(journalBuf, 0);
+            throw new AssertionError("expected staging past the cap to throw");
+        } catch (IllegalStateException expected) {
+            // the agent must flush first; silent dropping is the one unacceptable outcome
+        }
+        translator.resetStagedTrades();
+        assertEquals(0, translator.stagedTradeCount());
     }
 
     // ---- JournalTerminal -> TerminalRelease (deliberately status-blind) ----
