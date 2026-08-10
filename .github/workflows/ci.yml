@@ -43,8 +43,13 @@ jobs:
           java-version: 21
           cache: maven
 
+      # -s _match/.mvn-settings.xml: match-common's deps are all on Central today, but
+      # the day it takes a GitHub-Packages dep (cluster-kit), a bare install breaks —
+      # oms already installs it with the settings file for exactly that reason.
       - name: Install match-common into local Maven repo
-        run: mvn -B -f _match/pom.xml install -DskipTests -pl match-common -am
+        run: mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-common -am
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # verify runs the full gate: unit tests, the determinism corpus, and
       # ClusterBootSmokeTest (boots a real in-process single-node AE cluster).
@@ -150,7 +155,7 @@ jobs:
           # job has no reason to fetch (assets-bridge wants com.match:match-common,
           # which the build job installs from a second checkout), and building them
           # to throw them away is work either way.
-          mvn -B -f _match/pom.xml install -DskipTests -pl match-common -am
+          mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-common -am
           mvn -B -s .mvn-settings.xml clean package -pl "${JARS// /,}" -am -DskipTests \
             -DbuildSha=$(git rev-parse --short HEAD)
         env:
@@ -195,7 +200,7 @@ jobs:
           echo "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::675715936685:role/openexch-ci-artifact-publisher
           aws-region: eu-central-1
