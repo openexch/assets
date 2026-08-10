@@ -5,6 +5,7 @@ import com.openexchange.assets.infrastructure.generated.FeedPositionReportDecode
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder;
+import com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
@@ -48,6 +49,7 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
     private final FeedPositionReportDecoder feedPositionDecoder = new FeedPositionReportDecoder();
     private final SettlementAppliedDecoder settlementAppliedDecoder = new SettlementAppliedDecoder();
+    private final SettlementAppliedBatchDecoder settlementAppliedBatchDecoder = new SettlementAppliedBatchDecoder();
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
     private final QueryFeedPositionEncoder queryEncoder = new QueryFeedPositionEncoder();
     private final com.openexchange.assets.infrastructure.generated.SubscribeEncoder subscribeEncoder =
@@ -149,6 +151,16 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
             if (callback != null) {
                 settlementAppliedDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
                 callback.accept(settlementAppliedDecoder.tradeId());
+            }
+        } else if (headerDecoder.templateId() == SettlementAppliedBatchDecoder.TEMPLATE_ID) {
+            // v5: the AE coalesces consecutive settlement acks into one frame; each entry is one ack.
+            final LongConsumer callback = onSettlementApplied;
+            if (callback != null) {
+                settlementAppliedBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                for (final SettlementAppliedBatchDecoder.SettlementsDecoder s
+                        : settlementAppliedBatchDecoder.settlements()) {
+                    callback.accept(s.tradeId());
+                }
             }
         }
         // All other egress (acks, balance updates, snapshots) is for other consumers; ignore.

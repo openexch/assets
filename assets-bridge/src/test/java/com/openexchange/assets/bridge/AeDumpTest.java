@@ -2,8 +2,10 @@
 package com.openexchange.assets.bridge;
 
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
 import com.openexchange.assets.infrastructure.generated.FeedPositionReportEncoder;
+import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
@@ -23,7 +25,7 @@ import static org.junit.Assert.assertTrue;
 public class AeDumpTest {
 
     private final MessageHeaderEncoder header = new MessageHeaderEncoder();
-    private final UnsafeBuffer buf = new UnsafeBuffer(new byte[128]);
+    private final UnsafeBuffer buf = new UnsafeBuffer(new byte[1024]);
 
     private void feedBalance(AeDump.SnapshotCollector c, long userId, int assetId, long avail, long locked) {
         BalanceUpdateEncoder e = new BalanceUpdateEncoder();
@@ -71,6 +73,43 @@ public class AeDumpTest {
 
         feedPosition(c, c.posCorr, 88231L, 45012L);
         assertTrue("complete once all three terminators arrive", c.complete());
+
+        assertEquals(
+                "{\"balances\":["
+                        + "{\"userId\":900001,\"assetId\":0,\"available\":900,\"locked\":100},"
+                        + "{\"userId\":900001,\"assetId\":1,\"available\":50,\"locked\":0},"
+                        + "{\"userId\":900002,\"assetId\":0,\"available\":1000,\"locked\":0}],"
+                        + "\"holds\":[{\"orderId\":111,\"userId\":900001,\"assetId\":0,\"remaining\":100}],"
+                        + "\"consumePosition\":88231,\"lastAppliedTradeId\":45012}",
+                c.toJson());
+    }
+
+    /**
+     * v5: the AE answers snapshot requests with batch chunks. The collector must decode them to the
+     * same entries the single forms produce — same dedup, same terminators, same JSON.
+     */
+    @Test
+    public void collectsBatchFormsIntoTheSameJsonAsSingles() {
+        AeDump.SnapshotCollector c = new AeDump.SnapshotCollector();
+
+        BalanceUpdateBatchEncoder balBatch = new BalanceUpdateBatchEncoder();
+        BalanceUpdateBatchEncoder.UpdatesEncoder updates =
+                balBatch.wrapAndApplyHeader(buf, 0, header).updatesCount(3);
+        updates.next().userId(900001L).assetId(0).available(900L).locked(100L);
+        updates.next().userId(900001L).assetId(1).available(50L).locked(0L);
+        updates.next().userId(900002L).assetId(0).available(1000L).locked(0L);
+        c.onMessage(0, 0, buf, 0, MessageHeaderEncoder.ENCODED_LENGTH + balBatch.encodedLength(), null);
+        feedBalanceEnd(c, c.balanceCorr, 3);
+
+        HoldSnapshotBatchEncoder holdBatch = new HoldSnapshotBatchEncoder();
+        HoldSnapshotBatchEncoder.HoldsEncoder holds =
+                holdBatch.wrapAndApplyHeader(buf, 0, header).holdsCount(1);
+        holds.next().orderId(111L).userId(900001L).assetId(0).remaining(100L);
+        c.onMessage(0, 0, buf, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdBatch.encodedLength(), null);
+        feedHoldEnd(c, c.holdCorr, 1);
+
+        feedPosition(c, c.posCorr, 88231L, 45012L);
+        assertTrue(c.complete());
 
         assertEquals(
                 "{\"balances\":["

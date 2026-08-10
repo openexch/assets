@@ -19,6 +19,7 @@ import com.openexchange.assets.infrastructure.generated.ReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotDecoder;
 import com.openexchange.assets.infrastructure.generated.SetMoneyJournalDecoder;
+import com.openexchange.assets.infrastructure.generated.SettleBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.SettleDecoder;
 import com.openexchange.assets.infrastructure.generated.TerminalReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawDecoder;
@@ -40,6 +41,7 @@ public final class AssetsSbeDemuxer {
     private final HoldDecoder holdDecoder = new HoldDecoder();
     private final ReleaseDecoder releaseDecoder = new ReleaseDecoder();
     private final SettleDecoder settleDecoder = new SettleDecoder();
+    private final SettleBatchDecoder settleBatchDecoder = new SettleBatchDecoder();
     private final TerminalReleaseDecoder terminalReleaseDecoder = new TerminalReleaseDecoder();
     private final QueryFeedPositionDecoder queryFeedPositionDecoder = new QueryFeedPositionDecoder();
     private final InitTradeHighWaterDecoder initHighWaterDecoder = new InitTradeHighWaterDecoder();
@@ -71,6 +73,7 @@ public final class AssetsSbeDemuxer {
             case HoldDecoder.TEMPLATE_ID:     handleHold(buffer, offset, timestamp); break;
             case ReleaseDecoder.TEMPLATE_ID:  handleRelease(buffer, offset, timestamp); break;
             case SettleDecoder.TEMPLATE_ID:   handleSettle(buffer, offset, timestamp); break;
+            case SettleBatchDecoder.TEMPLATE_ID:            handleSettleBatch(buffer, offset, timestamp); break;
             case TerminalReleaseDecoder.TEMPLATE_ID:        handleTerminalRelease(buffer, offset, timestamp); break;
             case QueryFeedPositionDecoder.TEMPLATE_ID:      handleQueryFeedPosition(buffer, offset); break;
             case InitTradeHighWaterDecoder.TEMPLATE_ID:     handleInitHighWater(buffer, offset, timestamp); break;
@@ -143,6 +146,30 @@ public final class AssetsSbeDemuxer {
                 settleDecoder.quantity(),
                 settleDecoder.takerIsBuy() == BoolFlag.TRUE,
                 timestamp);
+    }
+
+    /**
+     * A v5 {@link SettleBatchDecoder SettleBatch}: entries are applied strictly in group order, each
+     * through the identical {@link SettlementProjector#onTrade} path as a single Settle — same field
+     * mapping, same tradeId idempotency, same journalPosition/consumePosition advance. One batch is one
+     * cluster log entry and one apply loop; the engine cannot tell the difference.
+     */
+    private void handleSettleBatch(DirectBuffer buffer, int offset, long timestamp) {
+        settleBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        for (final SettleBatchDecoder.SettlesDecoder s : settleBatchDecoder.settles()) {
+            projector.onTrade(
+                    s.journalPosition(),
+                    s.tradeId(),
+                    s.marketId(),
+                    s.takerOrderId(),
+                    s.takerUserId(),
+                    s.makerOrderId(),
+                    s.makerUserId(),
+                    s.price(),
+                    s.quantity(),
+                    s.takerIsBuy() == BoolFlag.TRUE,
+                    timestamp);
+        }
     }
 
     /** Feed-forward terminal from the ME journal: release the order's full residual hold. */

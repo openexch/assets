@@ -59,8 +59,15 @@ public final class BridgeAgent implements Runnable {
     private final MessageHeaderDecoder journalHeader = new MessageHeaderDecoder();
     private final JournalTradeDecoder tradeDecoder = new JournalTradeDecoder();
     private final JournalTerminalDecoder terminalDecoder = new JournalTerminalDecoder();
-    private final UnsafeBuffer outBuffer = new UnsafeBuffer(new byte[256]);
+    /** Sized for one full SettleBatch frame (~4.4 KB at the 64-trade cap), not just a single. */
+    private final UnsafeBuffer outBuffer = new UnsafeBuffer(new byte[8192]);
     private final IdleStrategy idle = new BackoffIdleStrategy();
+    // Per-staged-trade metadata, parallel to the translator's SettleBatch staging: the metrics
+    // (forward latency, ack in-flight arming, last-forwarded gauges) are recorded per trade at FLUSH
+    // time, when the batch's offer has actually returned — not at stage time, when nothing has left.
+    private final long[] stagedTradeIds = new long[JournalToMoneyTranslator.TRADE_BATCH_CAP];
+    private final long[] stagedEgressSeqs = new long[JournalToMoneyTranslator.TRADE_BATCH_CAP];
+    private final long[] stagedTimestamps = new long[JournalToMoneyTranslator.TRADE_BATCH_CAP];
     /**
      * Settle offers awaiting their SettlementApplied egress ack: tradeId -> offer-return
      * nanoTime. Agent-thread-only (egress is polled on this same thread), bounded at
@@ -115,6 +122,9 @@ public final class BridgeAgent implements Runnable {
         // broadcasts SettlementApplied at apply time, only to sessions connected then) —
         // drop the stale in-flight entries rather than let them accumulate to the cap.
         inFlightSettles.clear();
+        // Trades a dead epoch staged but never flushed are NOT carried over: the stateless resume
+        // re-reads them from the journal and the AE's idempotency absorbs any overlap.
+        translator.resetStagedTrades();
         try (AeFeedClient ae = AeFeedClient.connect(config, aeronDirectoryName)) {
             ae.onSettlementApplied(this::onSettlementAck);
             state.connectedToAe = true;
@@ -190,6 +200,10 @@ public final class BridgeAgent implements Runnable {
                         }
                     }
                     if (fragments == 0) {
+                        // The replay went quiet: whatever is staged leaves NOW. Batch fill must never
+                        // hold settlement latency hostage — a partial batch on an empty poll is the
+                        // normal quiet-market frame, not a failure to batch.
+                        flushSettleBatch(ae);
                         if (!liveFollow && replayDrained(replay, recording)) {
                             fullyDrained = true;
                             break; // stopped recording fully consumed -> next in chain
@@ -290,24 +304,35 @@ public final class BridgeAgent implements Runnable {
             final BridgeFilter.Action action = filter.onTrade(tradeDecoder.egressSeq(), tradeDecoder.tradeId());
             switch (action) {
                 case FORWARD -> {
-                    final int length = translator.translateTrade(buffer, offset, outBuffer, 0);
-                    ae.offerBlocking(outBuffer, length);
-                    recordSettleForwardLatency(tradeDecoder.timestamp());
-                    trackInFlightSettle(tradeDecoder.tradeId());
-                    state.forwardedTrades++;
-                    state.lastForwardedTradeId = tradeDecoder.tradeId();
-                    state.lastForwardedEgressSeq = tradeDecoder.egressSeq();
+                    // v5: trades leave as SettleBatch chunks. Stage now; the batch flushes at the
+                    // cap (here), on an interleaved terminal (journal order!), on an empty replay
+                    // poll, or on a halt — never sits waiting to fill.
+                    if (translator.stagedTradeCount() == JournalToMoneyTranslator.TRADE_BATCH_CAP) {
+                        flushSettleBatch(ae);
+                    }
+                    final int i = translator.stagedTradeCount();
+                    translator.stageTrade(buffer, offset);
+                    stagedTradeIds[i] = tradeDecoder.tradeId();
+                    stagedEgressSeqs[i] = tradeDecoder.egressSeq();
+                    stagedTimestamps[i] = tradeDecoder.timestamp();
                 }
                 case SKIP -> state.skippedEntries++;
-                case HALT -> halt("dense tradeId gap: journal shows tradeId=" + tradeDecoder.tradeId()
-                        + " after lastForwarded=" + filter.lastForwardedTradeId()
-                        + " (egressSeq=" + tradeDecoder.egressSeq() + ")", filter);
+                case HALT -> {
+                    // Everything staged precedes the gap and is legitimate money: flush it, THEN park.
+                    flushSettleBatch(ae);
+                    halt("dense tradeId gap: journal shows tradeId=" + tradeDecoder.tradeId()
+                            + " after lastForwarded=" + filter.lastForwardedTradeId()
+                            + " (egressSeq=" + tradeDecoder.egressSeq() + ")", filter);
+                }
             }
         } else if (journalHeader.templateId() == JournalTerminalDecoder.TEMPLATE_ID) {
             terminalDecoder.wrapAndApplyHeader(buffer, offset, journalHeader);
             final BridgeFilter.Action action = filter.onTerminal(terminalDecoder.egressSeq());
             switch (action) {
                 case FORWARD -> {
+                    // Journal order is the money order: the terminal must not overtake the staged
+                    // trades that precede it (a terminal releases the residual the settles drew on).
+                    flushSettleBatch(ae);
                     final int length = translator.translateTerminal(buffer, offset, outBuffer, 0);
                     ae.offerBlocking(outBuffer, length);
                     state.forwardedTerminals++;
@@ -316,6 +341,28 @@ public final class BridgeAgent implements Runnable {
                 case SKIP -> state.skippedEntries++;
                 case HALT -> { /* latched by a prior trade gap; terminals just stop flowing */ }
             }
+        }
+    }
+
+    /**
+     * Offer the staged trades as one SettleBatch frame, then record the per-trade bookkeeping the
+     * single-message path used to do at its offer: forward-latency samples, ack in-flight arming and
+     * the last-forwarded gauges. All entries share one offer-return instant — they left together.
+     * No-op when nothing is staged.
+     */
+    private void flushSettleBatch(final AeFeedClient ae) {
+        final int count = translator.stagedTradeCount();
+        if (count == 0) {
+            return;
+        }
+        final int length = translator.encodeStagedTrades(outBuffer, 0);
+        ae.offerBlocking(outBuffer, length);
+        for (int i = 0; i < count; i++) {
+            recordSettleForwardLatency(stagedTimestamps[i]);
+            trackInFlightSettle(stagedTradeIds[i]);
+            state.forwardedTrades++;
+            state.lastForwardedTradeId = stagedTradeIds[i];
+            state.lastForwardedEgressSeq = stagedEgressSeqs[i];
         }
     }
 

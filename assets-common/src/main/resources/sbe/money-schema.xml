@@ -2,8 +2,8 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="com.openexchange.assets.infrastructure.generated"
                    id="2"
-                   version="4"
-                   semanticVersion="0.4"
+                   version="5"
+                   semanticVersion="0.5"
                    description="Assets Engine money schema — balances, holds, settlement. All amounts are 8dp fixed-point int64."
 >
     <types>
@@ -122,6 +122,26 @@
         <field name="channels"      id="2" type="EgressChannels"/>
     </sbe:message>
 
+    <!-- v5 wire batching. Framing dominated the small money messages (~40B of Aeron+cluster framing
+         per 28-69B body), and every frame was one offer on the deterministic service thread and one
+         entry in the AE cluster log. Each batch entry carries EXACTLY its single-message fields with
+         identical per-entry semantics; the single forms above stay valid for tools and tests. -->
+
+    <sbe:message name="SettleBatch" id="33" sinceVersion="5" description="A run of Settle commands applied strictly in group order. Per-entry fields and semantics are identical to Settle (id=5), including tradeId idempotency and the journalPosition/consumePosition advance; one batch = one cluster log entry, which is the point.">
+        <group name="settles" id="10" dimensionType="groupSizeEncoding">
+            <field name="tradeId"       id="1" type="int64"/>
+            <field name="marketId"      id="2" type="int32"/>
+            <field name="takerOrderId"  id="3" type="int64"/>
+            <field name="takerUserId"   id="4" type="int64"/>
+            <field name="makerOrderId"  id="5" type="int64"/>
+            <field name="makerUserId"   id="6" type="int64"/>
+            <field name="price"         id="7" type="int64"/>
+            <field name="quantity"      id="8" type="int64"/>
+            <field name="takerIsBuy"    id="9" type="BoolFlag"/>
+            <field name="journalPosition" id="11" type="int64" description="ME settlement-journal egressSeq of this trade; drives consumePosition; 0 = direct ingress (tests/tools)"/>
+        </group>
+    </sbe:message>
+
     <!-- ============================ Egress events (AE -> client) ============================ -->
 
     <sbe:message name="HoldAck" id="10" description="A hold was accepted">
@@ -212,5 +232,47 @@
     <sbe:message name="HoldSnapshotEnd" id="20" description="Terminates the HoldSnapshotEntry stream answering RequestHoldSnapshot">
         <field name="correlationId" id="1" type="int64"/>
         <field name="entryCount"    id="2" type="int32"/>
+    </sbe:message>
+
+    <!-- v5 egress batches: the publisher coalesces consecutive same-type events of one drain cycle
+         into one frame per session. Entries are in emission order; per-entry fields are identical to
+         the single form. HoldReject/DepositAck/WithdrawAck/WithdrawReject/SettleFault stay single
+         (low rate; SettleFault must remain a loud standalone event). Snapshot replies stream as
+         BalanceUpdateBatch / HoldSnapshotBatch chunks; the *End terminators are unchanged. -->
+
+    <sbe:message name="BalanceUpdateBatch" id="22" sinceVersion="5" description="A run of BalanceUpdate events (id=12), in emission order">
+        <group name="updates" id="10" dimensionType="groupSizeEncoding">
+            <field name="userId"    id="1" type="int64"/>
+            <field name="assetId"   id="2" type="int32"/>
+            <field name="available" id="3" type="int64"/>
+            <field name="locked"    id="4" type="int64"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="HoldAckBatch" id="23" sinceVersion="5" description="A run of HoldAck events (id=10), in emission order, correlationId echo included per entry">
+        <group name="acks" id="10" dimensionType="groupSizeEncoding">
+            <field name="correlationId" id="1" type="int64"/>
+            <field name="orderId"       id="2" type="int64"/>
+            <field name="userId"        id="3" type="int64"/>
+            <field name="assetId"       id="4" type="int32"/>
+            <field name="amount"        id="5" type="int64"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="SettlementAppliedBatch" id="24" sinceVersion="5" description="A run of SettlementApplied events (id=13), in emission order">
+        <group name="settlements" id="10" dimensionType="groupSizeEncoding">
+            <field name="tradeId"      id="1" type="int64"/>
+            <field name="buyerUserId"  id="2" type="int64"/>
+            <field name="sellerUserId" id="3" type="int64"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="HoldSnapshotBatch" id="25" sinceVersion="5" description="A run of HoldSnapshotEntry events (id=19) answering RequestHoldSnapshot; HoldSnapshotEnd (id=20) still terminates the stream">
+        <group name="holds" id="10" dimensionType="groupSizeEncoding">
+            <field name="orderId"    id="1" type="int64"/>
+            <field name="userId"     id="2" type="int64"/>
+            <field name="assetId"    id="3" type="int32"/>
+            <field name="remaining"  id="4" type="int64"/>
+        </group>
     </sbe:message>
 </sbe:messageSchema>

@@ -22,6 +22,7 @@ import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotEn
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotEncoder;
 import com.openexchange.assets.infrastructure.generated.FeedPositionReportDecoder;
 import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder;
+import com.openexchange.assets.infrastructure.generated.SettleBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.SettleEncoder;
 import com.openexchange.assets.infrastructure.generated.TerminalReleaseEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
@@ -138,7 +139,7 @@ public class WireRoundTripTest {
         }
     }
 
-    private final MutableDirectBuffer ingress = new UnsafeBuffer(new byte[256]);
+    private final MutableDirectBuffer ingress = new UnsafeBuffer(new byte[4096]);
     private final MessageHeaderEncoder header = new MessageHeaderEncoder();
     private final DepositEncoder depositEncoder = new DepositEncoder();
     private final WithdrawEncoder withdrawEncoder = new WithdrawEncoder();
@@ -226,6 +227,65 @@ public class WireRoundTripTest {
         egress.lines.clear();
         queryFeedPosition(demuxer, 42);
         assertEquals(List.of("FEEDPOS corr=42 consumePos=8000 lastTradeId=1"), egress.lines);
+    }
+
+    /**
+     * The v5 SettleBatch ingress: entries apply strictly in group order with per-entry semantics
+     * identical to single Settle — including the tradeId idempotency high-water and the
+     * journalPosition -> consumePosition advance. A batch straddling the high-water must skip the
+     * already-applied entry and apply the rest, exactly as three single Settles would.
+     */
+    @Test
+    public void settleBatchAppliesEntriesInOrderWithSingleSettleSemantics() {
+        AssetsEngine engine = new AssetsEngine();
+        CapturingEgress egress = new CapturingEgress();
+        engine.setEventSink(new AssetsEventPublisher(egress));
+        AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
+
+        // Seller has 2 BTC held, buyer has 120k USD held: room for exactly two 1-BTC settles.
+        deposit(demuxer, 1, 100, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
+        deposit(demuxer, 2, 200, Asset.USD.id(), FixedPoint.fromDouble(120000.0));
+        hold(demuxer, 3, 1, 100, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
+        hold(demuxer, 4, 2, 200, Asset.USD.id(), FixedPoint.fromDouble(120000.0));
+
+        // Trade 1 lands as a single Settle: the high-water is now 1.
+        settleAt(demuxer, 5_000L, 1, 1, 2, 200, 1, 100,
+                FixedPoint.fromDouble(60000.0), FixedPoint.fromDouble(1.0), true);
+        egress.lines.clear();
+
+        // Batch of [trade 1 (already applied), trade 2 (new)]: entry 1 must be an idempotent no-op,
+        // entry 2 must settle, and the cursor must land on the LAST entry's journalPosition.
+        SettleBatchEncoder batchEncoder = new SettleBatchEncoder();
+        SettleBatchEncoder.SettlesEncoder g = batchEncoder
+                .wrapAndApplyHeader(ingress, 0, header)
+                .settlesCount(2);
+        g.next()
+                .tradeId(1).marketId(1)
+                .takerOrderId(2).takerUserId(200).makerOrderId(1).makerUserId(100)
+                .price(FixedPoint.fromDouble(60000.0)).quantity(FixedPoint.fromDouble(1.0))
+                .takerIsBuy(BoolFlag.TRUE).journalPosition(5_000L);
+        g.next()
+                .tradeId(2).marketId(1)
+                .takerOrderId(2).takerUserId(200).makerOrderId(1).makerUserId(100)
+                .price(FixedPoint.fromDouble(60000.0)).quantity(FixedPoint.fromDouble(1.0))
+                .takerIsBuy(BoolFlag.TRUE).journalPosition(6_000L);
+        demuxer.dispatch(ingress, 0,
+                MessageHeaderEncoder.ENCODED_LENGTH + batchEncoder.encodedLength(), 1000L);
+
+        // Only trade 2 applied: exactly one settle's egress (4 balance lines + 1 SETTLED).
+        assertEquals(List.of(
+                "BALANCE u=200 asset=0 avail=0 locked=0",
+                "BALANCE u=200 asset=1 avail=200000000 locked=0",
+                "BALANCE u=100 asset=1 avail=0 locked=0",
+                "BALANCE u=100 asset=0 avail=12000000000000 locked=0",
+                "SETTLED tradeId=2 buyer=200 seller=100"), egress.lines);
+
+        // Money ended where two settles put it, not three.
+        assertEquals(FixedPoint.fromDouble(2.0), engine.account(200).available(Asset.BTC.id()));
+        assertEquals(FixedPoint.fromDouble(120000.0), engine.account(100).available(Asset.USD.id()));
+        assertEquals(2L, engine.getLastAppliedTradeId());
+        assertEquals("cursor advances to the batch's last journalPosition",
+                6_000L, engine.getConsumePosition());
     }
 
     @Test

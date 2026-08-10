@@ -5,8 +5,10 @@ import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositEncoder;
+import com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldAckDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -56,7 +58,9 @@ public class ClusterBootSmokeTest {
         final AtomicLong lastAvail = new AtomicLong(-1);
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
         private final HoldAckDecoder holdAck = new HoldAckDecoder();
+        private final HoldAckBatchDecoder holdAckBatch = new HoldAckBatchDecoder();
         private final BalanceUpdateDecoder balance = new BalanceUpdateDecoder();
+        private final BalanceUpdateBatchDecoder balanceBatch = new BalanceUpdateBatchDecoder();
 
         @Override
         public void onMessage(long clusterSessionId, long timestamp, DirectBuffer buffer,
@@ -72,10 +76,26 @@ public class ClusterBootSmokeTest {
                     lastHoldAckCorr.set(holdAck.correlationId());
                     holdAcks.incrementAndGet();
                     break;
+                case HoldAckBatchDecoder.TEMPLATE_ID:
+                    // v5: live egress coalesces HoldAcks into batch frames (a lone ack is a batch of 1).
+                    holdAckBatch.wrapAndApplyHeader(buffer, offset, header);
+                    for (final HoldAckBatchDecoder.AcksDecoder a : holdAckBatch.acks()) {
+                        lastHoldAckCorr.set(a.correlationId());
+                        holdAcks.incrementAndGet();
+                    }
+                    break;
                 case BalanceUpdateDecoder.TEMPLATE_ID:
                     balance.wrapAndApplyHeader(buffer, offset, header);
                     lastAvail.set(balance.available());
                     lastLocked.set(balance.locked());
+                    break;
+                case BalanceUpdateBatchDecoder.TEMPLATE_ID:
+                    // v5: same, for the BalanceUpdate stream.
+                    balanceBatch.wrapAndApplyHeader(buffer, offset, header);
+                    for (final BalanceUpdateBatchDecoder.UpdatesDecoder u : balanceBatch.updates()) {
+                        lastAvail.set(u.available());
+                        lastLocked.set(u.locked());
+                    }
                     break;
                 default:
                     break;

@@ -7,8 +7,10 @@ import com.match.infrastructure.journal.generated.JournalTradeEncoder;
 import com.match.infrastructure.journal.generated.TerminalStatus;
 import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.FixedPoint;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositEncoder;
+import com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldAckDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -81,7 +83,9 @@ public class BridgeEndToEndTest {
         final Map<String, long[]> balances = new ConcurrentHashMap<>(); // "user:asset" -> {avail, locked}
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
         private final HoldAckDecoder holdAck = new HoldAckDecoder();
+        private final HoldAckBatchDecoder holdAckBatch = new HoldAckBatchDecoder();
         private final BalanceUpdateDecoder balance = new BalanceUpdateDecoder();
+        private final BalanceUpdateBatchDecoder balanceBatch = new BalanceUpdateBatchDecoder();
         private final MessageHeaderEncoder headerEnc = new MessageHeaderEncoder();
         private final DepositEncoder depositEnc = new DepositEncoder();
         private final HoldEncoder holdEnc = new HoldEncoder();
@@ -118,10 +122,22 @@ public class BridgeEndToEndTest {
             if (header.templateId() == HoldAckDecoder.TEMPLATE_ID) {
                 holdAck.wrapAndApplyHeader(buffer, offset, header);
                 holdAcks.incrementAndGet();
+            } else if (header.templateId() == HoldAckBatchDecoder.TEMPLATE_ID) {
+                // v5: live egress coalesces these; a lone ack arrives as a batch of one.
+                holdAckBatch.wrapAndApplyHeader(buffer, offset, header);
+                for (final HoldAckBatchDecoder.AcksDecoder a : holdAckBatch.acks()) {
+                    holdAcks.incrementAndGet();
+                }
             } else if (header.templateId() == BalanceUpdateDecoder.TEMPLATE_ID) {
                 balance.wrapAndApplyHeader(buffer, offset, header);
                 balances.put(balance.userId() + ":" + balance.assetId(),
                         new long[] {balance.available(), balance.locked()});
+            } else if (header.templateId() == BalanceUpdateBatchDecoder.TEMPLATE_ID) {
+                balanceBatch.wrapAndApplyHeader(buffer, offset, header);
+                for (final BalanceUpdateBatchDecoder.UpdatesDecoder u : balanceBatch.updates()) {
+                    balances.put(u.userId() + ":" + u.assetId(),
+                            new long[] {u.available(), u.locked()});
+                }
             }
         }
 
