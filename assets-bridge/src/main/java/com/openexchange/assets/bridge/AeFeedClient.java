@@ -59,6 +59,8 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     private final UnsafeBuffer queryBuffer = new UnsafeBuffer(new byte[64]);
 
     private long lastKeepAliveMs;
+    /** Set by onNewLeader (fires on this thread, inside pollEgress), consumed by duty(). */
+    private boolean pendingRedeclare;
     private long awaitedCorrelationId;
     private FeedPosition capturedPosition;
     /** Settlement-ack observer (tradeId); invoked on the polling thread — the bridge agent's. */
@@ -110,11 +112,51 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
      * rather than assumed. Losing it only costs traffic, never correctness.</p>
      */
     private void subscribeToWhatWeActuallyRead() {
+        offerBlocking(subscribeBuffer, encodeSubscribe());
+    }
+
+    private int encodeSubscribe() {
         subscribeEncoder.wrapAndApplyHeader(subscribeBuffer, 0, headerEncoder)
                 .correlationId(0L)
                 .channels().clear().acks(true).settlements(true);
-        offerBlocking(subscribeBuffer,
-                MessageHeaderEncoder.ENCODED_LENGTH + subscribeEncoder.encodedLength());
+        return MessageHeaderEncoder.ENCODED_LENGTH + subscribeEncoder.encodedLength();
+    }
+
+    /**
+     * A leader change the session SURVIVES still loses every piece of transport state this client
+     * declared, because both declarations live on the leader and are deliberately never snapshotted:
+     * the Subscribe narrowing (without it the new leader feeds this session the full BalanceUpdate
+     * firehose again) and the resumable mark from QueryFeedPosition (without it the new leader blocks
+     * on this session's full queue instead of closing it). Re-declare both as soon as {@link #duty()}
+     * gets the chance; until the offers land the flag stays up and every duty retries.
+     */
+    @Override
+    public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
+                            final int leaderMemberId, final String ingressEndpoints) {
+        System.out.println("[BRIDGE] AE new leader member=" + leaderMemberId + " term=" + leadershipTermId
+                + " — re-declaring transport state (subscription + feed-consumer mark)");
+        pendingRedeclare = true;
+    }
+
+    /** @return true when both transport-state frames were accepted by the new leader. */
+    private boolean redeclareTransportState() {
+        if (!tryOffer(subscribeBuffer, encodeSubscribe())) {
+            return false; // re-sending Subscribe twice is idempotent; retry both next duty
+        }
+        // correlationId 0 can never match awaitedCorrelationId (random >= 1): the engine's
+        // FeedPositionReport answer is ignored here, the query's only wanted effect is the
+        // leader-side feed-consumer mark.
+        queryEncoder.wrapAndApplyHeader(queryBuffer, 0, headerEncoder).correlationId(0L);
+        return tryOffer(queryBuffer, MessageHeaderEncoder.ENCODED_LENGTH + queryEncoder.encodedLength());
+    }
+
+    /** One non-blocking offer attempt; terminal codes throw exactly like {@link #offerOnce}. */
+    private boolean tryOffer(final DirectBuffer buffer, final int length) {
+        final long result = cluster.offer(buffer, 0, length);
+        if (result == Publication.CLOSED || result == Publication.MAX_POSITION_EXCEEDED) {
+            throw new SessionClosedException("AE ingress offer failed terminally: " + result);
+        }
+        return result > 0;
     }
 
     /** Cluster ingress endpoint list using the AE ClusterConfig port math (client port = base + n*100 + 2). */
@@ -217,7 +259,13 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
 
     /** Keep the session healthy: consume egress + protocol keep-alive. Call often from any wait loop. */
     void duty() {
-        cluster.pollEgress();
+        // pollEgress caps at 10 fragments per call; a single call per idle loop was a trickle that can
+        // never catch up with a leader-side backlog — drain until empty.
+        while (cluster.pollEgress() > 0) {
+        }
+        if (pendingRedeclare) {
+            pendingRedeclare = !redeclareTransportState();
+        }
         final long nowMs = System.currentTimeMillis();
         if (nowMs - lastKeepAliveMs >= KEEPALIVE_INTERVAL_MS) {
             cluster.sendKeepAlive();

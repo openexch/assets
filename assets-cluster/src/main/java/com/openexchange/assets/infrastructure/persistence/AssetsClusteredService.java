@@ -6,6 +6,7 @@ import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.infrastructure.generated.EgressChannelsDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.QueryFeedPositionDecoder;
 import com.openexchange.assets.infrastructure.generated.SubscribeDecoder;
 import com.openexchange.assets.infrastructure.publisher.SessionEgressQueue;
 import io.aeron.Counter;
@@ -80,12 +81,14 @@ public final class AssetsClusteredService implements ClusteredService {
     // (cluster.clientSessions() returns a JDK unmodifiable wrapper whose iterator() allocates).
     private final Long2ObjectHashMap<SessionEgressQueue> egressBySessionId = new Long2ObjectHashMap<>();
     private SessionEgressQueue[] egressQueues = new SessionEgressQueue[0];
-    private final MessageHeaderDecoder subscribeHeaderDecoder = new MessageHeaderDecoder();
+    /** Peeks ingress frames for the transport-level messages handled or observed at this boundary. */
+    private final MessageHeaderDecoder peekHeaderDecoder = new MessageHeaderDecoder();
     private final SubscribeDecoder subscribeDecoder = new SubscribeDecoder();
     private boolean sessionsDirty = true;
     private boolean drainTimerArmed;
     private volatile long drainTimerFires;
     private long egressStallCount;
+    private volatile long resumableSessionsClosed;
 
     // Live egress instrumentation, published as Aeron counters so AeronStat (and therefore every bench
     // run) can read them without touching this process. Updated only from the drain timer, never from
@@ -322,6 +325,9 @@ public final class AssetsClusteredService implements ClusteredService {
         // the ledger does. It is handled here and deliberately never reaches the engine, so the engine
         // stays a pure deterministic state machine and the subscription never enters a snapshot.
         if (!applyIfSubscribe(session, buffer, offset, length)) {
+            // Peeked, never consumed: a QueryFeedPosition marks its sender as resumable and still
+            // flows to the engine, which answers it with a FeedPositionReport.
+            markIfFeedConsumer(session, buffer, offset, length);
             // Deterministic on every replica: decode -> domain command -> engine mutation. The apply only
             // queues its egress; the offers happen in the drain below, off the apply's critical section.
             demuxer.dispatch(buffer, offset, length, timestamp);
@@ -466,12 +472,12 @@ public final class AssetsClusteredService implements ClusteredService {
         if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
             return false;
         }
-        subscribeHeaderDecoder.wrap(buffer, offset);
-        if (subscribeHeaderDecoder.templateId() != SubscribeDecoder.TEMPLATE_ID
-                || subscribeHeaderDecoder.schemaId() != SubscribeDecoder.SCHEMA_ID) {
+        peekHeaderDecoder.wrap(buffer, offset);
+        if (peekHeaderDecoder.templateId() != SubscribeDecoder.TEMPLATE_ID
+                || peekHeaderDecoder.schemaId() != SubscribeDecoder.SCHEMA_ID) {
             return false;
         }
-        subscribeDecoder.wrapAndApplyHeader(buffer, offset, subscribeHeaderDecoder);
+        subscribeDecoder.wrapAndApplyHeader(buffer, offset, peekHeaderDecoder);
         final EgressChannelsDecoder channels = subscribeDecoder.channels();
         int mask = 0;
         if (channels.acks())        mask |= AssetsEventPublisher.CH_ACKS;
@@ -489,13 +495,69 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     /**
-     * The queue hit its growth ceiling, which means this session's consumer has been unable to keep up
-     * for a long time. Block on that one session until it frees space, exactly as the old inline path
-     * blocked: money egress is never shed. Only that session's producer stalls, and only in this
-     * far-edge case; the other sessions keep their queued frames.
+     * Mark the session's queue resumable if this message is a QueryFeedPosition.
+     *
+     * <p>QueryFeedPosition is the first step of a consumer's RESUME protocol: the bridge sends it at
+     * every epoch start and rebuilds its skip-filter from the FeedPositionReport answer, so a sender
+     * has proven it can lose this session and resynchronise. That proof is what licenses
+     * {@link #appendAfterFreeingSpace} to close the session instead of blocking the engine when its
+     * queue hits the ceiling. The mark is a transport concern like Subscribe — leader-local, never
+     * snapshotted — but unlike Subscribe the message itself is FOR the engine, which answers it, so it
+     * is peeked here and still dispatched.</p>
+     */
+    private void markIfFeedConsumer(ClientSession session, DirectBuffer buffer, int offset, int length) {
+        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
+            return;
+        }
+        peekHeaderDecoder.wrap(buffer, offset);
+        if (peekHeaderDecoder.templateId() != QueryFeedPositionDecoder.TEMPLATE_ID
+                || peekHeaderDecoder.schemaId() != QueryFeedPositionDecoder.SCHEMA_ID) {
+            return;
+        }
+        if (isLeader && cluster != null) {
+            refreshSessionsIfNeeded();
+            final SessionEgressQueue queue = egressBySessionId.get(session.id());
+            if (queue != null) {
+                queue.markResumable();
+            }
+        }
+    }
+
+    /**
+     * The queue hit its growth ceiling: this session's consumer has been unable to keep up for a long
+     * time, and what happens next depends on whether that consumer can survive losing its session.
+     *
+     * <p><b>Resumable consumer (it sent QueryFeedPosition): close the session, keep the engine.</b>
+     * A consumer with a resume protocol — the bridge: {@code SessionClosedException} -> epoch restart
+     * -> QueryFeedPosition/FeedPositionReport -> skip-filter, with AE idempotency underneath — loses
+     * NOTHING when its session dies: it replays from positions. Blocking the whole engine for it
+     * would trade cluster availability for a guarantee it does not need — and that trade can
+     * livelock: an engine parked here rejects ingress, so a consumer that is itself waiting on this
+     * engine can never drain the very queue the engine is blocked on. {@link ClientSession#close()}
+     * goes through the consensus module, so followers observe the close deterministically via the
+     * log.</p>
+     *
+     * <p><b>Everything else: block on that one session until it frees space,</b> exactly as the old
+     * inline path blocked — money egress to a consumer without a resume protocol (OMS, load
+     * generators) is never shed. Only that session's producer stalls, and only in this far-edge case;
+     * the other sessions keep their queued frames.</p>
      */
     private void appendAfterFreeingSpace(SessionEgressQueue queue, MutableDirectBuffer buffer,
                                          int offset, int length) {
+        if (queue.isResumable()) {
+            resumableSessionsClosed++;
+            System.err.println("CRITICAL: assets egress queue full for RESUMABLE session=" + queue.sessionId()
+                    + " via=" + queue.session().responseChannel()
+                    + " (pending=" + queue.pendingBytes() + "B, backPressured=" + queue.backPressureCount()
+                    + ") — closing the session instead of blocking the engine; the consumer resyncs on reconnect");
+            queue.reset();
+            try {
+                queue.session().close();
+            } catch (final RuntimeException ignored) {
+                // already closing: the queue is empty either way and later drains discard on CLOSED
+            }
+            return; // engine keeps flowing; the un-queued frame is safe — resync replays from positions
+        }
         final long n = ++egressStallCount;
         if (n == 1 || n % 1000 == 0) {
             System.err.println("CRITICAL: assets egress queue full for session=" + queue.sessionId()
@@ -601,5 +663,14 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     public long drainTimerFires() {
         return drainTimerFires;
+    }
+
+    /**
+     * How many times a RESUMABLE session was closed at its queue ceiling instead of blocking the
+     * engine. Exposed for tests / diagnostics: this is the leader-availability decision the failover
+     * livelock fix rests on, so it is worth being able to assert on it.
+     */
+    public long resumableSessionsClosed() {
+        return resumableSessionsClosed;
     }
 }
