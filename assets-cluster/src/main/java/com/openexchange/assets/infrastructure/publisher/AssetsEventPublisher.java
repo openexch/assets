@@ -63,6 +63,22 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         void emit(MutableDirectBuffer buffer, int offset, int length, int channel, Routing routing);
     }
 
+    /**
+     * Optional second sink for LIVE balance updates only — the balance-feed side-channel's intake.
+     * Called from {@link #onBalanceUpdate} precisely when the emission is a live ({@code BROADCAST})
+     * update, never for snapshot-reply entries: a query reply is one session's answer, not a change.
+     * Decoded values rather than bytes, because the tap's consumer conflates by (userId, assetId)
+     * and re-encodes on its own thread. Like {@link Egress}, this is a signal — the publisher stays
+     * transport-free; wiring lives at the service/runtime boundary. Runs during apply on EVERY node
+     * (followers too), deliberately: the feed's store stays current everywhere, so a follower that
+     * gains leadership can replay it as a feed baseline.
+     */
+    public interface LiveBalanceTap {
+        LiveBalanceTap NONE = (userId, assetId, available, locked) -> { };
+
+        void onLiveBalance(long userId, int assetId, long available, long locked);
+    }
+
     // Egress channels. These mirror the EgressChannels bit set in money-schema.xml and are the unit a
     // session subscribes to. Classification lives here because this is the only class that knows which
     // encoder it just used; the engine stays free of transport concepts.
@@ -102,9 +118,17 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
+    /** See {@link LiveBalanceTap}: fed live balance updates; {@code NONE} when no feed is wired. */
+    private final LiveBalanceTap liveBalanceTap;
+
     public AssetsEventPublisher(Egress egress, BooleanSupplier queryReplyContext) {
+        this(egress, queryReplyContext, LiveBalanceTap.NONE);
+    }
+
+    public AssetsEventPublisher(Egress egress, BooleanSupplier queryReplyContext, LiveBalanceTap liveBalanceTap) {
         this.egress = egress;
         this.queryReplyContext = queryReplyContext;
+        this.liveBalanceTap = liveBalanceTap;
     }
 
     @Override
@@ -139,14 +163,19 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     /**
      * Live updates are the shared firehose ({@code BROADCAST}); the same frames streamed as a
      * balance-snapshot reply are for the asker only ({@code ORIGIN}). {@link #queryReplyContext}
-     * separates the two — see the class doc.
+     * separates the two — see the class doc. Only the live branch feeds {@link #liveBalanceTap}:
+     * snapshot-reply entries must never enter the side-channel feed.
      */
     @Override
     public void onBalanceUpdate(long userId, int assetId, long available, long locked) {
+        final boolean queryReply = queryReplyContext.getAsBoolean();
+        if (!queryReply) {
+            liveBalanceTap.onLiveBalance(userId, assetId, available, locked);
+        }
         balanceUpdateEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .userId(userId).assetId(assetId).available(available).locked(locked);
         flush(balanceUpdateEncoder.encodedLength(), CH_BALANCES,
-                queryReplyContext.getAsBoolean() ? Routing.ORIGIN : Routing.BROADCAST);
+                queryReply ? Routing.ORIGIN : Routing.BROADCAST);
     }
 
     @Override

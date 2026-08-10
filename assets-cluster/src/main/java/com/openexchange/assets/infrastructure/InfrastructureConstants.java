@@ -45,4 +45,14 @@ public final class InfrastructureConstants {
 
     /** Aeron IPC channel the money journal is published on. */
     public static final String MONEY_JOURNAL_CHANNEL = "aeron:ipc?term-length=4m";
+
+    // ==================== BALANCE FEED SIDE-CHANNEL ====================
+    // The conflated latest-value BalanceUpdate feed (dark unless BALANCE_FEED_CHANNEL names a
+    // channel): a plain Aeron publication fed by its own agent thread, so live balance fanout
+    // leaves the cluster egress path. Channel is deployment-shaped (multicast in colo, MDC in
+    // cloud) and therefore env/stack-profile, not a constant — see BalanceFeedRuntime. Stream id
+    // stays disjoint from the journal's 4101 for greppability, same policy as above.
+
+    /** Default Aeron stream id the balance feed publishes on (BALANCE_FEED_STREAM_ID overrides). */
+    public static final int BALANCE_FEED_STREAM_ID = 4201;
 }

@@ -128,6 +128,19 @@ public final class AssetsClusteredService implements ClusteredService {
         engine.setMoneyJournalSink(journalSink);
     }
 
+    /**
+     * This node's balance-feed conflation store, or null when the feed is off (the default). Written
+     * by this service thread on every LIVE balance update — on followers too, so the store is always
+     * current on every node — and published by the feed's own agent thread while this node leads.
+     * Node-local transport state like the egress queues: never replicated, never snapshotted. Must be
+     * set before the container launches, like the journal sink.
+     */
+    private com.openexchange.assets.infrastructure.feed.BalanceConflationStore balanceFeed;
+
+    public void setBalanceFeed(com.openexchange.assets.infrastructure.feed.BalanceConflationStore store) {
+        this.balanceFeed = store;
+    }
+
     // What this node answers about ITSELF, for whatever supervises it. The
     // money ledger has no external supervisor in the open deployment, so the
     // orchestrator's two questions are answered here: kill me (/health), and
@@ -151,9 +164,12 @@ public final class AssetsClusteredService implements ClusteredService {
         this.cluster = cluster;
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
-        engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery));
+        engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
+                balanceFeed != null ? balanceFeed::onBalanceUpdate
+                        : AssetsEventPublisher.LiveBalanceTap.NONE));
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
+            seedBalanceFeedFromSnapshot();
         }
         startNodeEndpoint();
         startDurability(cluster);
@@ -401,6 +417,12 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public void onRoleChange(Cluster.Role newRole) {
         this.isLeader = newRole == Cluster.Role.LEADER;
+        // The feed publishes only on the leader; a GAIN also queues a full-store sweep, which is the
+        // feed's natural baseline for consumers across the failover (the store itself is current on
+        // every node because the live tap runs during apply everywhere).
+        if (balanceFeed != null) {
+            balanceFeed.onRoleChange(isLeader);
+        }
         // A live role also means recovery is behind us; CANDIDATE withdraws
         // readiness, which is exactly when a rolling restart has to wait.
         readiness.roleChanged(newRole);
@@ -466,6 +488,25 @@ public final class AssetsClusteredService implements ClusteredService {
         if (length.value > 0) {
             BalanceSnapshotCodec.deserialize(collector, 0, length.value, engine);
         }
+    }
+
+    /**
+     * Seed the balance-feed store from restored state. The snapshot codec writes balances straight
+     * into accounts (no sink events), so a node recovering from a snapshot would otherwise hold a
+     * feed store that knows only the keys the post-snapshot replay touches — and its
+     * leadership-gain sweep would be a PARTIAL baseline, the silently-wrong kind. Boot-time only,
+     * off the money path; replayed commands then overwrite through the live tap.
+     */
+    private void seedBalanceFeedFromSnapshot() {
+        final com.openexchange.assets.infrastructure.feed.BalanceConflationStore feed = balanceFeed;
+        if (feed == null) {
+            return;
+        }
+        engine.forEachAccountByUserId(account -> {
+            final long userId = account.userId();
+            account.forEachNonZeroBalance((assetId, available, locked) ->
+                    feed.onBalanceUpdate(userId, assetId, available, locked));
+        });
     }
 
     /**
