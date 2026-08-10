@@ -113,6 +113,21 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private final MediaDriver driver;
     private final AeronCluster me;
     private final AeronCluster ae;
+    /**
+     * Balance-feed side-channel measurement tap ({@code --balance-feed <channel>}): a plain Aeron
+     * subscription on the same media driver, counting frames and entries — the consumer half of the
+     * AE's conflated latest-value feed. Counters only, by design: the feed's contract is "latest
+     * value, intermediates may conflate away", so a latency track would measure the conflation
+     * window, not the transport. Null when the flag is absent (default: off).
+     */
+    private final io.aeron.Aeron feedAeron;
+    private final io.aeron.Subscription feedSub;
+    private final io.aeron.FragmentAssembler feedHandler;
+    private final com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder feedUpdateDec =
+            new com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder();
+    private final com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder feedBatchDec =
+            new com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder();
+    private long feedFrames, feedEntries;
 
     // ---- SBE (ME side imported, AE side fully qualified to avoid header-codec name clash) ----
     private final com.match.infrastructure.generated.MessageHeaderEncoder meHeaderEnc =
@@ -318,6 +333,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         // AE substrate with nothing else in the picture.
         AeronCluster meClient = null;
         AeronCluster aeClient = null;
+        io.aeron.Aeron feedClient = null;
+        io.aeron.Subscription feedSubscription = null;
         try {
             meClient = aeOnly ? null : connect(aeronDir, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
             aeClient = connect(aeronDir, ingressEndpoints(aeHosts, aePortBase), egressHost, new AeEgress());
@@ -325,11 +342,28 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 sendSubscribe(aeClient);
                 System.out.println("AE egress narrowed to: " + String.join(",", subscribeChannels));
             }
+            // Balance-feed side-channel tap: a plain subscription through the same driver. Off by
+            // default; the channel must match the AE nodes' BALANCE_FEED_CHANNEL.
+            final String feedChannel = strArg(args, "--balance-feed", null);
+            if (feedChannel != null) {
+                // Default mirrors InfrastructureConstants.BALANCE_FEED_STREAM_ID (the loadgen does
+                // not depend on assets-cluster, same as it hardcodes the 9300 port base).
+                final int feedStream = intArg(args, "--balance-feed-stream", 4201);
+                feedClient = io.aeron.Aeron.connect(
+                        new io.aeron.Aeron.Context().aeronDirectoryName(aeronDir));
+                feedSubscription = feedClient.addSubscription(feedChannel, feedStream);
+                System.out.println("balance-feed tap subscribed: " + feedChannel
+                        + " stream " + feedStream);
+            } else if (hasFlag(args, "--balance-feed")) {
+                throw new IllegalArgumentException("--balance-feed requires a channel URI value");
+            }
         } catch (final RuntimeException e) {
             // The embedded media driver's threads are NOT daemons. A failed connect used to leave
             // them running with the constructor half-done, so close() never ran and the JVM never
             // exited: the process sat there forever and an automated run hung instead of failing in
             // the 10s connect timeout. Tear the driver down and let the exception surface.
+            org.agrona.CloseHelper.quietClose(feedSubscription);
+            org.agrona.CloseHelper.quietClose(feedClient);
             org.agrona.CloseHelper.quietClose(aeClient);
             org.agrona.CloseHelper.quietClose(meClient);
             org.agrona.CloseHelper.quietClose(driver);
@@ -337,6 +371,27 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
         this.me = meClient;
         this.ae = aeClient;
+        this.feedAeron = feedClient;
+        this.feedSub = feedSubscription;
+        this.feedHandler = feedSub == null ? null : new io.aeron.FragmentAssembler(this::onFeedFrame);
+    }
+
+    /** Count one balance-feed frame and its entries (single BalanceUpdate or BalanceUpdateBatch). */
+    private void onFeedFrame(final DirectBuffer buffer, final int offset, final int length,
+                             final Header header) {
+        if (length < aeHeaderDec.encodedLength()) {
+            return;
+        }
+        aeHeaderDec.wrap(buffer, offset);
+        final int body = offset + aeHeaderDec.encodedLength();
+        if (aeHeaderDec.templateId() == feedUpdateDec.sbeTemplateId()) {
+            feedFrames++;
+            feedEntries++;
+        } else if (aeHeaderDec.templateId() == feedBatchDec.sbeTemplateId()) {
+            feedFrames++;
+            feedBatchDec.wrap(buffer, body, aeHeaderDec.blockLength(), aeHeaderDec.version());
+            feedEntries += feedBatchDec.updates().count();
+        }
     }
 
     /** {@code i=host:port} CSV; port = base + i*100 + 2 (client-facing offset, both clusters). */
@@ -843,6 +898,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private void pollBoth() {
         if (me != null) me.pollEgress();
         ae.pollEgress();
+        if (feedSub != null) feedSub.poll(feedHandler, 64);
     }
 
     /**
@@ -904,6 +960,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 holdAcks / elapsedSec);
         out.printf("COMMITTED COMMANDS %.0f/s   (holds + releases through the log)%n",
                 committedCommands / elapsedSec);
+        printFeedLine(out);
         printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
         try {
             Files.createDirectories(outDir);
@@ -934,6 +991,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                         + "beat the ME egress batch flush)%n", settleLedJoins, tradeLedJoins);
         out.printf("unpaired at exit: trades %d / settles %d | pending lifecycles: %d%n",
                 tradeSeenNs.size(), settleSeenNs.size(), pending.size());
+        printFeedLine(out);
         printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
         printHist(out, "order lifecycle start->first ME status", orderAckHist);
         printHist(out, "  of which ME leg: order offer->first status", meLegHist);
@@ -954,6 +1012,19 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             out.println("hgrm files written to " + outDir.toAbsolutePath());
         } catch (final Exception e) {
             out.println("WARN: could not write hgrm files: " + e);
+        }
+    }
+
+    /**
+     * Balance-feed tap counters, printed only when {@code --balance-feed} was given. Entries may be
+     * FEWER than the balance mutations the run caused: the feed conflates to latest-value per
+     * (user, asset) by contract — a big gap between entries and mutations under load is the feature
+     * working, not loss.
+     */
+    private void printFeedLine(final PrintStream out) {
+        if (feedSub != null) {
+            out.printf("balance-feed seen n=%d frames=%d (conflated latest-value side-channel)%n",
+                    feedEntries, feedFrames);
         }
     }
 
@@ -982,6 +1053,8 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
     @Override
     public void close() {
+        org.agrona.CloseHelper.quietClose(feedSub);
+        org.agrona.CloseHelper.quietClose(feedAeron);
         org.agrona.CloseHelper.quietClose(me);
         org.agrona.CloseHelper.quietClose(ae);
         org.agrona.CloseHelper.quietClose(driver);
@@ -1061,6 +1134,11 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                                       Default: no Subscribe is sent and the AE broadcasts every
                                       channel to this session. "acks,settlements" keeps every
                                       loadgen counter live (BalanceUpdate is ignored by design)
+                  --balance-feed URI  also subscribe to the AE's conflated balance-feed
+                                      side-channel at this Aeron channel (must match the nodes'
+                                      BALANCE_FEED_CHANNEL); counts frames+entries and reports
+                                      a "balance-feed seen n=..." line (default: off)
+                  --balance-feed-stream N  feed stream id (default 4201)
                   --out DIR           hgrm output dir (default results)
                   --gen-id N          generator identity for multi-generator runs (default 0):
                                       separates order-id space, RNG stream and user range

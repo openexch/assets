@@ -64,6 +64,15 @@ public final class AeronCluster {
                 com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime.create(nodeId);
         assetsService.setMoneyJournalSink(journalRuntime.journal());
 
+        // Balance feed side-channel (dark unless BALANCE_FEED_CHANNEL is set): the conflation store
+        // is wired NOW so the service thread taps live balance updates from the first applied
+        // command; the publisher thread starts inside the launch path once the media driver is up.
+        final com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime feedRuntime =
+                com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime.createIfEnabled(nodeId);
+        if (feedRuntime != null) {
+            assetsService.setBalanceFeed(feedRuntime.store());
+        }
+
         final ClusterConfig clusterConfig = ClusterConfig.create(nodeId, hostAddresses, hostAddresses, portBase,
                 assetsService);
 
@@ -118,15 +127,16 @@ public final class AeronCluster {
                 nodeId, portBase, driverMode, TransportConfig.idleMode());
 
         if (driverMode == DriverMode.EXTERNAL) {
-            launchWithExternalDriver(clusterConfig, nodeId, barrier, journalRuntime);
+            launchWithExternalDriver(clusterConfig, nodeId, barrier, journalRuntime, feedRuntime);
         } else {
-            launchWithEmbeddedDriver(clusterConfig, barrier, journalRuntime);
+            launchWithEmbeddedDriver(clusterConfig, barrier, journalRuntime, feedRuntime);
         }
     }
 
     private static void launchWithExternalDriver(
             final ClusterConfig clusterConfig, final int nodeId, final ShutdownSignalBarrier barrier,
-            final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime) {
+            final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime,
+            final com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime feedRuntime) {
         final String aeronDir = TransportConfig.aeronDir(nodeId);
         log.info("Driver mode EXTERNAL: connecting to media driver at %s", aeronDir);
         TransportConfig.awaitExternalDriver(aeronDir, TransportConfig.EXTERNAL_DRIVER_TIMEOUT_MS);
@@ -134,12 +144,18 @@ public final class AeronCluster {
 
         // The journal writer is an archive CLIENT recording on the node's own archive (no second
         // archive): declared right after the Archive so it outlives the container (the ring keeps
-        // draining through service shutdown) but closes before the Archive stops recording.
+        // draining through service shutdown) but closes before the Archive stops recording. The
+        // balance feed is a plain driver client with no durable half; same outlive-the-container
+        // placement so the store's tail drains through service shutdown.
         try (
                 Archive ignored = Archive.launch(clusterConfig.archiveContext());
                 com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime ignoredJournal =
                         journalRuntime == null ? null
                                 : journalRuntime.start(clusterConfig.aeronArchiveContext().clone(),
+                                        clusterConfig.archiveContext().errorHandler());
+                com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime ignoredFeed =
+                        feedRuntime == null ? null
+                                : feedRuntime.start(aeronDir,
                                         clusterConfig.archiveContext().errorHandler());
                 ConsensusModule ignored1 = ConsensusModule.launch(
                         clusterConfig.consensusModuleContext().terminationHook(barrier::signal));
@@ -154,7 +170,8 @@ public final class AeronCluster {
 
     private static void launchWithEmbeddedDriver(
             final ClusterConfig clusterConfig, final ShutdownSignalBarrier barrier,
-            final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime) {
+            final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime,
+            final com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime feedRuntime) {
         try (
                 ClusteredMediaDriver ignored = ClusteredMediaDriver.launch(
                         clusterConfig.mediaDriverContext()
@@ -177,6 +194,12 @@ public final class AeronCluster {
                 com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime ignoredJournal =
                         journalRuntime == null ? null
                                 : journalRuntime.start(clusterConfig.aeronArchiveContext().clone(),
+                                        clusterConfig.archiveContext().errorHandler());
+                // Same for the balance feed publisher (plain driver client, no archive).
+                com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime ignoredFeed =
+                        feedRuntime == null ? null
+                                : feedRuntime.start(
+                                        clusterConfig.mediaDriverContext().aeronDirectoryName(),
                                         clusterConfig.archiveContext().errorHandler());
                 ClusteredServiceContainer ignored1 = ClusteredServiceContainer.launch(
                         clusterConfig.clusteredServiceContext().terminationHook(barrier::signal))) {
