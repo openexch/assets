@@ -26,16 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # assets-bridge depends on com.match:match-common (the ME settlement-journal
-      # SBE classes), the same way order-management does — install it from match main
-      # before the reactor build.
-      - name: Check out match (for match-common dependency)
-        uses: actions/checkout@v7
-        with:
-          repository: openexch/match
-          ref: main
-          path: _match
-
       - name: Set up Java 21
         uses: actions/setup-java@v5
         with:
@@ -43,13 +33,9 @@ jobs:
           java-version: 21
           cache: maven
 
-      # -s _match/.mvn-settings.xml: match-common's deps are all on Central today, but
-      # the day it takes a GitHub-Packages dep (cluster-kit), a bare install breaks —
-      # oms already installs it with the settings file for exactly that reason.
-      - name: Install match-common into local Maven repo
-        run: mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-common -am
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # com.match:match-common (the ME settlement-journal SBE classes) resolves from
+      # GitHub Packages at the version pinned in pom.xml — no more checking out match
+      # at floating main and installing a mutable "1.0" into ~/.m2.
 
       # verify runs the full gate: unit tests, the determinism corpus, and
       # ClusterBootSmokeTest (boots a real in-process single-node AE cluster).
@@ -107,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
+      packages: write # deploys the assets wire modules (assets-common, assets-cluster) to GitHub Packages
       id-token: write # OIDC: no long-lived AWS keys in this repo
     env:
       BUCKET: openexch-build-artifacts-675715936685
@@ -124,17 +110,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # assets-bridge depends on com.match:match-common (the ME settlement-journal
-      # SBE classes), so the publish job needs it installed too, not just the build
-      # job. main is a moving target here, as it already is for the build job: the
-      # bridge takes the journal decoders from whatever match main is at publish time.
-      - name: Check out match (for match-common dependency)
-        uses: actions/checkout@v7
-        with:
-          repository: openexch/match
-          ref: main
-          path: _match
-
       - name: Set up Java 21
         uses: actions/setup-java@v5
         with:
@@ -150,12 +125,8 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          # Only the module this job publishes, and its in-reactor dependencies.
-          # A full reactor build pulls in modules that need artifacts the publish
-          # job has no reason to fetch (assets-bridge wants com.match:match-common,
-          # which the build job installs from a second checkout), and building them
-          # to throw them away is work either way.
-          mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-common -am
+          # Only the modules this job publishes, and their in-reactor dependencies;
+          # cross-repo deps (match-common, cluster-kit) resolve pinned from Packages.
           mvn -B -s .mvn-settings.xml clean package -pl "${JARS// /,}" -am -DskipTests \
             -DbuildSha=$(git rev-parse --short HEAD)
         env:
@@ -337,3 +308,70 @@ jobs:
         env:
           DEST: ${{ steps.dest.outputs.prefix }}
         run: echo "published s3://${BUCKET}/${DEST}"
+
+      # ---- cross-repo wire artifacts ----
+      # oms consumes com.openexchange.assets:assets-common (compile) and assets-cluster
+      # (test-scoped, for its embedded-AE integration test). Same discipline as
+      # match-common: every main push deploys an IMMUTABLE 0.1.0.<utcstamp>.g<sha> to
+      # GitHub Packages, replacing oms's checkout-at-floating-main + a SNAPSHOT that
+      # lived in no registry at all. After the S3 steps so a Packages failure cannot
+      # block the box artifact; still fails the job loudly.
+      - name: Deploy assets wire modules to GitHub Packages
+        id: wire
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          V="0.1.0.$(date -u +%Y%m%d%H%M%S).g${GITHUB_SHA::7}"
+          mvn -B -q org.codehaus.mojo:versions-maven-plugin:2.16.2:set \
+            -DnewVersion="$V" -DgenerateBackupPoms=false
+          # ".," so the parent pom deploys too; assets-common rides in via -am for
+          # assets-cluster, but naming it keeps the intent explicit.
+          mvn -B -s .mvn-settings.xml deploy -pl .,assets-common,assets-cluster -am -DskipTests \
+            -DaltDeploymentRepository=github::https://maven.pkg.github.com/openexch/assets
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "published com.openexchange.assets:{assets-common,assets-cluster}:$V"
+
+      # Same consumer-bump machinery as match's: API commits (GitHub signs them),
+      # token-gated, loud skip without the secret, never fails the publish.
+      - name: Open consumer bump PR (oms)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.CONSUMER_BUMP_TOKEN }}
+          V: ${{ steps.wire.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "CONSUMER_BUMP_TOKEN not set; skipping the oms bump PR (pin goes stale until it exists)."
+            exit 0
+          fi
+          BRANCH="bump/assets-wire-${V}"
+          BASE=$(gh api "repos/openexch/oms/git/ref/heads/main" --jq .object.sha)
+          gh api -X POST "repos/openexch/oms/git/refs" \
+            -f ref="refs/heads/${BRANCH}" -f sha="$BASE" >/dev/null
+          CONTENT=$(gh api "repos/openexch/oms/contents/pom.xml?ref=${BRANCH}" --jq .content | base64 -d)
+          NEW=$(printf '%s' "$CONTENT" \
+            | sed -E "s|(<assets.version>)[^<]+(</assets.version>)|\1${V}\2|")
+          if [ "$CONTENT" = "$NEW" ]; then
+            echo "oms: no <assets.version> property found; skipping"; exit 0
+          fi
+          SHA=$(gh api "repos/openexch/oms/contents/pom.xml?ref=${BRANCH}" --jq .sha)
+          gh api -X PUT "repos/openexch/oms/contents/pom.xml" \
+            -f message="build: assets wire ${V}" \
+            -f content="$(printf '%s' "$NEW" | base64 -w0)" \
+            -f sha="$SHA" -f branch="$BRANCH" >/dev/null
+          LSHA=$(gh api "repos/openexch/oms/contents/producers.lock?ref=${BRANCH}" --jq .sha 2>/dev/null || true)
+          if [ -n "$LSHA" ]; then
+            LOCK=$(gh api "repos/openexch/oms/contents/producers.lock?ref=${BRANCH}" --jq .content | base64 -d \
+              | sed -E "s|^assets=.*|assets=${GITHUB_SHA}|")
+            gh api -X PUT "repos/openexch/oms/contents/producers.lock" \
+              -f message="build: producers.lock assets=${GITHUB_SHA::7}" \
+              -f content="$(printf '%s' "$LOCK" | base64 -w0)" \
+              -f sha="$LSHA" -f branch="$BRANCH" >/dev/null
+          fi
+          gh pr create --repo openexch/oms --base main --head "$BRANCH" \
+            --title "build: assets wire ${V}" \
+            --body "Automated wire-artifact bump from openexch/assets@${GITHUB_SHA::7}. CI green = the new wire decodes; merge."
+          gh pr merge --repo openexch/oms --auto --squash "$BRANCH" \
+            || echo "oms: auto-merge unavailable; PR stays open for a human"
