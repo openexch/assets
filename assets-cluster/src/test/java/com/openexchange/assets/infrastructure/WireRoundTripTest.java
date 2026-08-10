@@ -54,6 +54,8 @@ public class WireRoundTripTest {
         final List<String> lines = new ArrayList<>();
         /** Channel each emitted frame was tagged with, parallel to {@link #lines}. */
         final List<Integer> channels = new ArrayList<>();
+        /** Routing each emitted frame was tagged with, parallel to {@link #lines}. */
+        final List<AssetsEventPublisher.Routing> routings = new ArrayList<>();
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
         private final BalanceUpdateDecoder balance = new BalanceUpdateDecoder();
         private final DepositAckDecoder depositAck = new DepositAckDecoder();
@@ -68,8 +70,10 @@ public class WireRoundTripTest {
         private final FeedPositionReportDecoder feedPos = new FeedPositionReportDecoder();
 
         @Override
-        public void emit(MutableDirectBuffer buffer, int offset, int length, int channel) {
+        public void emit(MutableDirectBuffer buffer, int offset, int length, int channel,
+                         AssetsEventPublisher.Routing routing) {
             channels.add(channel);
+            routings.add(routing);
             header.wrap(buffer, offset);
             switch (header.templateId()) {
                 case BalanceUpdateDecoder.TEMPLATE_ID:
@@ -155,7 +159,7 @@ public class WireRoundTripTest {
     public void depositHoldSettleRoundTripThroughTheWire() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
-        engine.setEventSink(new AssetsEventPublisher(egress));
+        engine.setEventSink(new AssetsEventPublisher(egress, () -> false));
         AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         // seller (100) deposits 1 BTC, buyer (200) deposits 60000 USD (correlationIds echoed on the acks)
@@ -195,7 +199,7 @@ public class WireRoundTripTest {
     public void feedPathAdvancesConsumePositionAndAnswersFeedQuery() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
-        engine.setEventSink(new AssetsEventPublisher(egress));
+        engine.setEventSink(new AssetsEventPublisher(egress, () -> false));
         AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         deposit(demuxer, 1, 100, Asset.BTC.id(), FixedPoint.fromDouble(2.0));
@@ -239,7 +243,7 @@ public class WireRoundTripTest {
     public void settleBatchAppliesEntriesInOrderWithSingleSettleSemantics() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
-        engine.setEventSink(new AssetsEventPublisher(egress));
+        engine.setEventSink(new AssetsEventPublisher(egress, () -> false));
         AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         // Seller has 2 BTC held, buyer has 120k USD held: room for exactly two 1-BTC settles.
@@ -292,7 +296,7 @@ public class WireRoundTripTest {
     public void withdrawAckAndRejectRoundTrip() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
-        engine.setEventSink(new AssetsEventPublisher(egress));
+        engine.setEventSink(new AssetsEventPublisher(egress, () -> false));
         AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         deposit(demuxer, 1, 300, Asset.USD.id(), FixedPoint.fromDouble(1000.0));
@@ -312,7 +316,7 @@ public class WireRoundTripTest {
     public void snapshotQueriesRoundTrip() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
-        engine.setEventSink(new AssetsEventPublisher(egress));
+        engine.setEventSink(new AssetsEventPublisher(egress, () -> false));
         AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         deposit(demuxer, 0, 100, Asset.USD.id(), FixedPoint.fromDouble(1000.0));
@@ -340,7 +344,7 @@ public class WireRoundTripTest {
     public void initTradeHighWaterPrimesOnlyVirginLedger() {
         AssetsEngine engine = new AssetsEngine();
         CapturingEgress egress = new CapturingEgress();
-        engine.setEventSink(new AssetsEventPublisher(egress));
+        engine.setEventSink(new AssetsEventPublisher(egress, () -> false));
         AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
 
         // Virgin ledger: the primer is accepted and seeds the scalars, emitting no egress.
@@ -429,7 +433,7 @@ public class WireRoundTripTest {
     @Test
     public void everyEventIsFiledUnderTheChannelSubscribersExpect() {
         final CapturingEgress egress = new CapturingEgress();
-        final AssetsEventPublisher p = new AssetsEventPublisher(egress);
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> false);
 
         p.onHoldAck(1, 2, 3, 0, 100);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldAck");
@@ -460,8 +464,61 @@ public class WireRoundTripTest {
         assertChannel(egress, AssetsEventPublisher.CH_SNAPSHOTS, "HoldSnapshotEnd");
     }
 
+    /**
+     * The routing table, method by method: request-scoped events go to the ORIGIN session only,
+     * shared streams BROADCAST. Misrouting is silently wrong in both directions — an ORIGIN frame
+     * broadcast resurrects the foreign-ack fanout this table removed; a BROADCAST frame origin-scoped
+     * starves every other consumer of money events. BalanceUpdate is the context-dependent one:
+     * BROADCAST live, ORIGIN while a query reply is being streamed (the balance-snapshot entries).
+     */
+    @Test
+    public void everyEventIsRoutedToOriginOrBroadcastAsDesigned() {
+        final boolean[] queryReply = {false};
+        final CapturingEgress egress = new CapturingEgress();
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> queryReply[0]);
+
+        p.onDepositAck(1, 2, 0, 100, 100);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "DepositAck");
+        p.onWithdrawAck(1, 2, 0, 100, 0);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "WithdrawAck");
+        p.onHoldAck(1, 2, 3, 0, 100);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "HoldAck");
+        p.onHoldReject(1, 2, 3, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "HoldReject");
+        p.onWithdrawReject(1, 2, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "WithdrawReject");
+        p.onFeedPositionReport(1, 42, 7, true);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "FeedPositionReport");
+        p.onBalanceSnapshotEnd(1, 3);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "BalanceSnapshotEnd");
+        p.onHoldSnapshotEntry(1, 2, 0, 50);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "HoldSnapshotEntry");
+        p.onHoldSnapshotEnd(1, 1);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "HoldSnapshotEnd");
+
+        p.onSettlementApplied(9, 1, 2);
+        assertRouting(egress, AssetsEventPublisher.Routing.BROADCAST, "SettlementApplied");
+        p.onSettleFault(9, 1, 2, 0, 5, 5);
+        assertRouting(egress, AssetsEventPublisher.Routing.BROADCAST, "SettleFault");
+
+        p.onBalanceUpdate(2, 0, 100, 0);
+        assertRouting(egress, AssetsEventPublisher.Routing.BROADCAST, "live BalanceUpdate");
+        queryReply[0] = true;
+        p.onBalanceUpdate(2, 0, 100, 0);
+        assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "snapshot-reply BalanceUpdate");
+        queryReply[0] = false;
+        p.onBalanceUpdate(2, 0, 100, 0);
+        assertRouting(egress, AssetsEventPublisher.Routing.BROADCAST, "live BalanceUpdate after the reply");
+    }
+
     private static void assertChannel(CapturingEgress egress, int expected, String what) {
         assertEquals(what + " must be filed under channel " + expected,
                 Integer.valueOf(expected), egress.channels.get(egress.channels.size() - 1));
+    }
+
+    private static void assertRouting(CapturingEgress egress, AssetsEventPublisher.Routing expected,
+                                      String what) {
+        assertEquals(what + " must be routed " + expected,
+                expected, egress.routings.get(egress.routings.size() - 1));
     }
 }

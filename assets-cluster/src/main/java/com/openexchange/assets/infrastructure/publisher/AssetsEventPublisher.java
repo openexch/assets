@@ -20,6 +20,8 @@ import com.openexchange.assets.infrastructure.generated.WithdrawRejectEncoder;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 
+import java.util.function.BooleanSupplier;
+
 /**
  * Outbound adapter: implements the domain {@link AssetsEventSink} port by encoding each event to SBE
  * and handing the bytes to an {@link Egress} transport. The engine emits money events through the port
@@ -28,16 +30,37 @@ import org.agrona.concurrent.UnsafeBuffer;
  * <p>Single-threaded (the cluster service thread); one reusable buffer, no per-event allocation. Money
  * egress is <b>reliable</b> — it must never be shed — so {@link Egress} is expected to apply
  * backpressure rather than drop.</p>
+ *
+ * <p><b>Routing.</b> Each flush also names its {@link Routing}: request-scoped events (acks, rejects,
+ * query replies) are {@code ORIGIN} — intended only for the session whose command produced them —
+ * while genuinely shared streams (live balance updates, settlements) are {@code BROADCAST}. The
+ * classification lives here, next to the channel classification, because this is the only class that
+ * knows which encoder it just used; the publisher stays transport-free — it signals <em>intent</em>,
+ * and the transport resolves which session the origin actually is. The one context-dependent method is
+ * {@link #onBalanceUpdate}: a balance-snapshot reply streams its entries through it (see
+ * {@code SessionEgressQueue#subscribe}), so it asks {@link #queryReplyContext} — query commands mutate
+ * nothing and emit only reply frames, so while one is being dispatched every emission is
+ * origin-scoped.</p>
  */
 public final class AssetsEventPublisher implements AssetsEventSink {
+
+    /** Who a frame is for. Transport-side only: it decides which queue a frame lands in, never bytes. */
+    public enum Routing {
+        /** Request-scoped: deliver only to the session whose command is currently being applied. */
+        ORIGIN,
+        /** Shared stream: deliver to every session subscribed to the frame's channel. */
+        BROADCAST
+    }
 
     /** The reliable egress transport (a positioned, flow-controlled channel — never lossy). */
     public interface Egress {
         /**
          * @param channel one of the {@code CH_*} constants — which class of egress this frame is, so the
          *                transport can skip sessions that did not subscribe to it
+         * @param routing {@link Routing#ORIGIN} for request-scoped frames (only the commanding session),
+         *                {@link Routing#BROADCAST} for shared streams (every subscribed session)
          */
-        void emit(MutableDirectBuffer buffer, int offset, int length, int channel);
+        void emit(MutableDirectBuffer buffer, int offset, int length, int channel, Routing routing);
     }
 
     // Egress channels. These mirror the EgressChannels bit set in money-schema.xml and are the unit a
@@ -57,6 +80,12 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private static final int BUFFER_CAPACITY = 256;
 
     private final Egress egress;
+    /**
+     * Whether a read-only query command is currently being dispatched (see the class doc): true makes
+     * {@link #onBalanceUpdate} emissions snapshot-reply entries ({@code ORIGIN}) instead of live
+     * updates ({@code BROADCAST}). Supplied by the transport boundary, which owns the dispatch.
+     */
+    private final BooleanSupplier queryReplyContext;
     private final MutableDirectBuffer buffer = new UnsafeBuffer(new byte[BUFFER_CAPACITY]);
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
 
@@ -73,29 +102,30 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
-    public AssetsEventPublisher(Egress egress) {
+    public AssetsEventPublisher(Egress egress, BooleanSupplier queryReplyContext) {
         this.egress = egress;
+        this.queryReplyContext = queryReplyContext;
     }
 
     @Override
     public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
         depositAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable);
-        flush(depositAckEncoder.encodedLength(), CH_ACKS);
+        flush(depositAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
     @Override
     public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
         withdrawAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable);
-        flush(withdrawAckEncoder.encodedLength(), CH_ACKS);
+        flush(withdrawAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
     @Override
     public void onHoldAck(long correlationId, long orderId, long userId, int assetId, long amount) {
         holdAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId).amount(amount);
-        flush(holdAckEncoder.encodedLength(), CH_ACKS);
+        flush(holdAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
     @Override
@@ -103,49 +133,55 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         holdRejectEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId)
                 .amount(amount).reason(toSbe(reason));
-        flush(holdRejectEncoder.encodedLength(), CH_ACKS);
+        flush(holdRejectEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
+    /**
+     * Live updates are the shared firehose ({@code BROADCAST}); the same frames streamed as a
+     * balance-snapshot reply are for the asker only ({@code ORIGIN}). {@link #queryReplyContext}
+     * separates the two — see the class doc.
+     */
     @Override
     public void onBalanceUpdate(long userId, int assetId, long available, long locked) {
         balanceUpdateEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .userId(userId).assetId(assetId).available(available).locked(locked);
-        flush(balanceUpdateEncoder.encodedLength(), CH_BALANCES);
+        flush(balanceUpdateEncoder.encodedLength(), CH_BALANCES,
+                queryReplyContext.getAsBoolean() ? Routing.ORIGIN : Routing.BROADCAST);
     }
 
     @Override
     public void onSettlementApplied(long tradeId, long buyerUserId, long sellerUserId) {
         settlementAppliedEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .tradeId(tradeId).buyerUserId(buyerUserId).sellerUserId(sellerUserId);
-        flush(settlementAppliedEncoder.encodedLength(), CH_SETTLEMENTS);
+        flush(settlementAppliedEncoder.encodedLength(), CH_SETTLEMENTS, Routing.BROADCAST);
     }
 
     @Override
     public void onWithdrawReject(long correlationId, long userId, int assetId, long amount, RejectReason reason) {
         withdrawRejectEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).reason(toSbe(reason));
-        flush(withdrawRejectEncoder.encodedLength(), CH_ACKS);
+        flush(withdrawRejectEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
     @Override
     public void onBalanceSnapshotEnd(long correlationId, int entryCount) {
         balanceSnapshotEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).entryCount(entryCount);
-        flush(balanceSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS);
+        flush(balanceSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS, Routing.ORIGIN);
     }
 
     @Override
     public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) {
         holdSnapshotEntryEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .orderId(orderId).userId(userId).assetId(assetId).remaining(remaining);
-        flush(holdSnapshotEntryEncoder.encodedLength(), CH_SNAPSHOTS);
+        flush(holdSnapshotEntryEncoder.encodedLength(), CH_SNAPSHOTS, Routing.ORIGIN);
     }
 
     @Override
     public void onHoldSnapshotEnd(long correlationId, int entryCount) {
         holdSnapshotEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).entryCount(entryCount);
-        flush(holdSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS);
+        flush(holdSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS, Routing.ORIGIN);
     }
 
     @Override
@@ -155,7 +191,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .correlationId(correlationId).consumePosition(consumePosition)
                 .lastAppliedTradeId(lastAppliedTradeId)
                 .journalEnabled(journalEnabled ? BoolFlag.TRUE : BoolFlag.FALSE);
-        flush(feedPositionReportEncoder.encodedLength(), CH_ACKS);
+        flush(feedPositionReportEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
     @Override
@@ -164,11 +200,11 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         settleFaultEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .tradeId(tradeId).orderId(orderId).userId(userId).assetId(assetId)
                 .drawnFromAvailable(drawnFromAvailable).uncovered(uncovered);
-        flush(settleFaultEncoder.encodedLength(), CH_SETTLEMENTS);
+        flush(settleFaultEncoder.encodedLength(), CH_SETTLEMENTS, Routing.BROADCAST);
     }
 
-    private void flush(int bodyLength, int channel) {
-        egress.emit(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + bodyLength, channel);
+    private void flush(int bodyLength, int channel, Routing routing) {
+        egress.emit(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + bodyLength, channel, routing);
     }
 
     private static com.openexchange.assets.infrastructure.generated.RejectReason toSbe(RejectReason r) {

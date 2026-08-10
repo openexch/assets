@@ -42,8 +42,11 @@ import java.util.concurrent.TimeUnit;
  * the two-cluster-on-one-box capacity is validated on appropriate hardware. Money egress is reliable
  * (never shed): {@link #enqueueEgress} queues rather than drops.</p>
  *
- * <p><b>Egress shape.</b> Apply writes encoded frames into a per-session {@link SessionEgressQueue};
- * {@link #drainEgress()} offers them in bulk at the end of every {@code onSessionMessage}. Under load
+ * <p><b>Egress shape.</b> Apply writes encoded frames into a per-session {@link SessionEgressQueue} —
+ * request-scoped frames (acks, rejects, query replies) into the ORIGIN session's queue only, shared
+ * streams into every subscriber's (see {@link #enqueueEgress} for the routing and its delivery
+ * contract); {@link #drainEgress()} offers them in bulk at the end of every {@code onSessionMessage}.
+ * Under load
  * that is opportunistic batching (each drain sends whatever accumulated, so batches form by
  * themselves) — and since schema v5 the drain also COALESCES consecutive same-type high-rate events
  * into one batch frame (see {@link SessionEgressQueue}), so a SettleBatch worth of ingress leaves as a
@@ -84,6 +87,20 @@ public final class AssetsClusteredService implements ClusteredService {
     /** Peeks ingress frames for the transport-level messages handled or observed at this boundary. */
     private final MessageHeaderDecoder peekHeaderDecoder = new MessageHeaderDecoder();
     private final SubscribeDecoder subscribeDecoder = new SubscribeDecoder();
+    /**
+     * The session whose command is currently being dispatched — the ORIGIN that request-scoped egress
+     * (see {@link AssetsEventPublisher.Routing}) is delivered to. Set around {@code demuxer.dispatch}
+     * in {@link #onSessionMessage}, null everywhere else: no other entry point (timer, snapshot load)
+     * emits request-scoped frames, and {@link #enqueueToOrigin} asserts that. Leader-local transport
+     * state like the queues themselves — never replicated, never snapshotted.
+     */
+    private ClientSession originSession;
+    /**
+     * True while the dispatched command is a read-only query ({@link AssetsSbeDemuxer#isQuery}): a
+     * query emits only reply frames, so the publisher routes even its {@code BalanceUpdate} emissions
+     * (a balance-snapshot reply streams entries through that method) to the origin.
+     */
+    private boolean originIsQuery;
     private boolean sessionsDirty = true;
     private boolean drainTimerArmed;
     private volatile long drainTimerFires;
@@ -134,7 +151,7 @@ public final class AssetsClusteredService implements ClusteredService {
         this.cluster = cluster;
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
-        engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress));
+        engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery));
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
         }
@@ -328,9 +345,20 @@ public final class AssetsClusteredService implements ClusteredService {
             // Peeked, never consumed: a QueryFeedPosition marks its sender as resumable and still
             // flows to the engine, which answers it with a FeedPositionReport.
             markIfFeedConsumer(session, buffer, offset, length);
-            // Deterministic on every replica: decode -> domain command -> engine mutation. The apply only
-            // queues its egress; the offers happen in the drain below, off the apply's critical section.
-            demuxer.dispatch(buffer, offset, length, timestamp);
+            // The origin context: while the engine applies this command, request-scoped egress goes to
+            // THIS session (and, for a query, so does every emission — see isQueryIngress). Cleared in
+            // a finally so a throwing apply cannot leak one command's origin onto the next.
+            originSession = session;
+            originIsQuery = isQueryIngress(buffer, offset, length);
+            try {
+                // Deterministic on every replica: decode -> domain command -> engine mutation. The apply
+                // only queues its egress; the offers happen in the drain below, off the apply's critical
+                // section.
+                demuxer.dispatch(buffer, offset, length, timestamp);
+            } finally {
+                originSession = null;
+                originIsQuery = false;
+            }
         }
         drainEgress();
         armDrainTimerIfNeeded();
@@ -442,13 +470,32 @@ public final class AssetsClusteredService implements ClusteredService {
 
     /**
      * Reliable leader-only egress, called from inside the engine's apply: copy the encoded frame into
-     * every session's queue and return. Never shed — a dropped money event is unrecoverable — but also
-     * never offer here, because an inline offer means a back-pressured consumer parks the whole
-     * deterministic thread.
+     * the destination queue(s) and return. Never offer here, because an inline offer means a
+     * back-pressured consumer parks the whole deterministic thread.
+     *
+     * <p><b>Routing.</b> {@code BROADCAST} frames (live balance updates, settlements) are copied into
+     * every subscribed session's queue, as always. {@code ORIGIN} frames (acks, rejects, query replies)
+     * go ONLY to the session whose command is being applied — session count is no longer a multiplier
+     * on request-scoped egress, and consumers stop client-filtering foreign acks. Routing is entirely
+     * transport-side: it decides which QUEUE a frame lands in; the state machine and the emitted bytes
+     * are untouched, so replicas stay byte-identical.</p>
+     *
+     * <p><b>Delivery contract for request-scoped egress: AT-MOST-ONCE, TO THE ORIGIN.</b> An
+     * undelivered frame dies with its session — origin gone or unsubscribed here, or discarded on a
+     * CLOSED session at offer time — exactly as broadcast frames always have (see
+     * {@code SessionEgressQueue#offerFrame}). Recovery for a client that lost its session mid-flight
+     * is COMMAND RETRY + engine idempotency + authoritative resync (balance/hold snapshot queries),
+     * never re-delivery: the replicated log is the source of truth, the ack is a delivery
+     * optimization.</p>
      */
-    private void enqueueEgress(MutableDirectBuffer buffer, int offset, int length, int channel) {
+    private void enqueueEgress(MutableDirectBuffer buffer, int offset, int length, int channel,
+                               AssetsEventPublisher.Routing routing) {
         if (!isLeader || cluster == null) {
             return; // followers replicate state but do not emit client egress
+        }
+        if (routing == AssetsEventPublisher.Routing.ORIGIN) {
+            enqueueToOrigin(buffer, offset, length, channel);
+            return;
         }
         refreshSessionsIfNeeded();
         final SessionEgressQueue[] queues = egressQueues;
@@ -461,6 +508,46 @@ public final class AssetsClusteredService implements ClusteredService {
                 appendAfterFreeingSpace(queue, buffer, offset, length);
             }
         }
+    }
+
+    /**
+     * Queue a request-scoped frame for the origin session alone. See {@link #enqueueEgress} for the
+     * at-most-once delivery contract. An origin that is gone (its queue no longer exists) or that
+     * unsubscribed from this channel drops the frame — the documented semantics, and in-log-order a
+     * session cannot die between its command's ingress and this apply anyway, so the null path is
+     * defensive.
+     */
+    private void enqueueToOrigin(MutableDirectBuffer buffer, int offset, int length, int channel) {
+        final ClientSession origin = originSession;
+        if (origin == null) {
+            // Only a session-message dispatch emits request-scoped frames; timers and snapshot load
+            // emit none. Surface a violation in test JVMs (surefire enables assertions), stay silent
+            // on the money path in production — the log is authoritative either way.
+            assert false : "request-scoped egress emitted outside a session-message dispatch";
+            return;
+        }
+        refreshSessionsIfNeeded();
+        final SessionEgressQueue queue = egressBySessionId.get(origin.id());
+        if (queue == null || !queue.wants(channel)) {
+            return;
+        }
+        if (!queue.append(buffer, offset, length)) {
+            appendAfterFreeingSpace(queue, buffer, offset, length);
+        }
+    }
+
+    /**
+     * Peek: is this ingress frame a read-only query command? Mirrors what {@link AssetsSbeDemuxer}
+     * will do with the same bytes — a templateId switch, deliberately with no schema check the
+     * demuxer does not make — so {@link #originIsQuery} is true precisely while the demuxer is
+     * dispatching a query.
+     */
+    private boolean isQueryIngress(DirectBuffer buffer, int offset, int length) {
+        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
+            return false;
+        }
+        peekHeaderDecoder.wrap(buffer, offset);
+        return AssetsSbeDemuxer.isQuery(peekHeaderDecoder.templateId());
     }
 
     /**
