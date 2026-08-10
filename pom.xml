@@ -39,7 +39,7 @@
         <cluster-kit.version>0.1.6</cluster-kit.version>
         <aeron.version>1.52.2</aeron.version>
         <agrona.version>2.5.0</agrona.version>
-        <sbe.version>1.38.1</sbe.version>
+        <sbe.version>1.39.0</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
         <!-- Postgres + pool for the money projector (versions match the OMS repo). -->
         <postgresql.version>42.7.13</postgresql.version>
