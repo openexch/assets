@@ -61,6 +61,25 @@ public final class AssetsSbeDemuxer {
         this.projector = projector;
     }
 
+    /**
+     * Is this templateId one of the read-only QUERY commands ({@code QueryFeedPosition},
+     * {@code RequestBalanceSnapshot}, {@code RequestHoldSnapshot})? A query mutates nothing and emits
+     * only reply frames, so while {@link #dispatch} is handling one, <em>every</em> emission is scoped
+     * to the asking session — which is what lets the transport separate a balance-snapshot reply's
+     * {@code BalanceUpdate} entries from live broadcast updates. Kept next to the dispatch switch so a
+     * new query message cannot be added to one without the other.
+     */
+    public static boolean isQuery(final int templateId) {
+        switch (templateId) {
+            case QueryFeedPositionDecoder.TEMPLATE_ID:
+            case RequestBalanceSnapshotDecoder.TEMPLATE_ID:
+            case RequestHoldSnapshotDecoder.TEMPLATE_ID:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     public void dispatch(final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
         if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
             return;
