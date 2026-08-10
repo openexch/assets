@@ -516,14 +516,16 @@ public final class AssetsClusteredService implements ClusteredService {
      *
      * <p><b>Routing.</b> {@code BROADCAST} frames (live balance updates, settlements) are copied into
      * every subscribed session's queue, as always. {@code ORIGIN} frames (acks, rejects, query replies)
-     * go ONLY to the session whose command is being applied — session count is no longer a multiplier
-     * on request-scoped egress, and consumers stop client-filtering foreign acks. Routing is entirely
+     * go ONLY to the session whose command is being applied — and go there UNCONDITIONALLY: the
+     * Subscribe channel mask narrows broadcast streams, never the replies to a session's own commands
+     * (you sent the command, you get its answer). Session count is no longer a multiplier on
+     * request-scoped egress, and consumers stop client-filtering foreign acks. Routing is entirely
      * transport-side: it decides which QUEUE a frame lands in; the state machine and the emitted bytes
      * are untouched, so replicas stay byte-identical.</p>
      *
      * <p><b>Delivery contract for request-scoped egress: AT-MOST-ONCE, TO THE ORIGIN.</b> An
-     * undelivered frame dies with its session — origin gone or unsubscribed here, or discarded on a
-     * CLOSED session at offer time — exactly as broadcast frames always have (see
+     * undelivered frame dies with its session — origin gone here, or discarded on a CLOSED session at
+     * offer time — exactly as broadcast frames always have (see
      * {@code SessionEgressQueue#offerFrame}). Recovery for a client that lost its session mid-flight
      * is COMMAND RETRY + engine idempotency + authoritative resync (balance/hold snapshot queries),
      * never re-delivery: the replicated log is the source of truth, the ack is a delivery
@@ -535,7 +537,7 @@ public final class AssetsClusteredService implements ClusteredService {
             return; // followers replicate state but do not emit client egress
         }
         if (routing == AssetsEventPublisher.Routing.ORIGIN) {
-            enqueueToOrigin(buffer, offset, length, channel);
+            enqueueToOrigin(buffer, offset, length);
             return;
         }
         refreshSessionsIfNeeded();
@@ -552,13 +554,16 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     /**
-     * Queue a request-scoped frame for the origin session alone. See {@link #enqueueEgress} for the
-     * at-most-once delivery contract. An origin that is gone (its queue no longer exists) or that
-     * unsubscribed from this channel drops the frame — the documented semantics, and in-log-order a
-     * session cannot die between its command's ingress and this apply anyway, so the null path is
-     * defensive.
+     * Queue a request-scoped frame for the origin session alone, regardless of its channel mask —
+     * there is deliberately no channel here to consult a mask with. Subscription channels exist to
+     * narrow BROADCAST streams; they must never let a session accidentally silence the replies to
+     * its own commands. Concretely: a session subscribed to only acks and settlements that sends
+     * RequestBalanceSnapshot still receives the reply's BalanceUpdate-typed entries and its
+     * terminator. See {@link #enqueueEgress} for the at-most-once delivery contract. An origin that
+     * is gone (its queue no longer exists) drops the frame — and in-log-order a session cannot die
+     * between its command's ingress and this apply anyway, so the null path is defensive.
      */
-    private void enqueueToOrigin(MutableDirectBuffer buffer, int offset, int length, int channel) {
+    private void enqueueToOrigin(MutableDirectBuffer buffer, int offset, int length) {
         final ClientSession origin = originSession;
         if (origin == null) {
             // Only a session-message dispatch emits request-scoped frames; timers and snapshot load
@@ -569,7 +574,7 @@ public final class AssetsClusteredService implements ClusteredService {
         }
         refreshSessionsIfNeeded();
         final SessionEgressQueue queue = egressBySessionId.get(origin.id());
-        if (queue == null || !queue.wants(channel)) {
+        if (queue == null) {
             return;
         }
         if (!queue.append(buffer, offset, length)) {

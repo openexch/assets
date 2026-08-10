@@ -15,6 +15,7 @@ import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotEncoder;
+import com.openexchange.assets.infrastructure.generated.SubscribeEncoder;
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.cluster.ClusteredMediaDriver;
@@ -46,13 +47,19 @@ import static org.junit.Assert.assertTrue;
  * this routing existed, every session's queue got a copy of every frame — session count was an egress
  * multiplier — and consumers client-filtered foreign acks.
  *
- * <p>Two clients, A and B, both default-subscribed (CH_ALL — neither ever sends Subscribe):</p>
+ * <p>Three clients. A and B are default-subscribed (CH_ALL — neither ever sends Subscribe);
+ * C subscribes to only acks + settlements:</p>
  * <ol>
  *   <li>A's Deposit: the DepositAck reaches A alone; the live BalanceUpdate reaches both.</li>
  *   <li>B's balance-snapshot query: entries + terminator reach B alone (the entries are ordinary
  *       BalanceUpdate frames — the query-reply context is what separates them from the live stream);
  *       a subsequent deposit's live update still reaches both, proving live vs reply separation.</li>
  *   <li>A's Hold: the HoldAck reaches A alone; the hold's BalanceUpdate reaches both.</li>
+ *   <li>C's balance-snapshot query: the full reply (entries + terminator) reaches C even though its
+ *       mask holds neither BALANCES nor SNAPSHOTS — replies to a session's own commands bypass the
+ *       subscription gate, which narrows BROADCAST alone. Meanwhile no reply frame reaches the
+ *       full-subscribed pair, and live BalanceUpdates keep reaching A and B but never C: the mask
+ *       still narrows broadcast exactly as asked.</li>
  * </ol>
  *
  * <p>Assertions are decode-level (template + correlation) and batch-aware: since schema v5 the drain
@@ -164,8 +171,10 @@ public class RequestOriginEgressClusterTest {
         ClusteredServiceContainer container = null;
         AeronCluster clientA = null;
         AeronCluster clientB = null;
+        AeronCluster clientC = null;
         final RecordingEgress egressA = new RecordingEgress();
         final RecordingEgress egressB = new RecordingEgress();
+        final RecordingEgress egressC = new RecordingEgress();
         try {
             mediaDriver = ClusteredMediaDriver.launch(
                     cfg.mediaDriverContext().dirDeleteOnStart(true).dirDeleteOnShutdown(true)
@@ -181,10 +190,10 @@ public class RequestOriginEgressClusterTest {
 
             // ---- (a) A's deposit: ack to A only, live BalanceUpdate to both ----
             offer(a, encodeDeposit(0xA1L, USER_A, Asset.USD.id(), FixedPoint.fromDouble(100.0)));
-            pumpUntil(a, b, () -> egressA.depositAcks.get() >= 1
+            pumpUntil(() -> egressA.depositAcks.get() >= 1
                             && egressA.balanceUpdateEntries.get() >= 1
                             && egressB.balanceUpdateEntries.get() >= 1,
-                    "deposit ack to A + balance update to both");
+                    "deposit ack to A + balance update to both", a, b);
             assertEquals(0xA1L, egressA.lastDepositAckCorrelation.get());
             assertEquals(1, egressA.balanceUpdateEntries.get());
             // B saw the deposit's BalanceUpdate. Its queue is ordered and the ack (enqueued first)
@@ -195,7 +204,7 @@ public class RequestOriginEgressClusterTest {
 
             // ---- (b) B's balance-snapshot query: entries + terminator to B only ----
             offer(b, encodeRequestBalanceSnapshot(0xB1L));
-            pumpUntil(a, b, () -> egressB.snapshotEnds.get() >= 1, "snapshot reply to B");
+            pumpUntil(() -> egressB.snapshotEnds.get() >= 1, "snapshot reply to B", a, b);
             assertEquals(0xB1L, egressB.lastSnapshotEndCorrelation.get());
             assertEquals("one non-zero (user,asset) exists", 1, egressB.lastSnapshotEndEntryCount.get());
             assertEquals("B: live update + snapshot entry", 2, egressB.balanceUpdateEntries.get());
@@ -205,10 +214,10 @@ public class RequestOriginEgressClusterTest {
             // ...and live updates after the query still broadcast: A deposits again, BOTH see it.
             offer(a, encodeDeposit(0xA2L, USER_A, Asset.USD.id(), FixedPoint.fromDouble(50.0)));
             final long avail150 = FixedPoint.fromDouble(150.0);
-            pumpUntil(a, b, () -> egressA.depositAcks.get() >= 2
+            pumpUntil(() -> egressA.depositAcks.get() >= 2
                             && egressA.lastAvailable.get() == avail150
                             && egressB.lastAvailable.get() == avail150,
-                    "post-query live update to both");
+                    "post-query live update to both", a, b);
             assertEquals(0xA2L, egressA.lastDepositAckCorrelation.get());
             // A's ordered stream has advanced past the query window with no snapshot frames: the
             // reply was never queued for A. B got exactly the snapshot entry more than A did.
@@ -219,10 +228,10 @@ public class RequestOriginEgressClusterTest {
 
             // ---- (c) A's hold: HoldAck to A only, the hold's BalanceUpdate to both ----
             offer(a, encodeHold(7777L, 7777L, USER_A, Asset.USD.id(), FixedPoint.fromDouble(25.0)));
-            pumpUntil(a, b, () -> egressA.holdAcks.get() >= 1
+            pumpUntil(() -> egressA.holdAcks.get() >= 1
                             && egressA.balanceUpdateEntries.get() >= 3
                             && egressB.balanceUpdateEntries.get() >= 4,
-                    "hold ack to A + balance update to both");
+                    "hold ack to A + balance update to both", a, b);
             assertEquals(7777L, egressA.lastHoldAckCorrelation.get());
             assertEquals("foreign HoldAck must not reach B", 0, egressB.holdAcks.get());
             assertEquals(1, egressA.holdAcks.get());
@@ -232,9 +241,59 @@ public class RequestOriginEgressClusterTest {
             assertEquals(avail125, egressB.lastAvailable.get());
             assertEquals(locked25, egressA.lastLocked.get());
             assertEquals(locked25, egressB.lastLocked.get());
+
+            // ---- (d) narrow subscription: replies bypass the mask, the mask still narrows broadcast ----
+            clientC = connect(egressC, aeronDir, hosts);
+            final AeronCluster c = clientC;
+            // Ingress is ordered per session: the Subscribe is applied before the query below lands.
+            offer(c, encodeSubscribeAcksAndSettlements());
+            offer(c, encodeRequestBalanceSnapshot(0xC1L));
+            pumpUntil(() -> egressC.snapshotEnds.get() >= 1,
+                    "snapshot reply to narrow-subscribed C", a, b, c);
+            assertEquals(0xC1L, egressC.lastSnapshotEndCorrelation.get());
+            assertEquals("one non-zero (user,asset) exists", 1, egressC.lastSnapshotEndEntryCount.get());
+            assertEquals("reply entries reach the asker despite its mask",
+                    1, egressC.balanceUpdateEntries.get());
+            assertEquals(avail125, egressC.lastAvailable.get());
+            assertEquals(locked25, egressC.lastLocked.get());
+
+            // C's own deposit: the ack (origin-routed) reaches C; the live update broadcasts to the
+            // full-subscribed pair and must NOT reach C. Then A deposits: same shape from the other side.
+            offer(c, encodeDeposit(0xC2L, USER_A, Asset.USD.id(), FixedPoint.fromDouble(10.0)));
+            final long avail135 = FixedPoint.fromDouble(135.0);
+            pumpUntil(() -> egressC.depositAcks.get() >= 1
+                            && egressA.lastAvailable.get() == avail135
+                            && egressB.lastAvailable.get() == avail135,
+                    "C's deposit ack to C + its live update to A and B", a, b, c);
+            assertEquals(0xC2L, egressC.lastDepositAckCorrelation.get());
+
+            offer(a, encodeDeposit(0xA3L, USER_A, Asset.USD.id(), FixedPoint.fromDouble(5.0)));
+            final long avail140 = FixedPoint.fromDouble(140.0);
+            pumpUntil(() -> egressA.lastAvailable.get() == avail140
+                            && egressB.lastAvailable.get() == avail140,
+                    "post-subscription live update to the full-subscribed pair", a, b, c);
+            assertEquals(0xA3L, egressA.lastDepositAckCorrelation.get());
+            // A's and B's ordered streams have advanced past C's query window with no snapshot
+            // frames and exact broadcast counts: C's reply was never queued for them.
+            assertEquals(0, egressA.snapshotEnds.get());
+            assertEquals(1, egressB.snapshotEnds.get());
+            assertEquals(5, egressA.balanceUpdateEntries.get());
+            assertEquals(6, egressB.balanceUpdateEntries.get());
+
+            // C's negative rides its own ordered queue: a second query fences everything before it.
+            // Had either live update above been (wrongly) queued for C, it would precede this reply.
+            offer(c, encodeRequestBalanceSnapshot(0xC3L));
+            pumpUntil(() -> egressC.snapshotEnds.get() >= 2, "second snapshot reply to C", a, b, c);
+            assertEquals(0xC3L, egressC.lastSnapshotEndCorrelation.get());
+            assertEquals("C: two reply entries and NO broadcast — its mask still narrows the firehose",
+                    2, egressC.balanceUpdateEntries.get());
+            assertEquals(avail140, egressC.lastAvailable.get());
+            assertEquals("no foreign ack reached C", 1, egressC.depositAcks.get());
+            assertEquals(0, egressC.holdAcks.get());
         } finally {
             CloseHelper.quietClose(clientA);
             CloseHelper.quietClose(clientB);
+            CloseHelper.quietClose(clientC);
             CloseHelper.quietClose(container);
             CloseHelper.quietClose(mediaDriver);
             IoUtil.delete(tmp, true);
@@ -253,15 +312,16 @@ public class RequestOriginEgressClusterTest {
                 .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10)));
     }
 
-    /** Poll BOTH sessions until the condition holds — so "did not receive" is absence, not lag. */
-    private static void pumpUntil(final AeronCluster a, final AeronCluster b,
-                                  final BooleanSupplier condition, final String what) {
+    /** Poll EVERY session until the condition holds — so "did not receive" is absence, not lag. */
+    private static void pumpUntil(final BooleanSupplier condition, final String what,
+                                  final AeronCluster... clients) {
         final long deadline = System.currentTimeMillis() + 15_000;
         final BackoffIdleStrategy idle = new BackoffIdleStrategy();
         while (!condition.getAsBoolean()) {
             assertTrue("timed out waiting for: " + what, System.currentTimeMillis() < deadline);
-            a.pollEgress();
-            b.pollEgress();
+            for (final AeronCluster client : clients) {
+                client.pollEgress();
+            }
             idle.idle();
         }
     }
@@ -273,6 +333,7 @@ public class RequestOriginEgressClusterTest {
     private final DepositEncoder depositEnc = new DepositEncoder();
     private final HoldEncoder holdEnc = new HoldEncoder();
     private final RequestBalanceSnapshotEncoder balanceSnapshotEnc = new RequestBalanceSnapshotEncoder();
+    private final SubscribeEncoder subscribeEnc = new SubscribeEncoder();
 
     private int encodeDeposit(long correlationId, long userId, int assetId, long amount) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
@@ -291,6 +352,14 @@ public class RequestOriginEgressClusterTest {
     private int encodeRequestBalanceSnapshot(long correlationId) {
         balanceSnapshotEnc.wrapAndApplyHeader(ingress, 0, headerEnc).correlationId(correlationId);
         return MessageHeaderEncoder.ENCODED_LENGTH + balanceSnapshotEnc.encodedLength();
+    }
+
+    /** The bridge's real-world mask: acks + settlements, neither BALANCES nor SNAPSHOTS. */
+    private int encodeSubscribeAcksAndSettlements() {
+        subscribeEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
+                .correlationId(0L)
+                .channels().clear().acks(true).settlements(true);
+        return MessageHeaderEncoder.ENCODED_LENGTH + subscribeEnc.encodedLength();
     }
 
     private void offer(AeronCluster client, int length) {

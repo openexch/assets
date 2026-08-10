@@ -336,15 +336,17 @@ public class SessionEgressQueueTest {
     }
 
     @Test
-    public void snapshotsImplyBalancesBecauseEntriesRideOnBalanceUpdates() {
+    public void snapshotsNoLongerImplyBalancesBecauseRepliesBypassTheMask() {
         final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
         q.subscribe(AssetsEventPublisher.CH_SNAPSHOTS);
 
-        // A balance snapshot streams its entries as BalanceUpdate frames and then a terminator carrying
-        // the entry COUNT. Subscribing to snapshots without balances would deliver the count with no
-        // entries: a silently wrong answer. That combination must not be expressible.
+        // SNAPSHOTS used to drag BALANCES in: a snapshot reply streams its entries as BalanceUpdate
+        // frames, and a mask that silenced them would deliver the terminator's entry COUNT with no
+        // entries. Request-scoped replies now route to their origin UNCONDITIONALLY
+        // (AssetsClusteredService#enqueueToOrigin), so the asker gets its entries whatever its mask
+        // says — the mask narrows broadcast alone, and it is taken exactly as asked.
         assertTrue(q.wants(AssetsEventPublisher.CH_SNAPSHOTS));
-        assertTrue("snapshots must drag balances in with them",
+        assertFalse("the mask is exact: replies no longer depend on it",
                 q.wants(AssetsEventPublisher.CH_BALANCES));
     }
 
