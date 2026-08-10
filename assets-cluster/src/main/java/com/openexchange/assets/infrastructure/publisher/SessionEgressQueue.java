@@ -105,10 +105,11 @@ public final class SessionEgressQueue {
     private long backPressureCount;
     private int peakPendingBytes;
     /**
-     * Which egress channels this session wants. Defaults to everything, so a client that never sends
-     * Subscribe behaves exactly as it did before subscriptions existed. Transport state, never
-     * snapshotted: after a leader change or a snapshot restore it falls back to this default, which is
-     * the safe direction (more traffic, never missing traffic).
+     * Which BROADCAST egress channels this session wants — replies to its own commands bypass this
+     * mask entirely. Defaults to everything, so a client that never sends Subscribe behaves exactly
+     * as it did before subscriptions existed. Transport state, never snapshotted: after a leader
+     * change or a snapshot restore it falls back to this default, which is the safe direction (more
+     * traffic, never missing traffic).
      */
     private int channelMask = AssetsEventPublisher.CH_ALL;
     /**
@@ -169,18 +170,17 @@ public final class SessionEgressQueue {
     }
 
     /**
-     * A snapshot reply streams its entries as ordinary BalanceUpdate frames and then a terminator, so a
-     * session subscribed to SNAPSHOTS but not BALANCES would receive an entry COUNT with no entries: a
-     * silently wrong answer. Rather than let that be expressible, SNAPSHOTS implies BALANCES here.
-     * (The cleaner fix is a dedicated BalanceSnapshotEntry message, which belongs with the next schema
-     * change; until then this coupling is enforced rather than documented and hoped for.)
+     * The mask is taken exactly as asked: it narrows BROADCAST streams only, because request-scoped
+     * replies are routed to their origin unconditionally (see
+     * {@code AssetsClusteredService#enqueueToOrigin}). SNAPSHOTS used to imply BALANCES here — a
+     * snapshot reply streams its entries as ordinary BalanceUpdate frames, and a mask that could
+     * silence them would turn the terminator's entry COUNT into a silently wrong answer — with a note
+     * that a cleaner fix belonged later. Origin-unconditional replies are that cleaner fix: the
+     * entries reach the asker regardless of its mask, so the coupling is gone with the hazard it
+     * guarded.
      */
     public void subscribe(final int channels) {
-        int mask = channels;
-        if ((mask & AssetsEventPublisher.CH_SNAPSHOTS) != 0) {
-            mask |= AssetsEventPublisher.CH_BALANCES;
-        }
-        this.channelMask = mask;
+        this.channelMask = channels;
     }
 
     /**
