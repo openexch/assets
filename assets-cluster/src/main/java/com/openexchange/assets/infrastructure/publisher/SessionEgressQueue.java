@@ -60,8 +60,10 @@ public final class SessionEgressQueue {
      * consumer is already falling behind, which is exactly when the capacity is worth paying for.
      */
     static final int INITIAL_CAPACITY = 1 << 16;   // 64 KB
-    /** Growth ceiling per session. Past this the caller must free space rather than shed money events. */
-    static final int MAX_CAPACITY = 1 << 24;       // 16 MB
+    /** Growth ceiling per session. Past this the caller must decide rather than shed money events. */
+    // Property-overridable as transport-level tuning (and so tests can reach the ceiling without 16MB
+    // of traffic): per-node, never replicated state, so a system property is legitimate here.
+    static final int MAX_CAPACITY = Integer.getInteger("assets.egress.max.capacity.bytes", 1 << 24);
     /** Frames offered per session per drain, so one session cannot monopolise a duty cycle. */
     static final int DRAIN_LIMIT = 256;
     /** Max entries coalesced into one egress batch frame. */
@@ -109,6 +111,17 @@ public final class SessionEgressQueue {
      * the safe direction (more traffic, never missing traffic).
      */
     private int channelMask = AssetsEventPublisher.CH_ALL;
+    /**
+     * Whether this session's consumer has PROVEN it can survive losing the session: set when it sends
+     * QueryFeedPosition, the first step of the resume protocol (reconnect -> re-query -> skip-filter,
+     * with AE-side idempotency underneath). The engine's full-queue handling keys on this: a resumable
+     * consumer's session may be closed instead of blocking the engine, because resync replays
+     * everything from positions. Transport state exactly like {@link #channelMask} — never
+     * snapshotted. After a leader change the fresh queue defaults to NOT resumable, which is the safe
+     * direction: an unproven consumer blocks exactly as today, and the bridge re-identifies itself
+     * with a fresh QueryFeedPosition at every epoch start.
+     */
+    private boolean resumable;
 
     public SessionEgressQueue(final ClientSession session) {
         this.session = session;
@@ -144,6 +157,15 @@ public final class SessionEgressQueue {
 
     public boolean wants(final int channel) {
         return (channelMask & channel) != 0;
+    }
+
+    /** The consumer sent QueryFeedPosition: it owns a resume protocol. See {@link #resumable}. */
+    public void markResumable() {
+        this.resumable = true;
+    }
+
+    public boolean isResumable() {
+        return resumable;
     }
 
     /**
@@ -215,7 +237,10 @@ public final class SessionEgressQueue {
         return total;
     }
 
-    /** Discard everything queued, for example when this node stops being the leader. */
+    /**
+     * Discard everything queued, for example when this node stops being the leader. {@link #resumable}
+     * survives deliberately: it describes the consumer on this session, not the queued frames.
+     */
     public void reset() {
         pending.reset(INITIAL_CAPACITY);
         openBatchTemplateId = 0;

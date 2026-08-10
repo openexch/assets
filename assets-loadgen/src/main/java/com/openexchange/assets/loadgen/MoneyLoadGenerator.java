@@ -9,6 +9,7 @@ import com.openexchange.assets.domain.FixedPoint;
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
+import io.aeron.cluster.codecs.EventCode;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.Header;
@@ -736,6 +737,25 @@ public final class MoneyLoadGenerator implements AutoCloseable {
                 default -> { } // book updates, heartbeats: not our concern
             }
         }
+
+        // Log-only overrides: during failover drills these lines are the client-side timestamp of the
+        // redirect, the wall-clock counterpart of the server's election log.
+        @Override
+        public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
+                                final int leaderMemberId, final String ingressEndpoints) {
+            System.out.printf("%s [ME] NEW LEADER member=%d term=%d session=%d endpoints=%s%n",
+                    ILOG_TS.format(Instant.now()), leaderMemberId, leadershipTermId,
+                    clusterSessionId, ingressEndpoints);
+        }
+
+        @Override
+        public void onSessionEvent(final long correlationId, final long clusterSessionId,
+                                   final long leadershipTermId, final int leaderMemberId,
+                                   final EventCode code, final String detail) {
+            System.out.printf("%s [ME] SESSION EVENT code=%s member=%d term=%d session=%d detail=%s%n",
+                    ILOG_TS.format(Instant.now()), code, leaderMemberId, leadershipTermId,
+                    clusterSessionId, detail);
+        }
     }
 
     private final class AeEgress implements EgressListener {
@@ -797,6 +817,24 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             // BalanceUpdate / BalanceUpdateBatch and snapshots: high-volume, ignored by design —
             // identical semantics to before v5 (--subscribe acks,settlements stops them at the
             // source instead).
+        }
+
+        // Log-only overrides: same purpose as MeEgress — client-side wall-clock stamps for drills.
+        @Override
+        public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
+                                final int leaderMemberId, final String ingressEndpoints) {
+            System.out.printf("%s [AE] NEW LEADER member=%d term=%d session=%d endpoints=%s%n",
+                    ILOG_TS.format(Instant.now()), leaderMemberId, leadershipTermId,
+                    clusterSessionId, ingressEndpoints);
+        }
+
+        @Override
+        public void onSessionEvent(final long correlationId, final long clusterSessionId,
+                                   final long leadershipTermId, final int leaderMemberId,
+                                   final EventCode code, final String detail) {
+            System.out.printf("%s [AE] SESSION EVENT code=%s member=%d term=%d session=%d detail=%s%n",
+                    ILOG_TS.format(Instant.now()), code, leaderMemberId, leadershipTermId,
+                    clusterSessionId, detail);
         }
     }
 

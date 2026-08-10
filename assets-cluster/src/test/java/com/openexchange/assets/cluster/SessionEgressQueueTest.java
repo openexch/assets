@@ -263,6 +263,55 @@ public class SessionEgressQueueTest {
         assertEquals(0, session.delivered().length);
     }
 
+    // ---- resumable: the transport mark that licenses close-at-cap ----
+
+    @Test
+    public void resumableDefaultsToFalseSoAnUnprovenConsumerBlocksLikeToday() {
+        final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
+        // Also the post-leader-change state: a fresh queue must fall back to the blocking behaviour
+        // until the consumer re-identifies itself (the bridge re-queries at every epoch start).
+        assertFalse(q.isResumable());
+    }
+
+    @Test
+    public void markResumableFlipsTheFlag() {
+        final SessionEgressQueue q = new SessionEgressQueue(new ScriptedSession(1));
+        q.markResumable();
+        assertTrue(q.isResumable());
+    }
+
+    @Test
+    public void resetEmptiesPendingButKeepsResumable() {
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        queue.markResumable();
+        append(queue, 1);
+        append(queue, 2);
+
+        queue.reset();
+
+        assertTrue("reset discards the queued frames", queue.isEmpty());
+        assertTrue("but the consumer on this session still owns its resume protocol",
+                queue.isResumable());
+    }
+
+    @Test
+    public void appendAtTheCapStillReturnsFalseWhenResumable() {
+        // The append contract is unchanged by the flag: refuse at the ceiling, never shed. The
+        // DECISION about the refusal (block the engine vs close the session) lives in the service.
+        final ScriptedSession session = new ScriptedSession(7);
+        final SessionEgressQueue queue = new SessionEgressQueue(session);
+        queue.markResumable();
+        session.backPressureAfter(0);
+
+        boolean refused = false;
+        for (int i = 0; i < 1_000_000 && !refused; i++) {
+            frame.putInt(0, i);
+            refused = !queue.append(frame, 0, 64);
+        }
+        assertTrue("resumable changes the caller's decision, not the append contract", refused);
+    }
+
     // ---- step 3: per-session subscription ----
 
     @Test
