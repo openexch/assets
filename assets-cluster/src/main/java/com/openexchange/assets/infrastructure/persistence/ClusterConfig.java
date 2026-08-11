@@ -157,7 +157,11 @@ public final class ClusterConfig {
                 .controlResponseChannel(archiveContext.localControlChannel())
                 .aeronDirectoryName(aeronDirName);
 
-        final String snapshotChannel = "aeron:ipc?term-length=67108864";
+        // Snapshot IPC channel term-length is configurable (TRANSPORT_SNAPSHOT_TERM_LENGTH):
+        // 64m = a 192MB buffer per snapshot in /dev/shm, which on a co-located box exhausts
+        // the archive and fails snapshots (nothing prunes, the log grows). Default stays 64m.
+        final String snapshotChannel = "aeron:ipc?term-length="
+                + com.openexchange.assets.infrastructure.TransportConfig.snapshotTermLength();
 
         final ConsensusModule.Context consensusModuleContext = new ConsensusModule.Context()
                 .clusterMemberId(memberId)
