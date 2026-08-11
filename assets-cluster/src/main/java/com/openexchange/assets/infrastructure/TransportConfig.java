@@ -89,6 +89,17 @@ public final class TransportConfig {
         return envOrProp("TRANSPORT_LOG_TERM_LENGTH", "transport.log.term.length", "64m");
     }
 
+    /**
+     * Term length for the SNAPSHOT ipc channel. A snapshot publication maps a fresh
+     * 3-term buffer per cycle (64m = 192MB in /dev/shm every snapshot), which on a
+     * co-located box (two clusters sharing one tmpfs) exhausts the archive and fails
+     * snapshots with StorageSpaceException, so nothing prunes and the log grows.
+     * Small/co-located hosts set this down (snapshots are ~6MB); default 64m preserves prod.
+     */
+    public static String snapshotTermLength() {
+        return envOrProp("TRANSPORT_SNAPSHOT_TERM_LENGTH", "transport.snapshot.term.length", "64m");
+    }
+
     /** Build a UDP channel URI with the configured term-length, MTU and optional interface applied. */
     public static String udpChannel(final String base) {
         final StringBuilder sb = new StringBuilder(base);

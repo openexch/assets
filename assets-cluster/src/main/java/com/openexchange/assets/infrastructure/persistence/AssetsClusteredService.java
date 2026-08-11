@@ -236,8 +236,29 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     private void startNodeEndpoint() {
         try {
+            // Probe/metrics port: honor ASSETS_NODE_PORT if injected (the process
+            // manager sets it authoritatively), else fall back to 9700 + nodeId so
+            // co-located nodes never collide. Base is 9700, not 9600: 9600 is the
+            // Settlement Bridge's metrics port on the same box. cluster.memberId() is
+            // -1 this early in onStart, so read the id the way AeronCluster does.
+            // Empty env is treated as unset.
             final String env = System.getenv("ASSETS_NODE_PORT");
-            final int port = env != null ? Integer.parseInt(env) : 9600;
+            final int port;
+            if (env != null && !env.isEmpty()) {
+                port = Integer.parseInt(env);
+            } else {
+                String nodeStr = System.getenv("CLUSTER_NODE");
+                if (nodeStr == null || nodeStr.isEmpty()) {
+                    nodeStr = System.getProperty("node.id", "0");
+                }
+                int nodeId;
+                try {
+                    nodeId = Integer.parseInt(nodeStr.trim());
+                } catch (NumberFormatException nfe) {
+                    nodeId = 0;
+                }
+                port = 9700 + nodeId;
+            }
             nodeEndpoint = new com.openexchange.cluster.NodeEndpoint(readiness, null);
             nodeEndpoint.start(port);
         } catch (Exception e) {
