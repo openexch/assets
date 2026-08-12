@@ -49,7 +49,7 @@
              1.0.<utcstamp>.g<sha> from GitHub Packages, deployed by match CI on every main push.
              The trailing g<sha> names the exact match commit these wire bytes came from.
              Bumped by match CI's consumer-bump PR (or by hand: pick any published version). -->
-        <match.version>1.0.20260812144242.gbbcb122</match.version>
+        <match.version>1.0.20260812192626.gadac80c</match.version>
         <!-- Benchmark loadgen histograms (assets-loadgen only; not in any engine hot path). -->
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
         <!-- Default so surefire's ${argLine} resolves even before jacoco's prepare-agent sets it. -->
