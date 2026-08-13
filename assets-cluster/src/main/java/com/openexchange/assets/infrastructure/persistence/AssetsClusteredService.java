@@ -149,6 +149,10 @@ public final class AssetsClusteredService implements ClusteredService {
     private final com.openexchange.cluster.NodeReadiness readiness =
             new com.openexchange.cluster.NodeReadiness();
     private com.openexchange.cluster.NodeEndpoint nodeEndpoint;
+    // cluster-kit#15: the last role this duty cycle OBSERVED via cluster.role().
+    // Only feeds readiness in doBackgroundWork; isLeader and the rest of the
+    // role bookkeeping stay driven by the onRoleChange callback.
+    private Cluster.Role lastObservedRole;
 
     // What makes this cluster snapshot itself with no admin gateway running.
     // The AE is the engine this was missing on: nothing ever triggered its
@@ -276,6 +280,22 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public int doBackgroundWork(final long nowNs) {
         readiness.tick();
+        // cluster-kit#15: feed readiness by POLLING the role, never by trusting
+        // onRoleChange alone. Aeron fires that callback only on role TRANSITIONS,
+        // so a node that boots straight into FOLLOWER and stays there never gets
+        // it: /ready answered "catching up" forever and SnapshotLogPruner never
+        // pruned on that node (observed live 2026-08-12). An enum compare per
+        // cycle is free; the callback keeps its other side effects (isLeader,
+        // cadence, drain timer) and readiness.roleChanged is idempotent.
+        final Cluster.Role observedRole = cluster.role();
+        if (observedRole != lastObservedRole) {
+            lastObservedRole = observedRole;
+            readiness.roleChanged(observedRole);
+            if (observedRole == Cluster.Role.LEADER || observedRole == Cluster.Role.FOLLOWER) {
+                System.out.println("READINESS: role " + observedRole
+                        + " observed via duty-cycle poll (cluster-kit#15)");
+            }
+        }
         // At most once a second, and only on the leader: is the cluster due a
         // snapshot? Everything past that gate is a long compare.
         return snapshotCadence.tick(nowNs, isLeader, cluster.logPosition());
