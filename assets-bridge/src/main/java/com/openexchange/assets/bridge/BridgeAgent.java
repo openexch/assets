@@ -148,6 +148,16 @@ public final class BridgeAgent implements Runnable {
         }
     }
 
+    /**
+     * True for a stopped recording that never received a byte (start == stop). Replaying one
+     * is an archive error (requested start must be strictly below the limit — 0 < 0 fails),
+     * and there is nothing in it to forward, so the chain steps over it. Active recordings are
+     * never "empty-stopped": their stop position is NULL_POSITION while the head still moves.
+     */
+    static boolean isEmptyStopped(final ArchiveJournalSource.Recording recording) {
+        return !recording.isActive() && recording.stopPosition() <= recording.startPosition();
+    }
+
     private void followChain(final ArchiveJournalSource source, final BridgeFilter filter,
                             final AeFeedClient ae, final AeFeedClient.FeedPosition sync) {
         final List<ArchiveJournalSource.Recording> chain = source.recordings();
@@ -170,6 +180,16 @@ public final class BridgeAgent implements Runnable {
 
         for (int i = startIndex; i < chain.size(); i++) {
             final ArchiveJournalSource.Recording recording = chain.get(i);
+            if (isEmptyStopped(recording)) {
+                // A node restart can open a journal recording and stop it before a single
+                // byte lands (observed live 2026-08-23: a rolling update left recording 9
+                // empty-stopped). Asking the archive to replay it fails the start<limit
+                // check (0 < 0), which killed the epoch and looped the bridge forever on
+                // the same recording. Nothing was ever in it — step over, never replay.
+                System.out.println("[BRIDGE] skipping recording " + recording.recordingId()
+                        + " (stopped empty: start==stop==" + recording.startPosition() + ")");
+                continue;
+            }
             boolean fullyDrained = false;
             System.out.println("[BRIDGE] following recording " + recording.recordingId()
                     + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
