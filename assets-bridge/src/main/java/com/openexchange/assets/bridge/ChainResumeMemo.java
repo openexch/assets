@@ -4,7 +4,10 @@ package com.openexchange.assets.bridge;
 import com.openexchange.assets.infrastructure.archive.ArchiveJournalSource;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 
 /**
  * How far up the journal recording chain an epoch may skip — a LIVENESS aid, never a
@@ -46,6 +49,28 @@ final class ChainResumeMemo {
     private boolean sealed;
 
     /**
+     * Per-recording byte position past which every entry was SKIPPED — a within-recording twin of
+     * {@link #drainedPrefix} for the ONE recording that is only partially drained (the prefix skips
+     * whole recordings; this skips the drained head of the next one). Lets the next epoch openReplay
+     * from here instead of re-reading and re-skipping that head. The head-rescan of an
+     * outage-inflated recording is exactly what raced — and lost to — the AE's 10s session timeout
+     * in the 2026-09-02 stall: the scan never reached the tail before the session died, so nothing
+     * new was ever forwarded.
+     *
+     * <p>Safe because it is only ever advanced by a SKIP, and an entry is SKIPPED precisely when its
+     * egressSeq is at or below the AE's consumePosition — i.e. the AE has already applied it. So a
+     * replay resumed here re-sends only entries the AE has NOT applied; the inclusive boundary is
+     * absorbed by the AE's idempotency, and a dense-tradeId gap still HALTs. Monotonic (max only),
+     * so a later epoch never rewinds.</p>
+     *
+     * <p>Keyed by the whole {@link ArchiveJournalSource.Recording} (id + start + stop), not just the
+     * id: a head-purged or wiped-and-restarted archive presents a different start/stop, so its stale
+     * high-water simply never matches and the epoch falls back to a full scan. {@link #resumeIndex}
+     * prunes entries no longer in the chain, bounding the map to the live chain.</p>
+     */
+    private final Map<ArchiveJournalSource.Recording, Long> skipHighWater = new HashMap<>();
+
+    /**
      * The index in {@code chain} at which this epoch may start walking: past the prefix an
      * earlier epoch already drained at this very sync point, or 0 when anything differs.
      * Re-arms the memo for the given sync point as a side effect.
@@ -53,6 +78,12 @@ final class ChainResumeMemo {
     int resumeIndex(final List<ArchiveJournalSource.Recording> chain,
                     final long syncConsumePosition, final long syncLastAppliedTradeId) {
         sealed = false;
+        // Drop byte-resume marks for recordings no longer in the chain (head-purged, rolled, or a
+        // wiped archive whose ids restarted): they can never match again, and this bounds the map
+        // to the live chain. Kept across sync-point moves because a SKIP-derived mark stays valid
+        // as consumePosition only advances — unlike the drainedPrefix, whose empty-drain proof is
+        // specific to one sync point.
+        skipHighWater.keySet().retainAll(new HashSet<>(chain));
         final boolean resumable = consumePosition == syncConsumePosition
                 && lastAppliedTradeId == syncLastAppliedTradeId
                 && !drainedPrefix.isEmpty()
@@ -65,6 +96,25 @@ final class ChainResumeMemo {
         consumePosition = syncConsumePosition;
         lastAppliedTradeId = syncLastAppliedTradeId;
         return 0;
+    }
+
+    /**
+     * Where the next epoch should open {@code recording}'s replay: past the head this or an earlier
+     * epoch already skipped, or the recording's start when nothing is proven for it. Always at or
+     * before the first not-yet-applied entry (see {@link #skipHighWater}).
+     */
+    long replayStartPosition(final ArchiveJournalSource.Recording recording) {
+        final Long mark = skipHighWater.get(recording);
+        return mark == null ? recording.startPosition() : mark;
+    }
+
+    /**
+     * Record that {@code recording} was skipped up to {@code position} (an Aeron fragment boundary).
+     * Monotonic: a lower position never overwrites a higher one, so a failed epoch that got further
+     * than a later one still wins. Call with a SKIP boundary only — never a forwarded entry.
+     */
+    void noteSkipHighWater(final ArchiveJournalSource.Recording recording, final long position) {
+        skipHighWater.merge(recording, position, Math::max);
     }
 
     /**

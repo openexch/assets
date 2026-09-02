@@ -77,6 +77,15 @@ public final class BridgeAgent implements Runnable {
 
     private volatile boolean running = true;
     private long lastStatusLogMs;
+    /**
+     * The byte position up to which the recording currently being replayed has been SKIPPED this
+     * epoch. Set to the replay's start position when a recording opens, raised on every SKIP, and
+     * handed to {@link ChainResumeMemo#noteSkipHighWater} when the recording's replay block exits —
+     * so the next epoch resumes past the drained head instead of re-scanning it (the 2026-09-02
+     * settlement-stall bug: the head-rescan of an outage-inflated recording outran the AE session
+     * timeout).
+     */
+    private long currentRecordingSkipHighWater;
 
     /** How far up the chain an epoch may skip after an earlier one drained the head. */
     private final ChainResumeMemo resumeMemo = new ChainResumeMemo();
@@ -166,14 +175,18 @@ public final class BridgeAgent implements Runnable {
                     + " were already drained at this same sync point and forwarded nothing");
         }
         final FragmentHandler handler = (buffer, offset, length, header) ->
-                onJournalEntry(buffer, offset, filter, ae);
+                onJournalEntry(buffer, offset, filter, ae, header.position());
 
         for (int i = startIndex; i < chain.size(); i++) {
             final ArchiveJournalSource.Recording recording = chain.get(i);
             boolean fullyDrained = false;
+            final long replayFrom = resumeMemo.replayStartPosition(recording);
+            currentRecordingSkipHighWater = replayFrom;
             System.out.println("[BRIDGE] following recording " + recording.recordingId()
-                    + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
-            try (Subscription replay = source.openReplay(recording)) {
+                    + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)")
+                    + (replayFrom > recording.startPosition()
+                        ? " resuming at position " + replayFrom + " (drained head skipped)" : ""));
+            try (Subscription replay = source.openReplay(recording, replayFrom)) {
                 final boolean liveFollow = recording.isActive();
                 // Replay-progress gauges: a stopped recording's recorded position is its stop
                 // position (bounded cold catch-up lag = recording - consumed); an active one
@@ -263,6 +276,12 @@ public final class BridgeAgent implements Runnable {
                 if (followedRecordingEnded) {
                     break; // end the epoch: the next one re-lists and follows the successor
                 }
+            } finally {
+                // Even when a forward threw mid-recording, the head we skipped this epoch is proven
+                // applied (a SKIP means egressSeq <= the AE's consumePosition): record it so the next
+                // epoch resumes past it instead of re-scanning — that re-scan is what outran the
+                // 10s session timeout and wedged settlement on 2026-09-02.
+                resumeMemo.noteSkipHighWater(recording, currentRecordingSkipHighWater);
             }
             if (fullyDrained) {
                 resumeMemo.noteDrained(chain, i, forwardCount() != forwardsAtEpochStart);
@@ -294,7 +313,8 @@ public final class BridgeAgent implements Runnable {
     }
 
     private void onJournalEntry(final DirectBuffer buffer, final int offset,
-                                final BridgeFilter filter, final AeFeedClient ae) {
+                                final BridgeFilter filter, final AeFeedClient ae,
+                                final long fragmentEndPosition) {
         journalHeader.wrap(buffer, offset);
         if (journalHeader.schemaId() != JournalTradeDecoder.SCHEMA_ID) {
             return; // foreign schema on the journal stream — ignore
@@ -316,7 +336,12 @@ public final class BridgeAgent implements Runnable {
                     stagedEgressSeqs[i] = tradeDecoder.egressSeq();
                     stagedTimestamps[i] = tradeDecoder.timestamp();
                 }
-                case SKIP -> state.skippedEntries++;
+                case SKIP -> {
+                    state.skippedEntries++;
+                    // Skipped => already applied by the AE: safe to resume past here next epoch.
+                    currentRecordingSkipHighWater =
+                            Math.max(currentRecordingSkipHighWater, fragmentEndPosition);
+                }
                 case HALT -> {
                     // Everything staged precedes the gap and is legitimate money: flush it, THEN park.
                     flushSettleBatch(ae);
@@ -338,7 +363,12 @@ public final class BridgeAgent implements Runnable {
                     state.forwardedTerminals++;
                     state.lastForwardedEgressSeq = terminalDecoder.egressSeq();
                 }
-                case SKIP -> state.skippedEntries++;
+                case SKIP -> {
+                    state.skippedEntries++;
+                    // Skipped => already applied by the AE: safe to resume past here next epoch.
+                    currentRecordingSkipHighWater =
+                            Math.max(currentRecordingSkipHighWater, fragmentEndPosition);
+                }
                 case HALT -> { /* latched by a prior trade gap; terminals just stop flowing */ }
             }
         }

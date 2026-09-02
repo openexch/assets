@@ -134,4 +134,56 @@ public class ChainResumeMemoTest {
         // which is where the 16 hours of unsettled trades actually are.
         assertEquals(3, memo.resumeIndex(chain(), W, T));
     }
+
+    // --- within-recording byte resume (the 2026-09-02 stall: re-scanning an outage-inflated
+    // recording's drained head every epoch outran the AE's 10s session timeout) ---
+
+    @Test
+    public void replayStartsAtTheRecordingStartWhenNoHeadHasBeenSkipped() {
+        assertEquals(0L, memo.replayStartPosition(stopped(2, 0, 320)));
+        assertEquals(128L, memo.replayStartPosition(stopped(5, 128, 640)));
+    }
+
+    @Test
+    public void replayResumesPastTheSkippedHead() {
+        final Recording r = stopped(2, 0, 320);
+        memo.noteSkipHighWater(r, 256);
+        assertEquals(256L, memo.replayStartPosition(r));
+    }
+
+    @Test
+    public void theSkippedHeadHighWaterOnlyEverAdvances() {
+        final Recording r = stopped(2, 0, 320);
+        memo.noteSkipHighWater(r, 256);
+        memo.noteSkipHighWater(r, 128); // a later epoch that got LESS far must not rewind the mark
+        assertEquals(256L, memo.replayStartPosition(r));
+    }
+
+    @Test
+    public void theSkippedHeadSurvivesASyncPointMoveForARecordingStillInTheChain() {
+        // Unlike the drained-prefix proof, a SKIP-derived mark stays valid as consumePosition only
+        // advances, so it must NOT be dropped when the sync point moves.
+        final Recording r = stopped(2, 0, 320);
+        memo.noteSkipHighWater(r, 256);
+        memo.resumeIndex(chain(), W + 4096, T + 12); // sync moved; recording 2 still present
+        assertEquals(256L, memo.replayStartPosition(r));
+    }
+
+    @Test
+    public void theSkippedHeadIsForgottenWhenTheRecordingLeavesTheChain() {
+        final Recording r = stopped(2, 0, 320);
+        memo.noteSkipHighWater(r, 256);
+        // Retention purged recordings up to 2; the listing no longer holds this exact recording.
+        memo.resumeIndex(List.of(active(3, 0)), W, T);
+        assertEquals(0L, memo.replayStartPosition(r)); // pruned -> back to the recording start
+    }
+
+    @Test
+    public void aWipedRecordingWithTheSameIdDoesNotReuseAStaleSkippedHead() {
+        final Recording old = stopped(2, 0, 320);
+        memo.noteSkipHighWater(old, 256);
+        // A re-genesised archive re-recorded id 2 with different bytes (different start/stop): the
+        // key differs, so the stale 256 must not be reused — that would skip real, unapplied trades.
+        assertEquals(0L, memo.replayStartPosition(stopped(2, 0, 999)));
+    }
 }

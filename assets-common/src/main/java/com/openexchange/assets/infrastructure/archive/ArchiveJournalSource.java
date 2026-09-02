@@ -118,9 +118,30 @@ public final class ArchiveJournalSource implements AutoCloseable {
      * endpoint, then ask the archive to replay to the resolved address.
      */
     public Subscription openReplay(final Recording recording) {
+        return openReplay(recording, recording.startPosition());
+    }
+
+    /**
+     * Open a replay over [fromPosition, ...) instead of the recording's start, so the bridge can
+     * resume a partially-drained recording without re-reading (and re-skipping) its head. The
+     * head-rescan of an outage-inflated recording is what raced — and lost to — the AE session
+     * timeout in the 2026-09-02 settlement stall.
+     *
+     * <p>{@code fromPosition} must be a fragment-aligned position (an Aeron
+     * {@link io.aeron.logbuffer.Header#position()} value is), and the only caller supplies one it
+     * reached by draining this exact recording, so alignment holds. A value outside
+     * [startPosition, stopPosition] falls back to the recording start rather than trusting a stale
+     * offset — belt-and-braces with {@link com.openexchange.assets.bridge.ChainResumeMemo}'s own
+     * per-recording validation.</p>
+     */
+    public Subscription openReplay(final Recording recording, final long fromPosition) {
+        final long start = recording.startPosition();
+        final boolean inRange = fromPosition >= start
+                && (recording.isActive() || fromPosition <= recording.stopPosition());
+        final long from = inRange ? fromPosition : start;
         final long length = recording.isActive()
                 ? Long.MAX_VALUE
-                : recording.stopPosition() - recording.startPosition();
+                : recording.stopPosition() - from;
 
         final Subscription sub = archive.context().aeron()
                 .addSubscription("aeron:udp?endpoint=" + replayHost + ":0", replayStreamId);
@@ -134,7 +155,7 @@ public final class ArchiveJournalSource implements AutoCloseable {
             Thread.onSpinWait();
         }
         try {
-            archive.startReplay(recording.recordingId(), recording.startPosition(), length,
+            archive.startReplay(recording.recordingId(), from, length,
                     "aeron:udp?endpoint=" + resolved, replayStreamId);
         } catch (RuntimeException e) {
             CloseHelper.quietClose(sub);
