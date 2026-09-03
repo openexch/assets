@@ -179,6 +179,17 @@ public final class BridgeAgent implements Runnable {
 
         for (int i = startIndex; i < chain.size(); i++) {
             final ArchiveJournalSource.Recording recording = chain.get(i);
+            // An empty STOPPED recording (start == stop) holds nothing and cannot be replayed:
+            // openReplay would ask the archive for [0, 0) and the archive rejects it ("replay start
+            // position must be less than the limit position"). This is the genesis shape — the engine
+            // opens recording 0 and rolls before the first egress byte — so without stepping over it
+            // the bridge loops on recording 0 and never reaches the one that actually has trades.
+            // (2026-09-03 genesis: settlement wedged forever on an empty recording 0.)
+            if (!recording.isActive() && recording.startPosition() == recording.stopPosition()) {
+                System.out.println("[BRIDGE] skipping recording " + recording.recordingId()
+                        + " (stopped empty: start == stop == " + recording.startPosition() + ")");
+                continue;
+            }
             boolean fullyDrained = false;
             final long replayFrom = resumeMemo.replayStartPosition(recording);
             currentRecordingSkipHighWater = replayFrom;
