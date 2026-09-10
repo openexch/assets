@@ -5,8 +5,10 @@ import com.match.infrastructure.journal.generated.JournalTerminalDecoder;
 import com.match.infrastructure.journal.generated.JournalTradeDecoder;
 import com.match.infrastructure.journal.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.archive.ArchiveJournalSource;
+import io.aeron.Image;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.archive.client.ArchiveException;
 import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.Long2LongHashMap;
@@ -21,7 +23,7 @@ import java.util.List;
  *
  * Stateless by design. Every epoch starts from scratch: connect the AE session, ask it how
  * far it has consumed (FeedPositionReport -> W/T), build a fresh {@link BridgeFilter}, then
- * read the journal chain from the earliest retained byte forward — the filter skips what
+ * read the journal chain from the earliest unproven byte forward — the filter skips what
  * the AE already has, the AE's idempotency absorbs the inclusive boundary, and a dense
  * tradeId gap HALTS the bridge (correctness over liveness: a gap is a lost settlement).
  *
@@ -77,6 +79,7 @@ public final class BridgeAgent implements Runnable {
 
     private volatile boolean running = true;
     private long lastStatusLogMs;
+    private ArchiveJournalSource.Recording currentRecording;
 
     /** How far up the chain an epoch may skip after an earlier one drained the head. */
     private final ChainResumeMemo resumeMemo = new ChainResumeMemo();
@@ -134,6 +137,8 @@ public final class BridgeAgent implements Runnable {
             state.epochConsumePosition = pos.consumePosition();
             state.epochLastAppliedTradeId = pos.lastAppliedTradeId();
             state.sourceBacklogBytes = 0;
+            state.replayConsumedPosition = AeronArchive.NULL_POSITION;
+            state.replayRecordingPosition = AeronArchive.NULL_POSITION;
             state.epochs++;
             forwardsAtEpochStart = forwardCount();
             System.out.println("[BRIDGE] epoch " + state.epochs + ": AE at consumePosition="
@@ -148,70 +153,80 @@ public final class BridgeAgent implements Runnable {
         }
     }
 
-    /**
-     * True for a stopped recording that never received a byte (start == stop). Replaying one
-     * is an archive error (requested start must be strictly below the limit — 0 < 0 fails),
-     * and there is nothing in it to forward, so the chain steps over it. Active recordings are
-     * never "empty-stopped": their stop position is NULL_POSITION while the head still moves.
-     */
+    /** A malformed stopped extent is an error, never an empty recording. */
     static boolean isEmptyStopped(final ArchiveJournalSource.Recording recording) {
-        return !recording.isActive() && recording.stopPosition() <= recording.startPosition();
+        return recording.startPosition() >= 0 && !recording.isActive()
+                && recording.stopPosition() == recording.startPosition();
     }
 
     private void followChain(final ArchiveJournalSource source, final BridgeFilter filter,
                             final AeFeedClient ae, final AeFeedClient.FeedPosition sync) {
         final List<ArchiveJournalSource.Recording> chain = source.recordings();
+        final int startIndex = resumeMemo.resumeIndex(
+                source.identity(), chain, sync.consumePosition(), sync.lastAppliedTradeId());
+        if (resumeMemo.invalidationReason() != null) {
+            System.out.println("[BRIDGE] replay memo invalidated: " + resumeMemo.invalidationReason());
+        }
         if (chain.isEmpty()) {
             // Journal enabled but nothing recorded yet (or dark): wait and re-list next epoch.
             System.out.println("[BRIDGE] no journal recordings at " + source.endpoint() + " yet — waiting");
             sleep(ERROR_BACKOFF_MS);
             return;
         }
-        final int startIndex = resumeMemo.resumeIndex(
-                chain, sync.consumePosition(), sync.lastAppliedTradeId());
         if (startIndex > 0) {
-            System.out.println("[BRIDGE] resuming the chain at recording "
-                    + chain.get(startIndex).recordingId() + ": recordings "
-                    + chain.get(0).recordingId() + ".." + chain.get(startIndex - 1).recordingId()
-                    + " were already drained at this same sync point and forwarded nothing");
+            System.out.println("[BRIDGE] skipping proven recording prefix: source=" + source.identity()
+                    + " count=" + startIndex + " chainSize=" + chain.size());
         }
         final FragmentHandler handler = (buffer, offset, length, header) ->
-                onJournalEntry(buffer, offset, filter, ae);
+                onJournalEntry(buffer, offset, filter, ae, header.position());
 
         for (int i = startIndex; i < chain.size(); i++) {
             final ArchiveJournalSource.Recording recording = chain.get(i);
-            if (isEmptyStopped(recording)) {
-                // A node restart can open a journal recording and stop it before a single
-                // byte lands (observed live 2026-08-23: a rolling update left recording 9
-                // empty-stopped). Asking the archive to replay it fails the start<limit
-                // check (0 < 0), which killed the epoch and looped the bridge forever on
-                // the same recording. Nothing was ever in it — step over, never replay.
-                System.out.println("[BRIDGE] skipping recording " + recording.recordingId()
-                        + " (stopped empty: start==stop==" + recording.startPosition() + ")");
+            final long replayFrom = resumeMemo.replayStartPosition(recording);
+            if (isEmptyStopped(recording)
+                    || (!recording.isActive() && replayFrom == recording.stopPosition())) {
+                // Empty recordings belong to the drained prefix. Proven stopped EOF needs no
+                // replay: Aeron rejects a zero-length bounded replay. Active frontier still tails.
+                resumeMemo.noteDrained(chain, i, forwardCount() != forwardsAtEpochStart);
+                ae.duty();
                 continue;
             }
             boolean fullyDrained = false;
+            currentRecording = recording;
+            resumeMemo.beginRecording();
             System.out.println("[BRIDGE] following recording " + recording.recordingId()
-                    + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)"));
-            try (Subscription replay = source.openReplay(recording)) {
+                    + " source=" + source.identity() + " incarnation=" + recording.incarnation()
+                    + (recording.isActive() ? " (ACTIVE, live-follow)" : " (stopped)")
+                    + (replayFrom > recording.startPosition()
+                        ? " resuming at position " + replayFrom + " (drained head skipped)" : ""));
+            try (Subscription replay = openReplay(source, recording, replayFrom)) {
                 final boolean liveFollow = recording.isActive();
                 // Replay-progress gauges: a stopped recording's recorded position is its stop
                 // position (bounded cold catch-up lag = recording - consumed); an active one
                 // starts at its start position and is raised by the probe / consumed floor.
-                state.replayConsumedPosition = recording.startPosition();
-                state.replayRecordingPosition = liveFollow ? recording.startPosition() : recording.stopPosition();
+                state.replayConsumedPosition = replayFrom;
+                state.replayRecordingPosition = liveFollow ? replayFrom : recording.stopPosition();
                 final long connectDeadlineMs = System.currentTimeMillis() + CONNECT_TIMEOUT_MS;
                 long nextSourceCheckMs = System.currentTimeMillis() + SOURCE_CHECK_INTERVAL_MS;
                 long consumedAtLastCheck = NO_PRIOR_CHECK;
                 boolean imageWasLive = false;
+                Image replayImage = null;
                 boolean followedRecordingEnded = false;
                 while (running && !state.halted) {
+                    if (replay.imageCount() > 0) {
+                        replayImage = replay.imageAtIndex(0);
+                    }
                     final int fragments = source.poll(replay, handler, POLL_LIMIT);
                     ae.duty();
                     maybeLogStatus();
-                    imageWasLive |= replay.imageCount() > 0;
                     if (replay.imageCount() > 0) {
-                        final long consumedNow = replay.imageAtIndex(0).position();
+                        replayImage = replay.imageAtIndex(0);
+                    }
+                    imageWasLive |= replayImage != null;
+                    if (replayImage != null) {
+                        // Retain the image through detach so a bounded EOF can be verified by
+                        // its final position, never inferred from an early EOS/closed image.
+                        final long consumedNow = replayImage.position();
                         state.replayConsumedPosition = consumedNow;
                         if (consumedNow > state.replayRecordingPosition) {
                             // Consumed bytes were necessarily recorded: keeps the recorded-position
@@ -224,7 +239,7 @@ public final class BridgeAgent implements Runnable {
                         // hold settlement latency hostage — a partial batch on an empty poll is the
                         // normal quiet-market frame, not a failure to batch.
                         flushSettleBatch(ae);
-                        if (!liveFollow && replayDrained(replay, recording)) {
+                        if (!liveFollow && replayDrained(replay, recording, replayImage)) {
                             fullyDrained = true;
                             break; // stopped recording fully consumed -> next in chain
                         }
@@ -241,8 +256,7 @@ public final class BridgeAgent implements Runnable {
                         }
                         if (liveFollow && System.currentTimeMillis() >= nextSourceCheckMs) {
                             nextSourceCheckMs = System.currentTimeMillis() + SOURCE_CHECK_INTERVAL_MS;
-                            final long consumed = replay.imageCount() > 0
-                                    ? replay.imageAtIndex(0).position() : -1;
+                            final long consumed = replayImage != null ? replayImage.position() : replayFrom;
                             // Throws when the archive itself is gone -> epoch restart. This is
                             // what un-wedges a live-follow whose source process was killed.
                             final long recPos = source.recordingPosition(recording.recordingId());
@@ -296,6 +310,24 @@ public final class BridgeAgent implements Runnable {
         sleep(ERROR_BACKOFF_MS);
     }
 
+    private Subscription openReplay(final ArchiveJournalSource source,
+                                    final ArchiveJournalSource.Recording recording, final long from) {
+        try {
+            return source.openReplay(recording, from);
+        } catch (ArchiveException e) {
+            if (from > recording.startPosition() && e.errorCode() == ArchiveException.INVALID_POSITION) {
+                // Reject the optimization, never skip past a bad byte. Keep this failure visible;
+                // a later epoch re-reads from the catalog start against a fresh AE watermark.
+                // Real corruption is still reported by Aeron during that replay. Resource and
+                // connectivity failures retain the proof so retries do not rescan a large head.
+                resumeMemo.invalidate("archive rejected remembered position: source=" + source.identity()
+                        + " recording=" + recording + " position=" + from);
+                System.err.println("[BRIDGE] replay memo invalidated: " + resumeMemo.invalidationReason());
+            }
+            throw e;
+        }
+    }
+
     private long forwardCount() {
         return state.forwardedTrades + state.forwardedTerminals;
     }
@@ -305,18 +337,24 @@ public final class BridgeAgent implements Runnable {
         throw new IllegalStateException(reason);
     }
 
-    private boolean replayDrained(final Subscription replay, final ArchiveJournalSource.Recording recording) {
-        if (replay.imageCount() == 0) {
-            return replay.isClosed(); // bounded replay closes its image at the bound
+    private boolean replayDrained(final Subscription replay, final ArchiveJournalSource.Recording recording,
+                                  final Image image) {
+        if (image != null && image.position() >= recording.stopPosition()) {
+            return true;
         }
-        return replay.imageAtIndex(0).position()
-                >= recording.stopPosition() || replay.imageAtIndex(0).isEndOfStream();
+        if (replay.isClosed() || (image != null && (image.isClosed() || image.isEndOfStream()))) {
+            sourceStall("stopped replay ended before catalog EOF: recording=" + recording
+                    + " consumed=" + (image == null ? "unknown" : image.position()));
+        }
+        return false;
     }
 
     private void onJournalEntry(final DirectBuffer buffer, final int offset,
-                                final BridgeFilter filter, final AeFeedClient ae) {
+                                final BridgeFilter filter, final AeFeedClient ae,
+                                final long fragmentEndPosition) {
         journalHeader.wrap(buffer, offset);
         if (journalHeader.schemaId() != JournalTradeDecoder.SCHEMA_ID) {
+            resumeMemo.seal(); // unrecognized bytes cannot extend an applied-prefix proof
             return; // foreign schema on the journal stream — ignore
         }
         if (journalHeader.templateId() == JournalTradeDecoder.TEMPLATE_ID) {
@@ -324,6 +362,7 @@ public final class BridgeAgent implements Runnable {
             final BridgeFilter.Action action = filter.onTrade(tradeDecoder.egressSeq(), tradeDecoder.tradeId());
             switch (action) {
                 case FORWARD -> {
+                    resumeMemo.seal();
                     // v5: trades leave as SettleBatch chunks. Stage now; the batch flushes at the
                     // cap (here), on an interleaved terminal (journal order!), on an empty replay
                     // poll, or on a halt — never sits waiting to fill.
@@ -336,8 +375,14 @@ public final class BridgeAgent implements Runnable {
                     stagedEgressSeqs[i] = tradeDecoder.egressSeq();
                     stagedTimestamps[i] = tradeDecoder.timestamp();
                 }
-                case SKIP -> state.skippedEntries++;
+                case SKIP -> {
+                    state.skippedEntries++;
+                    // The filter also skips duplicates of trades staged earlier this epoch.
+                    // Only ids already applied at the initial AE sync can prove a byte prefix.
+                    resumeMemo.noteSkippedTrade(currentRecording, fragmentEndPosition, tradeDecoder.tradeId());
+                }
                 case HALT -> {
+                    resumeMemo.seal();
                     // Everything staged precedes the gap and is legitimate money: flush it, THEN park.
                     flushSettleBatch(ae);
                     halt("dense tradeId gap: journal shows tradeId=" + tradeDecoder.tradeId()
@@ -350,6 +395,7 @@ public final class BridgeAgent implements Runnable {
             final BridgeFilter.Action action = filter.onTerminal(terminalDecoder.egressSeq());
             switch (action) {
                 case FORWARD -> {
+                    resumeMemo.seal();
                     // Journal order is the money order: the terminal must not overtake the staged
                     // trades that precede it (a terminal releases the residual the settles drew on).
                     flushSettleBatch(ae);
@@ -358,9 +404,17 @@ public final class BridgeAgent implements Runnable {
                     state.forwardedTerminals++;
                     state.lastForwardedEgressSeq = terminalDecoder.egressSeq();
                 }
-                case SKIP -> state.skippedEntries++;
-                case HALT -> { /* latched by a prior trade gap; terminals just stop flowing */ }
+                case SKIP -> {
+                    state.skippedEntries++;
+                    // Terminal SKIP always uses the fixed initial AE consume watermark.
+                    resumeMemo.noteSkipHighWater(currentRecording, fragmentEndPosition);
+                }
+                case HALT -> {
+                    resumeMemo.seal(); // latched by a prior trade gap
+                }
             }
+        } else {
+            resumeMemo.seal();
         }
     }
 

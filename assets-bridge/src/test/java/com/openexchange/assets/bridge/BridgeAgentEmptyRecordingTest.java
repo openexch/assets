@@ -27,6 +27,11 @@ public class BridgeAgentEmptyRecordingTest {
     }
 
     @Test
+    public void malformedStoppedExtentIsNotSilentlySkipped() {
+        assertFalse(BridgeAgent.isEmptyStopped(new ArchiveJournalSource.Recording(9, 1024, 0)));
+    }
+
+    @Test
     public void activeRecordingIsNeverSkipped() {
         assertFalse(BridgeAgent.isEmptyStopped(
                 new ArchiveJournalSource.Recording(10, 0, AeronArchive.NULL_POSITION)));

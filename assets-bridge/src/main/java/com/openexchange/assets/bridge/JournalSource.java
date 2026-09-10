@@ -20,7 +20,10 @@ final class JournalSource {
     private JournalSource() {
     }
 
-    /** First-healthy-wins across the configured journal archives (all nodes journal identically). */
+    /**
+     * First reachable archive; connection success does not establish replay/settlement health.
+     * Nodes share logical journal events, not recording ids or byte positions.
+     */
     static ArchiveJournalSource connectFirstHealthy(final BridgeConfig config, final String aeronDirectoryName) {
         return ArchiveJournalSource.connectFirstHealthy(
                 config.journalArchiveEndpoints,
