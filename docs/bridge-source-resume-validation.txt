@@ -1,0 +1,120 @@
+Settlement source resume validation — 2026-09-10
+Review base: aabee7a4b07264db4e9da421383c2a9ffba3c65e; branch fix/bridge-source-resume (working changes)
+Java: Zulu OpenJDK 21.0.11; Maven 3.8.7
+Private dependencies: exact-source local builds (not relabelled jars); repository /tmp/bridge-source-build/repository
+cluster-kit 0.1.7 source 2b797fb215e8f60a35b6c41ca46f6846b6e21550
+match-common 1.0.20260909213922.g7f85ca5 source 7f85ca51a320985530a2fdb3b93a14c51248dbab
+
+Current main: Aeron 1.53.0 / Agrona 2.6.0 / SBE 1.40.1
+mvn -B -o -s .mvn-settings.xml -Dmaven.repo.local=/tmp/bridge-source-build/repository clean verify
+Full log: /tmp/bridge-source-build/main-final-source-verify.log
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 35.99 s -- in com.openexchange.assets.bridge.BridgeEndToEndTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.051 s -- in com.openexchange.assets.bridge.BridgeAgentResumeSafetyTest
+[INFO] Reactor Summary for Assets Engine Parent 0.1.0-SNAPSHOT:
+[INFO]
+[INFO] Assets Engine Parent ............................... SUCCESS [  0.052 s]
+[INFO] Assets Common ...................................... SUCCESS [  5.433 s]
+[INFO] Assets Cluster ..................................... SUCCESS [ 19.515 s]
+[INFO] Assets Settlement Bridge ........................... SUCCESS [ 42.234 s]
+[INFO] Assets Money Projector ............................. SUCCESS [  1.533 s]
+[INFO] Assets Money-Path Load Generator ................... SUCCESS [  2.281 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  01:11 min
+[INFO] Finished at: 2026-09-10T14:13:52+03:00
+[INFO] ------------------------------------------------------------------------
+
+Live substrate: Aeron 1.52.2 / Agrona 2.5.0 / SBE 1.39.0
+mvn -B -o -s .mvn-settings.xml -Dmaven.repo.local=/tmp/bridge-source-build/repository -Daeron.version=1.52.2 -Dagrona.version=2.5.0 -Dsbe.version=1.39.0 clean verify
+Full log: /tmp/bridge-source-build/live-final-source-verify.log
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 35.92 s -- in com.openexchange.assets.bridge.BridgeEndToEndTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.053 s -- in com.openexchange.assets.bridge.BridgeAgentResumeSafetyTest
+[INFO] Reactor Summary for Assets Engine Parent 0.1.0-SNAPSHOT:
+[INFO]
+[INFO] Assets Engine Parent ............................... SUCCESS [  0.055 s]
+[INFO] Assets Common ...................................... SUCCESS [  5.446 s]
+[INFO] Assets Cluster ..................................... SUCCESS [ 21.223 s]
+[INFO] Assets Settlement Bridge ........................... SUCCESS [ 42.284 s]
+[INFO] Assets Money Projector ............................. SUCCESS [  1.508 s]
+[INFO] Assets Money-Path Load Generator ................... SUCCESS [  2.246 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  01:12 min
+[INFO] Finished at: 2026-09-10T14:15:06+03:00
+[INFO] ------------------------------------------------------------------------
+
+Per runtime (JUnit XML totals):
+{
+  "assets-bridge": {
+    "tests": 72,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "assets-cluster": {
+    "tests": 241,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "assets-common": {
+    "tests": 45,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "assets-projector": {
+    "tests": 12,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 1
+  }
+}
+Total 370 reported; 369 executed and passed; 1 existing PostgresMoneyJournalStoreIntegrationTest skipped because PROJECTOR_PG_TEST_URL is unset.
+Loadgen has no test classes; its compile/package/verify passed.
+Both SBE versions emit identical bytes for all 68 money Java codecs. Pinned/deployed journal schema and 10 generated codecs are identical.
+
+Original unchanged deployed implementation reproductions (Aeron 1.52.2 header validator):
+observed source sequence: 9010 -> 9110 -> 9010; reproduction covers memo return from9110 to9010
+sourceOne: endpoint=9110 descriptor=(2,0,-1) valid frame at 81464704
+sourceZero: endpoint=9010 descriptor=(2,0,-1) valid frames at 81464576 and 81464736
+unchanged memo after source switch: replayStartPosition=81464704 (expected new source start0)
+actual Aeron 1.52.2 ReplaySession.isInvalidHeader: sourceOne@MARK=false, sourceZero@MARK=true
+sourceZero payload interpreted as header: frameLength=-236196816, streamId=0, termId=0
+PASS: cross-source memo reuse reproduces invalid replay offset without a journal hole or truncation
+
+epoch1: skipped empty0; drained recording1; recorded skipHighWater=3680688672
+epoch2: resumeIndex=0 start=3680688672 length=0 REJECTED: requested replay start position=3680688672 must be less than the limit position=3680688672 for recording 1
+epoch3: resumeIndex=0 start=3680688672 length=0 REJECTED: requested replay start position=3680688672 must be less than the limit position=3680688672 for recording 1
+epoch4: resumeIndex=0 start=3680688672 length=0 REJECTED: requested replay start position=3680688672 must be less than the limit position=3680688672 for recording 1
+epoch5: resumeIndex=0 start=3680688672 length=0 REJECTED: requested replay start position=3680688672 must be less than the limit position=3680688672 for recording 1
+control: same recording without preceding empty0 => resumeIndex=1 => active recording2; no EOF replay
+PASS: exact deployed memo deterministically wedges at EOF after an empty-recording prefix gap
+
+Non-final attempts: offline missing-artifact failures and Central transfer timeouts were resolved using exact artifacts with official checksums.
+One Maven run and one direct test JVM overlapped fixed test ports/directories: two E2E failures and direct exit 143. Those runs are excluded. Both final clean verify runs above were serial and passed.
+
+Security gate (same scanners, threshold and ignore-unfixed behavior as .github/workflows/ci.yml):
+Trivy 0.70.0, the default for aquasecurity/trivy-action@v0.36.0
+Official release SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+Database: ghcr.io/aquasecurity/trivy-db:2
+Verified OCI layer digest: sha256:a02f4433493c78d4d08b2ba3c0ed071e9720c346fcfab45241dddd2aa1593640
+Database UpdatedAt: 2026-09-10T07:06:15.043595671Z
+--skip-db-update uses the verified fresh database above; all configured scanners remain enabled.
+Input: tracked and nonignored review files, generated codecs restored to committed baseline, build outputs/cache excluded.
+Started: 2026-09-10T11:16:24.704388+00:00
+Command: /tmp/bridge-source-build/trivy-tool/trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --ignore-unfixed --format json --no-progress --skip-db-update --cache-dir /tmp/bridge-source-build/trivy-cache /tmp/bridge-source-build/trivy-input
+2026-09-10T14:16:24+03:00	INFO	[vuln] Vulnerability scanning is enabled
+2026-09-10T14:16:24+03:00	INFO	[secret] Secret scanning is enabled
+2026-09-10T14:16:24+03:00	INFO	[secret] If your scanning is slow, please try '--scanners vuln' to disable secret scanning
+2026-09-10T14:16:24+03:00	INFO	[secret] Please see https://trivy.dev/docs/v0.70/guide/scanner/secret#recommendation for faster secret detection
+2026-09-10T14:16:24+03:00	INFO	Number of language-specific files	num=6
+2026-09-10T14:16:24+03:00	INFO	[pom] Detecting vulnerabilities...
+
+Exit code: 0
+Sanitized report: /tmp/bridge-source-build/trivy-gate-sanitized.json
+
+Sanitized counts: {"exitCode": 0, "reportGenerated": true, "vulnerabilityCounts": {}, "secretCounts": {}}
+No matched secret payload or raw scanner JSON is persisted.

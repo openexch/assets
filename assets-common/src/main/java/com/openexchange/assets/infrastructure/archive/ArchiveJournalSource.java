@@ -27,7 +27,27 @@ import java.util.List;
  */
 public final class ArchiveJournalSource implements AutoCloseable {
 
-    public record Recording(long recordingId, long startPosition, long stopPosition) {
+    /** Connection namespace: recording ids and byte positions are local to this archive. */
+    public record SourceIdentity(String endpoint, int controlStreamId, int journalStreamId,
+                                 String channelUri) { }
+
+    /**
+     * Catalog fields identifying a recording's publication history. Session id can change on
+     * extension; that conservatively invalidates a memo. Stop timestamp/position are excluded:
+     * an active recording keeps its incarnation when it stops. This is an operational identity,
+     * not a content hash; restoring an exact catalog copy with edited segment bytes cannot be
+     * detected from catalog metadata alone.
+     */
+    public record RecordingIncarnation(long startTimestamp, int initialTermId, int sessionId,
+                                       int termBufferLength, int mtuLength, int streamId) { }
+
+    public record Recording(long recordingId, long startPosition, long stopPosition,
+                            RecordingIncarnation incarnation) {
+        /** Legacy/synthetic descriptors have no trusted incarnation for cached byte positions. */
+        public Recording(final long recordingId, final long startPosition, final long stopPosition) {
+            this(recordingId, startPosition, stopPosition, null);
+        }
+
         public boolean isActive() {
             return stopPosition == AeronArchive.NULL_POSITION;
         }
@@ -35,16 +55,18 @@ public final class ArchiveJournalSource implements AutoCloseable {
 
     private final AeronArchive archive;
     private final String endpoint;
+    private final SourceIdentity identity;
     private final int journalStreamId;
     private final String channelUri;
     private final int replayStreamId;
     private final String replayHost;
 
     private ArchiveJournalSource(final AeronArchive archive, final String endpoint,
-                                 final int journalStreamId, final String channelUri,
+                                 final int controlStreamId, final int journalStreamId, final String channelUri,
                                  final int replayStreamId, final String replayHost) {
         this.archive = archive;
         this.endpoint = endpoint;
+        this.identity = new SourceIdentity(endpoint, controlStreamId, journalStreamId, channelUri);
         this.journalStreamId = journalStreamId;
         this.channelUri = channelUri;
         this.replayStreamId = replayStreamId;
@@ -52,8 +74,8 @@ public final class ArchiveJournalSource implements AutoCloseable {
     }
 
     /**
-     * First-healthy-wins across the configured archive control endpoints (all nodes journal
-     * identically, so any reachable one is a valid source).
+     * First reachable archive control endpoint. This checks connectivity, not replay health.
+     * Replicas may contain the same logical events at different recording ids and byte positions.
      *
      * @param archiveEndpoints   archive control endpoints, tried in order (host:port each)
      * @param controlStreamId    the archive's control request stream id
@@ -85,7 +107,7 @@ public final class ArchiveJournalSource implements AutoCloseable {
                         .controlRequestChannel("aeron:udp?endpoint=" + endpoint.trim())
                         .controlRequestStreamId(controlStreamId)
                         .controlResponseChannel("aeron:udp?endpoint=" + host + ":0"));
-                return new ArchiveJournalSource(archive, endpoint.trim(), journalStreamId,
+                return new ArchiveJournalSource(archive, endpoint.trim(), controlStreamId, journalStreamId,
                         channelUri, replayStreamId, host);
             } catch (Exception e) {
                 last = e;
@@ -98,6 +120,10 @@ public final class ArchiveJournalSource implements AutoCloseable {
         return endpoint;
     }
 
+    public SourceIdentity identity() {
+        return identity;
+    }
+
     /** The journal recording chain, ascending recordingId (chronological incarnations). */
     public List<Recording> recordings() {
         final List<Recording> out = new ArrayList<>();
@@ -105,7 +131,9 @@ public final class ArchiveJournalSource implements AutoCloseable {
                 (controlSessionId, correlationId, recordingId, startTimestamp, stopTimestamp, startPosition,
                  stopPosition, initialTermId, segmentFileLength, termBufferLength, mtuLength,
                  sessionId, streamId, strippedChannel, originalChannel, sourceIdentity) ->
-                        out.add(new Recording(recordingId, startPosition, stopPosition)));
+                        out.add(new Recording(recordingId, startPosition, stopPosition,
+                                new RecordingIncarnation(startTimestamp, initialTermId, sessionId,
+                                        termBufferLength, mtuLength, streamId))));
         return out;
     }
 
@@ -118,9 +146,35 @@ public final class ArchiveJournalSource implements AutoCloseable {
      * endpoint, then ask the archive to replay to the resolved address.
      */
     public Subscription openReplay(final Recording recording) {
+        return openReplay(recording, recording.startPosition());
+    }
+
+    /**
+     * Open a replay over [fromPosition, ...) instead of the recording's start, so the bridge can
+     * resume a partially-drained recording without re-reading (and re-skipping) its head. The
+     * head-rescan of an outage-inflated recording is what raced — and lost to — the AE session
+     * timeout in the 2026-09-02 settlement stall.
+     *
+     * <p>{@code fromPosition} must be a fragment-aligned position (an Aeron
+     * {@link io.aeron.logbuffer.Header#position()} value is) from this exact source and recording
+     * incarnation. Invalid ranges fail visibly; the archive validates actual frame boundaries.
+     * The caller must advance past empty or fully consumed stopped recordings without opening
+     * a zero-length replay. An active recording's current frontier is legal: the unbounded
+     * replay waits there for new data.</p>
+     */
+    public Subscription openReplay(final Recording recording, final long fromPosition) {
+        final long start = recording.startPosition();
+        if (start < 0 || (!recording.isActive() && recording.stopPosition() < start)) {
+            throw new IllegalArgumentException("invalid recording bounds: source=" + identity
+                    + " recording=" + recording);
+        }
+        if (fromPosition < start || (!recording.isActive() && fromPosition >= recording.stopPosition())) {
+            throw new IllegalArgumentException("replay start outside replayable recording range: source="
+                    + identity + " recording=" + recording + " fromPosition=" + fromPosition);
+        }
         final long length = recording.isActive()
                 ? Long.MAX_VALUE
-                : recording.stopPosition() - recording.startPosition();
+                : recording.stopPosition() - fromPosition;
 
         final Subscription sub = archive.context().aeron()
                 .addSubscription("aeron:udp?endpoint=" + replayHost + ":0", replayStreamId);
@@ -134,7 +188,7 @@ public final class ArchiveJournalSource implements AutoCloseable {
             Thread.onSpinWait();
         }
         try {
-            archive.startReplay(recording.recordingId(), recording.startPosition(), length,
+            archive.startReplay(recording.recordingId(), fromPosition, length,
                     "aeron:udp?endpoint=" + resolved, replayStreamId);
         } catch (RuntimeException e) {
             CloseHelper.quietClose(sub);

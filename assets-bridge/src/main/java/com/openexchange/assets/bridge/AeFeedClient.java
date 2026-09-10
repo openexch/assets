@@ -88,7 +88,13 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
         final DelegatingListener holder = new DelegatingListener();
         final AeronCluster cluster = AeronCluster.connect(new AeronCluster.Context()
                 .aeronDirectoryName(aeronDirectoryName)
-                .ingressChannel("aeron:udp?term-length=4m")
+                // mtu MUST match the AE cluster ingress (TransportConfig.mtuLength(), default 8192)
+                // and every other AE client (see MoneyLoadGenerator's 8k). At the default 1408 a full
+                // v5 SettleBatch (~4.4KB, 64 trades) fragments and the cluster ingress never takes the
+                // fragmented frame, so the bridge's keepalives — sharing this publication — cannot land
+                // either and the session times out (-4). Single trades and terminals stay under 1408,
+                // so this only bites on backlog catch-up: the exact outage-recovery path (2026-09-02).
+                .ingressChannel("aeron:udp?term-length=4m|mtu=8192")
                 .ingressEndpoints(ingressEndpoints(config.aeClusterAddresses, config.aePortBase))
                 .egressChannel("aeron:udp?endpoint=" + config.aeEgressEndpoint + "|term-length=4m")
                 .egressListener(holder));
