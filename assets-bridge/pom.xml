@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.openexchange.assets</groupId>
         <artifactId>assets</artifactId>
-        <version>0.1.0-runtime.20260927.r00.g4dfc301</version>
+        <version>0.1.0-runtime.20260927.r00b.g4dfc301</version>
     </parent>
 
     <artifactId>assets-bridge</artifactId>
