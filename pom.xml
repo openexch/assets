@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange.assets</groupId>
     <artifactId>assets</artifactId>
-    <version>0.1.0-runtime.20260928.r02a.gc9dc0d0</version>
+    <version>0.1.0-runtime.20260928.r02b.gac983d8</version>
     <packaging>pom</packaging>
 
     <name>Assets Engine Parent</name>
