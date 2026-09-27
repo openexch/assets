@@ -184,6 +184,7 @@ public final class AssetsClusteredService implements ClusteredService {
 
     private void applyOnStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
+        if (consensusReadiness != null) { consensusReadiness.start(cluster.aeron()); }
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
         engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
@@ -583,6 +584,7 @@ public final class AssetsClusteredService implements ClusteredService {
 
     private void applyOnTerminate(Cluster cluster) {
         readiness.stopping();
+        if (consensusReadiness != null) { consensusReadiness.close(); }
         if (logPruner != null) {
             logPruner.stop();
         }
