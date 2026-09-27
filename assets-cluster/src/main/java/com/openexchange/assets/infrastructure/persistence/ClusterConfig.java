@@ -177,6 +177,10 @@ public final class ClusterConfig {
                 .ticksPerWheel(1024)
                 .maxConcurrentSessions(50);
 
+        if (clusteredService instanceof AssetsClusteredService engineService) {
+            engineService.readinessConsensus(consensusModuleContext);
+        }
+
         final List<ClusteredServiceContainer.Context> serviceContexts = new ArrayList<>();
 
         final ClusteredServiceContainer.Context clusteredServiceContext = new ClusteredServiceContainer.Context()
