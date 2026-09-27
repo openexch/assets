@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.openexchange.assets</groupId>
         <artifactId>assets</artifactId>
-        <version>0.1.0-runtime.20260928.r02b.gac983d8</version>
+        <version>0.1.0-runtime.20260928.r02c.ga6a1b5c</version>
     </parent>
 
     <artifactId>assets-loadgen</artifactId>
