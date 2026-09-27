@@ -150,6 +150,10 @@ public final class AssetsClusteredService implements ClusteredService {
             new com.openexchange.cluster.NodeReadiness();
     private com.openexchange.cluster.NodeEndpoint nodeEndpoint;
     private com.openexchange.cluster.ConsensusReadiness consensusReadiness;
+    // Aeron can reenter doBackgroundWork via idle() before the callback returns.
+    // Its logPosition is already the new event's position at that point.
+    private int applicationCallbackDepth;
+    private boolean applicationCallbackFailed;
 
     /** Wired before launch; the context owns the same-process consensus evidence. */
     public void readinessConsensus(final io.aeron.cluster.ConsensusModule.Context context) {
@@ -167,6 +171,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
+        applicationCallbackDepth++;
+        try {
+            applyOnStart(cluster, snapshotImage);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
@@ -281,6 +297,11 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     @Override
     public int doBackgroundWork(final long nowNs) {
+        if (applicationCallbackDepth != 0 || applicationCallbackFailed) {
+            readiness.tick();
+            if (applicationCallbackFailed) { readiness.unavailable("application-callback-failed"); }
+            return 0; // Never publish a partially applied event as completed.
+        }
         if (consensusReadiness == null) {
             readiness.tick();
             readiness.roleChanged(cluster.role());
@@ -370,6 +391,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onSessionOpen(ClientSession session, long timestamp) {
+        applicationCallbackDepth++;
+        try {
+            applyOnSessionOpen(session, timestamp);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnSessionOpen(ClientSession session, long timestamp) {
         sessionsDirty = true;
         drainEgress();
         // Arm here as well as in onSessionMessage: a leader that has a session but has not yet been
@@ -379,6 +412,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        applicationCallbackDepth++;
+        try {
+            applyOnSessionClose(session, timestamp, closeReason);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
         egressBySessionId.remove(session.id());
         sessionsDirty = true;
         drainEgress();
@@ -386,6 +431,19 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
+                                 int offset, int length, Header header) {
+        applicationCallbackDepth++;
+        try {
+            applyOnSessionMessage(session, timestamp, buffer, offset, length, header);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
                                  int offset, int length, Header header) {
         // Subscribe is a TRANSPORT concern, not money state: it changes who receives egress, never what
         // the ledger does. It is handled here and deliberately never reaches the engine, so the engine
@@ -415,6 +473,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
+        applicationCallbackDepth++;
+        try {
+            applyOnTimerEvent(correlationId, timestamp);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnTimerEvent(long correlationId, long timestamp) {
         // Holds have no TTL yet (auto-expiry is a later phase); the only timer is the egress drain belt.
         if (correlationId == EGRESS_DRAIN_TIMER_ID) {
             drainTimerArmed = false;
@@ -428,6 +498,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        applicationCallbackDepth++;
+        try {
+            applyOnTakeSnapshot(snapshotPublication);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
         final int length = BalanceSnapshotCodec.serialize(engine, buffer);
         idleStrategy.reset();
@@ -449,6 +531,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onRoleChange(Cluster.Role newRole) {
+        applicationCallbackDepth++;
+        try {
+            applyOnRoleChange(newRole);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnRoleChange(Cluster.Role newRole) {
         this.isLeader = newRole == Cluster.Role.LEADER;
         // The feed publishes only on the leader; a GAIN also queues a full-store sweep, which is the
         // feed's natural baseline for consumers across the failover (the store itself is current on
@@ -476,6 +570,18 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTerminate(Cluster cluster) {
+        applicationCallbackDepth++;
+        try {
+            applyOnTerminate(cluster);
+        } catch (RuntimeException | Error failure) {
+            applicationCallbackFailed = true;
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnTerminate(Cluster cluster) {
         readiness.stopping();
         if (logPruner != null) {
             logPruner.stop();
