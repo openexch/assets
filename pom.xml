@@ -37,14 +37,14 @@
              Aeron clusters share a substrate and one aeronmd can drive both. SBE is pinned
              independently of match. -->
         <cluster-kit.version>0.1.7</cluster-kit.version>
-        <aeron.version>1.53.0</aeron.version>
         <agrona.version>2.6.1</agrona.version>
-        <sbe.version>1.40.1</sbe.version>
+        <aeron.version>1.53.1</aeron.version>
+        <sbe.version>1.40.2</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
         <!-- Postgres + pool for the money projector (versions match the OMS repo). -->
         <postgresql.version>42.7.13</postgresql.version>
         <hikari.version>7.1.0</hikari.version>
-        <slf4j.version>2.0.18</slf4j.version>
+        <slf4j.version>2.0.19</slf4j.version>
         <!-- match repo (settlement-journal codecs consumed by assets-bridge): an IMMUTABLE
              1.0.<utcstamp>.g<sha> from GitHub Packages, deployed by match CI on every main push.
              The trailing g<sha> names the exact match commit these wire bytes came from.
@@ -178,7 +178,7 @@
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>exec-maven-plugin</artifactId>
-                    <version>3.6.3</version>
+                    <version>3.6.4</version>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
