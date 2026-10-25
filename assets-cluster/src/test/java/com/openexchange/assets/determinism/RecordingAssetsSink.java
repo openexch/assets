@@ -7,6 +7,7 @@ import com.openexchange.assets.domain.ConfigKind;
 import com.openexchange.assets.domain.CoreOrderView;
 import com.openexchange.assets.domain.DispatchKind;
 import com.openexchange.assets.domain.EventKind;
+import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.CoreRejectReason;
 import com.openexchange.assets.domain.GateReason;
@@ -165,5 +166,40 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     @Override
     public void onConfigApplied(ConfigKind kind, int marketId, long configVersion, long logPosition) {
         events.add(new AssetsEngineEvent.ConfigApplied(kind, marketId, configVersion));
+    }
+
+    // ---- RC1 S5 ----
+
+    @Override
+    public void onOrderFault(OrderFaultKind kind, long orderId, long userId, int marketId, long tradeId, long amount, long logPosition) {
+        events.add(new AssetsEngineEvent.OrderFault(kind, orderId, userId, marketId, tradeId, amount));
+    }
+
+    @Override
+    public void onOrderSnapshotBatch(long correlationId, CoreOrderView[] page, int count) {
+        for (int i = 0; i < count; i++) {
+            final CoreOrderView o = page[i];
+            events.add(new AssetsEngineEvent.OrderSnapshotEntry(correlationId, o.orderId(), o.userId(), o.marketId(),
+                    OrderStatus.fromCode(o.statusCode()), o.price(), o.quantity(), o.filledQty(), o.remainingQty(), o.holdAssetId(),
+                    o.holdAmount(), o.meOrderId(), o.sliceSeq()));
+        }
+    }
+
+    @Override
+    public void onOrderSnapshotEnd(long correlationId, int entryCount, long nextOrderId, long asOfLogPosition) {
+        events.add(new AssetsEngineEvent.OrderSnapshotEnd(correlationId, entryCount, nextOrderId));
+    }
+
+    @Override
+    public void onPendingDispatchEnd(long correlationId, int count, long headDispatchSeq) {
+        events.add(new AssetsEngineEvent.PendingDispatchEnd(correlationId, count, headDispatchSeq));
+    }
+
+    @Override
+    public void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                  long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                  long quantity, long budget, int timeInForceCode) {
+        events.add(new AssetsEngineEvent.MeDispatchReply(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId,
+                oldOrderId, marketId, orderTypeCode, sideCode, price, quantity, budget, timeInForceCode));
     }
 }

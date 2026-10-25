@@ -13,7 +13,7 @@ import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.CreateOrderEncoder;
-import com.openexchange.assets.infrastructure.generated.RequestOrderSnapshotEncoder;
+import com.openexchange.assets.infrastructure.generated.CoreConfigEncoder;
 import com.openexchange.assets.infrastructure.generated.DepositEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -374,10 +374,13 @@ public class IngressFenceTest {
 
     @Test
     public void knownButUnservedV6TemplateIsCountedNotApplied() {
-        // CreateOrder (50) is served since S4; RequestOrderSnapshot (53) lands in S5 and is the unserved probe now.
+        // CreateOrder (50) is served since S4, RequestOrderSnapshot (53) since S5; CoreConfig (70) lands in S7 and is
+        // the unserved probe now (empty groups keep the frame minimal and valid).
         final Rig r = new Rig();
-        final RequestOrderSnapshotEncoder e = new RequestOrderSnapshotEncoder().wrapAndApplyHeader(r.buf, 0, r.header)
-                .correlationId(1).userId(1).fromOrderId(0);
+        final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(r.buf, 0, r.header)
+                .correlationId(1).configVersion(1).behaviorVersion(1);
+        e.marketsCount(0);
+        e.assetsCount(0);
         r.dispatch(HEADER + e.encodedLength());
         assertEquals(1, r.demuxer.unhandledTemplateCount());
         assertEquals(0, r.demuxer.unknownTemplateCount());

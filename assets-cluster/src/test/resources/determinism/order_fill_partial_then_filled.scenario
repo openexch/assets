@@ -1,0 +1,16 @@
+# S5 contract 3.1 (R-C5a, C6): BUY 100 x 2 (user 1) and SELL 100 x 2 (user 2) learn their legs from the create
+# outcomes; trade 1 half-fills both (PARTIALLY_FILLED, the money settles from the two holds); trade 2 completes
+# them (the FILL events carry status FILLED, the residual release is 0, both records leave the store).
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=250.0
+DEPOSIT u=2 asset=1 amt=3.0
+CREATE u=1 market=1 side=0 type=0 px=100.0 qty=2.0 rid=1
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=2.0 rid=2
+MEOUTCOME order=1 kind=0 attempt=0 result=0 leg=101
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=102
+METRADE id=1 market=1 taker=2 maker=1 px=100.0 qty=1.0 takerBuy=0
+ORDERSNAP u=0 corr=1
+METRADE id=2 market=1 taker=2 maker=1 px=100.0 qty=1.0 takerBuy=0
+ORDERSNAP u=0 corr=2
+PENDINGDISPATCH corr=3

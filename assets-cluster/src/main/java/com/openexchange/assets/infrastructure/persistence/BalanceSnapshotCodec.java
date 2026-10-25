@@ -212,7 +212,7 @@ public final class BalanceSnapshotCodec {
                 o.price, o.quantity, o.budget, o.stopPrice, o.trailingDelta, o.trailingArmPrice, o.displayQty, o.hiddenQty,
                 o.sliceRemainingQty, o.expiresAtMs, o.filledQty, o.remainingQty, o.cumQuoteQty, o.lastPrice, o.lastQty,
                 o.holdAmount, o.createdAtMs, o.updatedAtMs, o.eventSeq, o.currentLegId, o.pendingPrice, o.pendingQuantity,
-                o.pendingHoldDelta, o.pendingHoldTarget, o.oldLegId};
+                o.pendingHoldDelta, o.pendingHoldTarget, o.oldLegId, o.pendingDispatchSeq, o.replaceDeadlineMs};
         for (final long v : longs) {
             dst.putLong(p, v);
             p += 8;
@@ -232,7 +232,7 @@ public final class BalanceSnapshotCodec {
     }
 
     private static int readOrder(DirectBuffer src, int p, CoreOrder o) {
-        final long[] longs = new long[31];
+        final long[] longs = new long[33];
         for (int i = 0; i < longs.length; i++) {
             longs[i] = src.getLong(p);
             p += 8;
@@ -244,7 +244,7 @@ public final class BalanceSnapshotCodec {
         o.remainingQty = longs[17]; o.cumQuoteQty = longs[18]; o.lastPrice = longs[19]; o.lastQty = longs[20];
         o.holdAmount = longs[21]; o.createdAtMs = longs[22]; o.updatedAtMs = longs[23]; o.eventSeq = longs[24];
         o.currentLegId = longs[25]; o.pendingPrice = longs[26]; o.pendingQuantity = longs[27]; o.pendingHoldDelta = longs[28];
-        o.pendingHoldTarget = longs[29]; o.oldLegId = longs[30];
+        o.pendingHoldTarget = longs[29]; o.oldLegId = longs[30]; o.pendingDispatchSeq = longs[31]; o.replaceDeadlineMs = longs[32];
         o.marketId = src.getInt(p); p += 4;
         o.flags = src.getInt(p); p += 4;
         o.holdAssetId = src.getInt(p); p += 4;

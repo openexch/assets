@@ -60,13 +60,13 @@ public class SweepTimerServiceTest {
         public long tryClaim(final int l, final io.aeron.logbuffer.BufferClaim c) { throw new UnsupportedOperationException(); }
 
         long sweepArms() {
-            return scheduled.stream().filter(s -> s[0] == AssetsClusteredService.SWEEP_TIMER_ID).count();
+            return scheduled.stream().filter(s -> AssetsClusteredService.isSweepTimerId(s[0])).count();
         }
 
         long lastSweepDeadline() {
             long d = -1;
             for (final long[] s : scheduled) {
-                if (s[0] == AssetsClusteredService.SWEEP_TIMER_ID) {
+                if (AssetsClusteredService.isSweepTimerId(s[0])) {
                     d = s[1];
                 }
             }

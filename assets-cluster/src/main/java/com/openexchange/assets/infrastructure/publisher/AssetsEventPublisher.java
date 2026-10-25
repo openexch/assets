@@ -3,6 +3,7 @@ package com.openexchange.assets.infrastructure.publisher;
 
 import com.openexchange.assets.domain.AdminResult;
 import com.openexchange.assets.domain.ConfigKind;
+import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.CoreOrderView;
 import com.openexchange.assets.domain.DispatchKind;
 import com.openexchange.assets.domain.EventKind;
@@ -15,6 +16,10 @@ import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.domain.SettleRejectReason;
 import com.openexchange.assets.infrastructure.generated.AdminAckEncoder;
 import com.openexchange.assets.infrastructure.generated.ConfigAppliedEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderFaultEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderSnapshotBatchEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderSnapshotEndEncoder;
+import com.openexchange.assets.infrastructure.generated.PendingDispatchEndEncoder;
 import com.openexchange.assets.infrastructure.generated.DepositRejectEncoder;
 import com.openexchange.assets.infrastructure.generated.MeDispatchEncoder;
 import com.openexchange.assets.infrastructure.generated.OrderAckEncoder;
@@ -121,7 +126,11 @@ public final class AssetsEventPublisher implements AssetsEventSink {
      */
     public static final int CH_ALL = CH_ACKS | CH_BALANCES | CH_SETTLEMENTS | CH_SNAPSHOTS;
 
-    private static final int BUFFER_CAPACITY = 256;
+    /**
+     * One encode buffer for every frame. 256 B fitted every v5 frame; RC1 S5's OrderSnapshotBatch (106) carries up to
+     * {@link #ORDER_SNAPSHOT_FRAME_CAP} entries of 160 B (8 972 B with headers), found by MeJournalBatchDemuxerTest.
+     */
+    private static final int BUFFER_CAPACITY = 16 * 1024;
 
     private final Egress egress;
     /**
@@ -152,6 +161,13 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final MeDispatchEncoder meDispatchEncoder = new MeDispatchEncoder();
     private final DepositRejectEncoder depositRejectEncoder = new DepositRejectEncoder();
     private final ConfigAppliedEncoder configAppliedEncoder = new ConfigAppliedEncoder();
+    // RC1 S5
+    private final OrderFaultEncoder orderFaultEncoder = new OrderFaultEncoder();
+    private final OrderSnapshotBatchEncoder orderSnapshotBatchEncoder = new OrderSnapshotBatchEncoder();
+    private final OrderSnapshotEndEncoder orderSnapshotEndEncoder = new OrderSnapshotEndEncoder();
+    private final PendingDispatchEndEncoder pendingDispatchEndEncoder = new PendingDispatchEndEncoder();
+    /** 106 entries per frame (wire-v6 2.4.4): 56 x 160 B + 12 B of headers = 8 972 B, inside {@link #BUFFER_CAPACITY}. */
+    public static final int ORDER_SNAPSHOT_FRAME_CAP = 56;
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
@@ -286,6 +302,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
             case INVALID_PRICE:     return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_PRICE;
             case INVALID_QUANTITY:  return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_QUANTITY;
             case NOTIONAL_OVERFLOW: return com.openexchange.assets.infrastructure.generated.SettleRejectReason.NOTIONAL_OVERFLOW;
+            case TRADE_GAP:         return com.openexchange.assets.infrastructure.generated.SettleRejectReason.TRADE_GAP;
             case INVALID_PARTY:     return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_PARTY;
             default: throw new IllegalArgumentException("unmapped SettleRejectReason " + r);
         }
@@ -383,6 +400,67 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .kind(com.openexchange.assets.infrastructure.generated.ConfigKind.get((short) kind.code()))
                 .marketId(marketId).configVersion(configVersion).logPosition(logPosition);
         flush(configAppliedEncoder.encodedLength(), CH_CONTROL, Routing.BROADCAST);
+    }
+
+    // ---- RC1 S5 ----
+
+    @Override
+    public void onOrderFault(OrderFaultKind kind, long orderId, long userId, int marketId, long tradeId, long amount, long logPosition) {
+        orderFaultEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .kind(com.openexchange.assets.infrastructure.generated.OrderFaultKind.get((short) kind.code()))
+                .orderId(orderId).userId(userId).marketId(marketId).tradeId(tradeId).amount(amount).logPosition(logPosition);
+        flush(orderFaultEncoder.encodedLength(), CH_CONTROL, Routing.BROADCAST);
+    }
+
+    @Override
+    public void onOrderSnapshotBatch(long correlationId, CoreOrderView[] page, int count) {
+        for (int from = 0; from < count; from += ORDER_SNAPSHOT_FRAME_CAP) {
+            final int n = Math.min(ORDER_SNAPSHOT_FRAME_CAP, count - from);
+            final OrderSnapshotBatchEncoder.OrdersEncoder g = orderSnapshotBatchEncoder
+                    .wrapAndApplyHeader(buffer, 0, headerEncoder).ordersCount(n);
+            for (int i = 0; i < n; i++) {
+                final CoreOrderView o = page[from + i];
+                g.next().orderId(o.orderId()).userId(o.userId()).marketId(o.marketId())
+                        .status(com.openexchange.assets.infrastructure.generated.OrderStatus.get((short) o.statusCode()))
+                        .side(com.openexchange.assets.infrastructure.generated.Side.get((short) o.sideCode()))
+                        .orderType(com.openexchange.assets.infrastructure.generated.OrderType.get((short) o.orderTypeCode()))
+                        .timeInForce(com.openexchange.assets.infrastructure.generated.TimeInForce.get((short) o.timeInForceCode()))
+                        .price(o.price()).quantity(o.quantity()).filledQty(o.filledQty()).remainingQty(o.remainingQty())
+                        .stopPrice(o.stopPrice()).displayQty(o.displayQty()).expiresAtMs(o.expiresAtMs())
+                        .holdAssetId(o.holdAssetId()).holdAmount(o.holdAmount())
+                        .clientOrderIdHigh(o.clientOrderIdHigh()).clientOrderIdLow(o.clientOrderIdLow())
+                        .meOrderId(o.meOrderId()).trailingArm(o.trailingArmPrice()).hiddenQty(o.hiddenQty())
+                        .sliceSeq(o.sliceSeq()).budget(o.budget()).createdAtMs(o.createdAtMs()).updatedAtMs(o.updatedAtMs());
+            }
+            flush(orderSnapshotBatchEncoder.encodedLength(), CH_SNAPSHOTS, Routing.ORIGIN);
+        }
+    }
+
+    @Override
+    public void onOrderSnapshotEnd(long correlationId, int entryCount, long nextOrderId, long asOfLogPosition) {
+        orderSnapshotEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).entryCount(entryCount).nextOrderId(nextOrderId).asOfLogPosition(asOfLogPosition);
+        flush(orderSnapshotEndEncoder.encodedLength(), CH_SNAPSHOTS, Routing.ORIGIN);
+    }
+
+    @Override
+    public void onPendingDispatchEnd(long correlationId, int count, long headDispatchSeq) {
+        pendingDispatchEndEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).count(count).headDispatchSeq(headDispatchSeq);
+        flush(pendingDispatchEndEncoder.encodedLength(), CH_DISPATCH, Routing.ORIGIN);
+    }
+
+    @Override
+    public void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                  long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                  long quantity, long budget, int timeInForceCode) {
+        meDispatchEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .dispatchSeq(dispatchSeq).commandIdHigh(commandIdHigh).commandIdLow(commandIdLow)
+                .kind(com.openexchange.assets.infrastructure.generated.DispatchKind.get((short) kind.code()))
+                .userId(userId).omsOrderId(omsOrderId).oldOrderId(oldOrderId).marketId(marketId)
+                .orderType((short) orderTypeCode).side((short) sideCode).price(price).quantity(quantity).budget(budget)
+                .timeInForce((short) timeInForceCode);
+        flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.ORIGIN);
     }
 
     private void flush(int bodyLength, int channel, Routing routing) {

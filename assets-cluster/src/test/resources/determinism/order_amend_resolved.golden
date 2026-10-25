@@ -1,0 +1,38 @@
+ADMINACK corr=0 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+DEPOSITACK corr=0 u=1 asset=0 amt=25000000000 newAvail=25000000000
+BALANCE u=1 asset=0 avail=25000000000 locked=0
+DEPOSITACK corr=0 u=2 asset=1 amt=300000000 newAvail=300000000
+BALANCE u=2 asset=1 avail=300000000 locked=0
+BALANCE u=1 asset=0 avail=5000000000 locked=20000000000
+MEDISPATCH seq=1 id=1/0 kind=CREATE u=1 order=1 old=0 market=1 type=0 side=0 px=10000000000 qty=200000000 budget=0 tif=0
+ORDERACK corr=0 order=1 u=1 market=1 status=PENDING_NEW dup=0 holdAsset=0 hold=20000000000 seq=1
+ORDEREVENT seq=1 order=1 u=1 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=0 hold=20000000000 holdRemaining=20000000000
+BALANCE u=2 asset=1 avail=100000000 locked=200000000
+MEDISPATCH seq=2 id=2/0 kind=CREATE u=2 order=2 old=0 market=1 type=0 side=1 px=10000000000 qty=200000000 budget=0 tif=0
+ORDERACK corr=0 order=2 u=2 market=1 status=PENDING_NEW dup=0 holdAsset=1 hold=200000000 seq=2
+ORDEREVENT seq=2 order=2 u=2 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=1 hold=200000000 holdRemaining=200000000
+ORDEREVENT seq=3 order=1 u=1 market=1 kind=ACK_NEW status=NEW reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=101 holdAsset=0 hold=20000000000 holdRemaining=20000000000
+ORDEREVENT seq=4 order=2 u=2 market=1 kind=ACK_NEW status=NEW reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=102 holdAsset=1 hold=200000000 holdRemaining=200000000
+BALANCE u=1 asset=0 avail=5000000000 locked=15000000000
+BALANCE u=1 asset=1 avail=50000000 locked=0
+BALANCE u=2 asset=1 avail=100000000 locked=150000000
+BALANCE u=2 asset=0 avail=5000000000 locked=0
+SETTLED tradeId=1 buyer=1 seller=2
+ORDEREVENT seq=5 order=2 u=2 market=1 kind=FILL status=PARTIALLY_FILLED reason=NONE px=10000000000 qty=200000000 filled=50000000 remaining=150000000 lastPx=10000000000 lastQty=50000000 trade=1 leg=102 holdAsset=1 hold=200000000 holdRemaining=150000000
+ORDEREVENT seq=6 order=1 u=1 market=1 kind=FILL status=PARTIALLY_FILLED reason=NONE px=10000000000 qty=200000000 filled=50000000 remaining=150000000 lastPx=10000000000 lastQty=50000000 trade=1 leg=101 holdAsset=0 hold=20000000000 holdRemaining=15000000000
+MEDISPATCH seq=3 id=1/6 kind=AMEND u=1 order=1 old=101 market=1 type=0 side=0 px=10000000000 qty=100000000 budget=0 tif=0
+ORDERACK corr=1 order=1 u=1 market=1 status=PENDING_REPLACE dup=0 holdAsset=0 hold=20000000000 seq=6
+ORDEREVENT seq=7 order=1 u=1 market=1 kind=DISPATCHED status=PENDING_REPLACE reason=NONE px=10000000000 qty=200000000 filled=50000000 remaining=150000000 lastPx=0 lastQty=0 trade=0 leg=101 holdAsset=0 hold=20000000000 holdRemaining=15000000000
+DISPATCHREPLY seq=3 id=1/6 kind=AMEND u=1 order=1 old=101 market=1 type=0 side=0 px=10000000000 qty=100000000 budget=0 tif=0
+PENDINGEND corr=2 n=1 head=3
+BALANCE u=1 asset=0 avail=10000000000 locked=10000000000
+ORDEREVENT seq=8 order=1 u=1 market=1 kind=REPLACED status=PARTIALLY_FILLED reason=NONE px=10000000000 qty=150000000 filled=50000000 remaining=100000000 lastPx=0 lastQty=0 trade=0 leg=103 holdAsset=0 hold=15000000000 holdRemaining=10000000000
+ORDERSNAP corr=3 order=1 u=1 market=1 status=PARTIALLY_FILLED px=10000000000 qty=150000000 filled=50000000 remaining=100000000 holdAsset=0 hold=15000000000 leg=103 attempt=1
+ORDERSNAPEND corr=3 n=1 next=0
+ORDERACK corr=0 order=1 u=1 market=1 status=PENDING_CANCEL dup=0 holdAsset=0 hold=15000000000 seq=8
+MEDISPATCH seq=4 id=1/9 kind=CANCEL u=1 order=1 old=103 market=1 type=0 side=0 px=0 qty=0 budget=0 tif=0
+ORDEREVENT seq=9 order=1 u=1 market=1 kind=DISPATCHED status=PARTIALLY_FILLED reason=NONE px=10000000000 qty=150000000 filled=50000000 remaining=100000000 lastPx=0 lastQty=0 trade=0 leg=103 holdAsset=0 hold=15000000000 holdRemaining=10000000000
+BALANCE u=1 asset=0 avail=20000000000 locked=0
+ORDEREVENT seq=10 order=1 u=1 market=1 kind=CANCELLED status=CANCELLED reason=NONE px=10000000000 qty=150000000 filled=50000000 remaining=100000000 lastPx=0 lastQty=0 trade=0 leg=103 holdAsset=0 hold=15000000000 holdRemaining=0
+ORDERSNAPEND corr=4 n=0 next=0

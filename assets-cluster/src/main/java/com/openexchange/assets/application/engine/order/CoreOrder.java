@@ -8,11 +8,12 @@ import com.openexchange.assets.domain.CoreOrderView;
  * indexed by the dense {@code orderId}. Every field is replicated state except nothing: diagnostics live on
  * the engine. Codes are wire codes (money-schema v6 enums) so the record serializes without a mapping table.
  *
- * <p>Serialized size is fixed at {@link #SNAPSHOT_BYTES}: 31 longs, 4 ints, 1 short, 6 bytes.</p>
+ * <p>Serialized size is fixed at {@link #SNAPSHOT_BYTES}: 33 longs, 4 ints, 1 short, 6 bytes (S5 added
+ * {@code pendingDispatchSeq} and {@code replaceDeadlineMs}).</p>
  */
 public final class CoreOrder implements CoreOrderView {
 
-    public static final int SNAPSHOT_BYTES = 31 * 8 + 4 * 4 + 2 + 6;
+    public static final int SNAPSHOT_BYTES = 33 * 8 + 4 * 4 + 2 + 6;
 
     // state flags (u16)
     public static final int F_CANCEL_PENDING = 1;
@@ -60,6 +61,10 @@ public final class CoreOrder implements CoreOrderView {
     public long pendingHoldDelta;
     public long pendingHoldTarget;
     public long oldLegId;
+    /** dispatchSeq of the ME command in flight (0 = none); orders the RequestPendingDispatch replay (S5). */
+    public long pendingDispatchSeq;
+    /** Log-time deadline of the open replace window (0 = none); its deadline-index entry is derived from it (S5). */
+    public long replaceDeadlineMs;
     public int marketId;
     public int flags;
     public int holdAssetId;
@@ -77,7 +82,7 @@ public final class CoreOrder implements CoreOrderView {
         price = 0; quantity = 0; budget = 0; stopPrice = 0; trailingDelta = 0; trailingArmPrice = 0; displayQty = 0;
         hiddenQty = 0; sliceRemainingQty = 0; expiresAtMs = 0; filledQty = 0; remainingQty = 0; cumQuoteQty = 0;
         lastPrice = 0; lastQty = 0; holdAmount = 0; createdAtMs = 0; updatedAtMs = 0; eventSeq = 0; currentLegId = 0;
-        pendingPrice = 0; pendingQuantity = 0; pendingHoldDelta = 0; pendingHoldTarget = 0; oldLegId = 0;
+        pendingPrice = 0; pendingQuantity = 0; pendingHoldDelta = 0; pendingHoldTarget = 0; oldLegId = 0; pendingDispatchSeq = 0; replaceDeadlineMs = 0;
         marketId = 0; flags = 0; holdAssetId = 0; attempt = 0; stateFlags = 0;
         side = 0; orderType = 0; timeInForce = 0; status = 0; rejectReason = 0; pendingKind = 0;
     }
@@ -123,4 +128,15 @@ public final class CoreOrder implements CoreOrderView {
     public long clientOrderIdLow() { return clientOrderIdLow; }
     public long createdAtMs() { return createdAtMs; }
     public long updatedAtMs() { return updatedAtMs; }
+    public long budget() { return budget; }
+    public long displayQty() { return displayQty; }
+    public long hiddenQty() { return hiddenQty; }
+    public long expiresAtMs() { return expiresAtMs; }
+    public long trailingArmPrice() { return trailingArmPrice; }
+    public int sliceSeq() { return attempt; }
+
+    /** A live ME leg is known for this order (learned from the create outcome or an implicit-ack trade). */
+    public boolean hasLeg() {
+        return currentLegId != 0;
+    }
 }

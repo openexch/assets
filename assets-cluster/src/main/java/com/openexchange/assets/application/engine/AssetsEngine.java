@@ -805,6 +805,33 @@ public final class AssetsEngine {
         return orders;
     }
 
+    // ---- RC1 S5: hold and gate effects owned by the order lifecycle (single release owner) ----
+
+    /**
+     * Release {@code amount} of the order's hold back to available ({@code amount < 0} = everything left) and
+     * publish the balance line. Returns the amount actually released (0 when there is no such hold).
+     */
+    public long releaseOrderHold(long userId, long orderId, long amount) {
+        final Account a = accounts.get(userId);
+        if (a == null) {
+            return 0L;
+        }
+        final int assetId = a.holdAssetId(orderId);
+        if (assetId < 0) {
+            return 0L;
+        }
+        final long released = a.release(orderId, amount);
+        sink.onBalanceUpdate(userId, assetId, a.available(assetId), a.locked(assetId));
+        return released;
+    }
+
+    /** An internal gate transition (no AdminAck): MeCommandOutcome CAPACITY, bridge halt, apply fault. */
+    public void suspendGateInternally(int marketId, GateReason reason) {
+        if (gate.set(marketId, GateState.SUSPENDED, reason)) {
+            sink.onAdmissionState(marketId, GateState.SUSPENDED, reason, false, lastLogTime, logPosition, false);
+        }
+    }
+
     public AssetsEventSink eventSink() {
         return sink;
     }
