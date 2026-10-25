@@ -74,6 +74,24 @@ public enum CoreRejectReason
 
     NOT_RESUMABLE((short)36),
 
+
+    /**
+     * behaviour v2: price outside the recorded market [minPrice, maxPrice] (RC1 S7)
+     */
+    PRICE_OUT_OF_BAND((short)37),
+
+
+    /**
+     * behaviour v2: price not a multiple of the recorded tickSize (RC1 S7)
+     */
+    PRICE_OFF_TICK((short)38),
+
+
+    /**
+     * behaviour v2: quantity not a multiple of the recorded lotSize (RC1 S7)
+     */
+    QTY_OFF_LOT((short)39),
+
     /**
      * To be used to represent not present or null.
      */
@@ -141,6 +159,9 @@ public enum CoreRejectReason
             case 34: return UNSUPPORTED_TIF;
             case 35: return UNREGISTERED_SESSION;
             case 36: return NOT_RESUMABLE;
+            case 37: return PRICE_OUT_OF_BAND;
+            case 38: return PRICE_OFF_TICK;
+            case 39: return QTY_OFF_LOT;
             case 255: return NULL_VAL;
         }
 

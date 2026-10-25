@@ -183,6 +183,12 @@ public final class OrderEngine {
             reject(sink, c, CoreRejectReason.GATE_CLOSED, c.marketId, now, false);
             return;
         }
+        // 0a. behaviour v2 (RC1 S7 section 5): tick, lot and price band from the recorded CoreConfig; structural
+        final CoreRejectReason shape = behaviourShape(c.marketId, c.price, c.stopPrice, c.quantity);
+        if (shape != null) {
+            reject(sink, c, shape, c.price, now, false);
+            return;
+        }
 
         // 0b. requestId: a replay returns the stored decision and consumes nothing
         final RequestTable.Entry seen = requests.get(c.userId, c.requestIdHigh, c.requestIdLow);
@@ -415,6 +421,38 @@ public final class OrderEngine {
                 armed ? OrderStatus.PENDING_TRIGGER : OrderStatus.PENDING_NEW, false, holdAsset, holdAmount, now, eventSeq);
         sink.onOrderEvent(eventSeq, ledger.getLogPosition(), o, EventKind.ACCEPTED, CoreRejectReason.NONE, 0L, 0L, 0L,
                 account.holdRemaining(orderId), now);
+    }
+
+    // ---------------------------------------------------------------- RC1 S7: behaviour v2 admission shape
+
+    /**
+     * Behaviour v2 (S7 contract section 5): with a recorded CoreConfig, a priced order must sit on the tick and inside
+     * [minPrice, maxPrice], a stop price on the tick, a quantity on the lot (lotSize > 0). v1 checks nothing. One field
+     * read on the hot path; the strategy is the version itself.
+     */
+    private CoreRejectReason behaviourShape(final int marketId, final long price, final long stopPrice, final long quantity) {
+        if (ledger.coreConfig().behaviorVersion() < 2) {
+            return null;
+        }
+        final com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef d = ledger.coreConfig().market(marketId);
+        if (d == null) {
+            return null;
+        }
+        if (price > 0) {
+            if (price < d.minPrice() || price > d.maxPrice()) {
+                return CoreRejectReason.PRICE_OUT_OF_BAND;
+            }
+            if (price % d.tickSize() != 0) {
+                return CoreRejectReason.PRICE_OFF_TICK;
+            }
+        }
+        if (stopPrice > 0 && stopPrice % d.tickSize() != 0) {
+            return CoreRejectReason.PRICE_OFF_TICK;
+        }
+        if (d.lotSize() > 0 && quantity % d.lotSize() != 0) {
+            return CoreRejectReason.QTY_OFF_LOT;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------- RC1 S6: synthetic shape helpers
@@ -1280,6 +1318,12 @@ public final class OrderEngine {
         }
         if (!ledger.gate().admits(o.marketId)) {
             rejectAmend(sink, c, CoreRejectReason.GATE_CLOSED, o.marketId, now, false);
+            return;
+        }
+        final CoreRejectReason amendShape = behaviourShape(o.marketId, c.newPrice == 0 ? o.price : c.newPrice, 0L,
+                c.newQuantity == 0 ? o.quantity : c.newQuantity);
+        if (amendShape != null) {
+            rejectAmend(sink, c, amendShape, c.newPrice, now, false);
             return;
         }
         final MarketRisk m = markets[o.marketId];

@@ -70,6 +70,11 @@ public final class AssetsClusteredService implements ClusteredService {
     private final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, projector);
 
     {
+        // RC1 S7: a CoreConfig cross-check failure stops this node (A-9 rule), through the same seam as the apply fence.
+        engine.setConfigFailFast(() -> this.failFast.run());
+    }
+
+    {
         // RC1 S3 (K6): the replicated registration decides; these are its leader-local transport effects.
         demuxer.setTransportHooks(new AssetsSbeDemuxer.TransportHooks() {
             public void onSessionRegistered(final long sessionId, final int channelMask, final boolean resumable) {

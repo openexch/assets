@@ -1,0 +1,39 @@
+ADMINACK corr=0 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+DEPOSITACK corr=0 u=1 asset=0 amt=10000000000000 newAvail=10000000000000
+BALANCE u=1 asset=0 avail=10000000000000 locked=0
+DEPOSITACK corr=0 u=2 asset=1 amt=1000000000 newAvail=1000000000
+BALANCE u=2 asset=1 avail=1000000000 locked=0
+ADMINACK corr=71 ref=70 result=ADOPTED reason=0 cfg=1
+CONFIGAPPLIED kind=CORE market=0 version=1
+BALANCE u=1 asset=0 avail=9989970000000 locked=10030000000
+MEDISPATCH seq=1 id=1/0 kind=CREATE u=1 order=1 old=0 market=1 type=0 side=0 px=10030000000 qty=100000000 budget=0 tif=0
+ORDERACK corr=0 order=1 u=1 market=1 status=PENDING_NEW dup=0 holdAsset=0 hold=10030000000 seq=1
+ORDEREVENT seq=1 order=1 u=1 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=10030000000 qty=100000000 filled=0 remaining=100000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=0 hold=10030000000 holdRemaining=10030000000
+BALANCE u=1 asset=0 avail=9989470000000 locked=10530000000
+MEDISPATCH seq=2 id=2/0 kind=CREATE u=1 order=2 old=0 market=1 type=0 side=0 px=500000000 qty=100000000 budget=0 tif=0
+ORDERACK corr=0 order=2 u=1 market=1 status=PENDING_NEW dup=0 holdAsset=0 hold=500000000 seq=2
+ORDEREVENT seq=2 order=2 u=1 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=500000000 qty=100000000 filled=0 remaining=100000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=0 hold=500000000 holdRemaining=500000000
+BALANCE u=2 asset=1 avail=985000000 locked=15000000
+MEDISPATCH seq=3 id=3/0 kind=CREATE u=2 order=3 old=0 market=1 type=0 side=1 px=10000000000 qty=15000000 budget=0 tif=0
+ORDERACK corr=0 order=3 u=2 market=1 status=PENDING_NEW dup=0 holdAsset=1 hold=15000000 seq=3
+ORDEREVENT seq=3 order=3 u=2 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=10000000000 qty=15000000 filled=0 remaining=15000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=1 hold=15000000 holdRemaining=15000000
+ADMINACK corr=72 ref=70 result=ACCEPTED reason=0 cfg=2
+CONFIGAPPLIED kind=CORE market=0 version=2
+ORDERREJECT corr=0 u=1 order=0 market=1 ref=50 reason=PRICE_OFF_TICK detail=10030000000
+ORDERREJECT corr=0 u=1 order=0 market=1 ref=50 reason=PRICE_OUT_OF_BAND detail=500000000
+ORDERREJECT corr=0 u=1 order=0 market=1 ref=50 reason=PRICE_OUT_OF_BAND detail=100050000000
+ORDERREJECT corr=0 u=2 order=0 market=1 ref=50 reason=QTY_OFF_LOT detail=10000000000
+BALANCE u=1 asset=0 avail=9979420000000 locked=20580000000
+MEDISPATCH seq=4 id=4/0 kind=CREATE u=1 order=4 old=0 market=1 type=0 side=0 px=10050000000 qty=100000000 budget=0 tif=0
+ORDERACK corr=0 order=4 u=1 market=1 status=PENDING_NEW dup=0 holdAsset=0 hold=10050000000 seq=4
+ORDEREVENT seq=4 order=4 u=1 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=10050000000 qty=100000000 filled=0 remaining=100000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=0 hold=10050000000 holdRemaining=10050000000
+BALANCE u=2 asset=1 avail=965000000 locked=35000000
+MEDISPATCH seq=5 id=5/0 kind=CREATE u=2 order=5 old=0 market=1 type=1 side=1 px=0 qty=20000000 budget=0 tif=0
+ORDERACK corr=0 order=5 u=2 market=1 status=PENDING_NEW dup=0 holdAsset=1 hold=20000000 seq=5
+ORDEREVENT seq=5 order=5 u=2 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=0 qty=20000000 filled=0 remaining=20000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=1 hold=20000000 holdRemaining=20000000
+ORDERREJECT corr=0 u=2 order=0 market=1 ref=50 reason=QTY_OFF_LOT detail=0
+ORDERREJECT corr=0 u=2 order=0 market=1 ref=50 reason=PRICE_OFF_TICK detail=0
+ADMINACK corr=73 ref=70 result=DUPLICATE reason=0 cfg=2
+ORDERREJECT corr=0 u=1 order=0 market=1 ref=50 reason=PRICE_OFF_TICK detail=10030000000
+ORDERACK corr=0 order=1 u=1 market=1 status=PENDING_CANCEL dup=0 holdAsset=0 hold=10030000000 seq=1

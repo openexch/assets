@@ -139,7 +139,8 @@ public final class BalanceSnapshotCodec {
 
         // Sections, ascending by id: 1 ACCOUNTS, 2 ORDERS, 3 USER_RISK, 4 MARKET_STATE, 5 GATES, 6 REQUEST_IDS,
         // 9 SESSIONS on this build (RC1 S4); 7 and 8 land with their slices.
-        dst.putInt(pos[0], 7);
+        final boolean withConfig = engine.coreConfig().recorded() != null;
+        dst.putInt(pos[0], withConfig ? 8 : 7);
         pos[0] += 4;
         pos[0] = writeAccountsSection(engine, dst, pos[0]);
         pos[0] = writeOrdersSection(engine, dst, pos[0]);
@@ -147,6 +148,9 @@ public final class BalanceSnapshotCodec {
         pos[0] = writeMarketStateSection(engine, dst, pos[0]);
         pos[0] = writeGatesSection(engine, dst, pos[0]);
         pos[0] = writeRequestsSection(engine, dst, pos[0]);
+        if (withConfig) {
+            pos[0] = writeCoreConfigSection(engine, dst, pos[0]); // RC1 S7: only when a config is recorded
+        }
         pos[0] = writeSessionsSection(engine, dst, pos[0]);
 
         return pos[0] - offset;
@@ -459,6 +463,96 @@ public final class BalanceSnapshotCodec {
      * {sessionId:long, registered:u8, resumable:u8, readerKind:u8, reserved:u8, channelMask:int,
      *  identity:long, sourceEpoch:long, principalLength:short, principal bytes}.
      */
+    private static final int CORE_MARKET_BYTES = 4 + 16 + 4 + 4 + 8 * 4;
+    private static final int CORE_ASSET_BYTES = 4 + 8 + 1;
+
+    /** Section 8 CORE_CONFIG (layout page): versions, then markets and assets ascending by id, fixed-size rows. */
+    private static int writeCoreConfigSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final com.openexchange.assets.domain.commands.CoreConfigCommand c = engine.coreConfig().recorded();
+        int p = start;
+        dst.putShort(p, SECTION_CORE_CONFIG); p += 2;
+        final int lengthSlot = p; p += 4;
+        final int bodyStart = p;
+        dst.putLong(p, c.configVersion); p += 8;
+        dst.putLong(p, c.behaviorVersion); p += 8;
+        dst.putInt(p, c.markets.length); p += 4;
+        for (final com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef m : c.markets) {
+            dst.putInt(p, m.marketId()); p += 4;
+            p = putAscii(dst, p, m.symbol(), 16);
+            dst.putInt(p, m.baseAssetId()); p += 4;
+            dst.putInt(p, m.quoteAssetId()); p += 4;
+            dst.putLong(p, m.tickSize()); p += 8;
+            dst.putLong(p, m.minPrice()); p += 8;
+            dst.putLong(p, m.maxPrice()); p += 8;
+            dst.putLong(p, m.lotSize()); p += 8;
+        }
+        dst.putInt(p, c.assets.length); p += 4;
+        for (final com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef a : c.assets) {
+            dst.putInt(p, a.assetId()); p += 4;
+            p = putAscii(dst, p, a.code(), 8);
+            dst.putByte(p, (byte) a.scale()); p += 1;
+        }
+        dst.putInt(lengthSlot, p - bodyStart);
+        return p;
+    }
+
+    private static int putAscii(MutableDirectBuffer dst, int p, String s, int width) {
+        for (int i = 0; i < width; i++) {
+            dst.putByte(p + i, i < s.length() ? (byte) s.charAt(i) : 0);
+        }
+        return p + width;
+    }
+
+    private static String getAscii(DirectBuffer src, int p, int width) {
+        final StringBuilder sb = new StringBuilder(width);
+        for (int i = 0; i < width; i++) {
+            final byte b = src.getByte(p + i);
+            if (b == 0) {
+                break;
+            }
+            sb.append((char) b);
+        }
+        return sb.toString();
+    }
+
+    private static int readCoreConfigSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        final com.openexchange.assets.domain.commands.CoreConfigCommand c = new com.openexchange.assets.domain.commands.CoreConfigCommand();
+        c.reset();
+        c.configVersion = src.getLong(pos); pos += 8;
+        c.behaviorVersion = src.getLong(pos); pos += 8;
+        final int nm = src.getInt(pos); pos += 4;
+        if (nm < 0 || (long) nm * CORE_MARKET_BYTES > limit - pos) {
+            throw new IllegalStateException("balance snapshot CORE_CONFIG declares " + nm + " markets");
+        }
+        c.markets = new com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef[nm];
+        for (int i = 0; i < nm; i++) {
+            final int id = src.getInt(pos); pos += 4;
+            final String symbol = getAscii(src, pos, 16); pos += 16;
+            final int base = src.getInt(pos); pos += 4;
+            final int quote = src.getInt(pos); pos += 4;
+            final long tick = src.getLong(pos); pos += 8;
+            final long min = src.getLong(pos); pos += 8;
+            final long max = src.getLong(pos); pos += 8;
+            final long lot = src.getLong(pos); pos += 8;
+            c.markets[i] = new com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef(id, symbol, base, quote, tick, min, max, lot);
+        }
+        final int na = src.getInt(pos); pos += 4;
+        if (na < 0 || (long) na * CORE_ASSET_BYTES != limit - pos) {
+            throw new IllegalStateException("balance snapshot CORE_CONFIG declares " + na + " assets");
+        }
+        c.assets = new com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef[na];
+        for (int i = 0; i < na; i++) {
+            final int id = src.getInt(pos); pos += 4;
+            final String code = getAscii(src, pos, 8); pos += 8;
+            final int scale = src.getByte(pos) & 0xFF; pos += 1;
+            c.assets[i] = new com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef(id, code, scale);
+        }
+        engine.coreConfig().restore(c);
+        engine.crossCheckConfigOrFail("restore"); // section 4: a restored config this node cannot run stops it
+        return pos;
+    }
+
     private static int writeSessionsSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
         final int[] pos = {start};
         dst.putShort(pos[0], SECTION_SESSIONS);
@@ -613,6 +707,13 @@ public final class BalanceSnapshotCodec {
                     if (endPos != sectionEnd) {
                         throw new IllegalStateException("balance snapshot GATES section declares " + sectionLength
                                 + " bytes but decodes " + (endPos - pos));
+                    }
+                    break;
+                }
+                case SECTION_CORE_CONFIG: {
+                    final int endPos = readCoreConfigSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot CORE_CONFIG section length mismatch");
                     }
                     break;
                 }

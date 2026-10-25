@@ -805,6 +805,54 @@ public final class AssetsEngine {
         return orders;
     }
 
+    // ---- RC1 S7: CoreConfig and the behaviour version ----
+
+    private final com.openexchange.assets.application.engine.config.CoreConfigStateMachine coreConfig =
+            new com.openexchange.assets.application.engine.config.CoreConfigStateMachine();
+    /** Node-local fail-fast hook for the CoreConfig cross-check (A-9 rule); the service installs its halt. */
+    private Runnable configFailFast = () -> { };
+
+    public com.openexchange.assets.application.engine.config.CoreConfigStateMachine coreConfig() {
+        return coreConfig;
+    }
+
+    public void setConfigFailFast(Runnable failFast) {
+        this.configFailFast = failFast;
+    }
+
+    /** CoreConfig (70), ADMIN class: contract S7 section 3, then the node-local cross-check (section 4). */
+    public void applyCoreConfig(com.openexchange.assets.domain.commands.CoreConfigCommand c, long timestamp) {
+        observeLogTime(timestamp);
+        final var decision = coreConfig.decide(c);
+        final long version = coreConfig.apply(decision, c);
+        final AdminResult result;
+        switch (decision) {
+            case ADOPT: result = AdminResult.ADOPTED; break;
+            case ACCEPT:
+            case SWITCH: result = AdminResult.ACCEPTED; break;
+            case DUPLICATE: result = AdminResult.DUPLICATE; break;
+            case STALE: result = AdminResult.STALE; break;
+            default: result = AdminResult.REJECTED; break;
+        }
+        sink.onAdminAck(c.correlationId, 70, result, result == AdminResult.REJECTED ? CoreRejectReason.INVALID.code() : 0, version);
+        if (decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.ADOPT
+                || decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.ACCEPT
+                || decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.SWITCH) {
+            sink.onConfigApplied(com.openexchange.assets.domain.ConfigKind.CORE, 0, version, logPosition);
+            crossCheckConfigOrFail(decision.name());
+        }
+    }
+
+    /** Section 4: a node whose compiled truth differs from the declared config must not serve (never a reject). */
+    public void crossCheckConfigOrFail(String context) {
+        final String mismatch = coreConfig.crossCheck();
+        if (mismatch != null) {
+            LOG.error("CORE-CONFIG CRITICAL (%s): this node differs from the cluster's declared config: %s; exiting (fail-fast)",
+                    context, mismatch);
+            configFailFast.run();
+        }
+    }
+
     // ---- RC1 S5: hold and gate effects owned by the order lifecycle (single release owner) ----
 
     /**

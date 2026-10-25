@@ -225,6 +225,13 @@ public final class AssetsScenarioRunner {
             case "SNAPSHOT":
                 snapshotRoundTrip();
                 break;
+            case "CORECONFIG":
+                // RC1 S7: the compiled markets and assets as a CoreConfig; tick/min/max/lot apply to every market
+                engine.applyCoreConfig(coreConfigFor(reqLong(kv, "ver"), reqLong(kv, "behavior"),
+                        kv.containsKey("tick") ? reqAmount(kv, "tick") : 1L, kv.containsKey("min") ? reqAmount(kv, "min") : 1L,
+                        kv.containsKey("max") ? reqAmount(kv, "max") : 1_000_000_000_000_000L, kv.containsKey("lot") ? reqAmount(kv, "lot") : 0L,
+                        kv.containsKey("corr") ? reqLong(kv, "corr") : 0L), clock.now());
+                break;
             // ---- RC1 S5: ME feed events (bridge class), amend, quarantine, queries ----
             case "METRADE": {
                 final long taker = reqLong(kv, "taker");
@@ -420,6 +427,28 @@ public final class AssetsScenarioRunner {
     }
 
     // ---- parsing helpers (the text conventions live in the kit) ----
+
+    /** The compiled Market.ALL / Asset tables as a CoreConfig command (RC1 S7 DSL and tests). */
+    public static com.openexchange.assets.domain.commands.CoreConfigCommand coreConfigFor(long version, long behavior, long tick,
+            long min, long max, long lot, long correlationId) {
+        final com.openexchange.assets.domain.commands.CoreConfigCommand c = new com.openexchange.assets.domain.commands.CoreConfigCommand();
+        c.reset();
+        c.correlationId = correlationId;
+        c.configVersion = version;
+        c.behaviorVersion = behavior;
+        final java.util.List<com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef> ms = new java.util.ArrayList<>();
+        for (final com.openexchange.assets.domain.Market m : com.openexchange.assets.domain.Market.ALL) {
+            ms.add(new com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef(m.marketId(), m.symbol(),
+                    m.baseAsset().id(), m.quoteAsset().id(), tick, min, max, lot));
+        }
+        c.markets = ms.toArray(new com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef[0]);
+        final java.util.List<com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef> as = new java.util.ArrayList<>();
+        for (final com.openexchange.assets.domain.Asset a : com.openexchange.assets.domain.Asset.values()) {
+            as.add(new com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef(a.id(), a.name(), 8));
+        }
+        c.assets = as.toArray(new com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef[0]);
+        return c;
+    }
 
     private static Map<String, String> parseKv(String[] tokens) {
         return ScenarioText.parseKv(tokens);
