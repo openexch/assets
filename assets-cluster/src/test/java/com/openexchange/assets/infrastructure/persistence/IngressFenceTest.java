@@ -374,18 +374,20 @@ public class IngressFenceTest {
 
     @Test
     public void knownButUnservedV6TemplateIsCountedNotApplied() {
-        // CreateOrder (50) is served since S4, RequestOrderSnapshot (53) since S5; CoreConfig (70) lands in S7 and is
-        // the unserved probe now (empty groups keep the frame minimal and valid).
+        // RC1 S7 retires the probe: CoreConfig (70) was the last unserved template in 50-114, so this frame is now
+        // served (the engine's decision table) and the unhandled counter stays 0. Kept under its old name so the
+        // counter's history stays readable; CoreConfigWireTest owns the served behaviour.
         final Rig r = new Rig();
         final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(r.buf, 0, r.header)
                 .correlationId(1).configVersion(1).behaviorVersion(1);
         e.marketsCount(0);
         e.assetsCount(0);
         r.dispatch(HEADER + e.encodedLength());
-        assertEquals(1, r.demuxer.unhandledTemplateCount());
+        assertEquals(0, r.demuxer.unhandledTemplateCount());
         assertEquals(0, r.demuxer.unknownTemplateCount());
         assertEquals(0, r.demuxer.applyErrorCount());
         assertEquals(0, r.engine.accountCount());
+        assertEquals("served: the engine took a decision", 1, r.engine.coreConfig().adoptedCount() + r.engine.coreConfig().rejectCount());
     }
 
     // ---- RED-F11 / F12: mutation then throw is an apply failure, never poison ----

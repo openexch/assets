@@ -298,6 +298,7 @@ public final class AssetsSbeDemuxer {
     private final MeCommandOutcomeDecoder meCommandOutcomeDecoder = new MeCommandOutcomeDecoder();
     private final RequestPendingDispatchDecoder requestPendingDispatchDecoder = new RequestPendingDispatchDecoder();
     private final QuarantineOrderDecoder quarantineOrderDecoder = new QuarantineOrderDecoder();
+    private final CoreConfigDecoder coreConfigDecoder = new CoreConfigDecoder();
     private final AmendOrderCommand amendOrderCommand = new AmendOrderCommand();
     private final CreateOrderCommand createOrderCommand = new CreateOrderCommand();
     private final CancelOrderCommand cancelOrderCommand = new CancelOrderCommand();
@@ -381,6 +382,15 @@ public final class AssetsSbeDemuxer {
             rejectFrameBounds();
             return;
         }
+        if (templateId == MeJournalTradeBatchDecoder.TEMPLATE_ID
+                && !groupWithinFrame(HEADER + block, MeJournalTradeBatchDecoder.TradesDecoder.sbeBlockLength(), length)) {
+            rejectFrameBounds(); // RC1 S7: the S5 batch was missing from this list
+            return;
+        }
+        if (templateId == CoreConfigDecoder.TEMPLATE_ID && !coreConfigGroupsWithinFrame(HEADER + block, length)) {
+            rejectFrameBounds();
+            return;
+        }
 
         // 5. Session authority (K6): class mask, registration-first, user scope. RegisterSession itself is
         //    judged by the registry (so a session with no usable principal gets a REJECTED ack, not silence).
@@ -427,6 +437,7 @@ public final class AssetsSbeDemuxer {
                 case MeCommandOutcomeDecoder.TEMPLATE_ID:       handleMeCommandOutcome(timestamp); break;
                 case RequestPendingDispatchDecoder.TEMPLATE_ID: handleRequestPendingDispatch(); break;
                 case QuarantineOrderDecoder.TEMPLATE_ID:        handleQuarantineOrder(timestamp); break;
+                case CoreConfigDecoder.TEMPLATE_ID:             handleCoreConfig(timestamp); break;
                 case HoldDecoder.TEMPLATE_ID:                   handleHold(timestamp); break;
                 case ReleaseDecoder.TEMPLATE_ID:                handleRelease(timestamp); break;
                 case SettleDecoder.TEMPLATE_ID:                 handleSettle(timestamp); break;
@@ -445,7 +456,7 @@ public final class AssetsSbeDemuxer {
                     rejectDecode("Subscribe frame reached the engine");
                     break;
                 default:
-                    // v6 templates defined by this schema and served from later slices (CoreConfig S7, SwitchBehavior).
+                    // v6 templates defined by this schema and not served by this build (none after RC1 S7 in 50-114).
                     // Counted so a gateway speaking ahead of this build is visible, never silent.
                     unhandled(templateId);
                     break;
@@ -718,6 +729,39 @@ public final class AssetsSbeDemuxer {
                 requestPendingDispatchDecoder.fromDispatchSeq(), requestPendingDispatchDecoder.maxEntries());
     }
 
+    /** CoreConfig (70, ADMIN): groups decoded with raw character checks first; the decision table is the engine's. */
+    private void handleCoreConfig(long timestamp) {
+        coreConfigDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final com.openexchange.assets.domain.commands.CoreConfigCommand c = new com.openexchange.assets.domain.commands.CoreConfigCommand();
+        c.reset();
+        c.correlationId = coreConfigDecoder.correlationId();
+        c.configVersion = coreConfigDecoder.configVersion();
+        c.behaviorVersion = coreConfigDecoder.behaviorVersion();
+        final java.util.List<com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef> markets = new java.util.ArrayList<>();
+        for (final CoreConfigDecoder.MarketsDecoder m : coreConfigDecoder.markets()) {
+            final String symbol = fixedAscii(m::symbol, CoreConfigDecoder.MarketsDecoder.symbolLength());
+            if (symbol == null) {
+                rejectDecode("CoreConfig market " + m.marketId() + " symbol bytes");
+                return;
+            }
+            markets.add(new com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef(m.marketId(), symbol, m.baseAssetId(),
+                    m.quoteAssetId(), m.tickSize(), m.minPrice(), m.maxPrice(), m.lotSize()));
+        }
+        final java.util.List<com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef> assets = new java.util.ArrayList<>();
+        for (final CoreConfigDecoder.AssetsDecoder a : coreConfigDecoder.assets()) {
+            final String code = fixedAscii(a::code, CoreConfigDecoder.AssetsDecoder.codeLength());
+            if (code == null) {
+                rejectDecode("CoreConfig asset " + a.assetId() + " code bytes");
+                return;
+            }
+            assets.add(new com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef(a.assetId(), code, a.scale()));
+        }
+        c.markets = markets.toArray(new com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef[0]);
+        c.assets = assets.toArray(new com.openexchange.assets.domain.commands.CoreConfigCommand.AssetDef[0]);
+        applying = true;
+        engine.applyCoreConfig(c, timestamp);
+    }
+
     private void handleQuarantineOrder(long timestamp) {
         quarantineOrderDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         applying = true;
@@ -964,6 +1008,33 @@ public final class AssetsSbeDemuxer {
     /** A money boolean is 0 or 1. 255 (NULL_VAL) is not a value for money either. */
     private static boolean validBool(final int raw) {
         return raw == BoolFlag.FALSE.value() || raw == BoolFlag.TRUE.value();
+    }
+
+    /** CoreConfig's two consecutive groups (markets, then assets) both inside the frame. */
+    private boolean coreConfigGroupsWithinFrame(final int marketsOffset, final int length) {
+        if (!groupWithinFrame(marketsOffset, CoreConfigDecoder.MarketsDecoder.sbeBlockLength(), length)) {
+            return false;
+        }
+        final int block = Short.toUnsignedInt(frame.getShort(marketsOffset, ByteOrder.LITTLE_ENDIAN));
+        final int count = Short.toUnsignedInt(frame.getShort(marketsOffset + 2, ByteOrder.LITTLE_ENDIAN));
+        final int assetsOffset = marketsOffset + GROUP_HEADER + block * count;
+        return groupWithinFrame(assetsOffset, CoreConfigDecoder.AssetsDecoder.sbeBlockLength(), length);
+    }
+
+    /** A fixed-length SBE char field as a String up to the first NUL; null when a byte is not printable ASCII. */
+    private static String fixedAscii(final java.util.function.IntUnaryOperator byteAt, final int length) {
+        final StringBuilder sb = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            final int b = byteAt.applyAsInt(i) & 0xFF;
+            if (b == 0) {
+                break;
+            }
+            if (b < 0x21 || b > 0x7E) {
+                return null;
+            }
+            sb.append((char) b);
+        }
+        return sb.toString();
     }
 
     /** One repeating group starting at {@code groupOffset}: header present, entry block sane, count fits. */

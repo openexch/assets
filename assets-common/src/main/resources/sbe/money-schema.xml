@@ -139,6 +139,9 @@
             <validValue name="UNSUPPORTED_TIF">34</validValue>
             <validValue name="UNREGISTERED_SESSION">35</validValue>
             <validValue name="NOT_RESUMABLE">36</validValue>
+            <validValue name="PRICE_OUT_OF_BAND" description="behaviour v2: price outside the recorded market [minPrice, maxPrice] (RC1 S7)">37</validValue>
+            <validValue name="PRICE_OFF_TICK" description="behaviour v2: price not a multiple of the recorded tickSize (RC1 S7)">38</validValue>
+            <validValue name="QTY_OFF_LOT" description="behaviour v2: quantity not a multiple of the recorded lotSize (RC1 S7)">39</validValue>
         </enum>
         <!-- Session classes (K6; critic C5 + D10). The authoritative class comes from the authenticator's principal;
              RegisterSession.sessionClass is an assertion checked against it. -->

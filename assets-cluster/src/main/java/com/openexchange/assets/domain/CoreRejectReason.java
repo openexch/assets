@@ -37,7 +37,13 @@ public enum CoreRejectReason {
     STOP_WOULD_TRIGGER_IMMEDIATELY(33),
     UNSUPPORTED_TIF(34),
     UNREGISTERED_SESSION(35),
-    NOT_RESUMABLE(36);
+    NOT_RESUMABLE(36),
+    /** RC1 S7, behaviour v2: price outside the recorded market band. */
+    PRICE_OUT_OF_BAND(37),
+    /** RC1 S7, behaviour v2: price not a multiple of the recorded tick size. */
+    PRICE_OFF_TICK(38),
+    /** RC1 S7, behaviour v2: quantity not a multiple of the recorded lot size. */
+    QTY_OFF_LOT(39);
 
     private final int code;
 
