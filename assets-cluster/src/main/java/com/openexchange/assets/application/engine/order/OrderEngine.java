@@ -2,18 +2,26 @@
 package com.openexchange.assets.application.engine.order;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
+import com.openexchange.assets.application.engine.gate.OrderEntryGate;
 import com.openexchange.assets.application.engine.time.DeadlineIndex;
 import com.openexchange.assets.domain.Account;
 import com.openexchange.assets.domain.AdminResult;
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.ConfigKind;
+import com.openexchange.assets.domain.CoreOrderView;
 import com.openexchange.assets.domain.CoreRejectReason;
 import com.openexchange.assets.domain.DispatchKind;
 import com.openexchange.assets.domain.EventKind;
 import com.openexchange.assets.domain.FixedPoint;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.OrderFaultKind;
+import com.openexchange.assets.domain.SettleRejectReason;
+import com.openexchange.assets.domain.commands.SettleCommand;
+import org.agrona.collections.Long2LongHashMap;
 import com.openexchange.assets.domain.Market;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.RejectReason;
+import com.openexchange.assets.domain.commands.AmendOrderCommand;
 import com.openexchange.assets.domain.commands.CancelOrderCommand;
 import com.openexchange.assets.domain.commands.CreateOrderCommand;
 import com.openexchange.assets.domain.commands.RiskConfigSetCommand;
@@ -50,6 +58,33 @@ public final class OrderEngine {
     private static final int T_RISK = 71;
     private static final int T_BREAKER = 72;
     private static final int T_REQUEST_RISK = 75;
+    private static final int T_AMEND = 52;
+    private static final int T_ORDER_SNAPSHOT = 53;
+    private static final int T_QUARANTINE = 74;
+    /** Replace window observability deadline (lifecycle B5, D6): no state change when it fires. */
+    public static final long REPLACE_DEADLINE_MS = 10_000L;
+    /** RequestOrderSnapshot page cap (contract 3.6). */
+    public static final int ORDER_SNAPSHOT_PAGE = 512;
+    public static final int PENDING_DISPATCH_DEFAULT = 1024;
+    public static final int PENDING_DISPATCH_CAP = 4096;
+    private static final int ST_NEW = 0;
+    private static final int ST_PARTIALLY_FILLED = 1;
+    private static final int ST_FILLED = 2;
+    private static final int ST_CANCELLED = 3;
+    private static final int ST_REJECTED = 4;
+    private static final int ST_EXPIRED = 5;
+    private static final int ST_PENDING_NEW = 6;
+    private static final int ST_PENDING_REPLACE = 9;
+    private static final int RESULT_APPLIED = 0;
+    private static final int RESULT_REJECTED = 1;
+    private static final int RESULT_CONFLICT = 2;
+    private static final int RESULT_CAPACITY = 3;
+    private static final int RESULT_UNKNOWN_LEG = 4;
+    private static final int RESULT_NOT_OWNER = 5;
+    private static final int RESULT_UNKNOWN_MARKET = 6;
+
+    private final SettleCommand settleCommand = new SettleCommand();
+    private final CoreOrderView[] snapshotPage = new CoreOrderView[ORDER_SNAPSHOT_PAGE];
 
     private final AssetsEngine ledger;
     private final OrderStore orders = new OrderStore();
@@ -59,6 +94,15 @@ public final class OrderEngine {
     private long[] userScratch = new long[256];
 
     // Diagnostics (node-local, not replicated, not snapshotted).
+    private long staleTerminalCount;
+    private long staleOutcomeCount;
+    private long redundantOutcomeCount;
+    private long implicitAckCount;
+    private long conflictCount;
+    private long cancelRefusedCount;
+    private long replaceSlowCount;
+    private long tradeGapCount;
+    private long orderFaultCount;
     private long acceptedCount;
     private long rejectedCount;
     private long cancelledCount;
@@ -325,9 +369,119 @@ public final class OrderEngine {
                           final long price, final long quantity, final long budget) {
         final long dispatchSeq = ledger.getDispatchSeq() + 1;
         ledger.setDispatchSeq(dispatchSeq);
+        o.pendingDispatchSeq = dispatchSeq;
+        o.set(CoreOrder.F_DISPATCH_PENDING);
         final long idLow = ((long) o.attempt << 2) | kind.code();
         sink.onMeDispatch(dispatchSeq, o.orderId, idLow, kind, o.userId, o.orderId, oldLegId, o.marketId,
                 o.orderType, o.side, price, quantity, budget, o.timeInForce);
+    }
+
+    /** Mint the single cancel for a resting leg (attempt+1, kind CANCEL) and say so on the orders channel. */
+    private void mintCancel(final CoreOrder o, final long now) {
+        o.attempt++;
+        o.pendingKind = (byte) CoreOrder.PK_CANCEL;
+        o.updatedAtMs = now;
+        dispatch(ledger.eventSink(), o, DispatchKind.CANCEL, o.currentLegId, 0L, 0L, 0L);
+        emitEvent(o, EventKind.DISPATCHED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+    }
+
+    private void clearPending(final CoreOrder o) {
+        o.unset(CoreOrder.F_DISPATCH_PENDING);
+        o.pendingDispatchSeq = 0L;
+        o.pendingKind = (byte) CoreOrder.PK_NONE;
+    }
+
+    private static int kindCodeOf(final int pendingKind) {
+        switch (pendingKind) {
+            case CoreOrder.PK_CREATE: return DispatchKind.CREATE.code();
+            case CoreOrder.PK_CANCEL: return DispatchKind.CANCEL.code();
+            case CoreOrder.PK_AMEND:  return DispatchKind.AMEND.code();
+            default: return -1;
+        }
+    }
+
+    private long holdRemaining(final CoreOrder o) {
+        final Account a = ledger.account(o.userId);
+        return a == null ? 0L : a.holdRemaining(o.orderId);
+    }
+
+    /** One OrderEvent per transition with a fresh eventSeq (projector idempotency key). */
+    private void emitEvent(final CoreOrder o, final EventKind kind, final CoreRejectReason reason, final long lastPrice,
+                           final long lastQty, final long tradeId, final long now) {
+        final long eventSeq = ledger.getEventSeq() + 1;
+        ledger.setEventSeq(eventSeq);
+        o.eventSeq = eventSeq;
+        ledger.eventSink().onOrderEvent(eventSeq, ledger.getLogPosition(), o, kind, reason, lastPrice, lastQty, tradeId,
+                holdRemaining(o), now);
+    }
+
+    private void fault(final OrderFaultKind kind, final CoreOrder o, final long tradeId, final long amount) {
+        orderFaultCount++;
+        ledger.eventSink().onOrderFault(kind, o.orderId, o.userId, o.marketId, tradeId, amount, ledger.getLogPosition());
+    }
+
+    /**
+     * The single terminal apply (contract 3.2): release whatever the order still holds, drop its deadlines and pending
+     * dispatch, emit the terminal event with the record still visible, then remove the record from every index.
+     */
+    private void terminalize(final CoreOrder o, final int statusCode, final EventKind kind, final CoreRejectReason reason,
+                             final long lastPrice, final long lastQty, final long tradeId, final long now) {
+        if (o.expiresAtMs > 0 && !o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
+            ledger.deadlines().remove(o.expiresAtMs, o.orderId, DeadlineIndex.KIND_GTD);
+        }
+        if (o.replaceDeadlineMs > 0) {
+            ledger.deadlines().remove(o.replaceDeadlineMs, o.orderId, DeadlineIndex.KIND_REPLACE);
+            o.replaceDeadlineMs = 0L;
+        }
+        clearPending(o);
+        o.unset(CoreOrder.F_REPLACE_PENDING);
+        o.status = (byte) statusCode;
+        o.rejectReason = (byte) reason.code();
+        o.updatedAtMs = now;
+        ledger.releaseOrderHold(o.userId, o.orderId, -1L);
+        emitEvent(o, kind, reason, lastPrice, lastQty, tradeId, now);
+        if (statusCode == ST_CANCELLED || statusCode == ST_EXPIRED) {
+            cancelledCount++;
+        }
+        orders.remove(o);
+    }
+
+    /** B7 resolution: the ME replaced the leg; install the window and settle the hold to its target. */
+    private void resolveReplace(final CoreOrder o, final long newLegId, final long now) {
+        if (o.pendingHoldDelta < 0) {
+            ledger.releaseOrderHold(o.userId, o.orderId, -o.pendingHoldDelta);
+        }
+        o.holdAmount = o.pendingHoldTarget;
+        o.price = o.pendingPrice;
+        o.quantity = o.pendingQuantity;
+        o.remainingQty = Math.max(0L, o.quantity - o.filledQty);
+        o.currentLegId = newLegId;
+        closeReplaceWindow(o, now);
+        emitEvent(o, EventKind.REPLACED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+    }
+
+    /** B7 abort: the ME refused the amend; give back the top-up, the order stays live on the old leg. */
+    private void abortReplace(final CoreOrder o, final CoreRejectReason reason, final long now) {
+        if (o.pendingHoldDelta > 0) {
+            ledger.releaseOrderHold(o.userId, o.orderId, o.pendingHoldDelta);
+        }
+        closeReplaceWindow(o, now);
+        emitEvent(o, EventKind.REPLACED, reason, 0L, 0L, 0L, now);
+    }
+
+    private void closeReplaceWindow(final CoreOrder o, final long now) {
+        if (o.replaceDeadlineMs > 0) {
+            ledger.deadlines().remove(o.replaceDeadlineMs, o.orderId, DeadlineIndex.KIND_REPLACE);
+            o.replaceDeadlineMs = 0L;
+        }
+        o.pendingPrice = 0L;
+        o.pendingQuantity = 0L;
+        o.pendingHoldDelta = 0L;
+        o.pendingHoldTarget = 0L;
+        o.oldLegId = 0L;
+        o.unset(CoreOrder.F_REPLACE_PENDING);
+        o.status = (byte) (o.filledQty > 0 ? ST_PARTIALLY_FILLED : ST_NEW);
+        o.updatedAtMs = now;
     }
 
     private void reject(final AssetsEventSink sink, final CreateOrderCommand c, final CoreRejectReason reason, final long detail,
@@ -403,7 +557,7 @@ public final class OrderEngine {
             rejectCancel(sink, c, orderId, CoreRejectReason.NOT_OWNER, now);
             return;
         }
-        if (o.isTerminal()) {
+        if (o.isTerminal() || o.has(CoreOrder.F_QUARANTINED)) {
             rejectCancel(sink, c, orderId, CoreRejectReason.NOT_OPEN, now);
             return;
         }
@@ -415,20 +569,17 @@ public final class OrderEngine {
         }
         o.set(CoreOrder.F_CANCEL_PENDING);
         o.updatedAtMs = now;
-        if (!o.has(CoreOrder.F_DISPATCH_PENDING) && o.currentLegId != 0) {
-            // a leg is resting at the ME: mint the cancel now (C8b); while the create is unresolved the flag
-            // alone is recorded and the cancel is minted when the ACK lands (S5)
-            o.attempt++;
-            o.pendingKind = (byte) CoreOrder.PK_CANCEL;
-            o.set(CoreOrder.F_DISPATCH_PENDING);
-            dispatch(sink, o, DispatchKind.CANCEL, o.currentLegId, 0L, 0L, 0L);
-        }
-        cancelledCount++;
+        final boolean mint = !o.has(CoreOrder.F_DISPATCH_PENDING) && o.currentLegId != 0;
         if (hasRequest) {
             remember(c.userId, c.requestIdHigh, c.requestIdLow, c.fingerprint(), now, RequestTable.KIND_CANCEL, orderId, 0);
         }
         sink.onOrderAck(c.correlationId, c.requestIdHigh, c.requestIdLow, orderId, c.userId, o.marketId,
                 OrderStatus.PENDING_CANCEL, false, o.holdAssetId, o.holdAmount, now, o.eventSeq);
+        if (mint) {
+            // a leg is resting at the ME: mint the cancel now (C8b); while the create is unresolved the flag
+            // alone is recorded and the cancel is minted when the ACK lands (3.3)
+            mintCancel(o, now);
+        }
     }
 
     private void rejectCancel(final AssetsEventSink sink, final CancelOrderCommand c, final long orderId,
@@ -532,13 +683,21 @@ public final class OrderEngine {
                 o.set(CoreOrder.F_EXPIRY_REQUESTED);
                 o.set(CoreOrder.F_CANCEL_PENDING);
                 o.updatedAtMs = now;
-                if (!o.has(CoreOrder.F_DISPATCH_PENDING) && o.currentLegId != 0) {
-                    o.attempt++;
-                    o.pendingKind = (byte) CoreOrder.PK_CANCEL;
-                    o.set(CoreOrder.F_DISPATCH_PENDING);
-                    dispatch(ledger.eventSink(), o, DispatchKind.CANCEL, o.currentLegId, 0L, 0L, 0L);
+                if (!o.has(CoreOrder.F_DISPATCH_PENDING) && o.currentLegId != 0 && !o.has(CoreOrder.F_QUARANTINED)) {
+                    mintCancel(o, now);
                 }
                 // the create is unresolved: the single cancel is minted when the ACK lands (C9 + C8b)
+                break;
+            }
+            case DeadlineIndex.KIND_REPLACE: {
+                final CoreOrder o = orders.get(id);
+                if (o != null && o.has(CoreOrder.F_REPLACE_PENDING) && o.replaceDeadlineMs == deadlineMs) {
+                    // observability only (B5, D6): the durable outcome resolves the window. Re-armed while the window
+                    // stays open, so a stuck replace keeps ticking (one entry per open window, derivable from the record).
+                    replaceSlowCount++;
+                    o.replaceDeadlineMs = deadlineMs + REPLACE_DEADLINE_MS;
+                    ledger.deadlines().add(o.replaceDeadlineMs, o.orderId, DeadlineIndex.KIND_REPLACE);
+                }
                 break;
             }
             case DeadlineIndex.KIND_REQUEST_TTL:
@@ -548,6 +707,539 @@ public final class OrderEngine {
                 break;
         }
     }
+
+    // ---------------------------------------------------------------- RC1 S5: feed (bridge) events
+
+    /** MeJournalTrade (61) / one entry of MeJournalTradeBatch (62). Contract S5 §3.1. */
+    public void applyTrade(final long egressSeq, final long tradeId, final int marketId, final long takerLegId,
+                           final long takerUserId, final long makerLegId, final long makerUserId, final long price,
+                           final long quantity, final boolean takerIsBuy, final long meTimestamp, final long takerOmsOrderId,
+                           final long makerOmsOrderId, final long meEpoch, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        final long now = ledger.getLastLogTime();
+        final long last = ledger.getLastAppliedTradeId();
+        if (tradeId <= last) {
+            return; // already applied: byte-level no-op (R-C5b)
+        }
+        if (tradeId != last + 1) {
+            tradeGapCount++;
+            ledger.eventSink().onSettleRejected(tradeId, marketId, egressSeq, SettleRejectReason.TRADE_GAP, last + 1);
+            return;
+        }
+        // 1. money, for the full trade quantity, through the ledger's settle (hold-scoped, faults never silent)
+        final SettleCommand sc = settleCommand;
+        sc.reset();
+        sc.setJournalPosition(egressSeq);
+        sc.setTradeId(tradeId);
+        sc.setMarketId(marketId);
+        sc.setTakerOrderId(takerOmsOrderId);
+        sc.setTakerUserId(takerUserId);
+        sc.setMakerOrderId(makerOmsOrderId);
+        sc.setMakerUserId(makerUserId);
+        sc.setPrice(price);
+        sc.setQuantity(quantity);
+        sc.setTakerIsBuy(takerIsBuy);
+        if (!ledger.settle(sc, timestamp)) {
+            return; // refused before any mutation (SettleRejected emitted); the order accounting stays untouched too
+        }
+        // 2. the two core orders (either may be a legacy hold the core does not own)
+        applyFill(takerOmsOrderId, takerLegId, takerUserId, price, quantity, tradeId, now);
+        applyFill(makerOmsOrderId, makerLegId, makerUserId, price, quantity, tradeId, now);
+    }
+
+    private void applyFill(final long omsOrderId, final long legId, final long userId, final long price, final long quantity,
+                           final long tradeId, final long now) {
+        final CoreOrder o = orders.get(omsOrderId);
+        if (o == null) {
+            return;
+        }
+        if (o.userId != userId) {
+            fault(OrderFaultKind.SETTLE, o, tradeId, quantity);
+            return;
+        }
+        boolean implicitAck = false;
+        boolean windowClosedByTrade = false;
+        if (legId != 0 && o.currentLegId == 0 && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE) {
+            // implicit ack: the leg exists at the ME (contract 3.1); the post-ack rules run after the fill below
+            o.currentLegId = legId;
+            clearPending(o);
+            o.status = (byte) ST_NEW;
+            o.updatedAtMs = now;
+            implicitAckCount++;
+            implicitAck = true;
+            emitEvent(o, EventKind.ACK_NEW, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+        } else if (legId != 0 && legId != o.currentLegId) {
+            if (o.has(CoreOrder.F_REPLACE_PENDING) && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_AMEND) {
+                // a trade on the NEW leg before the amend outcome: resolve first (B7), then fill; the window is closed
+                // by this trade, so the post-window rules (3.8 #9/#13: a cancel flagged meanwhile) run after the fill
+                clearPending(o);
+                resolveReplace(o, legId, now);
+                windowClosedByTrade = true;
+            } else {
+                fault(OrderFaultKind.SETTLE, o, tradeId, quantity);
+                return;
+            }
+        }
+        final long fillQty = Math.min(quantity, o.remainingQty);
+        final long excess = quantity - fillQty;
+        if (excess > 0) {
+            fault(OrderFaultKind.OVERFILL, o, tradeId, excess);
+        }
+        if (fillQty <= 0) {
+            if (implicitAck) {
+                afterAck(o, now);
+            }
+            return;
+        }
+        o.filledQty += fillQty;
+        o.remainingQty -= fillQty;
+        o.cumQuoteQty += FixedPoint.multiply(price, fillQty);
+        o.lastPrice = price;
+        o.lastQty = fillQty;
+        o.updatedAtMs = now;
+        final UserRisk u = userOrCreate(o.userId);
+        final long pos = u.position[o.marketId];
+        final long projected = o.side == SIDE_BUY ? pos + fillQty : pos - fillQty;
+        final boolean wrap = o.side == SIDE_BUY ? projected < pos : projected > pos;
+        if (wrap) {
+            fault(OrderFaultKind.POSITION_OVERFLOW, o, tradeId, fillQty);
+            u.position[o.marketId] = o.side == SIDE_BUY ? Long.MAX_VALUE : Long.MIN_VALUE + 1;
+        } else {
+            u.position[o.marketId] = projected;
+        }
+        if (o.remainingQty == 0) {
+            terminalize(o, ST_FILLED, EventKind.FILL, CoreRejectReason.NONE, price, fillQty, tradeId, now);
+            return;
+        }
+        if (o.status == ST_PENDING_NEW || o.status == ST_NEW) {
+            o.status = (byte) ST_PARTIALLY_FILLED; // an open replace window keeps PENDING_REPLACE until it resolves
+        }
+        emitEvent(o, EventKind.FILL, CoreRejectReason.NONE, price, fillQty, tradeId, now);
+        if (implicitAck) {
+            afterAck(o, now);
+        }
+        if (windowClosedByTrade && orders.get(o.orderId) == o) {
+            afterWindow(o, now);
+        }
+    }
+
+    /** What a create ACK triggers once the leg is known: the cancel asked for meanwhile (C8b) or the IOC cancel (C13). */
+    private void afterAck(final CoreOrder o, final long now) {
+        if (o.has(CoreOrder.F_QUARANTINED) || o.has(CoreOrder.F_DISPATCH_PENDING)) {
+            return;
+        }
+        if (o.has(CoreOrder.F_CANCEL_PENDING)) {
+            mintCancel(o, now);
+        } else if (o.has(CoreOrder.F_IOC) && o.remainingQty > 0) {
+            o.set(CoreOrder.F_CANCEL_PENDING);
+            mintCancel(o, now);
+        }
+    }
+
+    /** A replace window closed (resolved or aborted) with the order still live: a cancel asked for meanwhile goes out now. */
+    private void afterWindow(final CoreOrder o, final long now) {
+        if (o.remainingQty == 0) {
+            terminalize(o, ST_FILLED, EventKind.FILL, CoreRejectReason.NONE, o.lastPrice, 0L, 0L, now); // fills inside the window reached the new quantity
+            return;
+        }
+        if (o.has(CoreOrder.F_CANCEL_PENDING) && !o.has(CoreOrder.F_QUARANTINED) && !o.has(CoreOrder.F_DISPATCH_PENDING)) {
+            mintCancel(o, now);
+        }
+    }
+
+    /** MeJournalTerminal (63). Contract S5 §3.2. */
+    public void applyTerminal(final long egressSeq, final long legId, final long userId, final int marketId, final int statusCode,
+                              final long meTimestamp, final long omsOrderId, final long meEpoch, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        final long now = ledger.getLastLogTime();
+        final CoreOrder o = orders.get(omsOrderId);
+        if (o == null) {
+            staleTerminalCount++;
+            return;
+        }
+        if (o.has(CoreOrder.F_REPLACE_PENDING) && legId != 0 && legId != o.currentLegId) {
+            // the NEW leg speaks before the amend outcome: resolve first, then apply (B7)
+            clearPending(o);
+            resolveReplace(o, legId, now);
+        }
+        if (legId != o.currentLegId) {
+            staleTerminalCount++;
+            return;
+        }
+        if (o.has(CoreOrder.F_REPLACE_PENDING)) {
+            if (statusCode == ST_REJECTED) {
+                clearPending(o); // the ME named the OLD leg when it refused the amend (A6): abort, order stays live
+                abortReplace(o, CoreRejectReason.ME_REJECTED, now);
+                afterWindow(o, now);
+            } else {
+                staleTerminalCount++; // the replace's own cancel of the old leg: bookkeeping only
+            }
+            return;
+        }
+        switch (statusCode) {
+            case ST_FILLED:
+                if (o.remainingQty > 0) {
+                    fault(OrderFaultKind.SETTLE, o, 0L, o.remainingQty);
+                }
+                terminalize(o, ST_FILLED, EventKind.FILL, CoreRejectReason.NONE, o.lastPrice, 0L, 0L, now);
+                break;
+            case ST_CANCELLED:
+                if (o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
+                    terminalize(o, ST_EXPIRED, EventKind.EXPIRED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                } else {
+                    terminalize(o, ST_CANCELLED, EventKind.CANCELLED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                }
+                break;
+            case ST_REJECTED:
+                terminalize(o, ST_REJECTED, EventKind.REJECTED, CoreRejectReason.ME_REJECTED, 0L, 0L, 0L, now);
+                break;
+            case ST_EXPIRED:
+                terminalize(o, ST_EXPIRED, EventKind.EXPIRED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                break;
+            default:
+                staleTerminalCount++;
+                break;
+        }
+    }
+
+    /** MeCommandOutcome (64). Contract S5 §3.3. */
+    public void applyOutcome(final long egressSeq, final long commandIdHigh, final long commandIdLow, final long userId,
+                             final long omsOrderId, final long oldOrderId, final long price, final long quantity, final long budget,
+                             final int marketId, final int commandKind, final int result, final long legId, final int reason,
+                             final long meTimestamp, final long meEpoch, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        final long now = ledger.getLastLogTime();
+        final CoreOrder o = orders.get(commandIdHigh);
+        if (o == null || !o.has(CoreOrder.F_DISPATCH_PENDING)
+                || commandIdLow != (((long) o.attempt << 2) | kindCodeOf(o.pendingKind))) {
+            if (o != null && legId != 0 && legId == o.currentLegId && result == RESULT_APPLIED) {
+                redundantOutcomeCount++; // the leg was already learned (implicit ack by trade) or delivered twice
+            } else {
+                staleOutcomeCount++;
+            }
+            return;
+        }
+        final int pending = o.pendingKind;
+        switch (result) {
+            case RESULT_APPLIED:
+                if (pending == CoreOrder.PK_CREATE) {
+                    o.currentLegId = legId;
+                    clearPending(o);
+                    if (o.status == ST_PENDING_NEW) {
+                        o.status = (byte) ST_NEW;
+                    }
+                    o.updatedAtMs = now;
+                    emitEvent(o, EventKind.ACK_NEW, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                    afterAck(o, now); // C8b cancel asked for meanwhile, or C13 IOC: one cancel
+                } else if (pending == CoreOrder.PK_CANCEL) {
+                    clearPending(o);
+                    if (o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
+                        terminalize(o, ST_EXPIRED, EventKind.EXPIRED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                    } else {
+                        terminalize(o, ST_CANCELLED, EventKind.CANCELLED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                    }
+                } else {
+                    clearPending(o);
+                    resolveReplace(o, legId, now);
+                    afterWindow(o, now);
+                }
+                break;
+            case RESULT_REJECTED:
+            case RESULT_UNKNOWN_LEG:
+            case RESULT_NOT_OWNER:
+            case RESULT_UNKNOWN_MARKET: {
+                final CoreRejectReason why = result == RESULT_REJECTED ? CoreRejectReason.ME_REJECTED
+                        : result == RESULT_UNKNOWN_LEG ? CoreRejectReason.ME_UNKNOWN_LEG
+                        : result == RESULT_NOT_OWNER ? CoreRejectReason.NOT_OWNER : CoreRejectReason.UNKNOWN_MARKET;
+                if (pending == CoreOrder.PK_CREATE) {
+                    clearPending(o);
+                    terminalize(o, ST_REJECTED, EventKind.REJECTED, why, 0L, 0L, 0L, now);
+                } else if (pending == CoreOrder.PK_CANCEL) {
+                    clearPending(o); // the leg is gone or refused: the journal terminal settles it; the flag stays
+                    cancelRefusedCount++;
+                } else {
+                    clearPending(o);
+                    abortReplace(o, why, now);
+                    afterWindow(o, now);
+                }
+                break;
+            }
+            case RESULT_CONFLICT:
+                clearPending(o);
+                o.set(CoreOrder.F_QUARANTINED);
+                o.rejectReason = (byte) CoreRejectReason.ME_CONFLICT.code();
+                o.updatedAtMs = now;
+                conflictCount++;
+                emitEvent(o, EventKind.QUARANTINED, CoreRejectReason.ME_CONFLICT, 0L, 0L, 0L, now);
+                break;
+            case RESULT_CAPACITY:
+                // the ME command ledger is full: close order entry, keep the dispatch pending for the resync (2.6)
+                ledger.suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.ME_CAPACITY);
+                break;
+            default:
+                staleOutcomeCount++;
+                break;
+        }
+    }
+
+    // ---------------------------------------------------------------- RC1 S5: AmendOrder, QuarantineOrder, queries
+
+    /** AmendOrder (52). Contract S5 §3.4 (lifecycle B7). */
+    public void applyAmend(final AmendOrderCommand c, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        final long now = ledger.getLastLogTime();
+        final AssetsEventSink sink = ledger.eventSink();
+        if (!c.hasRequestId()) {
+            rejectAmend(sink, c, CoreRejectReason.MISSING_REQUEST_ID, 0, now, false);
+            return;
+        }
+        final RequestTable.Entry seen = requests.get(c.userId, c.requestIdHigh, c.requestIdLow);
+        if (seen != null) {
+            if (seen.fingerprint != c.fingerprint()) {
+                rejectAmend(sink, c, CoreRejectReason.REQUEST_ID_PAYLOAD_MISMATCH, seen.requestSeq, now, false);
+                return;
+            }
+            if (seen.reason != 0) {
+                rejectAmend(sink, c, reasonOf(seen.reason), 0, now, false);
+                return;
+            }
+            final CoreOrder live = orders.get(seen.orderId);
+            sink.onOrderAck(c.correlationId, c.requestIdHigh, c.requestIdLow, seen.orderId, c.userId,
+                    live == null ? 0 : live.marketId, live == null ? OrderStatus.PENDING_REPLACE : statusOf(live), true,
+                    live == null ? 0 : live.holdAssetId, live == null ? 0L : live.holdAmount, now, live == null ? 0L : live.eventSeq);
+            return;
+        }
+        if (requests.countFor(c.userId) >= RequestTable.PER_USER_CAP) {
+            rejectAmend(sink, c, CoreRejectReason.TOO_MANY_PENDING_REQUESTS, requests.countFor(c.userId), now, false);
+            return;
+        }
+        final CoreOrder o = orders.get(c.orderId);
+        if (o == null) {
+            rejectAmend(sink, c, CoreRejectReason.UNKNOWN_ORDER, c.orderId, now, false);
+            return;
+        }
+        if (o.userId != c.userId) {
+            rejectAmend(sink, c, CoreRejectReason.NOT_OWNER, c.orderId, now, false);
+            return;
+        }
+        if (o.isTerminal() || o.has(CoreOrder.F_QUARANTINED) || o.has(CoreOrder.F_CANCEL_PENDING)
+                || (o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE)
+                || (o.orderType != TYPE_LIMIT && o.orderType != TYPE_LIMIT_MAKER)) {
+            rejectAmend(sink, c, CoreRejectReason.NOT_OPEN, c.orderId, now, false);
+            return;
+        }
+        if (o.has(CoreOrder.F_REPLACE_PENDING)) {
+            rejectAmend(sink, c, CoreRejectReason.AMEND_PENDING, c.orderId, now, false);
+            return;
+        }
+        if (!ledger.gate().admits(o.marketId)) {
+            rejectAmend(sink, c, CoreRejectReason.GATE_CLOSED, o.marketId, now, false);
+            return;
+        }
+        final MarketRisk m = markets[o.marketId];
+        final UserRisk u = userOrCreate(c.userId);
+        u.roll(now);
+        if (u.secCount >= m.maxOrdersPerSec || u.minCount >= m.maxOrdersPerMin) {
+            rejectAmend(sink, c, CoreRejectReason.RATE_LIMIT, u.secCount >= m.maxOrdersPerSec ? m.maxOrdersPerSec : m.maxOrdersPerMin, now, true);
+            return;
+        }
+        u.secCount++;
+        u.minCount++;
+        if (m.breakerTripped) {
+            rejectAmend(sink, c, CoreRejectReason.CIRCUIT_BREAKER, o.marketId, now, true);
+            return;
+        }
+        final long newPrice = c.newPrice == 0 ? o.price : c.newPrice;
+        final long newQty = c.newQuantity == 0 ? o.quantity : c.newQuantity;
+        final long legQty = newQty - o.filledQty;
+        if (c.newPrice < 0 || c.newQuantity < 0 || (c.newPrice == 0 && c.newQuantity == 0) || legQty <= 0) {
+            rejectAmend(sink, c, CoreRejectReason.INVALID, legQty, now, true);
+            return;
+        }
+        if (newQty < m.minQuantity) {
+            rejectAmend(sink, c, CoreRejectReason.SIZE_TOO_SMALL, m.minQuantity, now, true);
+            return;
+        }
+        if (newQty > m.maxQuantity) {
+            rejectAmend(sink, c, CoreRejectReason.SIZE_TOO_LARGE, m.maxQuantity, now, true);
+            return;
+        }
+        if (!FixedPoint.multiplyFits(newPrice, legQty) || !FixedPoint.multiplyFits(newPrice, newQty)) {
+            rejectAmend(sink, c, CoreRejectReason.NOTIONAL_TOO_LARGE, newPrice, now, true);
+            return;
+        }
+        final long legNotional = FixedPoint.multiply(newPrice, legQty);
+        if ((o.side == SIDE_BUY && legNotional <= 0) || legNotional < m.minNotional) {
+            rejectAmend(sink, c, CoreRejectReason.NOTIONAL_TOO_SMALL, legNotional, now, true);
+            return;
+        }
+        if (legNotional > m.maxNotional) {
+            rejectAmend(sink, c, CoreRejectReason.NOTIONAL_TOO_LARGE, legNotional, now, true);
+            return;
+        }
+        if (m.lastTradePrice > 0 && m.priceCollarBps > 0) {
+            final long dev = Math.abs(newPrice - m.lastTradePrice);
+            final long limit = bps(m.lastTradePrice, m.priceCollarBps);
+            if (dev > limit) {
+                rejectAmend(sink, c, CoreRejectReason.PRICE_COLLAR, limit, now, true);
+                return;
+            }
+        }
+        // hold target and delta (LS:93-103, 162-174 formulas, exact fixed point)
+        final long holdTarget;
+        final long holdDelta;
+        if (o.side == SIDE_BUY) {
+            holdTarget = FixedPoint.multiply(newPrice, newQty);
+            final long oldLeg = FixedPoint.multiply(o.price, o.quantity - o.filledQty);
+            holdDelta = legNotional - oldLeg;
+        } else {
+            holdTarget = newQty;
+            holdDelta = legQty - (o.quantity - o.filledQty);
+        }
+        final Account account = ledger.account(c.userId);
+        if (holdDelta > 0) {
+            final RejectReason held = account == null ? RejectReason.INSUFFICIENT_FUNDS
+                    : account.hold(o.orderId, o.holdAssetId, holdDelta, false);
+            if (!held.accepted()) {
+                rejectAmend(sink, c, CoreRejectReason.INSUFFICIENT_FUNDS, holdDelta, now, true);
+                return;
+            }
+            sink.onBalanceUpdate(c.userId, o.holdAssetId, account.available(o.holdAssetId), account.locked(o.holdAssetId));
+        }
+        // ---- accepted: window, dispatch, deadline, requestId, ack, event
+        o.pendingPrice = newPrice;
+        o.pendingQuantity = newQty;
+        o.pendingHoldDelta = holdDelta;
+        o.pendingHoldTarget = holdTarget;
+        o.oldLegId = o.currentLegId;
+        o.set(CoreOrder.F_REPLACE_PENDING);
+        o.status = (byte) ST_PENDING_REPLACE;
+        o.attempt++;
+        o.pendingKind = (byte) CoreOrder.PK_AMEND;
+        o.updatedAtMs = now;
+        o.replaceDeadlineMs = now + REPLACE_DEADLINE_MS;
+        ledger.deadlines().add(o.replaceDeadlineMs, o.orderId, DeadlineIndex.KIND_REPLACE);
+        dispatch(sink, o, DispatchKind.AMEND, o.currentLegId, newPrice, legQty, 0L);
+        remember(c.userId, c.requestIdHigh, c.requestIdLow, c.fingerprint(), now, RequestTable.KIND_AMEND, o.orderId, 0);
+        sink.onOrderAck(c.correlationId, c.requestIdHigh, c.requestIdLow, o.orderId, c.userId, o.marketId,
+                OrderStatus.PENDING_REPLACE, false, o.holdAssetId, o.holdAmount, now, o.eventSeq);
+        emitEvent(o, EventKind.DISPATCHED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+    }
+
+    private void rejectAmend(final AssetsEventSink sink, final AmendOrderCommand c, final CoreRejectReason reason, final long detail,
+                             final long now, final boolean remember) {
+        rejectedCount++;
+        sink.onOrderReject(c.correlationId, c.requestIdHigh, c.requestIdLow, c.userId, c.orderId, 0, T_AMEND, reason, 255, detail, now);
+        if (remember && c.hasRequestId()) {
+            remember(c.userId, c.requestIdHigh, c.requestIdLow, c.fingerprint(), now, RequestTable.KIND_AMEND, c.orderId, reason.code());
+        }
+    }
+
+    /** QuarantineOrder (74). Contract S5 §3.5 (lifecycle C14). */
+    public void applyQuarantine(final long correlationId, final long orderId, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        final long now = ledger.getLastLogTime();
+        final AssetsEventSink sink = ledger.eventSink();
+        final CoreOrder o = orders.get(orderId);
+        if (o == null) {
+            sink.onAdminAck(correlationId, T_QUARANTINE, AdminResult.REJECTED, CoreRejectReason.UNKNOWN_ORDER.code(), 0L);
+            return;
+        }
+        if (o.has(CoreOrder.F_QUARANTINED)) {
+            sink.onAdminAck(correlationId, T_QUARANTINE, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        o.set(CoreOrder.F_QUARANTINED);
+        o.updatedAtMs = now;
+        sink.onAdminAck(correlationId, T_QUARANTINE, AdminResult.ACCEPTED, 0, 0L);
+        emitEvent(o, EventKind.QUARANTINED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+    }
+
+    /** RequestOrderSnapshot (53), ORIGIN-only reply. Contract S5 §3.6. */
+    public void applyRequestOrderSnapshot(final long correlationId, final long userId, final long fromOrderId,
+                                          final boolean allUsersAllowed) {
+        final AssetsEventSink sink = ledger.eventSink();
+        if (userId == 0 && !allUsersAllowed) {
+            sink.onOrderReject(correlationId, 0L, 0L, userId, 0L, 0, T_ORDER_SNAPSHOT, CoreRejectReason.INVALID, 255, 0L,
+                    ledger.getLastLogTime());
+            return;
+        }
+        final int[] n = {0};
+        final long[] lastId = {0L};
+        final boolean[] more = {false};
+        orders.forEachByOrderId(o -> {
+            if (o.orderId <= fromOrderId || (userId != 0 && o.userId != userId)) {
+                return;
+            }
+            if (n[0] == ORDER_SNAPSHOT_PAGE) {
+                more[0] = true;
+                return;
+            }
+            snapshotPage[n[0]++] = o;
+            lastId[0] = o.orderId;
+        });
+        if (n[0] > 0) {
+            sink.onOrderSnapshotBatch(correlationId, snapshotPage, n[0]);
+        }
+        sink.onOrderSnapshotEnd(correlationId, n[0], more[0] ? lastId[0] : 0L, ledger.getLogPosition());
+        Arrays.fill(snapshotPage, 0, n[0], null);
+    }
+
+    /** RequestPendingDispatch (65), ORIGIN-only reply. Contract S5 §3.6. */
+    public void applyRequestPendingDispatch(final long correlationId, final long fromDispatchSeq, final int maxEntries) {
+        final AssetsEventSink sink = ledger.eventSink();
+        final int max = maxEntries <= 0 ? PENDING_DISPATCH_DEFAULT : Math.min(maxEntries, PENDING_DISPATCH_CAP);
+        // a resync is rare and leader-only in effect: an allocation per call is acceptable (not a hot path)
+        final Long2LongHashMap seqToOrder = new Long2LongHashMap(-1L);
+        orders.forEachByOrderId(o -> {
+            if (o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingDispatchSeq > fromDispatchSeq) {
+                seqToOrder.put(o.pendingDispatchSeq, o.orderId);
+            }
+        });
+        final long[] seqs = new long[seqToOrder.size()];
+        int i = 0;
+        for (final long seq : seqToOrder.keySet()) {
+            seqs[i++] = seq;
+        }
+        Arrays.sort(seqs);
+        final int count = Math.min(max, seqs.length);
+        for (int k = 0; k < count; k++) {
+            final CoreOrder o = orders.get(seqToOrder.get(seqs[k]));
+            final DispatchKind kind;
+            long oldLeg = 0L, price = 0L, qty = 0L, budget = 0L;
+            switch (o.pendingKind) {
+                case CoreOrder.PK_CANCEL:
+                    kind = DispatchKind.CANCEL;
+                    oldLeg = o.currentLegId;
+                    break;
+                case CoreOrder.PK_AMEND:
+                    kind = DispatchKind.AMEND;
+                    oldLeg = o.oldLegId;
+                    price = o.pendingPrice;
+                    qty = o.pendingQuantity - o.filledQty;
+                    break;
+                default:
+                    kind = DispatchKind.CREATE;
+                    price = o.price;
+                    qty = o.quantity;
+                    budget = o.budget;
+                    break;
+            }
+            sink.onMeDispatchReply(o.pendingDispatchSeq, o.orderId, ((long) o.attempt << 2) | kind.code(), kind, o.userId, o.orderId,
+                    oldLeg, o.marketId, o.orderType, o.side, price, qty, budget, o.timeInForce);
+        }
+        sink.onPendingDispatchEnd(correlationId, count, ledger.getDispatchSeq());
+    }
+
+    public long staleTerminalCount() { return staleTerminalCount; }
+    public long staleOutcomeCount() { return staleOutcomeCount; }
+    public long redundantOutcomeCount() { return redundantOutcomeCount; }
+    public long implicitAckCount() { return implicitAckCount; }
+    public long conflictCount() { return conflictCount; }
+    public long cancelRefusedCount() { return cancelRefusedCount; }
+    public long replaceSlowCount() { return replaceSlowCount; }
+    public long tradeGapCount() { return tradeGapCount; }
+    public long orderFaultCount() { return orderFaultCount; }
 
     // ---------------------------------------------------------------- money requestIds (Deposit/Withdraw)
 
@@ -573,6 +1265,9 @@ public final class OrderEngine {
         orders.add(o);
         if (o.expiresAtMs > 0 && !o.isTerminal() && !o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
             ledger.deadlines().add(o.expiresAtMs, o.orderId, DeadlineIndex.KIND_GTD);
+        }
+        if (o.replaceDeadlineMs > 0 && o.has(CoreOrder.F_REPLACE_PENDING)) {
+            ledger.deadlines().add(o.replaceDeadlineMs, o.orderId, DeadlineIndex.KIND_REPLACE);
         }
     }
 

@@ -14,6 +14,12 @@ public enum SettleRejectReason
 
     INVALID_PARTY((short)4),
 
+
+    /**
+     * tradeId jumped past lastApplied+1: trades were skipped upstream; refused, cursor held (RC1 S5)
+     */
+    TRADE_GAP((short)5),
+
     /**
      * To be used to represent not present or null.
      */
@@ -51,6 +57,7 @@ public enum SettleRejectReason
             case 2: return INVALID_QUANTITY;
             case 3: return NOTIONAL_OVERFLOW;
             case 4: return INVALID_PARTY;
+            case 5: return TRADE_GAP;
             case 255: return NULL_VAL;
         }
 

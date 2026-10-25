@@ -1,0 +1,13 @@
+# S5 contract 3.4 / B7 (R-C12c): BUY 100 x 2 is amended UP to 110 (holdDelta +20 USD topped up in the apply,
+# status PENDING_REPLACE, one AMEND dispatch); the ME rejects the amend (result 1): the window is aborted, the
+# 20 USD top-up released, the order stays NEW at 100 x 2 on leg 101 and nothing is pending.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=250.0
+CREATE u=1 market=1 side=0 type=0 px=100.0 qty=2.0 rid=1
+MEOUTCOME order=1 kind=0 attempt=0 result=0 leg=101
+AMEND u=1 order=1 px=110.0 rid=2 corr=1
+ORDERSNAP u=1 corr=2
+MEOUTCOME order=1 kind=2 attempt=1 result=1 reason=7 old=101
+ORDERSNAP u=1 corr=3
+PENDINGDISPATCH corr=4

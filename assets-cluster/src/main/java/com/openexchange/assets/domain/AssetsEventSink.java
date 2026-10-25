@@ -119,4 +119,24 @@ public interface AssetsEventSink {
 
     /** BROADCAST control: a config record was applied (wire ConfigApplied). */
     void onConfigApplied(ConfigKind kind, int marketId, long configVersion, long logPosition);
+
+    // ---- RC1 S5 (defaults are no-ops so that test fakes outside the order scope need not change) ----
+
+    /** BROADCAST control: an order-level anomaly, settled and reported (wire OrderFault 113). */
+    default void onOrderFault(OrderFaultKind kind, long orderId, long userId, int marketId, long tradeId, long amount,
+                              long logPosition) { }
+
+    /** ORIGIN reply page for RequestOrderSnapshot (wire OrderSnapshotBatch 106, framed by the publisher). */
+    default void onOrderSnapshotBatch(long correlationId, CoreOrderView[] page, int count) { }
+
+    /** ORIGIN terminator for RequestOrderSnapshot (wire OrderSnapshotEnd 107). */
+    default void onOrderSnapshotEnd(long correlationId, int entryCount, long nextOrderId, long asOfLogPosition) { }
+
+    /** ORIGIN terminator for RequestPendingDispatch (wire PendingDispatchEnd 108). */
+    default void onPendingDispatchEnd(long correlationId, int count, long headDispatchSeq) { }
+
+    /** ORIGIN re-emission of a pending MeDispatch for RequestPendingDispatch (same wire frame 104). */
+    default void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                   long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                   long quantity, long budget, int timeInForceCode) { }
 }

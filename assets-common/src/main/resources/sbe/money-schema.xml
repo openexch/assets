@@ -202,6 +202,7 @@
             <validValue name="INVALID_QUANTITY">2</validValue>
             <validValue name="NOTIONAL_OVERFLOW">3</validValue>
             <validValue name="INVALID_PARTY">4</validValue>
+            <validValue name="TRADE_GAP" description="tradeId jumped past lastApplied+1: trades were skipped upstream; refused, cursor held (RC1 S5)">5</validValue>
         </enum>
         <!-- All 32 bits RESERVED in v6; a nonzero value is rejected UNSUPPORTED_FLAGS. -->
         <set name="OrderFlags" encodingType="uint32">

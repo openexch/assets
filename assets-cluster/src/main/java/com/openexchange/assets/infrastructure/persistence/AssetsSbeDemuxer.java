@@ -13,6 +13,7 @@ import com.openexchange.assets.infrastructure.generated.RegisterSessionDecoder;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.domain.Asset;
+import com.openexchange.assets.domain.commands.AmendOrderCommand;
 import com.openexchange.assets.domain.commands.CancelOrderCommand;
 import com.openexchange.assets.domain.commands.CreateOrderCommand;
 import com.openexchange.assets.domain.commands.DepositCommand;
@@ -288,6 +289,16 @@ public final class AssetsSbeDemuxer {
     private final RiskConfigSetDecoder riskConfigSetDecoder = new RiskConfigSetDecoder();
     private final CircuitBreakerDecoder circuitBreakerDecoder = new CircuitBreakerDecoder();
     private final RequestRiskConfigDecoder requestRiskConfigDecoder = new RequestRiskConfigDecoder();
+    // RC1 S5
+    private final AmendOrderDecoder amendOrderDecoder = new AmendOrderDecoder();
+    private final RequestOrderSnapshotDecoder requestOrderSnapshotDecoder = new RequestOrderSnapshotDecoder();
+    private final MeJournalTradeDecoder meJournalTradeDecoder = new MeJournalTradeDecoder();
+    private final MeJournalTradeBatchDecoder meJournalTradeBatchDecoder = new MeJournalTradeBatchDecoder();
+    private final MeJournalTerminalDecoder meJournalTerminalDecoder = new MeJournalTerminalDecoder();
+    private final MeCommandOutcomeDecoder meCommandOutcomeDecoder = new MeCommandOutcomeDecoder();
+    private final RequestPendingDispatchDecoder requestPendingDispatchDecoder = new RequestPendingDispatchDecoder();
+    private final QuarantineOrderDecoder quarantineOrderDecoder = new QuarantineOrderDecoder();
+    private final AmendOrderCommand amendOrderCommand = new AmendOrderCommand();
     private final CreateOrderCommand createOrderCommand = new CreateOrderCommand();
     private final CancelOrderCommand cancelOrderCommand = new CancelOrderCommand();
     private final RiskConfigSetCommand riskConfigSetCommand = new RiskConfigSetCommand();
@@ -408,6 +419,14 @@ public final class AssetsSbeDemuxer {
                 case RiskConfigSetDecoder.TEMPLATE_ID:          handleRiskConfigSet(timestamp); break;
                 case CircuitBreakerDecoder.TEMPLATE_ID:         handleCircuitBreaker(timestamp); break;
                 case RequestRiskConfigDecoder.TEMPLATE_ID:      handleRequestRiskConfig(); break;
+                case AmendOrderDecoder.TEMPLATE_ID:             handleAmendOrder(timestamp); break;
+                case RequestOrderSnapshotDecoder.TEMPLATE_ID:   handleRequestOrderSnapshot(authority); break;
+                case MeJournalTradeDecoder.TEMPLATE_ID:         handleMeJournalTrade(timestamp); break;
+                case MeJournalTradeBatchDecoder.TEMPLATE_ID:    handleMeJournalTradeBatch(timestamp); break;
+                case MeJournalTerminalDecoder.TEMPLATE_ID:      handleMeJournalTerminal(timestamp); break;
+                case MeCommandOutcomeDecoder.TEMPLATE_ID:       handleMeCommandOutcome(timestamp); break;
+                case RequestPendingDispatchDecoder.TEMPLATE_ID: handleRequestPendingDispatch(); break;
+                case QuarantineOrderDecoder.TEMPLATE_ID:        handleQuarantineOrder(timestamp); break;
                 case HoldDecoder.TEMPLATE_ID:                   handleHold(timestamp); break;
                 case ReleaseDecoder.TEMPLATE_ID:                handleRelease(timestamp); break;
                 case SettleDecoder.TEMPLATE_ID:                 handleSettle(timestamp); break;
@@ -426,8 +445,7 @@ public final class AssetsSbeDemuxer {
                     rejectDecode("Subscribe frame reached the engine");
                     break;
                 default:
-                    // v6 templates defined by this schema and served from later slices (AmendOrder,
-                    // RequestOrderSnapshot, MeJournal*, RequestPendingDispatch, CoreConfig, QuarantineOrder).
+                    // v6 templates defined by this schema and served from later slices (CoreConfig S7, SwitchBehavior).
                     // Counted so a gateway speaking ahead of this build is visible, never silent.
                     unhandled(templateId);
                     break;
@@ -600,6 +618,110 @@ public final class AssetsSbeDemuxer {
         applying = true;
         engine.orders().applyCircuitBreaker(circuitBreakerDecoder.correlationId(), circuitBreakerDecoder.marketId(),
                 action == 1, timestamp);
+    }
+
+    // ---- RC1 S5: amend, quarantine, feed events, queries ----
+
+    private void handleAmendOrder(long timestamp) {
+        amendOrderDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final AmendOrderCommand c = amendOrderCommand;
+        c.reset();
+        c.correlationId = amendOrderDecoder.correlationId();
+        c.userId = amendOrderDecoder.userId();
+        c.orderId = amendOrderDecoder.orderId();
+        c.requestIdHigh = amendOrderDecoder.requestIdHigh();
+        c.requestIdLow = amendOrderDecoder.requestIdLow();
+        c.newPrice = amendOrderDecoder.newPrice();
+        c.newQuantity = amendOrderDecoder.newQuantity();
+        applying = true;
+        engine.orders().applyAmend(c, timestamp);
+    }
+
+    private void handleRequestOrderSnapshot(final SessionAuthority authority) {
+        requestOrderSnapshotDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final boolean allUsers = authority.isTrusted() || authority.sessionClass() == SessionClass.ADMIN;
+        applying = true;
+        engine.orders().applyRequestOrderSnapshot(requestOrderSnapshotDecoder.correlationId(), requestOrderSnapshotDecoder.userId(),
+                requestOrderSnapshotDecoder.fromOrderId(), allUsers);
+    }
+
+    private void handleMeJournalTrade(long timestamp) {
+        meJournalTradeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int buy = meJournalTradeDecoder.takerIsBuyRaw();
+        if (!validBool(buy)) {
+            rejectDecode("MeJournalTrade takerIsBuy " + buy);
+            return;
+        }
+        applying = true;
+        engine.orders().applyTrade(meJournalTradeDecoder.egressSeq(), meJournalTradeDecoder.tradeId(), meJournalTradeDecoder.marketId(),
+                meJournalTradeDecoder.takerOrderId(), meJournalTradeDecoder.takerUserId(), meJournalTradeDecoder.makerOrderId(),
+                meJournalTradeDecoder.makerUserId(), meJournalTradeDecoder.price(), meJournalTradeDecoder.quantity(),
+                buy == BoolFlag.TRUE.value(), meJournalTradeDecoder.meTimestamp(), meJournalTradeDecoder.takerOmsOrderId(),
+                meJournalTradeDecoder.makerOmsOrderId(), meJournalTradeDecoder.meEpoch(), timestamp);
+    }
+
+    private void handleMeJournalTradeBatch(long timestamp) {
+        meJournalTradeBatchDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        // Raw enum bytes are validated for the WHOLE group before the first entry is applied (K5: no partial batch).
+        final int count = meJournalTradeBatchDecoder.trades().count();
+        final int blockLength = MeJournalTradeBatchDecoder.TradesDecoder.sbeBlockLength();
+        final int groupStart = HEADER + MeJournalTradeBatchDecoder.BLOCK_LENGTH + MeJournalTradeBatchDecoder.TradesDecoder.sbeHeaderSize();
+        for (int i = 0; i < count; i++) {
+            final int raw = frame.getByte(groupStart + i * blockLength + MeJournalTradeBatchDecoder.TradesDecoder.takerIsBuyEncodingOffset()) & 0xFF;
+            if (!validBool(raw)) {
+                rejectDecode("MeJournalTradeBatch takerIsBuy " + raw + " at " + i);
+                return;
+            }
+        }
+        meJournalTradeBatchDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        applying = true;
+        for (final MeJournalTradeBatchDecoder.TradesDecoder t : meJournalTradeBatchDecoder.trades()) {
+            engine.orders().applyTrade(t.egressSeq(), t.tradeId(), t.marketId(), t.takerOrderId(), t.takerUserId(), t.makerOrderId(),
+                    t.makerUserId(), t.price(), t.quantity(), t.takerIsBuyRaw() == BoolFlag.TRUE.value(), t.meTimestamp(),
+                    t.takerOmsOrderId(), t.makerOmsOrderId(), t.meEpoch(), timestamp);
+        }
+    }
+
+    private void handleMeJournalTerminal(long timestamp) {
+        meJournalTerminalDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int status = meJournalTerminalDecoder.statusRaw();
+        if (status < 2 || status > 5) {
+            rejectDecode("MeJournalTerminal status " + status);
+            return;
+        }
+        applying = true;
+        engine.orders().applyTerminal(meJournalTerminalDecoder.egressSeq(), meJournalTerminalDecoder.orderId(), meJournalTerminalDecoder.userId(),
+                meJournalTerminalDecoder.marketId(), status, meJournalTerminalDecoder.meTimestamp(), meJournalTerminalDecoder.omsOrderId(),
+                meJournalTerminalDecoder.meEpoch(), timestamp);
+    }
+
+    private void handleMeCommandOutcome(long timestamp) {
+        meCommandOutcomeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int kind = meCommandOutcomeDecoder.commandKind();
+        final int result = meCommandOutcomeDecoder.result();
+        if (kind < 0 || kind > 2 || result < 0 || result > 6) {
+            rejectDecode("MeCommandOutcome kind " + kind + " result " + result);
+            return;
+        }
+        applying = true;
+        engine.orders().applyOutcome(meCommandOutcomeDecoder.egressSeq(), meCommandOutcomeDecoder.commandIdHigh(),
+                meCommandOutcomeDecoder.commandIdLow(), meCommandOutcomeDecoder.userId(), meCommandOutcomeDecoder.omsOrderId(),
+                meCommandOutcomeDecoder.oldOrderId(), meCommandOutcomeDecoder.price(), meCommandOutcomeDecoder.quantity(),
+                meCommandOutcomeDecoder.budget(), meCommandOutcomeDecoder.marketId(), kind, result, meCommandOutcomeDecoder.orderId(),
+                meCommandOutcomeDecoder.reason(), meCommandOutcomeDecoder.meTimestamp(), meCommandOutcomeDecoder.meEpoch(), timestamp);
+    }
+
+    private void handleRequestPendingDispatch() {
+        requestPendingDispatchDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        applying = true;
+        engine.orders().applyRequestPendingDispatch(requestPendingDispatchDecoder.correlationId(),
+                requestPendingDispatchDecoder.fromDispatchSeq(), requestPendingDispatchDecoder.maxEntries());
+    }
+
+    private void handleQuarantineOrder(long timestamp) {
+        quarantineOrderDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        applying = true;
+        engine.orders().applyQuarantine(quarantineOrderDecoder.correlationId(), quarantineOrderDecoder.orderId(), timestamp);
     }
 
     private void handleRequestRiskConfig() {

@@ -113,10 +113,41 @@ public final class AssetsClusteredService implements ClusteredService {
      * counter-allocated id desynced across switchovers and silently killed the flush chain. Rescheduling
      * the same id is idempotent, so at most one drain timer exists cluster-wide.
      */
-    private static final long EGRESS_DRAIN_TIMER_ID = 1_000_000_000_000L;
+    /**
+     * Timer ids are per LEADERSHIP TERM: {@code BASE + leadershipTermId} (RC1 S5). Aeron 1.53's consensus module counts,
+     * per correlationId, every TimerEvent a node consumes from the log while no timer with that id is pending
+     * ({@code onReplayTimerEvent}: followers do this for every expiry, the leader only during replay/catch-up) and
+     * silently swallows that many later {@code scheduleTimer} calls for the id ({@code onScheduleTimer}); the map is
+     * never pruned. A fixed id is therefore poisoned on a node that was a follower for a while: after it becomes
+     * leader its first re-arm is swallowed, {@code *Armed} stays true and the periodic timer is dead. A fresh id per
+     * term starts at count 0 on the new leader, the same id is safe within the term (the live leader never feeds the
+     * counter), and the map grows by one key per term, not per tick. Anything at or above a base is that timer kind.
+     */
+    private static final long EGRESS_DRAIN_TIMER_BASE = 1_000_000_000_000L;
+    static final long SWEEP_TIMER_BASE = 2_000_000_000_000_000L;
+    /** The ids term 0 would use; kept for the in-process service test. */
+    static final long EGRESS_DRAIN_TIMER_ID = EGRESS_DRAIN_TIMER_BASE;
+    static final long SWEEP_TIMER_ID = SWEEP_TIMER_BASE;
+    /** Current leadership term (from onNewLeadershipTermEvent, also seen during replay); -1 until known. */
+    private long leadershipTermId = -1L;
+
+    static boolean isSweepTimerId(final long correlationId) {
+        return correlationId >= SWEEP_TIMER_BASE;
+    }
+
+    static boolean isDrainTimerId(final long correlationId) {
+        return correlationId >= EGRESS_DRAIN_TIMER_BASE && correlationId < SWEEP_TIMER_BASE;
+    }
+
+    /** Terms are spaced by {@link #TIMER_ID_TERM_STRIDE} so consecutive terms never use adjacent ids (control runs). */
+    static final long TIMER_ID_TERM_STRIDE = 1_000_000L;
+
+    private long termTimerId(final long base) {
+        return base + Math.max(0L, leadershipTermId) * TIMER_ID_TERM_STRIDE;
+    }
     private static final long EGRESS_DRAIN_BACKSTOP_MS = 10;
     /** RC1 S2 (K3-D): the ONE deadline sweep timer; constant id, re-armed every SWEEP_PERIOD_MS while the index is non-empty. */
-    static final long SWEEP_TIMER_ID = 1_000_000_000_001L;
+
     static final long SWEEP_PERIOD_MS = 100;
     private boolean sweepArmed;
     private volatile long sweepTimerFires;
@@ -699,7 +730,7 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnTimerEvent(long correlationId, long timestamp) {
-        if (correlationId == SWEEP_TIMER_ID) {
+        if (isSweepTimerId(correlationId)) {
             // Replicated: a TimerEvent is a log entry, so every member pops the same entries at the same
             // log time; only the leader re-arms, and only while something is left to sweep.
             sweepArmed = false;
@@ -709,7 +740,7 @@ public final class AssetsClusteredService implements ClusteredService {
             armSweepIfNeeded();
             return;
         }
-        if (correlationId == EGRESS_DRAIN_TIMER_ID) {
+        if (isDrainTimerId(correlationId)) {
             drainTimerArmed = false;
             drainTimerFires++;
             final long drainStartNs = System.nanoTime();
@@ -850,6 +881,13 @@ public final class AssetsClusteredService implements ClusteredService {
             }
             idleStrategy.idle();
         }
+    }
+
+    @Override
+    public void onNewLeadershipTermEvent(long leadershipTermId, long logPosition, long timestamp, long termBaseLogPosition,
+                                         int leaderMemberId, int logSessionId, TimeUnit timeUnit, int appVersion) {
+        // Seen live and during replay (in log order): the latest term names the timer ids this node arms as leader.
+        this.leadershipTermId = leadershipTermId;
     }
 
     @Override
@@ -1269,10 +1307,9 @@ public final class AssetsClusteredService implements ClusteredService {
         if (sweepArmed || !isLeader || cluster == null || engine.deadlines().isEmpty()) {
             return;
         }
-        final long deadline = cluster.time()
-                + cluster.timeUnit().convert(SWEEP_PERIOD_MS, TimeUnit.MILLISECONDS);
+        final long deadline = cluster.time() + cluster.timeUnit().convert(SWEEP_PERIOD_MS, TimeUnit.MILLISECONDS);
         idleStrategy.reset();
-        while (!cluster.scheduleTimer(SWEEP_TIMER_ID, deadline)) {
+        while (!cluster.scheduleTimer(termTimerId(SWEEP_TIMER_BASE), deadline)) {
             idleStrategy.idle();
         }
         sweepArmed = true;
@@ -1289,7 +1326,7 @@ public final class AssetsClusteredService implements ClusteredService {
         final long deadline = cluster.time()
                 + cluster.timeUnit().convert(EGRESS_DRAIN_BACKSTOP_MS, TimeUnit.MILLISECONDS);
         idleStrategy.reset();
-        while (!cluster.scheduleTimer(EGRESS_DRAIN_TIMER_ID, deadline)) {
+        while (!cluster.scheduleTimer(termTimerId(EGRESS_DRAIN_TIMER_BASE), deadline)) {
             idleStrategy.idle();
         }
         drainTimerArmed = true;

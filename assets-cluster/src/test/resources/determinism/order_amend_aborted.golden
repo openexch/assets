@@ -1,0 +1,20 @@
+ADMINACK corr=0 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+DEPOSITACK corr=0 u=1 asset=0 amt=25000000000 newAvail=25000000000
+BALANCE u=1 asset=0 avail=25000000000 locked=0
+BALANCE u=1 asset=0 avail=5000000000 locked=20000000000
+MEDISPATCH seq=1 id=1/0 kind=CREATE u=1 order=1 old=0 market=1 type=0 side=0 px=10000000000 qty=200000000 budget=0 tif=0
+ORDERACK corr=0 order=1 u=1 market=1 status=PENDING_NEW dup=0 holdAsset=0 hold=20000000000 seq=1
+ORDEREVENT seq=1 order=1 u=1 market=1 kind=ACCEPTED status=PENDING_NEW reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=0 holdAsset=0 hold=20000000000 holdRemaining=20000000000
+ORDEREVENT seq=2 order=1 u=1 market=1 kind=ACK_NEW status=NEW reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=101 holdAsset=0 hold=20000000000 holdRemaining=20000000000
+BALANCE u=1 asset=0 avail=3000000000 locked=22000000000
+MEDISPATCH seq=2 id=1/6 kind=AMEND u=1 order=1 old=101 market=1 type=0 side=0 px=11000000000 qty=200000000 budget=0 tif=0
+ORDERACK corr=1 order=1 u=1 market=1 status=PENDING_REPLACE dup=0 holdAsset=0 hold=20000000000 seq=2
+ORDEREVENT seq=3 order=1 u=1 market=1 kind=DISPATCHED status=PENDING_REPLACE reason=NONE px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=101 holdAsset=0 hold=20000000000 holdRemaining=22000000000
+ORDERSNAP corr=2 order=1 u=1 market=1 status=PENDING_REPLACE px=10000000000 qty=200000000 filled=0 remaining=200000000 holdAsset=0 hold=20000000000 leg=101 attempt=1
+ORDERSNAPEND corr=2 n=1 next=0
+BALANCE u=1 asset=0 avail=5000000000 locked=20000000000
+ORDEREVENT seq=4 order=1 u=1 market=1 kind=REPLACED status=NEW reason=ME_REJECTED px=10000000000 qty=200000000 filled=0 remaining=200000000 lastPx=0 lastQty=0 trade=0 leg=101 holdAsset=0 hold=20000000000 holdRemaining=20000000000
+ORDERSNAP corr=3 order=1 u=1 market=1 status=NEW px=10000000000 qty=200000000 filled=0 remaining=200000000 holdAsset=0 hold=20000000000 leg=101 attempt=1
+ORDERSNAPEND corr=3 n=1 next=0
+PENDINGEND corr=4 n=0 head=2

@@ -25,4 +25,13 @@ public interface CoreOrderView {
     long clientOrderIdLow();
     long createdAtMs();
     long updatedAtMs();
+
+    // ---- RC1 S5 (OrderSnapshotBatch fields) ----
+    long budget();
+    long displayQty();
+    long hiddenQty();
+    long expiresAtMs();
+    long trailingArmPrice();
+    /** The order's attempt counter (slice/leg sequence on the wire). */
+    int sliceSeq();
 }

@@ -12,5 +12,7 @@ public enum SettleRejectReason {
     INVALID_PRICE,
     INVALID_QUANTITY,
     NOTIONAL_OVERFLOW,
-    INVALID_PARTY
+    INVALID_PARTY,
+    /** RC1 S5: tradeId &gt; lastApplied + 1 on the MeJournalTrade path; trades were skipped upstream. */
+    TRADE_GAP
 }

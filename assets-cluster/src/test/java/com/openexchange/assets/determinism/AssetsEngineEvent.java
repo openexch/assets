@@ -5,6 +5,7 @@ import com.openexchange.assets.domain.AdminResult;
 import com.openexchange.assets.domain.ConfigKind;
 import com.openexchange.assets.domain.DispatchKind;
 import com.openexchange.assets.domain.EventKind;
+import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.CoreRejectReason;
 import com.openexchange.assets.domain.GateReason;
@@ -26,7 +27,9 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.FeedPositionReport, AssetsEngineEvent.SettleFault,
                 AssetsEngineEvent.SettleRejected, AssetsEngineEvent.OrderReject, AssetsEngineEvent.AdminAck,
                 AssetsEngineEvent.AdmissionState, AssetsEngineEvent.OrderAck, AssetsEngineEvent.OrderEvent,
-                AssetsEngineEvent.MeDispatch, AssetsEngineEvent.DepositReject, AssetsEngineEvent.ConfigApplied {
+                AssetsEngineEvent.MeDispatch, AssetsEngineEvent.DepositReject, AssetsEngineEvent.ConfigApplied,
+        AssetsEngineEvent.OrderFault, AssetsEngineEvent.OrderSnapshotEntry, AssetsEngineEvent.OrderSnapshotEnd,
+        AssetsEngineEvent.PendingDispatchEnd, AssetsEngineEvent.MeDispatchReply {
 
     String render();
 
@@ -210,6 +213,51 @@ public sealed interface AssetsEngineEvent
         @Override
         public String render() {
             return String.format("CONFIGAPPLIED kind=%s market=%d version=%d", kind.name(), marketId, configVersion);
+        }
+    }
+
+    // ---- RC1 S5 ----
+
+    record OrderFault(OrderFaultKind kind, long orderId, long userId, int marketId, long tradeId, long amount) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("ORDERFAULT kind=%s order=%d u=%d market=%d trade=%d amount=%d", kind.name(), orderId, userId, marketId, tradeId, amount);
+        }
+    }
+
+    record OrderSnapshotEntry(long correlationId, long orderId, long userId, int marketId, OrderStatus status, long price, long quantity,
+                              long filledQty, long remainingQty, int holdAssetId, long holdAmount, long meOrderId, int sliceSeq)
+            implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("ORDERSNAP corr=%d order=%d u=%d market=%d status=%s px=%d qty=%d filled=%d remaining=%d holdAsset=%d hold=%d leg=%d attempt=%d",
+                    correlationId, orderId, userId, marketId, status == null ? "?" : status.name(), price, quantity, filledQty, remainingQty,
+                    holdAssetId, holdAmount, meOrderId, sliceSeq);
+        }
+    }
+
+    record OrderSnapshotEnd(long correlationId, int entryCount, long nextOrderId) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("ORDERSNAPEND corr=%d n=%d next=%d", correlationId, entryCount, nextOrderId);
+        }
+    }
+
+    record PendingDispatchEnd(long correlationId, int count, long headDispatchSeq) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("PENDINGEND corr=%d n=%d head=%d", correlationId, count, headDispatchSeq);
+        }
+    }
+
+    record MeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId, long omsOrderId,
+                           long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget, int timeInForce)
+            implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("DISPATCHREPLY seq=%d id=%d/%d kind=%s u=%d order=%d old=%d market=%d type=%d side=%d px=%d qty=%d budget=%d tif=%d",
+                    dispatchSeq, commandIdHigh, commandIdLow, kind.name(), userId, omsOrderId, oldOrderId, marketId, orderType, side, price,
+                    quantity, budget, timeInForce);
         }
     }
 }

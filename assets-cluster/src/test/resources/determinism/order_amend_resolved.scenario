@@ -1,0 +1,20 @@
+# S5 contract 3.4 / B7 (R-C12b): BUY 100 x 2 half-fills at 100, then is amended DOWN to a total of 1.5
+# (legQty 1.0, holdDelta -50 USD); the AMEND outcome APPLIED with the new leg resolves the window: 50 USD
+# released, price/quantity installed, status PARTIALLY_FILLED on leg 103; the cancel then releases the rest
+# and the user's locked USD is 0.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=250.0
+DEPOSIT u=2 asset=1 amt=3.0
+CREATE u=1 market=1 side=0 type=0 px=100.0 qty=2.0 rid=1
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=2.0 rid=2
+MEOUTCOME order=1 kind=0 attempt=0 result=0 leg=101
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=102
+METRADE id=1 market=1 taker=2 maker=1 px=100.0 qty=0.5 takerBuy=0
+AMEND u=1 order=1 qty=1.5 rid=3 corr=1
+PENDINGDISPATCH corr=2
+MEOUTCOME order=1 kind=2 attempt=1 result=0 leg=103 old=101
+ORDERSNAP u=1 corr=3
+CANCEL u=1 order=1 rid=4
+METERMINAL order=1 leg=103 status=3
+ORDERSNAP u=1 corr=4

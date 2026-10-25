@@ -49,6 +49,9 @@ import java.util.Map;
  *   GATE market=0 open=1                   order-entry gate (ADMIN); RISKCFG market= ver= [maxOpen= perSec= perMin= collarBps= slipBps= ...]
  *   BREAKER market= trip=1|0 ; MARKETTICK market= bid= ask= ver= [last= lastTradeId=]
  *   CREATE u= market= side= type= [px=] qty= [budget=] [tif=] [exp=] [cid=] [rid=] ; CANCEL u= [order=|cid=] [rid=]
+ *   METRADE id= market= taker= maker= px= qty= takerBuy= [takerLeg= makerLeg= takerUser= makerUser= seq=] ; METERMINAL order= leg= status=
+ *   MEOUTCOME order= kind= attempt= result= [leg= reason= old=] ; AMEND u= order= [px=] [qty=] [rid=] ; QUARANTINE order=
+ *   ORDERSNAP u= [from=] ; PENDINGDISPATCH [from=] [max=]
  *   SNAPSHOT                               serialize -> restore into a fresh engine
  * </pre>
  * Amounts/prices (amt, px) are decimals converted to 8dp fixed-point; asset/market/order/user ids are
@@ -221,6 +224,64 @@ public final class AssetsScenarioRunner {
                 break;
             case "SNAPSHOT":
                 snapshotRoundTrip();
+                break;
+            // ---- RC1 S5: ME feed events (bridge class), amend, quarantine, queries ----
+            case "METRADE": {
+                final long taker = reqLong(kv, "taker");
+                final long maker = reqLong(kv, "maker");
+                final com.openexchange.assets.application.engine.order.CoreOrder to = engine.orders().orders().get(taker);
+                final com.openexchange.assets.application.engine.order.CoreOrder mo = engine.orders().orders().get(maker);
+                final long takerUser = kv.containsKey("takerUser") ? reqLong(kv, "takerUser") : (to == null ? 0L : to.userId);
+                final long makerUser = kv.containsKey("makerUser") ? reqLong(kv, "makerUser") : (mo == null ? 0L : mo.userId);
+                final long takerLeg = kv.containsKey("takerLeg") ? reqLong(kv, "takerLeg") : (to == null ? 0L : to.currentLegId);
+                final long makerLeg = kv.containsKey("makerLeg") ? reqLong(kv, "makerLeg") : (mo == null ? 0L : mo.currentLegId);
+                engine.orders().applyTrade(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "id"), reqInt(kv, "market"),
+                        takerLeg, takerUser, makerLeg, makerUser, reqAmount(kv, "px"), reqAmount(kv, "qty"), reqLong(kv, "takerBuy") != 0,
+                        clock.now(), taker, maker, 0L, clock.now());
+                break;
+            }
+            case "METERMINAL": {
+                final long order = reqLong(kv, "order");
+                final com.openexchange.assets.application.engine.order.CoreOrder o = engine.orders().orders().get(order);
+                engine.orders().applyTerminal(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "leg"),
+                        kv.containsKey("u") ? reqLong(kv, "u") : (o == null ? 0L : o.userId),
+                        kv.containsKey("market") ? reqInt(kv, "market") : (o == null ? 0 : o.marketId),
+                        reqInt(kv, "status"), clock.now(), order, 0L, clock.now());
+                break;
+            }
+            case "MEOUTCOME": {
+                final long order = reqLong(kv, "order");
+                final int kind = reqInt(kv, "kind");
+                final int attempt = reqInt(kv, "attempt");
+                final com.openexchange.assets.application.engine.order.CoreOrder o = engine.orders().orders().get(order);
+                engine.orders().applyOutcome(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, order, ((long) attempt << 2) | kind,
+                        o == null ? 0L : o.userId, order, kv.containsKey("old") ? reqLong(kv, "old") : 0L, 0L, 0L, 0L,
+                        o == null ? 0 : o.marketId, kind, reqInt(kv, "result"), kv.containsKey("leg") ? reqLong(kv, "leg") : 0L,
+                        kv.containsKey("reason") ? reqInt(kv, "reason") : 0, clock.now(), 0L, clock.now());
+                break;
+            }
+            case "AMEND": {
+                final com.openexchange.assets.domain.commands.AmendOrderCommand c = new com.openexchange.assets.domain.commands.AmendOrderCommand();
+                c.reset();
+                c.correlationId = kv.containsKey("corr") ? reqLong(kv, "corr") : 0L;
+                c.userId = reqLong(kv, "u");
+                c.orderId = reqLong(kv, "order");
+                c.newPrice = kv.containsKey("px") ? reqAmount(kv, "px") : 0L;
+                c.newQuantity = kv.containsKey("qty") ? reqAmount(kv, "qty") : 0L;
+                c.requestIdLow = kv.containsKey("rid") ? reqLong(kv, "rid") : 0L;
+                engine.orders().applyAmend(c, clock.now());
+                break;
+            }
+            case "QUARANTINE":
+                engine.orders().applyQuarantine(kv.containsKey("corr") ? reqLong(kv, "corr") : 0L, reqLong(kv, "order"), clock.now());
+                break;
+            case "ORDERSNAP":
+                engine.orders().applyRequestOrderSnapshot(kv.containsKey("corr") ? reqLong(kv, "corr") : 0L, reqLong(kv, "u"),
+                        kv.containsKey("from") ? reqLong(kv, "from") : 0L, true);
+                break;
+            case "PENDINGDISPATCH":
+                engine.orders().applyRequestPendingDispatch(kv.containsKey("corr") ? reqLong(kv, "corr") : 0L,
+                        kv.containsKey("from") ? reqLong(kv, "from") : 0L, kv.containsKey("max") ? reqInt(kv, "max") : 0);
                 break;
             // ---- RC1 S4: order lifecycle verbs (admission, cancel, risk config, breaker, tick, gate) ----
             case "GATE": {
