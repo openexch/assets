@@ -13,6 +13,9 @@ import com.openexchange.assets.infrastructure.generated.HoldRejectEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
+import com.openexchange.assets.infrastructure.generated.ProtoOrderEventEncoder;
+import com.openexchange.assets.infrastructure.generated.ProtoOrderStatus;
+import com.openexchange.assets.infrastructure.generated.ProtoRejectReason;
 import com.openexchange.assets.infrastructure.generated.SettleFaultEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckEncoder;
@@ -90,8 +93,10 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     public static final int CH_SETTLEMENTS = 1 << 2;
     /** Snapshot streams and their terminators. */
     public static final int CH_SNAPSHOTS = 1 << 3;
+    /** RC0 spike: ProtoOrderEvent frames (order lifecycle). */
+    public static final int CH_ORDERS = 1 << 4;
     /** What a session gets when it never subscribes: everything, i.e. the pre-subscription behaviour. */
-    public static final int CH_ALL = CH_ACKS | CH_BALANCES | CH_SETTLEMENTS | CH_SNAPSHOTS;
+    public static final int CH_ALL = CH_ACKS | CH_BALANCES | CH_SETTLEMENTS | CH_SNAPSHOTS | CH_ORDERS;
 
     private static final int BUFFER_CAPACITY = 256;
 
@@ -117,6 +122,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final SettleFaultEncoder settleFaultEncoder = new SettleFaultEncoder();
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
+    private final ProtoOrderEventEncoder protoOrderEventEncoder = new ProtoOrderEventEncoder();
 
     /** See {@link LiveBalanceTap}: fed live balance updates; {@code NONE} when no feed is wired. */
     private final LiveBalanceTap liveBalanceTap;
@@ -230,6 +236,24 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .tradeId(tradeId).orderId(orderId).userId(userId).assetId(assetId)
                 .drawnFromAvailable(drawnFromAvailable).uncovered(uncovered);
         flush(settleFaultEncoder.encodedLength(), CH_SETTLEMENTS, Routing.BROADCAST);
+    }
+
+    /**
+     * RC0 spike. A correlated event (the commanding session's own create/cancel) is {@code ORIGIN};
+     * fill-driven and timer-driven events carry correlationId 0 and go to every session subscribed to
+     * the orders channel (the gateway scopes them to its users; K9).
+     */
+    @Override
+    public void onProtoOrderEvent(long correlationId, long orderId, long userId, int marketId, int status, int reason,
+                                  long filledQty, long remainingQty, long lastPrice, long lastQty, long holdAmount,
+                                  long updatedAtMs, long eventSeq) {
+        protoOrderEventEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).orderId(orderId).userId(userId).marketId(marketId)
+                .status(ProtoOrderStatus.get((short) status)).reason(ProtoRejectReason.get((short) reason))
+                .filledQty(filledQty).remainingQty(remainingQty).lastPrice(lastPrice).lastQty(lastQty)
+                .holdAmount(holdAmount).updatedAtMs(updatedAtMs).eventSeq(eventSeq);
+        flush(protoOrderEventEncoder.encodedLength(), CH_ORDERS,
+                correlationId != 0L ? Routing.ORIGIN : Routing.BROADCAST);
     }
 
     private void flush(int bodyLength, int channel, Routing routing) {

@@ -54,12 +54,21 @@ public final class AssetsEngine {
     public static final int CMD_SETTLE = 4;
     public static final int CMD_INIT_HIGH_WATER = 5;
     public static final int CMD_SET_MONEY_JOURNAL = 6;
+    // RC0 spike: prototype order lifecycle (see ProtoOrderEngine). Not a product contract.
+    public static final int CMD_PROTO_ORDER_CREATE = 7;
+    public static final int CMD_PROTO_ORDER_CANCEL = 8;
+    public static final int CMD_PROTO_ORDER_FILL = 9;
+    public static final int CMD_PROTO_RISK_CONFIG = 10;
+    public static final int CMD_PROTO_ORDER_EXPIRE = 11;
 
     private static final Logger LOG = Logger.getLogger(AssetsEngine.class);
 
     private final Long2ObjectHashMap<Account> accounts = new Long2ObjectHashMap<>();
     private final SettlementService settlement = new SettlementService();
     private AssetsEventSink sink;
+    // RC0 spike: the order lifecycle prototype shares this ledger's accounts and event sink.
+    private final com.openexchange.assets.application.proto.ProtoOrderEngine proto =
+            new com.openexchange.assets.application.proto.ProtoOrderEngine(this);
 
     private long lastAppliedTradeId = 0L;
     private long consumePosition = 0L;
@@ -97,6 +106,16 @@ public final class AssetsEngine {
         this.sink = sink;
     }
 
+    /** The outbound port, for the prototype order engine (same single-thread contract). */
+    public AssetsEventSink eventSink() {
+        return sink;
+    }
+
+    /** RC0 spike: the prototype order engine riding on this ledger. */
+    public com.openexchange.assets.application.proto.ProtoOrderEngine proto() {
+        return proto;
+    }
+
     /**
      * Wire this node's journal sink — where its records are written. Node-local: it does NOT decide
      * whether journaling happens, which is replicated state driven by {@link #CMD_SET_MONEY_JOURNAL}.
@@ -130,6 +149,16 @@ public final class AssetsEngine {
             case CMD_SETTLE:          applySettle((SettleCommand) command, timestamp); break;
             case CMD_INIT_HIGH_WATER: applyInitHighWater((InitTradeHighWaterCommand) command); break;
             case CMD_SET_MONEY_JOURNAL: applySetMoneyJournal((SetMoneyJournalCommand) command); break;
+            case CMD_PROTO_ORDER_CREATE:
+                proto.applyCreate((com.openexchange.assets.domain.commands.ProtoOrderCreateCommand) command, timestamp); break;
+            case CMD_PROTO_ORDER_CANCEL:
+                proto.applyCancel((com.openexchange.assets.domain.commands.ProtoOrderCancelCommand) command, timestamp); break;
+            case CMD_PROTO_ORDER_FILL:
+                proto.applyFill((com.openexchange.assets.domain.commands.ProtoOrderFillCommand) command, timestamp); break;
+            case CMD_PROTO_RISK_CONFIG:
+                proto.applyRiskConfig((com.openexchange.assets.domain.commands.ProtoRiskConfigCommand) command); break;
+            case CMD_PROTO_ORDER_EXPIRE:
+                proto.applyExpire((com.openexchange.assets.domain.commands.ProtoOrderExpireCommand) command, timestamp); break;
             default: throw new IllegalArgumentException("unknown command type " + type);
         }
     }

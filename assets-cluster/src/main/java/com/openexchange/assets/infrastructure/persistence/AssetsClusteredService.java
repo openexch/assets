@@ -179,6 +179,9 @@ public final class AssetsClusteredService implements ClusteredService {
     // before onTakeSnapshot returns (see awaitSnapshotRecorded). Cloned context: never shares lock
     // state with the cluster's own archive client. Closed in onTerminate.
     private AeronArchive snapshotArchive;
+    private final SnapshotEnvelope snapshotEnvelope = new SnapshotEnvelope();
+    private final com.openexchange.assets.domain.commands.ProtoOrderExpireCommand protoExpireCommand =
+            new com.openexchange.assets.domain.commands.ProtoOrderExpireCommand();
     /** Bounded wait for a wedged snapshot publication (all chunks share one deadline). */
     private static final long SNAPSHOT_OFFER_DEADLINE_MS = 30_000;
     /** Bounded wait for the archive to ingest the published snapshot bytes. */
@@ -206,6 +209,14 @@ public final class AssetsClusteredService implements ClusteredService {
         engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
                 balanceFeed != null ? balanceFeed::onBalanceUpdate
                         : AssetsEventPublisher.LiveBalanceTap.NONE));
+        // RC0 spike: a GTD deadline is a cluster timer keyed by orderId (ids stay far below the drain
+        // timer's id). Legal here because the engine only asks during onSessionMessage.
+        engine.proto().setTimerPort((orderId, deadlineMs) -> {
+            idleStrategy.reset();
+            while (!this.cluster.scheduleTimer(orderId, deadlineMs)) {
+                idleStrategy.idle();
+            }
+        });
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
             seedBalanceFeedFromSnapshot();
@@ -581,6 +592,14 @@ public final class AssetsClusteredService implements ClusteredService {
             updateEgressCounters();
             reportEgressPressure(timestamp);
             armDrainTimerIfNeeded();
+        } else if (correlationId > 0 && correlationId < EGRESS_DRAIN_TIMER_ID) {
+            // RC0 spike: a GTD deadline. The TimerEvent is a log entry, so every replica expires the
+            // order at the same position; an order already closed is a no-op.
+            protoExpireCommand.reset();
+            protoExpireCommand.orderId = correlationId;
+            engine.applyCommand(AssetsEngine.CMD_PROTO_ORDER_EXPIRE, protoExpireCommand, timestamp);
+            drainEgress();
+            armDrainTimerIfNeeded();
         }
     }
 
@@ -600,7 +619,9 @@ public final class AssetsClusteredService implements ClusteredService {
     private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
         final long startNs = System.nanoTime();
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        final int length = BalanceSnapshotCodec.serialize(engine, buffer);
+        // Payload in place after the envelope header; sealed with length + CRC32C (K5).
+        final int payloadLength = BalanceSnapshotCodec.serialize(engine, buffer, SnapshotEnvelope.payloadOffset());
+        final int length = snapshotEnvelope.seal(buffer, payloadLength);
         final long serializedNs = System.nanoTime();
 
         // Chunked, like the matching engine's A-2 fix: a single offer() throws
@@ -619,8 +640,8 @@ public final class AssetsClusteredService implements ClusteredService {
         awaitSnapshotRecorded(snapshotPublication);
         final long recordedNs = System.nanoTime();
 
-        System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " bytes=" + length
-                + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
+        System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " orders=" + engine.proto().openOrderCount()
+                + " bytes=" + length + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
                 + " serializeMs=" + ((serializedNs - startNs) / 1_000_000)
                 + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
                 + " recordMs=" + ((recordedNs - offeredNs) / 1_000_000)
@@ -836,17 +857,28 @@ public final class AssetsClusteredService implements ClusteredService {
         System.out.println("[SNAPSHOT] reassembled " + length.value + " byte(s) in " + polls
                 + " poll(s) from image position " + snapshotImage.position());
         if (length.value > 0) {
+            final int payloadOffset;
+            final int payloadLength;
+            if (SnapshotEnvelope.isEnveloped(collector, length.value)) {
+                payloadLength = snapshotEnvelope.open(collector, length.value); // magic, length, CRC32C verified
+                payloadOffset = SnapshotEnvelope.payloadOffset();
+            } else {
+                payloadOffset = 0; // pre-envelope snapshot: bare payload
+                payloadLength = length.value;
+            }
             final BalanceSnapshotCodec.Decoded decoded =
-                    BalanceSnapshotCodec.deserialize(collector, 0, length.value, engine);
-            if (decoded.bytesConsumed != length.value) {
+                    BalanceSnapshotCodec.deserialize(collector, payloadOffset, payloadLength, engine);
+            if (decoded.bytesConsumed != payloadLength) {
                 // The codec read fewer or more bytes than the image carried: a mis-framed or foreign
                 // payload. Refusing to start beats serving a ledger assembled from part of a snapshot.
-                throw new IllegalStateException("assets snapshot length mismatch: image=" + length.value
+                throw new IllegalStateException("assets snapshot length mismatch: payload=" + payloadLength
                         + " decoded=" + decoded.bytesConsumed + " accounts=" + decoded.accountCount
                         + " holds=" + decoded.holdCount);
             }
             System.out.println("[SNAPSHOT] restored accounts=" + decoded.accountCount
-                    + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
+                    + " holds=" + decoded.holdCount + " orders=" + decoded.orderCount
+                    + " enveloped=" + (payloadOffset != 0)
+                    + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
                     + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq);
         }
     }
@@ -978,6 +1010,7 @@ public final class AssetsClusteredService implements ClusteredService {
         if (channels.balances())    mask |= AssetsEventPublisher.CH_BALANCES;
         if (channels.settlements()) mask |= AssetsEventPublisher.CH_SETTLEMENTS;
         if (channels.snapshots())   mask |= AssetsEventPublisher.CH_SNAPSHOTS;
+        if (channels.orders())      mask |= AssetsEventPublisher.CH_ORDERS;
         if (isLeader && cluster != null) {
             refreshSessionsIfNeeded();
             final SessionEgressQueue queue = egressBySessionId.get(session.id());

@@ -72,6 +72,9 @@ public final class BalanceSnapshotCodec {
     /** v3 layout tag: v2 plus the replicated journalEnabled flag. */
     static final long LAYOUT_V3_TAG = -3L;
 
+    /** v4 layout tag (RC0 spike): v3 followed by the prototype order block ({@code ProtoOrderEngine}). */
+    static final long LAYOUT_V4_TAG = -4L;
+
     private BalanceSnapshotCodec() {
     }
 
@@ -83,15 +86,18 @@ public final class BalanceSnapshotCodec {
         public final int accountCount;
         public final int holdCount;
         public final int bytesConsumed;
+        /** RC0 spike: open orders restored from the v4 order block (0 for older layouts). */
+        public final int orderCount;
 
         Decoded(long lastAppliedTradeId, long consumePosition, long journalSeq,
-                int accountCount, int holdCount, int bytesConsumed) {
+                int accountCount, int holdCount, int bytesConsumed, int orderCount) {
             this.lastAppliedTradeId = lastAppliedTradeId;
             this.consumePosition = consumePosition;
             this.journalSeq = journalSeq;
             this.accountCount = accountCount;
             this.holdCount = holdCount;
             this.bytesConsumed = bytesConsumed;
+            this.orderCount = orderCount;
         }
     }
 
@@ -101,10 +107,19 @@ public final class BalanceSnapshotCodec {
      * @return number of bytes written — offer {@code dst, 0, length}
      */
     public static int serialize(AssetsEngine engine, MutableDirectBuffer dst) {
-        final int assets = Asset.count();
-        final int[] pos = {0};
+        return serialize(engine, dst, 0);
+    }
 
-        dst.putLong(pos[0], LAYOUT_V3_TAG);
+    /**
+     * Serialize starting at {@code offset} (so an envelope header can precede the payload in place).
+     *
+     * @return number of PAYLOAD bytes written from {@code offset}
+     */
+    public static int serialize(AssetsEngine engine, MutableDirectBuffer dst, final int offset) {
+        final int assets = Asset.count();
+        final int[] pos = {offset};
+
+        dst.putLong(pos[0], LAYOUT_V4_TAG);
         pos[0] += 8;
         dst.putLong(pos[0], engine.getLastAppliedTradeId());
         pos[0] += 8;
@@ -143,7 +158,9 @@ public final class BalanceSnapshotCodec {
             });
         });
 
-        return pos[0];
+        // RC0 spike: the prototype order block, after the ledger it rides on.
+        pos[0] = engine.proto().serialize(dst, pos[0]);
+        return pos[0] - offset;
     }
 
     /**
@@ -168,7 +185,7 @@ public final class BalanceSnapshotCodec {
             pos += 8;
             journalSeq = 0L;
             journalEnabled = false;
-        } else if (first == LAYOUT_V2_TAG || first == LAYOUT_V3_TAG) {
+        } else if (first == LAYOUT_V2_TAG || first == LAYOUT_V3_TAG || first == LAYOUT_V4_TAG) {
             pos += 8;
             lastAppliedTradeId = src.getLong(pos);
             pos += 8;
@@ -176,7 +193,7 @@ public final class BalanceSnapshotCodec {
             pos += 8;
             journalSeq = src.getLong(pos);
             pos += 8;
-            if (first == LAYOUT_V3_TAG) {
+            if (first == LAYOUT_V3_TAG || first == LAYOUT_V4_TAG) {
                 journalEnabled = src.getByte(pos) != 0;
                 pos += 1;
             } else {
@@ -229,6 +246,12 @@ public final class BalanceSnapshotCodec {
             holdTotal += numHolds;
         }
 
-        return new Decoded(lastAppliedTradeId, consumePosition, journalSeq, numAccounts, holdTotal, pos - offset);
+        int orderCount = 0;
+        if (first == LAYOUT_V4_TAG) {
+            pos = engine.proto().deserialize(src, pos);
+            orderCount = engine.proto().openOrderCount();
+        }
+
+        return new Decoded(lastAppliedTradeId, consumePosition, journalSeq, numAccounts, holdTotal, pos - offset, orderCount);
     }
 }

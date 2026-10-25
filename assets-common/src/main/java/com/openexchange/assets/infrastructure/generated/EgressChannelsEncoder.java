@@ -132,4 +132,23 @@ public final class EgressChannelsEncoder
     {
         return value ? bits | (1 << 3) : bits & ~(1 << 3);
     }
+    /**
+     * RC0 spike: ProtoOrderEvent stream (order lifecycle events not addressed to the commanding session)
+     *
+     * @param value true if orders is set or false if not.
+     * @return this for a fluent API.
+     */
+
+    public EgressChannelsEncoder orders(final boolean value)
+    {
+        int bits = buffer.getInt(offset, BYTE_ORDER);
+        bits = value ? bits | (1 << 4) : bits & ~(1 << 4);
+        buffer.putInt(offset, bits, BYTE_ORDER);
+        return this;
+    }
+
+    public static int orders(final int bits, final boolean value)
+    {
+        return value ? bits | (1 << 4) : bits & ~(1 << 4);
+    }
 }

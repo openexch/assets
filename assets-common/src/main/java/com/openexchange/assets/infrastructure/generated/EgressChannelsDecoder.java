@@ -120,6 +120,21 @@ public final class EgressChannelsDecoder
     {
         return 0 != (value & (1 << 3));
     }
+    /**
+     * RC0 spike: ProtoOrderEvent stream (order lifecycle events not addressed to the commanding session)
+     *
+     * @return true if orders set or false if not.
+     */
+
+    public boolean orders()
+    {
+        return 0 != (buffer.getInt(offset, BYTE_ORDER) & (1 << 4));
+    }
+
+    public static boolean orders(final int value)
+    {
+        return 0 != (value & (1 << 4));
+    }
 
     public String toString()
     {
@@ -169,6 +184,15 @@ public final class EgressChannelsDecoder
                 builder.append(',');
             }
             builder.append("snapshots");
+            atLeastOne = true;
+        }
+        if (orders())
+        {
+            if (atLeastOne)
+            {
+                builder.append(',');
+            }
+            builder.append("orders");
             atLeastOne = true;
         }
         builder.append('}');

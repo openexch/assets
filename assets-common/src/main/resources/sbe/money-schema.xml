@@ -40,7 +40,53 @@
             <choice name="balances"    description="the BalanceUpdate firehose: one per changed (user, asset) line">1</choice>
             <choice name="settlements" description="SettlementApplied and SettleFault">2</choice>
             <choice name="snapshots"   description="balance/hold snapshot streams and their terminators">3</choice>
+            <choice name="orders"      description="RC0 spike: ProtoOrderEvent stream (order lifecycle events not addressed to the commanding session)">4</choice>
         </set>
+        <!-- RC0 spike (OMS + ledger core measurement): prototype order lifecycle vocabulary. NOT a product wire contract. -->
+        <enum name="ProtoSide" encodingType="uint8">
+            <validValue name="BUY">0</validValue>
+            <validValue name="SELL">1</validValue>
+        </enum>
+        <enum name="ProtoOrderType" encodingType="uint8">
+            <validValue name="LIMIT">0</validValue>
+            <validValue name="MARKET">1</validValue>
+            <validValue name="STOP_LOSS">2</validValue>
+            <validValue name="STOP_LIMIT">3</validValue>
+            <validValue name="TRAILING_STOP">4</validValue>
+            <validValue name="ICEBERG">5</validValue>
+            <validValue name="LIMIT_MAKER">6</validValue>
+        </enum>
+        <enum name="ProtoTimeInForce" encodingType="uint8">
+            <validValue name="GTC">0</validValue>
+            <validValue name="IOC">1</validValue>
+            <validValue name="FOK">2</validValue>
+            <validValue name="GTD">3</validValue>
+        </enum>
+        <enum name="ProtoOrderStatus" encodingType="uint8">
+            <validValue name="NEW">0</validValue>
+            <validValue name="PARTIALLY_FILLED">1</validValue>
+            <validValue name="FILLED">2</validValue>
+            <validValue name="CANCELLED">3</validValue>
+            <validValue name="REJECTED">4</validValue>
+            <validValue name="EXPIRED">5</validValue>
+        </enum>
+        <enum name="ProtoRejectReason" encodingType="uint8">
+            <validValue name="NONE">0</validValue>
+            <validValue name="RATE_LIMIT">1</validValue>
+            <validValue name="CIRCUIT_BREAKER">2</validValue>
+            <validValue name="SIZE">3</validValue>
+            <validValue name="NOTIONAL">4</validValue>
+            <validValue name="PRICE_COLLAR">5</validValue>
+            <validValue name="OPEN_ORDERS">6</validValue>
+            <validValue name="INSUFFICIENT_FUNDS">7</validValue>
+            <validValue name="POSITION">8</validValue>
+            <validValue name="DUPLICATE_CLIENT_ORDER_ID">9</validValue>
+            <validValue name="UNKNOWN_ORDER">10</validValue>
+            <validValue name="NOT_OWNER">11</validValue>
+            <validValue name="INVALID">12</validValue>
+            <validValue name="EXPIRED">13</validValue>
+            <validValue name="NOT_OPEN">14</validValue>
+        </enum>
     </types>
 
     <!-- ============================ Ingress commands (client -> AE) ============================ -->
@@ -275,4 +321,73 @@
             <field name="remaining"  id="4" type="int64"/>
         </group>
     </sbe:message>
+
+    <!-- ======================= RC0 spike: prototype order lifecycle (measurement only) ======================= -->
+
+    <sbe:message name="ProtoOrderCreate" id="40" description="RC0 spike ingress: place an order in the core (risk + hold + record)">
+        <field name="correlationId"     id="1"  type="int64"/>
+        <field name="userId"            id="2"  type="int64"/>
+        <field name="clientOrderIdHigh" id="3"  type="int64"/>
+        <field name="clientOrderIdLow"  id="4"  type="int64"/>
+        <field name="requestIdHigh"     id="5"  type="int64"/>
+        <field name="requestIdLow"      id="6"  type="int64"/>
+        <field name="marketId"          id="7"  type="int32"/>
+        <field name="side"              id="8"  type="ProtoSide"/>
+        <field name="orderType"         id="9"  type="ProtoOrderType"/>
+        <field name="timeInForce"       id="10" type="ProtoTimeInForce"/>
+        <field name="price"             id="11" type="int64"/>
+        <field name="quantity"          id="12" type="int64"/>
+        <field name="stopPrice"         id="13" type="int64"/>
+        <field name="displayQty"        id="14" type="int64"/>
+        <field name="expiresAtMs"       id="15" type="int64"/>
+        <field name="flags"             id="16" type="uint32"/>
+    </sbe:message>
+
+    <sbe:message name="ProtoOrderCancel" id="41" description="RC0 spike ingress: cancel an open core order (owner only)">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="orderId"       id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="ProtoOrderFill" id="42" description="RC0 spike ingress: a trade between two core orders (stands in for the ME journal feed)">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="tradeId"       id="2" type="int64"/>
+        <field name="marketId"      id="3" type="int32"/>
+        <field name="buyOrderId"    id="4" type="int64"/>
+        <field name="sellOrderId"   id="5" type="int64"/>
+        <field name="price"         id="6" type="int64"/>
+        <field name="quantity"      id="7" type="int64"/>
+        <field name="takerIsBuy"    id="8" type="BoolFlag"/>
+    </sbe:message>
+
+    <sbe:message name="ProtoOrderEvent" id="43" description="RC0 spike egress: one order lifecycle event">
+        <field name="correlationId" id="1"  type="int64"/>
+        <field name="orderId"       id="2"  type="int64"/>
+        <field name="userId"        id="3"  type="int64"/>
+        <field name="marketId"      id="4"  type="int32"/>
+        <field name="status"        id="5"  type="ProtoOrderStatus"/>
+        <field name="reason"        id="6"  type="ProtoRejectReason"/>
+        <field name="filledQty"     id="7"  type="int64"/>
+        <field name="remainingQty"  id="8"  type="int64"/>
+        <field name="lastPrice"     id="9"  type="int64"/>
+        <field name="lastQty"       id="10" type="int64"/>
+        <field name="holdAmount"    id="11" type="int64"/>
+        <field name="updatedAtMs"   id="12" type="int64"/>
+        <field name="eventSeq"      id="13" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="ProtoRiskConfig" id="44" description="RC0 spike ingress: per-market risk limits (replicated; defaults apply until set)">
+        <field name="correlationId"        id="1"  type="int64"/>
+        <field name="marketId"             id="2"  type="int32"/>
+        <field name="maxOrdersPerSec"      id="3"  type="int32"/>
+        <field name="maxOrdersPerMin"      id="4"  type="int32"/>
+        <field name="minQty"               id="5"  type="int64"/>
+        <field name="maxQty"               id="6"  type="int64"/>
+        <field name="maxNotional"          id="7"  type="int64"/>
+        <field name="collarPct"            id="8"  type="int32"/>
+        <field name="maxOpenOrders"        id="9"  type="int32"/>
+        <field name="maxPositionPerMarket" id="10" type="int64"/>
+        <field name="circuitBreaker"       id="11" type="BoolFlag"/>
+    </sbe:message>
+
 </sbe:messageSchema>

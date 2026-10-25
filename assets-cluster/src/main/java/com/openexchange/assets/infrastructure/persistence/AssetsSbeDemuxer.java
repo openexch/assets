@@ -6,6 +6,10 @@ import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
+import com.openexchange.assets.domain.commands.ProtoOrderCancelCommand;
+import com.openexchange.assets.domain.commands.ProtoOrderCreateCommand;
+import com.openexchange.assets.domain.commands.ProtoOrderFillCommand;
+import com.openexchange.assets.domain.commands.ProtoRiskConfigCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
 import com.openexchange.assets.domain.commands.SetMoneyJournalCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
@@ -14,6 +18,10 @@ import com.openexchange.assets.infrastructure.generated.DepositDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldDecoder;
 import com.openexchange.assets.infrastructure.generated.InitTradeHighWaterDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.ProtoOrderCancelDecoder;
+import com.openexchange.assets.infrastructure.generated.ProtoOrderCreateDecoder;
+import com.openexchange.assets.infrastructure.generated.ProtoOrderFillDecoder;
+import com.openexchange.assets.infrastructure.generated.ProtoRiskConfigDecoder;
 import com.openexchange.assets.infrastructure.generated.QueryFeedPositionDecoder;
 import com.openexchange.assets.infrastructure.generated.ReleaseDecoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotDecoder;
@@ -48,6 +56,10 @@ public final class AssetsSbeDemuxer {
     private final SetMoneyJournalDecoder setMoneyJournalDecoder = new SetMoneyJournalDecoder();
     private final RequestBalanceSnapshotDecoder balanceSnapshotDecoder = new RequestBalanceSnapshotDecoder();
     private final RequestHoldSnapshotDecoder holdSnapshotDecoder = new RequestHoldSnapshotDecoder();
+    private final ProtoOrderCreateDecoder protoCreateDecoder = new ProtoOrderCreateDecoder();
+    private final ProtoOrderCancelDecoder protoCancelDecoder = new ProtoOrderCancelDecoder();
+    private final ProtoOrderFillDecoder protoFillDecoder = new ProtoOrderFillDecoder();
+    private final ProtoRiskConfigDecoder protoRiskConfigDecoder = new ProtoRiskConfigDecoder();
 
     private final DepositCommand depositCommand = new DepositCommand();
     private final WithdrawCommand withdrawCommand = new WithdrawCommand();
@@ -55,6 +67,10 @@ public final class AssetsSbeDemuxer {
     private final ReleaseCommand releaseCommand = new ReleaseCommand();
     private final InitTradeHighWaterCommand initHighWaterCommand = new InitTradeHighWaterCommand();
     private final SetMoneyJournalCommand setMoneyJournalCommand = new SetMoneyJournalCommand();
+    private final ProtoOrderCreateCommand protoCreateCommand = new ProtoOrderCreateCommand();
+    private final ProtoOrderCancelCommand protoCancelCommand = new ProtoOrderCancelCommand();
+    private final ProtoOrderFillCommand protoFillCommand = new ProtoOrderFillCommand();
+    private final ProtoRiskConfigCommand protoRiskConfigCommand = new ProtoRiskConfigCommand();
 
     public AssetsSbeDemuxer(AssetsEngine engine, SettlementProjector projector) {
         this.engine = engine;
@@ -99,8 +115,81 @@ public final class AssetsSbeDemuxer {
             case RequestBalanceSnapshotDecoder.TEMPLATE_ID: handleRequestBalanceSnapshot(buffer, offset); break;
             case RequestHoldSnapshotDecoder.TEMPLATE_ID:    handleRequestHoldSnapshot(buffer, offset); break;
             case SetMoneyJournalDecoder.TEMPLATE_ID:        handleSetMoneyJournal(buffer, offset, timestamp); break;
+            case ProtoOrderCreateDecoder.TEMPLATE_ID:       handleProtoCreate(buffer, offset, timestamp); break;
+            case ProtoOrderCancelDecoder.TEMPLATE_ID:       handleProtoCancel(buffer, offset, timestamp); break;
+            case ProtoOrderFillDecoder.TEMPLATE_ID:         handleProtoFill(buffer, offset, timestamp); break;
+            case ProtoRiskConfigDecoder.TEMPLATE_ID:        handleProtoRiskConfig(buffer, offset, timestamp); break;
             default: break; // unknown message — ignore on the hot path
         }
+    }
+
+    // ---- RC0 spike: prototype order lifecycle ----
+
+    private void handleProtoCreate(DirectBuffer buffer, int offset, long timestamp) {
+        protoCreateDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        final ProtoOrderCreateCommand c = protoCreateCommand;
+        c.reset();
+        c.correlationId = protoCreateDecoder.correlationId();
+        c.userId = protoCreateDecoder.userId();
+        c.clientOrderIdHigh = protoCreateDecoder.clientOrderIdHigh();
+        c.clientOrderIdLow = protoCreateDecoder.clientOrderIdLow();
+        c.requestIdHigh = protoCreateDecoder.requestIdHigh();
+        c.requestIdLow = protoCreateDecoder.requestIdLow();
+        c.marketId = protoCreateDecoder.marketId();
+        // Unknown enum bytes decode as NULL_VAL (255) and are rejected as INVALID by the engine: never a throw.
+        c.side = protoCreateDecoder.side().value();
+        c.orderType = protoCreateDecoder.orderType().value();
+        c.timeInForce = protoCreateDecoder.timeInForce().value();
+        c.price = protoCreateDecoder.price();
+        c.quantity = protoCreateDecoder.quantity();
+        c.stopPrice = protoCreateDecoder.stopPrice();
+        c.displayQty = protoCreateDecoder.displayQty();
+        c.expiresAtMs = protoCreateDecoder.expiresAtMs();
+        c.flags = (int) protoCreateDecoder.flags();
+        engine.applyCommand(AssetsEngine.CMD_PROTO_ORDER_CREATE, c, timestamp);
+    }
+
+    private void handleProtoCancel(DirectBuffer buffer, int offset, long timestamp) {
+        protoCancelDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        final ProtoOrderCancelCommand c = protoCancelCommand;
+        c.reset();
+        c.correlationId = protoCancelDecoder.correlationId();
+        c.userId = protoCancelDecoder.userId();
+        c.orderId = protoCancelDecoder.orderId();
+        engine.applyCommand(AssetsEngine.CMD_PROTO_ORDER_CANCEL, c, timestamp);
+    }
+
+    private void handleProtoFill(DirectBuffer buffer, int offset, long timestamp) {
+        protoFillDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        final ProtoOrderFillCommand c = protoFillCommand;
+        c.reset();
+        c.correlationId = protoFillDecoder.correlationId();
+        c.tradeId = protoFillDecoder.tradeId();
+        c.marketId = protoFillDecoder.marketId();
+        c.buyOrderId = protoFillDecoder.buyOrderId();
+        c.sellOrderId = protoFillDecoder.sellOrderId();
+        c.price = protoFillDecoder.price();
+        c.quantity = protoFillDecoder.quantity();
+        c.takerIsBuy = protoFillDecoder.takerIsBuy() == BoolFlag.TRUE;
+        engine.applyCommand(AssetsEngine.CMD_PROTO_ORDER_FILL, c, timestamp);
+    }
+
+    private void handleProtoRiskConfig(DirectBuffer buffer, int offset, long timestamp) {
+        protoRiskConfigDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+        final ProtoRiskConfigCommand c = protoRiskConfigCommand;
+        c.reset();
+        c.correlationId = protoRiskConfigDecoder.correlationId();
+        c.marketId = protoRiskConfigDecoder.marketId();
+        c.maxOrdersPerSec = protoRiskConfigDecoder.maxOrdersPerSec();
+        c.maxOrdersPerMin = protoRiskConfigDecoder.maxOrdersPerMin();
+        c.minQty = protoRiskConfigDecoder.minQty();
+        c.maxQty = protoRiskConfigDecoder.maxQty();
+        c.maxNotional = protoRiskConfigDecoder.maxNotional();
+        c.collarPct = protoRiskConfigDecoder.collarPct();
+        c.maxOpenOrders = protoRiskConfigDecoder.maxOpenOrders();
+        c.maxPositionPerMarket = protoRiskConfigDecoder.maxPositionPerMarket();
+        c.circuitBreaker = protoRiskConfigDecoder.circuitBreaker() == BoolFlag.TRUE;
+        engine.applyCommand(AssetsEngine.CMD_PROTO_RISK_CONFIG, c, timestamp);
     }
 
     // Decoders read each field at its own fixed SBE offset, so read order is not load-bearing; we still

@@ -75,4 +75,14 @@ public interface AssetsEventSink {
      */
     void onSettleFault(long tradeId, long orderId, long userId, int assetId,
                        long drawnFromAvailable, long uncovered);
+
+    /**
+     * RC0 spike: one order lifecycle event from the prototype order engine ({@code ProtoOrderEngine}).
+     * Codes are the wire enums' values. Default no-op so the existing sinks and golden harness are
+     * untouched; the production publisher encodes it as {@code ProtoOrderEvent}.
+     */
+    default void onProtoOrderEvent(long correlationId, long orderId, long userId, int marketId, int status,
+                                   int reason, long filledQty, long remainingQty, long lastPrice, long lastQty,
+                                   long holdAmount, long updatedAtMs, long eventSeq) {
+    }
 }
