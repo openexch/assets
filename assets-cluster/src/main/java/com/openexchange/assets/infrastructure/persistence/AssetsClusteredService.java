@@ -152,6 +152,11 @@ public final class AssetsClusteredService implements ClusteredService {
             new com.openexchange.cluster.NodeReadiness();
     private com.openexchange.cluster.NodeEndpoint nodeEndpoint;
     private com.openexchange.cluster.ConsensusReadiness consensusReadiness;
+    // Per-message service-thread cost (apply vs drain), per-template cost and the last snapshot's
+    // size/timings, served as /metrics by the node endpoint. Plain writes on this thread only; see
+    // AssetsNodeMetrics for the publish/acquire visibility contract.
+    private final com.openexchange.assets.infrastructure.metrics.AssetsNodeMetrics nodeMetrics =
+            new com.openexchange.assets.infrastructure.metrics.AssetsNodeMetrics();
     // Aeron can reenter doBackgroundWork via idle() before the callback returns.
     // Its logPosition is already the new event's position at that point.
     private int applicationCallbackDepth;
@@ -197,6 +202,7 @@ public final class AssetsClusteredService implements ClusteredService {
         if (consensusReadiness != null) { consensusReadiness.start(cluster.aeron()); }
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
+        nodeMetrics.setRole(cluster.role().code());
         engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
                 balanceFeed != null ? balanceFeed::onBalanceUpdate
                         : AssetsEventPublisher.LiveBalanceTap.NONE));
@@ -209,6 +215,49 @@ public final class AssetsClusteredService implements ClusteredService {
         // Started, not ready: the snapshot is loaded but the log replay may
         // still be running. Readiness waits for current consensus and application evidence.
         readiness.started();
+    }
+
+    /**
+     * What this node exposes about itself beyond liveness. Suppliers run on the endpoint thread and
+     * read plain longs or Aeron counters; nothing here can block the service thread. The histogram
+     * and snapshot series come from {@code nodeMetrics} itself.
+     */
+    private com.openexchange.assets.infrastructure.metrics.AssetsMetricsBody metricsBody() {
+        return new com.openexchange.assets.infrastructure.metrics.AssetsMetricsBody(nodeMetrics)
+                .gauge("assets_accounts",
+                        "Accounts in the ledger (never shrinks; a rejected command still creates its account)",
+                        () -> engine.accountCount())
+                .gauge("assets_last_applied_trade_id", "Settlement high-water (dense ME tradeId) applied by this ledger",
+                        engine::getLastAppliedTradeId)
+                .gauge("assets_consume_position", "ME settlement-journal egressSeq watermark this ledger has applied",
+                        engine::getConsumePosition)
+                .gauge("assets_journal_seq", "Money journal sequence (last entry written)", engine::getJournalSeq)
+                .gauge("assets_money_journal_enabled", "1 if the money journal is armed on this ledger, else 0",
+                        () -> engine.isMoneyJournalEnabled() ? 1 : 0)
+                .counter("assets_settle_faults_total",
+                        "Settle legs that could not draw fully from their order hold (MUST be alerted on)",
+                        engine::getSettleFaultCount)
+                .counter("assets_suppressed_feed_releases_total",
+                        "Feed TerminalReleases suppressed on OMS-managed holds", engine::getSuppressedFeedReleaseCount)
+                .counter("assets_exhausted_holds_reaped_total", "Fully drawn holds reaped from accounts",
+                        engine::getExhaustedHoldsReaped)
+                .counter("assets_drain_timer_fires_total",
+                        "Idle-path egress drain belt fires (leader only; a chain that stops advancing is match#25)",
+                        () -> drainTimerFires)
+                .counter("assets_resumable_sessions_closed_total",
+                        "Resumable sessions closed at their egress queue ceiling instead of blocking the engine",
+                        () -> resumableSessionsClosed)
+                .gauge("assets_sessions", "Client sessions with an egress queue on this node", () -> egressQueues.length)
+                .gauge("assets_egress_pending_bytes", "Bytes queued for egress across sessions (-1 until the leader counters exist)",
+                        () -> egressPendingBytes == null ? -1 : egressPendingBytes.get())
+                .gauge("assets_egress_peak_pending_bytes", "Peak of assets_egress_pending_bytes (-1 until the leader counters exist)",
+                        () -> egressPeakPendingBytes == null ? -1 : egressPeakPendingBytes.get())
+                .counter("assets_egress_back_pressured_total",
+                        "Egress offers that hit back pressure (-1 until the leader counters exist)",
+                        () -> egressBackPressured == null ? -1 : egressBackPressured.get())
+                .gauge("assets_application_callback_failed",
+                        "1 once a cluster callback threw on this node (apply latched, /ready 503), else 0",
+                        () -> applicationCallbackFailed ? 1 : 0);
     }
 
     /**
@@ -275,24 +324,30 @@ public final class AssetsClusteredService implements ClusteredService {
             // Settlement Bridge's metrics port on the same box. cluster.memberId() is
             // -1 this early in onStart, so read the id the way AeronCluster does.
             // Empty env is treated as unset.
+            String nodeStr = System.getenv("CLUSTER_NODE");
+            if (nodeStr == null || nodeStr.isEmpty()) {
+                nodeStr = System.getProperty("node.id", "0");
+            }
+            int nodeId;
+            try {
+                nodeId = Integer.parseInt(nodeStr.trim());
+            } catch (NumberFormatException nfe) {
+                nodeId = 0;
+            }
+            nodeMetrics.setMemberId(nodeId);
+            // Env first (process manager), then the system property (in-process tests pick a free
+            // port without touching the environment), else the per-node default.
             final String env = System.getenv("ASSETS_NODE_PORT");
+            final String prop = System.getProperty("assets.node.port");
             final int port;
             if (env != null && !env.isEmpty()) {
                 port = Integer.parseInt(env);
+            } else if (prop != null && !prop.isEmpty()) {
+                port = Integer.parseInt(prop);
             } else {
-                String nodeStr = System.getenv("CLUSTER_NODE");
-                if (nodeStr == null || nodeStr.isEmpty()) {
-                    nodeStr = System.getProperty("node.id", "0");
-                }
-                int nodeId;
-                try {
-                    nodeId = Integer.parseInt(nodeStr.trim());
-                } catch (NumberFormatException nfe) {
-                    nodeId = 0;
-                }
                 port = 9700 + nodeId;
             }
-            nodeEndpoint = new com.openexchange.cluster.NodeEndpoint(readiness, null);
+            nodeEndpoint = new com.openexchange.cluster.NodeEndpoint(readiness, metricsBody()::render);
             nodeEndpoint.start(port);
         } catch (Exception e) {
             // A probe endpoint must never be the reason the ledger does not start.
@@ -459,6 +514,13 @@ public final class AssetsClusteredService implements ClusteredService {
         // Subscribe is a TRANSPORT concern, not money state: it changes who receives egress, never what
         // the ledger does. It is handled here and deliberately never reaches the engine, so the engine
         // stays a pure deterministic state machine and the subscription never enters a snapshot.
+        // Service-thread cost, apply and drain timed separately (RC0 measurement input). Diagnostic
+        // nanoTime only: nothing here feeds replicated state. Sampled per ASSETS_APPLY_SAMPLE_SHIFT
+        // (default: every message).
+        boolean sampled = false;
+        int templateId = -1;
+        long dispatchStartNs = 0L;
+        long dispatchEndNs = 0L;
         if (!applyIfSubscribe(session, buffer, offset, length)) {
             // Peeked, never consumed: a QueryFeedPosition marks its sender as resumable and still
             // flows to the engine, which answers it with a FeedPositionReport.
@@ -468,6 +530,12 @@ public final class AssetsClusteredService implements ClusteredService {
             // a finally so a throwing apply cannot leak one command's origin onto the next.
             originSession = session;
             originIsQuery = isQueryIngress(buffer, offset, length);
+            sampled = nodeMetrics.shouldSample();
+            if (sampled) {
+                templateId = length >= MessageHeaderDecoder.ENCODED_LENGTH
+                        ? peekHeaderDecoder.wrap(buffer, offset).templateId() : -1;
+                dispatchStartNs = System.nanoTime();
+            }
             try {
                 // Deterministic on every replica: decode -> domain command -> engine mutation. The apply
                 // only queues its egress; the offers happen in the drain below, off the apply's critical
@@ -477,8 +545,15 @@ public final class AssetsClusteredService implements ClusteredService {
                 originSession = null;
                 originIsQuery = false;
             }
+            if (sampled) {
+                dispatchEndNs = System.nanoTime();
+            }
         }
         drainEgress();
+        if (sampled) {
+            nodeMetrics.recordMessage(templateId, dispatchEndNs - dispatchStartNs,
+                    System.nanoTime() - dispatchEndNs, header.position());
+        }
         armDrainTimerIfNeeded();
     }
 
@@ -500,7 +575,9 @@ public final class AssetsClusteredService implements ClusteredService {
         if (correlationId == EGRESS_DRAIN_TIMER_ID) {
             drainTimerArmed = false;
             drainTimerFires++;
+            final long drainStartNs = System.nanoTime();
             drainEgress();
+            nodeMetrics.recordTimerDrain(System.nanoTime() - drainStartNs);
             updateEgressCounters();
             reportEgressPressure(timestamp);
             armDrainTimerIfNeeded();
@@ -548,6 +625,8 @@ public final class AssetsClusteredService implements ClusteredService {
                 + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
                 + " recordMs=" + ((recordedNs - offeredNs) / 1_000_000)
                 + " logPosition=" + cluster.logPosition());
+        nodeMetrics.stampSnapshot(System.currentTimeMillis(), length, chunks, serializedNs - startNs,
+                offeredNs - serializedNs, recordedNs - offeredNs, cluster.logPosition());
 
         // The baseline for the next snapshot, on EVERY member and whoever asked for this one.
         snapshotCadence.snapshotTaken(cluster.logPosition(), System.nanoTime());
@@ -650,6 +729,7 @@ public final class AssetsClusteredService implements ClusteredService {
 
     private void applyOnRoleChange(Cluster.Role newRole) {
         this.isLeader = newRole == Cluster.Role.LEADER;
+        nodeMetrics.setRole(newRole.code());
         // The feed publishes only on the leader; a GAIN also queues a full-store sweep, which is the
         // feed's natural baseline for consumers across the failover (the store itself is current on
         // every node because the live tap runs during apply everywhere).

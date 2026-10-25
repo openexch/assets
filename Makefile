@@ -10,7 +10,7 @@ test:
 
 # Fast, in-process determinism + snapshot-replay + conservation + recovery suite (the gate).
 determinism:
-	mvn -pl assets-cluster -am test -Dtest='DeterminismCorpusTest,EngineSnapshotReplayTest,ConservationInvariantTest,BalanceSnapshotCodecTest,WireRoundTripTest,ReplayRecoveryTest,ConservationFuzzTest,TotalLossRebuildTest,SnapshotChunkingTransportTest' -Dsurefire.failIfNoSpecifiedTests=false
+	mvn -pl assets-cluster -am test -Dtest='DeterminismCorpusTest,EngineSnapshotReplayTest,ConservationInvariantTest,BalanceSnapshotCodecTest,WireRoundTripTest,ReplayRecoveryTest,ConservationFuzzTest,TotalLossRebuildTest,SnapshotChunkingTransportTest,AssetsNodeMetricsTest' -Dsurefire.failIfNoSpecifiedTests=false
 
 # Regenerate determinism golden files after an INTENTIONAL output change (review the diff, then commit).
 update-goldens:
@@ -21,7 +21,7 @@ update-goldens:
 # the live money stack, PIN it off the matching engine's cores, e.g.:
 #   taskset -c 20-23 mvn -pl assets-cluster test -Dtest=ClusterBootSmokeTest
 integration:
-	mvn -pl assets-cluster -am test -Dtest='ClusterBootSmokeTest,SnapshotCadenceClusterTest,SnapshotChunkedRestoreClusterTest' -Dsurefire.failIfNoSpecifiedTests=false
+	mvn -pl assets-cluster -am test -Dtest='ClusterBootSmokeTest,SnapshotCadenceClusterTest,SnapshotChunkedRestoreClusterTest,NodeMetricsClusterTest' -Dsurefire.failIfNoSpecifiedTests=false
 
 clean:
 	mvn clean
