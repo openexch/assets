@@ -239,5 +239,8 @@ public class ConservationFuzzTest {
         @Override public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId, boolean journalEnabled) { }
         @Override public void onSettleFault(long tradeId, long orderId, long userId, int assetId, long drawnFromAvailable, long uncovered) { }
         @Override public void onSettleRejected(long tradeId, int marketId, long journalPosition, com.openexchange.assets.domain.SettleRejectReason reason, long detail) { }
+        public void onOrderReject(long c, long rh, long rl, long u, long o, int m, int ref, com.openexchange.assets.domain.CoreRejectReason r, int me, long d, long t) { }
+        public void onAdminAck(long c, int ref, com.openexchange.assets.domain.AdminResult r, int reason, long cfg) { }
+        public void onAdmissionState(int m, com.openexchange.assets.domain.GateState gs, com.openexchange.assets.domain.GateReason gr, boolean b, long at, long lp, boolean o) { }
     };
 }

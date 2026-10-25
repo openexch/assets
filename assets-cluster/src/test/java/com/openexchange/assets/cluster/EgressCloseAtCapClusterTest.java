@@ -12,6 +12,7 @@ import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.cluster.ClusteredMediaDriver;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -97,6 +98,7 @@ public class EgressCloseAtCapClusterTest {
 
         final List<String> hosts = List.of("localhost");
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
@@ -127,6 +129,7 @@ public class EgressCloseAtCapClusterTest {
             container = ClusteredServiceContainer.launch(cfg.clusteredServiceContext());
 
             wedged = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.BRIDGE))
                     .egressListener((clusterSessionId, timestamp, buffer, offset, length, header) -> { })
                     // 64K term: transport back-pressure after ~32KB un-polled, so the session's queue
                     // is what accumulates toward the (lowered) cap.
@@ -137,6 +140,7 @@ public class EgressCloseAtCapClusterTest {
                             hosts, PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
                     .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10)));
             healthy = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                     .egressListener(healthyEgress)
                     .egressChannel("aeron:udp?endpoint=localhost:0")
                     .ingressChannel("aeron:udp?term-length=16m|mtu=8192")
@@ -147,6 +151,8 @@ public class EgressCloseAtCapClusterTest {
 
             // Step 1 of the resume protocol: the wedged client identifies itself as a feed consumer.
             // After this offer it never polls egress again — the metal-drill wedge, in miniature.
+            // RC1 S3: the resumable mark is now the replicated RegisterSession, not a QueryFeedPosition side effect.
+            TestAuth.register(wedged, SessionClass.BRIDGE);
             offer(wedged, encodeQueryFeedPosition(0xFEEDL));
 
             // Pump: every deposit's egress fans out to BOTH sessions' queues. The healthy session

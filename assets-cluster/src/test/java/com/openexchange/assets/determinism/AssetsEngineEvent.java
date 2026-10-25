@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.determinism;
 
+import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
 import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.domain.SettleRejectReason;
 
@@ -16,7 +20,8 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.Settled, AssetsEngineEvent.BalanceSnapshotEnd,
                 AssetsEngineEvent.HoldSnapshotEntry, AssetsEngineEvent.HoldSnapshotEnd,
                 AssetsEngineEvent.FeedPositionReport, AssetsEngineEvent.SettleFault,
-                AssetsEngineEvent.SettleRejected {
+                AssetsEngineEvent.SettleRejected, AssetsEngineEvent.OrderReject, AssetsEngineEvent.AdminAck,
+                AssetsEngineEvent.AdmissionState {
 
     String render();
 
@@ -126,6 +131,34 @@ public sealed interface AssetsEngineEvent
         public String render() {
             return String.format("SETTLEREJECTED trade=%d market=%d pos=%d reason=%s detail=%d",
                     tradeId, marketId, journalPosition, reason.name(), detail);
+        }
+    }
+
+    record OrderReject(long correlationId, long userId, long orderId, int marketId, int refTemplateId,
+                       CoreRejectReason reason, long detail) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("ORDERREJECT corr=%d u=%d order=%d market=%d ref=%d reason=%s detail=%d",
+                    correlationId, userId, orderId, marketId, refTemplateId, reason.name(), detail);
+        }
+    }
+
+    record AdminAck(long correlationId, int refTemplateId, AdminResult result, int reason, long configVersion)
+            implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("ADMINACK corr=%d ref=%d result=%s reason=%d cfg=%d",
+                    correlationId, refTemplateId, result.name(), reason, configVersion);
+        }
+    }
+
+    record AdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                          boolean toOrigin) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("ADMISSION market=%d gate=%s reason=%s breaker=%s %s",
+                    marketId, gateState.name(), gateReason.name(), circuitBreaker ? "on" : "off",
+                    toOrigin ? "origin" : "broadcast");
         }
     }
 }

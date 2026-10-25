@@ -2,7 +2,16 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
+import com.openexchange.assets.application.engine.session.SessionAuthority;
 import com.openexchange.assets.application.projection.SettlementProjector;
+import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
+import com.openexchange.assets.infrastructure.generated.EgressChannelsDecoder;
+import com.openexchange.assets.infrastructure.generated.OrderEntryGateDecoder;
+import com.openexchange.assets.infrastructure.generated.RegisterSessionDecoder;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
+import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
@@ -186,7 +195,120 @@ public final class AssetsSbeDemuxer {
         }
     }
 
-    public void dispatch(final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
+    /** Leader-local transport effects of replicated session decisions; set by the service. */
+    public interface TransportHooks {
+        TransportHooks NONE = new TransportHooks() {
+            public void onSessionRegistered(long sessionId, int channelMask, boolean resumable) { }
+            public void onSessionRejected(long sessionId) { }
+        };
+
+        void onSessionRegistered(long sessionId, int channelMask, boolean resumable);
+
+        void onSessionRejected(long sessionId);
+    }
+
+    private TransportHooks hooks = TransportHooks.NONE;
+
+    public void setTransportHooks(final TransportHooks hooks) {
+        this.hooks = hooks == null ? TransportHooks.NONE : hooks;
+    }
+
+    // ---- RC1 S3 (K6): the class-mask table, one int of class bits per templateId; zero allocation ----
+    private static final int BIT_GATEWAY = 1 << SessionClass.GATEWAY.value();
+    private static final int BIT_FORWARDER = 1 << SessionClass.FORWARDER.value();
+    private static final int BIT_BRIDGE = 1 << SessionClass.BRIDGE.value();
+    private static final int BIT_ADMIN = 1 << SessionClass.ADMIN.value();
+    private static final int BIT_TOOL = 1 << SessionClass.TOOL.value();
+    private static final int BIT_TREASURY = 1 << SessionClass.TREASURY.value();
+    private static final int ANY_CLASS = BIT_GATEWAY | BIT_FORWARDER | BIT_BRIDGE | BIT_ADMIN | BIT_TOOL | BIT_TREASURY;
+    private static final int[] CLASS_MASK = new int[256];
+    /** Templates a production-class session may send BEFORE it has registered (queries and the registration itself). */
+    private static final boolean[] PRE_REGISTRATION = new boolean[256];
+    /** Templates whose body carries a userId the session's scope must allow. */
+    private static final boolean[] USER_SCOPED = new boolean[256];
+    /** Templates that start with a correlationId (echoed on the ORIGIN reject). */
+    private static final boolean[] HAS_CORRELATION = new boolean[256];
+
+    static {
+        CLASS_MASK[DepositDecoder.TEMPLATE_ID] = BIT_TREASURY | BIT_ADMIN | BIT_TOOL;
+        CLASS_MASK[WithdrawDecoder.TEMPLATE_ID] = BIT_TREASURY | BIT_ADMIN | BIT_TOOL;
+        CLASS_MASK[HoldDecoder.TEMPLATE_ID] = BIT_TOOL | BIT_ADMIN;
+        CLASS_MASK[ReleaseDecoder.TEMPLATE_ID] = BIT_TOOL | BIT_ADMIN;
+        CLASS_MASK[SettleDecoder.TEMPLATE_ID] = BIT_BRIDGE | BIT_TOOL;
+        CLASS_MASK[SettleBatchDecoder.TEMPLATE_ID] = BIT_BRIDGE | BIT_TOOL;
+        CLASS_MASK[TerminalReleaseDecoder.TEMPLATE_ID] = BIT_BRIDGE | BIT_TOOL;
+        CLASS_MASK[QueryFeedPositionDecoder.TEMPLATE_ID] = ANY_CLASS;
+        CLASS_MASK[RequestBalanceSnapshotDecoder.TEMPLATE_ID] = BIT_ADMIN | BIT_TOOL;
+        CLASS_MASK[RequestHoldSnapshotDecoder.TEMPLATE_ID] = BIT_ADMIN | BIT_TOOL;
+        CLASS_MASK[InitTradeHighWaterDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[SubscribeDecoder.TEMPLATE_ID] = ANY_CLASS;
+        CLASS_MASK[SetMoneyJournalDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[CreateOrderDecoder.TEMPLATE_ID] = BIT_GATEWAY;
+        CLASS_MASK[CancelOrderDecoder.TEMPLATE_ID] = BIT_GATEWAY;
+        CLASS_MASK[AmendOrderDecoder.TEMPLATE_ID] = BIT_GATEWAY;
+        CLASS_MASK[RequestOrderSnapshotDecoder.TEMPLATE_ID] = BIT_GATEWAY | BIT_ADMIN;
+        CLASS_MASK[MarketTickDecoder.TEMPLATE_ID] = BIT_FORWARDER;
+        CLASS_MASK[MeJournalTradeDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[MeJournalTradeBatchDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[MeJournalTerminalDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[MeCommandOutcomeDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[RequestPendingDispatchDecoder.TEMPLATE_ID] = BIT_FORWARDER;
+        CLASS_MASK[CoreConfigDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[RiskConfigSetDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[CircuitBreakerDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[OrderEntryGateDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[QuarantineOrderDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[RequestRiskConfigDecoder.TEMPLATE_ID] = BIT_ADMIN;
+        CLASS_MASK[RegisterSessionDecoder.TEMPLATE_ID] = ANY_CLASS;
+        PRE_REGISTRATION[QueryFeedPositionDecoder.TEMPLATE_ID] = true;
+        PRE_REGISTRATION[SubscribeDecoder.TEMPLATE_ID] = true;
+        PRE_REGISTRATION[RegisterSessionDecoder.TEMPLATE_ID] = true;
+        for (final int t : new int[] {DepositDecoder.TEMPLATE_ID, WithdrawDecoder.TEMPLATE_ID, HoldDecoder.TEMPLATE_ID,
+                ReleaseDecoder.TEMPLATE_ID, CreateOrderDecoder.TEMPLATE_ID, CancelOrderDecoder.TEMPLATE_ID,
+                AmendOrderDecoder.TEMPLATE_ID, RequestOrderSnapshotDecoder.TEMPLATE_ID}) {
+            USER_SCOPED[t] = true;
+        }
+        for (final int t : new int[] {1, 2, 3, 7, 8, 9, 32, 50, 51, 52, 53, 65, 70, 71, 72, 73, 74, 75, 80}) {
+            HAS_CORRELATION[t] = true;
+        }
+    }
+
+    /** Classes that must RegisterSession before anything but a query: the production consumers. */
+    private static boolean requiresRegistration(final SessionClass c) {
+        return c == SessionClass.GATEWAY || c == SessionClass.FORWARDER || c == SessionClass.BRIDGE;
+    }
+
+    private final RegisterSessionDecoder registerSessionDecoder = new RegisterSessionDecoder();
+    private final OrderEntryGateDecoder orderEntryGateDecoder = new OrderEntryGateDecoder();
+    /** A session this registry never saw (or whose principal was unreadable): authorises nothing. */
+    private final SessionAuthority unknownSession = new SessionAuthority(-2L, null);
+
+    /**
+     * Dispatch a frame from a cluster session: the frame gate, then the session's authority (class mask,
+     * registration-first for production classes, user scope), then the handler. Every authority failure is
+     * a deterministic ORIGIN OrderReject naming the template, counted, never a mutation or a fence event.
+     */
+    public void dispatch(final long sessionId, final DirectBuffer buffer, final int offset, final int length,
+                         final long timestamp) {
+        final SessionAuthority authority = engine.sessions().get(sessionId);
+        dispatchChecked(authority == null ? unknownSession : authority, buffer, offset, length, timestamp);
+    }
+
+    /** Commands refused for session authority (class, user scope, registration). */
+    public long unauthorisedCount() {
+        return engine.getUnauthorisedCount();
+    }
+
+    /**
+     * Dispatch under the TRUSTED authority (every class, every user): in-process tests and tools only.
+     * The service never calls this; it dispatches by session id.
+     */
+    public void dispatchTrusted(final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
+        dispatchChecked(SessionAuthority.TRUSTED, buffer, offset, length, timestamp);
+    }
+
+    private void dispatchChecked(final SessionAuthority authority, final DirectBuffer buffer, final int offset,
+                                 final int length, final long timestamp) {
         if (applyFailed) {
             throw new IllegalStateException("Ingress application already failed; restart required");
         }
@@ -237,7 +359,32 @@ public final class AssetsSbeDemuxer {
             return;
         }
 
-        // 5. Body decode and apply. Decode poison (IAE/IOOBE before any application callback) is dropped
+        // 5. Session authority (K6): class mask, registration-first, user scope. RegisterSession itself is
+        //    judged by the registry (so a session with no usable principal gets a REJECTED ack, not silence).
+        if (!authority.isTrusted() && templateId != RegisterSessionDecoder.TEMPLATE_ID) {
+            // Order (hardening B3.4): registration first, then class, then user scope.
+            if (requiresRegistration(authority.sessionClass()) && !authority.isRegistered()
+                    && !PRE_REGISTRATION[templateId]) {
+                engine.rejectUnauthorised(templateId, correlationIdOf(templateId), userIdOf(templateId),
+                        CoreRejectReason.UNREGISTERED_SESSION, authority.sessionId());
+                return;
+            }
+            if ((CLASS_MASK[templateId] & authority.classBit()) == 0) {
+                engine.rejectUnauthorised(templateId, correlationIdOf(templateId), userIdOf(templateId),
+                        CoreRejectReason.UNAUTHORIZED_CLASS, authority.sessionClass().value());
+                return;
+            }
+            if (USER_SCOPED[templateId]) {
+                final long userId = userIdOf(templateId);
+                if (!authority.allowsUser(userId)) {
+                    engine.rejectUnauthorised(templateId, correlationIdOf(templateId), userId,
+                            CoreRejectReason.NOT_OWNER, userId);
+                    return;
+                }
+            }
+        }
+
+        // 6. Body decode and apply. Decode poison (IAE/IOOBE before any application callback) is dropped
         //    deterministically; any failure after `applying = true` latches and escapes to the service.
         try {
             switch (templateId) {
@@ -253,15 +400,17 @@ public final class AssetsSbeDemuxer {
                 case RequestBalanceSnapshotDecoder.TEMPLATE_ID: handleRequestBalanceSnapshot(); break;
                 case RequestHoldSnapshotDecoder.TEMPLATE_ID:    handleRequestHoldSnapshot(); break;
                 case SetMoneyJournalDecoder.TEMPLATE_ID:        handleSetMoneyJournal(timestamp); break;
+                case RegisterSessionDecoder.TEMPLATE_ID:     handleRegisterSession(authority, timestamp); break;
+                case OrderEntryGateDecoder.TEMPLATE_ID:      handleOrderEntryGate(timestamp); break;
                 case SubscribeDecoder.TEMPLATE_ID:
                     // Transport-level; consumed at the service boundary before dispatch. Reaching
                     // here means the service peek declined it (bad length/version): drop, count.
                     rejectDecode("Subscribe frame reached the engine");
                     break;
                 default:
-                    // v6 order / feed / admin / session templates: defined by this schema, served from
-                    // RC1 S3 (RegisterSession, OrderEntryGate) and S4+ (orders, feed, config). Counted
-                    // so a gateway speaking ahead of this build is visible, never silent.
+                    // v6 order / feed / admin templates defined by this schema and served from RC1 S4+
+                    // (orders, feed, config). Counted so a gateway speaking ahead of this build is
+                    // visible, never silent.
                     unhandled(templateId);
                     break;
             }
@@ -471,6 +620,76 @@ public final class AssetsSbeDemuxer {
         holdSnapshotDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         applying = true;
         engine.requestHoldSnapshot(holdSnapshotDecoder.correlationId());
+    }
+
+    /**
+     * RegisterSession (replicated): the registry asserts the class against the principal and requires a
+     * resumable declaration; the leader-local effects (egress mask, resumable mark, or closing a refused
+     * session) go through the transport hooks the service installed.
+     */
+    private void handleRegisterSession(final SessionAuthority authority, final long timestamp) {
+        registerSessionDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int classRaw = registerSessionDecoder.sessionClassRaw();
+        final int resumableRaw = registerSessionDecoder.resumableRaw();
+        if (classRaw < 0 || classRaw > 6 || !validBool(resumableRaw)) {
+            rejectDecode("RegisterSession class " + classRaw + " resumable " + resumableRaw);
+            return;
+        }
+        final SessionClass asserted = com.openexchange.assets.auth.CorePrincipal.classOf(classRaw);
+        final EgressChannelsDecoder ch = registerSessionDecoder.channels();
+        int mask = 0;
+        if (ch.acks())        mask |= AssetsEventPublisher.CH_ACKS;
+        if (ch.balances())    mask |= AssetsEventPublisher.CH_BALANCES;
+        if (ch.settlements()) mask |= AssetsEventPublisher.CH_SETTLEMENTS;
+        if (ch.snapshots())   mask |= AssetsEventPublisher.CH_SNAPSHOTS;
+        if (ch.orders())      mask |= AssetsEventPublisher.CH_ORDERS;
+        if (ch.dispatch())    mask |= AssetsEventPublisher.CH_DISPATCH;
+        if (ch.control())     mask |= AssetsEventPublisher.CH_CONTROL;
+        final long correlationId = registerSessionDecoder.correlationId();
+        final int readerKind = registerSessionDecoder.readerKind();
+        final long identity = registerSessionDecoder.identity();
+        final long sourceEpoch = registerSessionDecoder.sourceEpoch();
+        applying = true;
+        final var registration = engine.applyRegisterSession(authority.sessionId(), correlationId, asserted, mask,
+                resumableRaw == BoolFlag.TRUE.value(), readerKind, identity, sourceEpoch, timestamp);
+        if (registration.result() == com.openexchange.assets.domain.AdminResult.REJECTED) {
+            hooks.onSessionRejected(authority.sessionId());
+        } else {
+            hooks.onSessionRegistered(authority.sessionId(), mask, true);
+        }
+    }
+
+    /** OrderEntryGate (ADMIN, replicated): raw enum bytes are validated before anything is applied. */
+    private void handleOrderEntryGate(final long timestamp) {
+        orderEntryGateDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final GateState state = GateState.fromCode(orderEntryGateDecoder.stateRaw());
+        final GateReason reason = GateReason.fromCode(orderEntryGateDecoder.reasonRaw());
+        if (state == null || reason == null) {
+            rejectDecode("OrderEntryGate state " + orderEntryGateDecoder.stateRaw() + " reason " + orderEntryGateDecoder.reasonRaw());
+            return;
+        }
+        applying = true;
+        engine.applyOrderEntryGate(orderEntryGateDecoder.correlationId(), orderEntryGateDecoder.marketId(), state, reason, timestamp);
+    }
+
+    /** The frame's correlationId when its template starts with one, else 0. Frame already bounds-checked. */
+    private long correlationIdOf(final int templateId) {
+        return HAS_CORRELATION[templateId] ? frame.getLong(HEADER) : 0L;
+    }
+
+    /** The frame's userId for a user-scoped template, else 0. Offsets come from the generated codecs. */
+    private long userIdOf(final int templateId) {
+        switch (templateId) {
+            case DepositDecoder.TEMPLATE_ID:  return frame.getLong(HEADER + DepositDecoder.userIdEncodingOffset());
+            case WithdrawDecoder.TEMPLATE_ID: return frame.getLong(HEADER + WithdrawDecoder.userIdEncodingOffset());
+            case HoldDecoder.TEMPLATE_ID:     return frame.getLong(HEADER + HoldDecoder.userIdEncodingOffset());
+            case ReleaseDecoder.TEMPLATE_ID:  return frame.getLong(HEADER + ReleaseDecoder.userIdEncodingOffset());
+            case CreateOrderDecoder.TEMPLATE_ID: return frame.getLong(HEADER + CreateOrderDecoder.userIdEncodingOffset());
+            case CancelOrderDecoder.TEMPLATE_ID: return frame.getLong(HEADER + CancelOrderDecoder.userIdEncodingOffset());
+            case AmendOrderDecoder.TEMPLATE_ID:  return frame.getLong(HEADER + AmendOrderDecoder.userIdEncodingOffset());
+            case RequestOrderSnapshotDecoder.TEMPLATE_ID: return frame.getLong(HEADER + RequestOrderSnapshotDecoder.userIdEncodingOffset());
+            default: return 0L;
+        }
     }
 
     // ---- validity helpers (no allocation, no throw) ----

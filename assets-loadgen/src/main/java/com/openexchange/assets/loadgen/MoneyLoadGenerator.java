@@ -428,6 +428,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private static AeronCluster connect(final String aeronDir, final String ingressEndpoints,
                                         final String egressHost, final EgressListener listener) {
         return AeronCluster.connect(new AeronCluster.Context()
+                // RC1 S3 (K6): both clusters may authenticate; the AE requires it. One TOOL credential
+                // (AE_AUTH_CREDENTIAL / -Dassets.auth.credential) is presented to every connect; a
+                // cluster without an authenticator ignores it.
+                .credentialsSupplier(credentialsOrNone())
                 .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10))
                 .aeronDirectoryName(aeronDir)
                 .ingressChannel("aeron:udp?term-length=16m|mtu=8k")
@@ -1154,5 +1158,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         try (MoneyLoadGenerator gen = new MoneyLoadGenerator(args)) {
             gen.run();
         }
+    }
+
+    private static io.aeron.security.CredentialsSupplier credentialsOrNone() {
+        final com.openexchange.assets.auth.CoreCredentials c = com.openexchange.assets.auth.CoreCredentials.fromEnvironment();
+        return c == null ? new io.aeron.security.NullCredentialsSupplier() : c.supplier();
     }
 }

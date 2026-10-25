@@ -83,4 +83,18 @@ public interface AssetsEventSink {
      * MUST be alerted on: the feed is delivering trades this ledger cannot book.
      */
     void onSettleRejected(long tradeId, int marketId, long journalPosition, SettleRejectReason reason, long detail);
+
+    // ---- RC1 S3: session authority, admin and gate outcomes ----
+
+    /** ORIGIN reject of an ingress command (wire OrderReject). refTemplateId names the refused template. */
+    void onOrderReject(long correlationId, long requestIdHigh, long requestIdLow, long userId, long orderId,
+                       int marketId, int refTemplateId, CoreRejectReason reason, int meReason, long detail,
+                       long rejectedAtMs);
+
+    /** ORIGIN reply to an admin command or RegisterSession (wire AdminAck). */
+    void onAdminAck(long correlationId, int refTemplateId, AdminResult result, int reason, long configVersion);
+
+    /** Gate state for one market (0 = global); BROADCAST on control, or ORIGIN when answering RegisterSession. */
+    void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                          long atMs, long logPosition, boolean toOrigin);
 }

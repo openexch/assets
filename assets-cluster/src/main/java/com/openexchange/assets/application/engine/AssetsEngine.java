@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.application.engine;
 
+import com.openexchange.assets.application.engine.gate.OrderEntryGate;
+import com.openexchange.assets.application.engine.session.SessionAuthority;
+import com.openexchange.assets.application.engine.session.SessionRegistry;
 import com.openexchange.assets.application.engine.time.DeadlineIndex;
+import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import com.openexchange.assets.domain.Account;
 import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.AssetsEventSink;
@@ -95,6 +103,14 @@ public final class AssetsEngine {
      * single sweep timer while it is non-empty; {@link #sweep} pops what is due.
      */
     private final DeadlineIndex deadlines = new DeadlineIndex();
+    /** RC1 S3 (K6): every live session's authority; replicated-derived, snapshotted (section 9). */
+    private final SessionRegistry sessions = new SessionRegistry();
+    /** RC1 S3 (K5 item 3): the replicated order-entry gate; snapshotted (section 5). */
+    private final OrderEntryGate gate = new OrderEntryGate();
+    /** Commands refused for session authority (class, scope, registration). Alarm target, not snapshotted. */
+    private long unauthorisedCount = 0L;
+    /** The log position of the entry being applied; set by the service, carried on control egress. Transient. */
+    private long logPosition = 0L;
 
     // Money journal (dark by default): a dead, perfectly-predicted branch per applied command when
     // off; when armed, every APPLIED movement is emitted through the port with a dense journalSeq.
@@ -725,6 +741,76 @@ public final class AssetsEngine {
         });
         if (breach[0] != null) {
             throw new IllegalStateException("restored ledger fails its invariants: " + breach[0]);
+        }
+    }
+
+    // ---- RC1 S3: session authority and the order-entry gate ----
+
+    public SessionRegistry sessions() {
+        return sessions;
+    }
+
+    public OrderEntryGate gate() {
+        return gate;
+    }
+
+    public AssetsEventSink eventSink() {
+        return sink;
+    }
+
+    /** The service sets this before dispatching a log entry; control egress carries it as an ordering key. */
+    public void setLogPosition(long position) {
+        this.logPosition = position;
+    }
+
+    public long getLogPosition() {
+        return logPosition;
+    }
+
+    public long getUnauthorisedCount() {
+        return unauthorisedCount;
+    }
+
+    /**
+     * A command refused before any mutation for a session-authority reason (class mismatch, foreign user,
+     * unregistered session): a deterministic ORIGIN reject naming the template, never a fence event.
+     */
+    public void rejectUnauthorised(int refTemplateId, long correlationId, long userId, CoreRejectReason reason, long detail) {
+        unauthorisedCount++;
+        sink.onOrderReject(correlationId, 0L, 0L, userId, 0L, 0, refTemplateId, reason, 255, detail, lastLogTime);
+    }
+
+    /**
+     * RegisterSession (replicated): assert the class, require resumable, record the declaration; reply
+     * AdminAck plus the global gate state so a gateway learns admission at connect.
+     *
+     * @return the registration outcome (the service closes the session on REJECTED)
+     */
+    public SessionRegistry.Registration applyRegisterSession(long sessionId, long correlationId, SessionClass assertedClass,
+                                                              int channelMask, boolean resumable, int readerKind,
+                                                              long identity, long sourceEpoch, long timestamp) {
+        observeLogTime(timestamp);
+        final SessionRegistry.Registration r = sessions.register(sessionId, assertedClass, channelMask, resumable,
+                readerKind, identity, sourceEpoch);
+        sink.onAdminAck(correlationId, 80, r.result(), r.reason().code(), 0L);
+        if (r.result() != AdminResult.REJECTED) {
+            sink.onAdmissionState(OrderEntryGate.GLOBAL, gate.state(OrderEntryGate.GLOBAL), gate.reason(OrderEntryGate.GLOBAL),
+                    false, lastLogTime, logPosition, true);
+        }
+        return r;
+    }
+
+    /** OrderEntryGate (ADMIN, replicated): set one gate; DUPLICATE when unchanged; broadcast the new state. */
+    public void applyOrderEntryGate(long correlationId, int marketId, GateState state, GateReason reason, long timestamp) {
+        observeLogTime(timestamp);
+        if (!OrderEntryGate.validMarket(marketId) || state == null || reason == null) {
+            sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.UNKNOWN_MARKET.code(), 0L);
+            return;
+        }
+        final boolean changed = gate.set(marketId, state, reason);
+        sink.onAdminAck(correlationId, 73, changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, 0, 0L);
+        if (changed) {
+            sink.onAdmissionState(marketId, state, reason, false, lastLogTime, logPosition, false);
         }
     }
 }

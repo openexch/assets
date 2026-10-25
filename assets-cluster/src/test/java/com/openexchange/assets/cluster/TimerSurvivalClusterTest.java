@@ -6,6 +6,7 @@ import com.openexchange.cluster.ClusterPorts;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
 import io.aeron.cluster.ClusteredMediaDriver;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
@@ -235,6 +236,7 @@ public class TimerSurvivalClusterTest {
     private static Member boot(final int id, final List<String> hosts, final File tmp) {
         final Member m = new Member(id);
         m.service = new TimerProbeService(id);
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(id, hosts, hosts, PORT_BASE, m.service);
         cfg.baseDir(new File(tmp, "node" + id));
         cfg.aeronDirectoryName(new File(tmp, "driver" + id).getAbsolutePath());
@@ -275,6 +277,7 @@ public class TimerSurvivalClusterTest {
         while (System.currentTimeMillis() < deadline) {
             try {
                 return AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                         .egressListener((sessionId, timestamp, buffer, offset, length, header) -> {
                             if (length >= FRAME_LENGTH && buffer.getInt(offset) == KIND_FIRED) {
                                 firedSeen.add(new long[] {buffer.getLong(offset + 4), buffer.getLong(offset + 12),

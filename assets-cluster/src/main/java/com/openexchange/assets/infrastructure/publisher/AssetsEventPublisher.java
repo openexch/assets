@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.infrastructure.publisher;
 
+import com.openexchange.assets.domain.AdminResult;
 import com.openexchange.assets.domain.AssetsEventSink;
+import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
 import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.domain.SettleRejectReason;
+import com.openexchange.assets.infrastructure.generated.AdminAckEncoder;
+import com.openexchange.assets.infrastructure.generated.AdmissionStateEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderRejectEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.DepositAckEncoder;
@@ -92,7 +99,16 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     public static final int CH_SETTLEMENTS = 1 << 2;
     /** Snapshot streams and their terminators. */
     public static final int CH_SNAPSHOTS = 1 << 3;
-    /** What a session gets when it never subscribes: everything, i.e. the pre-subscription behaviour. */
+    /** v6: OrderEvent / OrderEventBatch (gateways). */
+    public static final int CH_ORDERS = 1 << 4;
+    /** v6: MeDispatch / MeDispatchBatch (forwarder sessions). */
+    public static final int CH_DISPATCH = 1 << 5;
+    /** v6: AdmissionState (gate and breaker changes). */
+    public static final int CH_CONTROL = 1 << 6;
+    /**
+     * What a session gets when it never subscribes or registers: the four pre-v6 channels. The three
+     * v6 streams are opt-in (RegisterSession), so a v5-era tool never receives the order firehose.
+     */
     public static final int CH_ALL = CH_ACKS | CH_BALANCES | CH_SETTLEMENTS | CH_SNAPSHOTS;
 
     private static final int BUFFER_CAPACITY = 256;
@@ -118,6 +134,9 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final FeedPositionReportEncoder feedPositionReportEncoder = new FeedPositionReportEncoder();
     private final SettleFaultEncoder settleFaultEncoder = new SettleFaultEncoder();
     private final SettleRejectedEncoder settleRejectedEncoder = new SettleRejectedEncoder();
+    private final OrderRejectEncoder orderRejectEncoder = new OrderRejectEncoder();
+    private final AdminAckEncoder adminAckEncoder = new AdminAckEncoder();
+    private final AdmissionStateEncoder admissionStateEncoder = new AdmissionStateEncoder();
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
@@ -253,6 +272,39 @@ public final class AssetsEventPublisher implements AssetsEventSink {
             case INVALID_PARTY:     return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_PARTY;
             default: throw new IllegalArgumentException("unmapped SettleRejectReason " + r);
         }
+    }
+
+    @Override
+    public void onOrderReject(long correlationId, long requestIdHigh, long requestIdLow, long userId, long orderId,
+                              int marketId, int refTemplateId, CoreRejectReason reason, int meReason, long detail,
+                              long rejectedAtMs) {
+        orderRejectEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).requestIdHigh(requestIdHigh).requestIdLow(requestIdLow)
+                .userId(userId).orderId(orderId).marketId(marketId).refTemplateId(refTemplateId)
+                .reason(com.openexchange.assets.infrastructure.generated.CoreRejectReason.get((short) reason.code()))
+                .meReason((short) meReason).detail(detail).rejectedAtMs(rejectedAtMs);
+        flush(orderRejectEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
+    }
+
+    @Override
+    public void onAdminAck(long correlationId, int refTemplateId, AdminResult result, int reason, long configVersion) {
+        adminAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).refTemplateId(refTemplateId)
+                .result(com.openexchange.assets.infrastructure.generated.AdminResult.get((short) result.code()))
+                .reason((short) reason).configVersion(configVersion);
+        flush(adminAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
+    }
+
+    @Override
+    public void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                                 long atMs, long logPosition, boolean toOrigin) {
+        admissionStateEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .marketId(marketId)
+                .gateState(com.openexchange.assets.infrastructure.generated.GateState.get((short) gateState.code()))
+                .gateReason(com.openexchange.assets.infrastructure.generated.GateReason.get((short) gateReason.code()))
+                .circuitBreaker(circuitBreaker ? BoolFlag.TRUE : BoolFlag.FALSE)
+                .atMs(atMs).logPosition(logPosition);
+        flush(admissionStateEncoder.encodedLength(), CH_CONTROL, toOrigin ? Routing.ORIGIN : Routing.BROADCAST);
     }
 
     private void flush(int bodyLength, int channel, Routing routing) {

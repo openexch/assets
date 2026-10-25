@@ -175,7 +175,12 @@ public final class ClusterConfig {
                 .logFragmentLimit(64)
                 .wheelTickResolutionNs(1_000_000)
                 .ticksPerWheel(1024)
-                .maxConcurrentSessions(50);
+                .maxConcurrentSessions(50)
+                // RC1 S3 (K6): every session authenticates against the node-local key table
+                // (-Dassets.auth.keys / ASSETS_AUTH_KEYS); the minted principal rides the SessionOpen log
+                // event to every member. An unset table rejects every session, loudly, by design.
+                .authenticatorSupplier(() -> new com.openexchange.assets.infrastructure.auth.CoreAuthenticator(
+                        com.openexchange.assets.auth.AuthKeyTable.fromEnvironment()));
 
         if (clusteredService instanceof AssetsClusteredService engineService) {
             engineService.readinessConsensus(consensusModuleContext);

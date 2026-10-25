@@ -83,7 +83,7 @@ public class IngressFenceTest {
         }
 
         void dispatch(int length) {
-            demuxer.dispatch(buf, 0, length, TS);
+            demuxer.dispatchTrusted(buf, 0, length, TS);
         }
 
         /** Events recorded since the last {@link #markNow()}: the recorder's list is read-only. */
@@ -145,8 +145,8 @@ public class IngressFenceTest {
     public void invalidPhysicalBoundsAreDroppedBeforeHeaderAccess() {
         final Rig r = new Rig();
         final UnsafeBuffer tiny = new UnsafeBuffer(new byte[4]);
-        r.demuxer.dispatch(tiny, 0, 8, TS);
-        r.demuxer.dispatch(tiny, Integer.MAX_VALUE, 8, TS);
+        r.demuxer.dispatchTrusted(tiny, 0, 8, TS);
+        r.demuxer.dispatchTrusted(tiny, Integer.MAX_VALUE, 8, TS);
         assertEquals(2, r.demuxer.decodeRejectCount());
         assertEquals(0, r.demuxer.applyErrorCount());
         r.dispatch(r.deposit(1, 0, 100)); // the healthy engine continues
@@ -159,7 +159,7 @@ public class IngressFenceTest {
         final int len = r.deposit(1, 0, 100);
         final UnsafeBuffer shifted = new UnsafeBuffer(new byte[512]);
         shifted.putBytes(17, r.buf, 0, len);
-        r.demuxer.dispatch(shifted, 17, len, TS);
+        r.demuxer.dispatchTrusted(shifted, 17, len, TS);
         assertEquals(1, r.engine.accountCount());
         assertEquals(0, r.demuxer.decodeRejectCount());
     }
@@ -407,6 +407,9 @@ public class IngressFenceTest {
             public void onFeedPositionReport(long c, long p, long t, boolean j) { }
             public void onSettleFault(long t, long o, long u, int a, long d, long un) { }
             public void onSettleRejected(long t, int m, long p, SettleRejectReason r, long d) { }
+            public void onOrderReject(long c, long rh, long rl, long u, long o, int m, int ref, com.openexchange.assets.domain.CoreRejectReason r, int me, long d, long t) { }
+            public void onAdminAck(long c, int ref, com.openexchange.assets.domain.AdminResult r, int reason, long cfg) { }
+            public void onAdmissionState(int m, com.openexchange.assets.domain.GateState gs, com.openexchange.assets.domain.GateReason gr, boolean b, long at, long lp, boolean o) { }
         };
     }
 

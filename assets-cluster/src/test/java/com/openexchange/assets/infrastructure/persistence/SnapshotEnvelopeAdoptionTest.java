@@ -132,5 +132,8 @@ public class SnapshotEnvelopeAdoptionTest {
         public void onFeedPositionReport(long c, long p, long t, boolean j) { }
         public void onSettleFault(long t, long o, long u, int a, long d, long un) { }
         public void onSettleRejected(long t, int m, long p, com.openexchange.assets.domain.SettleRejectReason r, long d) { }
+        public void onOrderReject(long c, long rh, long rl, long u, long o, int m, int ref, com.openexchange.assets.domain.CoreRejectReason r, int me, long d, long t) { }
+        public void onAdminAck(long c, int ref, com.openexchange.assets.domain.AdminResult r, int reason, long cfg) { }
+        public void onAdmissionState(int m, com.openexchange.assets.domain.GateState gs, com.openexchange.assets.domain.GateReason gr, boolean b, long at, long lp, boolean o) { }
     }
 }

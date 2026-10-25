@@ -9,6 +9,7 @@ import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.RecordingLog;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import org.agrona.CloseHelper;
@@ -69,6 +70,7 @@ public class SnapshotCadenceClusterTest {
 
         final List<String> hosts = List.of("localhost");
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
@@ -101,6 +103,7 @@ public class SnapshotCadenceClusterTest {
             container = ClusteredServiceContainer.launch(cfg.clusteredServiceContext());
 
             client = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                     .egressListener((sessionId, timestamp, buffer, offset, length, header) -> { })
                     .egressChannel("aeron:udp?endpoint=localhost:0")
                     .ingressChannel("aeron:udp?term-length=64k")

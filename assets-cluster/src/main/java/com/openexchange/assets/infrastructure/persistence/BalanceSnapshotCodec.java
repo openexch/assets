@@ -3,7 +3,11 @@ package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.domain.Account;
+import com.openexchange.assets.application.engine.gate.OrderEntryGate;
+import com.openexchange.assets.application.engine.session.SessionAuthority;
 import com.openexchange.assets.domain.Asset;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 
@@ -60,6 +64,8 @@ public final class BalanceSnapshotCodec {
     public static final short SECTION_REQUEST_IDS = 6;
     public static final short SECTION_READER_REGISTRY = 7;
     public static final short SECTION_CORE_CONFIG = 8;
+    /** Live session authorities (RC1 S3, K6): replicated-derived, so a restored member agrees with its peers. */
+    public static final short SECTION_SESSIONS = 9;
 
     private static final int FLAG_JOURNAL_ENABLED = 1;
     private static final int KNOWN_FLAGS = FLAG_JOURNAL_ENABLED;
@@ -126,10 +132,12 @@ public final class BalanceSnapshotCodec {
         dst.putByte(pos[0], (byte) (engine.isMoneyJournalEnabled() ? FLAG_JOURNAL_ENABLED : 0));
         pos[0] += 1;
 
-        // Sections, ascending by id. Only ACCOUNTS exists on this build; later slices append theirs.
-        dst.putInt(pos[0], 1);
+        // Sections, ascending by id: 1 ACCOUNTS, 5 GATES, 9 SESSIONS on this build; later slices append theirs.
+        dst.putInt(pos[0], 3);
         pos[0] += 4;
         pos[0] = writeAccountsSection(engine, dst, pos[0]);
+        pos[0] = writeGatesSection(engine, dst, pos[0]);
+        pos[0] = writeSessionsSection(engine, dst, pos[0]);
 
         return pos[0] - offset;
     }
@@ -169,6 +177,71 @@ public final class BalanceSnapshotCodec {
                 dst.putByte(pos[0], (byte) (omsManagedRelease ? 1 : 0));
                 pos[0] += 1;
             });
+        });
+        dst.putInt(lengthSlot, pos[0] - bodyStart);
+        return pos[0];
+    }
+
+    /** Section 5: the order-entry gate, marketId 0 (global) .. MARKETS, {marketId:int, state:u8, reason:u8}. */
+    private static int writeGatesSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        int pos = start;
+        dst.putShort(pos, SECTION_GATES);
+        pos += 2;
+        final int lengthSlot = pos;
+        pos += 4;
+        final int bodyStart = pos;
+        final OrderEntryGate gate = engine.gate();
+        dst.putInt(pos, OrderEntryGate.MARKETS + 1);
+        pos += 4;
+        for (int m = 0; m <= OrderEntryGate.MARKETS; m++) {
+            dst.putInt(pos, m);
+            pos += 4;
+            dst.putByte(pos, (byte) gate.state(m).code());
+            pos += 1;
+            dst.putByte(pos, (byte) gate.reason(m).code());
+            pos += 1;
+        }
+        dst.putInt(lengthSlot, pos - bodyStart);
+        return pos;
+    }
+
+    /**
+     * Section 9: every live session authority, ascending by session id:
+     * {sessionId:long, registered:u8, resumable:u8, readerKind:u8, reserved:u8, channelMask:int,
+     *  identity:long, sourceEpoch:long, principalLength:short, principal bytes}.
+     */
+    private static int writeSessionsSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final int[] pos = {start};
+        dst.putShort(pos[0], SECTION_SESSIONS);
+        pos[0] += 2;
+        final int lengthSlot = pos[0];
+        pos[0] += 4;
+        final int bodyStart = pos[0];
+        dst.putInt(pos[0], engine.sessions().size());
+        pos[0] += 4;
+        engine.sessions().forEachBySessionId(a -> {
+            dst.putLong(pos[0], a.sessionId());
+            pos[0] += 8;
+            dst.putByte(pos[0], (byte) (a.isRegistered() ? 1 : 0));
+            pos[0] += 1;
+            dst.putByte(pos[0], (byte) (a.isResumable() ? 1 : 0));
+            pos[0] += 1;
+            dst.putByte(pos[0], (byte) a.readerKind());
+            pos[0] += 1;
+            dst.putByte(pos[0], (byte) 0);
+            pos[0] += 1;
+            dst.putInt(pos[0], a.channelMask());
+            pos[0] += 4;
+            dst.putLong(pos[0], a.identity());
+            pos[0] += 8;
+            dst.putLong(pos[0], a.sourceEpoch());
+            pos[0] += 8;
+            final byte[] principal = a.principal().sessionClass() == com.openexchange.assets.infrastructure.generated.SessionClass.UNSET
+                    ? new byte[0] : a.principal().encode();
+            dst.putShort(pos[0], (short) principal.length);
+            pos[0] += 2;
+            dst.putBytes(pos[0], principal);
+            pos[0] += principal.length;
         });
         dst.putInt(lengthSlot, pos[0] - bodyStart);
         return pos[0];
@@ -257,6 +330,22 @@ public final class BalanceSnapshotCodec {
                     }
                     break;
                 }
+                case SECTION_GATES: {
+                    final int endPos = readGatesSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot GATES section declares " + sectionLength
+                                + " bytes but decodes " + (endPos - pos));
+                    }
+                    break;
+                }
+                case SECTION_SESSIONS: {
+                    final int endPos = readSessionsSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot SESSIONS section declares " + sectionLength
+                                + " bytes but decodes " + (endPos - pos));
+                    }
+                    break;
+                }
                 default:
                     throw new IllegalStateException("balance snapshot section id " + id
                             + " is not known to this build (layout page sections 2..8 land with their slices)");
@@ -266,6 +355,69 @@ public final class BalanceSnapshotCodec {
         }
         return new Decoded(lastAppliedTradeId, consumePosition, journalSeq, lastLogTime, accounts, holds,
                 sectionCount, pos - offset);
+    }
+
+    private static int readGatesSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        final int count = src.getInt(pos);
+        pos += 4;
+        if (count < 0 || limit - pos < count * 6) {
+            throw new IllegalStateException("balance snapshot GATES section declares " + count + " gates");
+        }
+        engine.gate().reset();
+        for (int i = 0; i < count; i++) {
+            final int marketId = src.getInt(pos);
+            pos += 4;
+            final GateState state = GateState.fromCode(src.getByte(pos) & 0xFF);
+            pos += 1;
+            final GateReason reason = GateReason.fromCode(src.getByte(pos) & 0xFF);
+            pos += 1;
+            if (!OrderEntryGate.validMarket(marketId) || state == null || reason == null) {
+                throw new IllegalStateException("balance snapshot GATES section: market " + marketId
+                        + " state/reason bytes this build does not know");
+            }
+            engine.gate().set(marketId, state, reason);
+        }
+        return pos;
+    }
+
+    private static int readSessionsSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        final int count = src.getInt(pos);
+        pos += 4;
+        if (count < 0) {
+            throw new IllegalStateException("balance snapshot SESSIONS section declares " + count + " sessions");
+        }
+        for (int i = 0; i < count; i++) {
+            if (limit - pos < 8 + 4 + 4 + 8 + 8 + 2) {
+                throw new IllegalStateException("balance snapshot SESSIONS section truncated at session " + i);
+            }
+            final long sessionId = src.getLong(pos);
+            pos += 8;
+            final boolean registered = src.getByte(pos) != 0;
+            pos += 1;
+            final boolean resumable = src.getByte(pos) != 0;
+            pos += 1;
+            final int readerKind = src.getByte(pos) & 0xFF;
+            pos += 1;
+            pos += 1; // reserved
+            final int channelMask = src.getInt(pos);
+            pos += 4;
+            final long identity = src.getLong(pos);
+            pos += 8;
+            final long sourceEpoch = src.getLong(pos);
+            pos += 8;
+            final int principalLength = src.getShort(pos) & 0xFFFF;
+            pos += 2;
+            if (limit - pos < principalLength) {
+                throw new IllegalStateException("balance snapshot SESSIONS section: principal runs past the section");
+            }
+            final byte[] principal = new byte[principalLength];
+            src.getBytes(pos, principal);
+            pos += principalLength;
+            engine.sessions().restore(sessionId, principal, registered, channelMask, resumable, readerKind, identity, sourceEpoch);
+        }
+        return pos;
     }
 
     /** @return {accounts, holds, endPosition} */
