@@ -47,6 +47,10 @@ public final class OrderEngine {
     public static final int TYPE_LIMIT = 0;
     public static final int TYPE_MARKET = 1;
     public static final int TYPE_LIMIT_MAKER = 2;
+    public static final int TYPE_STOP_LOSS = 3;
+    public static final int TYPE_STOP_LIMIT = 4;
+    public static final int TYPE_TRAILING_STOP = 5;
+    public static final int TYPE_ICEBERG = 6;
     public static final int TIF_GTC = 0;
     public static final int TIF_IOC = 1;
     public static final int TIF_FOK = 2;
@@ -83,7 +87,14 @@ public final class OrderEngine {
     private static final int RESULT_NOT_OWNER = 5;
     private static final int RESULT_UNKNOWN_MARKET = 6;
 
+    private static final int ST_PENDING_TRIGGER = 7;
+
     private final SettleCommand settleCommand = new SettleCommand();
+    private final TriggerBook triggers = new TriggerBook();
+    private final org.agrona.collections.LongArrayList firedScratch = new org.agrona.collections.LongArrayList();
+    private long invalidTickCount;
+    private long triggeredCount;
+    private long sliceCount;
     private final CoreOrderView[] snapshotPage = new CoreOrderView[ORDER_SNAPSHOT_PAGE];
 
     private final AssetsEngine ledger;
@@ -133,19 +144,21 @@ public final class OrderEngine {
             reject(sink, c, CoreRejectReason.INVALID, c.quantity <= 0 ? c.quantity : c.side, now, false);
             return;
         }
-        if (c.orderType > TYPE_LIMIT_MAKER) {
-            reject(sink, c, CoreRejectReason.INVALID, c.orderType, now, false); // synthetic types land in S6
-            return;
-        }
-        if (c.orderType == TYPE_MARKET ? c.price != 0 : c.price <= 0) {
+        // field shape per type (S6 contract section 1): price-less types carry no price, only they may carry a budget
+        final boolean priceLess = isPriceLess(c.orderType);
+        if (priceLess ? c.price != 0 : c.price <= 0) {
             reject(sink, c, CoreRejectReason.INVALID, c.price, now, false);
             return;
         }
-        if (c.orderType != TYPE_MARKET && c.budget != 0) {
+        if (!priceLess && c.budget != 0) {
             reject(sink, c, CoreRejectReason.INVALID, c.budget, now, false);
             return;
         }
-        if (c.timeInForce == TIF_FOK) {
+        if (!syntheticFieldsValid(c)) {
+            reject(sink, c, CoreRejectReason.INVALID, c.orderType, now, false);
+            return;
+        }
+        if (c.timeInForce == TIF_FOK || (c.orderType >= TYPE_STOP_LOSS && c.timeInForce == TIF_IOC)) {
             reject(sink, c, CoreRejectReason.UNSUPPORTED_TIF, c.timeInForce, now, false);
             return;
         }
@@ -229,27 +242,38 @@ public final class OrderEngine {
         }
         long refPrice = c.price;
         long budget = c.budget;
-        if (c.orderType == TYPE_MARKET && c.side == SIDE_BUY) {
-            if (budget == 0) {
+        final boolean priceLessBuy = priceLess && c.side == SIDE_BUY;
+        if (priceLessBuy && budget == 0) {
+            // the deterministic estimate (S6 contract section 1): MARKET on the ask, STOP_LOSS on its stop price,
+            // TRAILING_STOP on ask + delta (its trigger point if the ask never falls), times (1 + slippage bps)
+            final long base;
+            if (c.orderType == TYPE_STOP_LOSS) {
+                base = c.stopPrice;
+            } else {
                 if (m.bestAsk <= 0) {
                     reject(sink, c, CoreRejectReason.NO_REFERENCE_PRICE, c.marketId, now, true);
                     return;
                 }
-                final long slip = ONE_FP + (long) m.marketBuySlippageBps * 10_000L;
-                if (!FixedPoint.multiplyFits(m.bestAsk, slip)) {
+                if (c.orderType == TYPE_TRAILING_STOP && m.bestAsk > Long.MAX_VALUE - c.trailingDelta) {
                     reject(sink, c, CoreRejectReason.NOTIONAL_TOO_LARGE, m.bestAsk, now, true);
                     return;
                 }
-                refPrice = FixedPoint.multiply(m.bestAsk, slip);
-                if (!FixedPoint.multiplyFits(refPrice, c.quantity)) {
-                    reject(sink, c, CoreRejectReason.NOTIONAL_TOO_LARGE, refPrice, now, true);
-                    return;
-                }
-                budget = FixedPoint.multiply(refPrice, c.quantity);
+                base = c.orderType == TYPE_TRAILING_STOP ? m.bestAsk + c.trailingDelta : m.bestAsk;
             }
+            final long slip = ONE_FP + (long) m.marketBuySlippageBps * 10_000L;
+            if (!FixedPoint.multiplyFits(base, slip)) {
+                reject(sink, c, CoreRejectReason.NOTIONAL_TOO_LARGE, base, now, true);
+                return;
+            }
+            refPrice = FixedPoint.multiply(base, slip);
+            if (!FixedPoint.multiplyFits(refPrice, c.quantity)) {
+                reject(sink, c, CoreRejectReason.NOTIONAL_TOO_LARGE, refPrice, now, true);
+                return;
+            }
+            budget = FixedPoint.multiply(refPrice, c.quantity);
         }
         long notional = 0L;
-        if (c.orderType == TYPE_MARKET && c.side == SIDE_BUY) {
+        if (priceLessBuy) {
             notional = budget;
         } else if (refPrice > 0) {
             if (!FixedPoint.multiplyFits(refPrice, c.quantity)) {
@@ -274,6 +298,16 @@ public final class OrderEngine {
             final long limit = bps(m.lastTradePrice, m.priceCollarBps);
             if (dev > limit) {
                 reject(sink, c, CoreRejectReason.PRICE_COLLAR, limit, now, true);
+                return;
+            }
+        }
+
+        // 4b. a stop that is already crossed would fire on the next tick: refused (S6 contract section 1, D8)
+        if (c.orderType == TYPE_STOP_LOSS || c.orderType == TYPE_STOP_LIMIT) {
+            final boolean crossed = c.side == SIDE_SELL ? m.bestBid > 0 && m.bestBid <= c.stopPrice
+                    : m.bestAsk > 0 && m.bestAsk >= c.stopPrice;
+            if (crossed) {
+                reject(sink, c, CoreRejectReason.STOP_WOULD_TRIGGER_IMMEDIATELY, c.side == SIDE_SELL ? m.bestBid : m.bestAsk, now, true);
                 return;
             }
         }
@@ -333,16 +367,30 @@ public final class OrderEngine {
         o.price = c.price;
         o.quantity = c.quantity;
         o.budget = budget;
+        o.stopPrice = c.stopPrice;
+        o.trailingDelta = c.trailingDelta;
+        o.displayQty = c.displayQty;
         o.expiresAtMs = c.timeInForce == TIF_GTD ? c.expiresAtMs : 0L;
-        o.status = (byte) OrderStatus.PENDING_NEW.code();
+        final boolean armed = isTriggered(c.orderType);
+        o.status = (byte) (armed ? OrderStatus.PENDING_TRIGGER.code() : OrderStatus.PENDING_NEW.code());
         o.remainingQty = c.quantity;
         o.holdAssetId = holdAsset;
         o.holdAmount = holdAmount;
         o.createdAtMs = now;
         o.updatedAtMs = now;
         o.attempt = 0;
-        o.pendingKind = (byte) CoreOrder.PK_CREATE;
-        o.set(CoreOrder.F_DISPATCH_PENDING);
+        if (c.orderType == TYPE_TRAILING_STOP) {
+            final long quote = c.side == SIDE_SELL ? m.bestBid : m.bestAsk;
+            o.trailingArmPrice = quote > 0 ? quote : 0L;
+        }
+        if (c.orderType == TYPE_ICEBERG) {
+            o.sliceRemainingQty = c.displayQty;
+            o.hiddenQty = c.quantity - c.displayQty;
+        }
+        if (!armed) {
+            o.pendingKind = (byte) CoreOrder.PK_CREATE;
+            o.set(CoreOrder.F_DISPATCH_PENDING);
+        }
         if (c.timeInForce == TIF_IOC) {
             o.set(CoreOrder.F_IOC);
         }
@@ -350,6 +398,9 @@ public final class OrderEngine {
         ledger.setEventSeq(eventSeq);
         o.eventSeq = eventSeq;
         orders.add(o);
+        if (armed) {
+            triggers.add(o);
+        }
         if (o.expiresAtMs > 0) {
             ledger.deadlines().add(o.expiresAtMs, orderId, DeadlineIndex.KIND_GTD);
         }
@@ -357,11 +408,60 @@ public final class OrderEngine {
         acceptedCount++;
 
         sink.onBalanceUpdate(c.userId, holdAsset, account.available(holdAsset), account.locked(holdAsset));
-        dispatch(sink, o, DispatchKind.CREATE, 0L, c.price, c.quantity, budget);
+        if (!armed) {
+            dispatch(sink, o, DispatchKind.CREATE, 0L, c.price, createQuantity(o), budget);
+        }
         sink.onOrderAck(c.correlationId, c.requestIdHigh, c.requestIdLow, orderId, c.userId, c.marketId,
-                OrderStatus.PENDING_NEW, false, holdAsset, holdAmount, now, eventSeq);
+                armed ? OrderStatus.PENDING_TRIGGER : OrderStatus.PENDING_NEW, false, holdAsset, holdAmount, now, eventSeq);
         sink.onOrderEvent(eventSeq, ledger.getLogPosition(), o, EventKind.ACCEPTED, CoreRejectReason.NONE, 0L, 0L, 0L,
                 account.holdRemaining(orderId), now);
+    }
+
+    // ---------------------------------------------------------------- RC1 S6: synthetic shape helpers
+
+    /** MARKET, STOP_LOSS and TRAILING_STOP carry no limit price (the ME child is a MARKET order). */
+    static boolean isPriceLess(final int orderType) {
+        return orderType == TYPE_MARKET || orderType == TYPE_STOP_LOSS || orderType == TYPE_TRAILING_STOP;
+    }
+
+    /** A stop or trailing order waits in a trigger book; an iceberg works slices at once. */
+    static boolean isTriggered(final int orderType) {
+        return orderType == TYPE_STOP_LOSS || orderType == TYPE_STOP_LIMIT || orderType == TYPE_TRAILING_STOP;
+    }
+
+    /** S6 contract section 1 table: required and forbidden fields per type (the price/budget rules are checked apart). */
+    private static boolean syntheticFieldsValid(final CreateOrderCommand c) {
+        switch (c.orderType) {
+            case TYPE_STOP_LOSS:
+                return c.stopPrice > 0 && c.trailingDelta == 0 && c.displayQty == 0;
+            case TYPE_STOP_LIMIT:
+                return c.stopPrice > 0 && c.trailingDelta == 0 && c.displayQty == 0;
+            case TYPE_TRAILING_STOP:
+                return c.trailingDelta > 0 && c.stopPrice == 0 && c.displayQty == 0;
+            case TYPE_ICEBERG:
+                return c.displayQty > 0 && c.displayQty < c.quantity && c.stopPrice == 0 && c.trailingDelta == 0;
+            default:
+                return c.stopPrice == 0 && c.trailingDelta == 0 && c.displayQty == 0;
+        }
+    }
+
+    /** The order type the ME sees for the current command of {@code o} (children of stops are MARKET or LIMIT). */
+    static int meOrderType(final CoreOrder o) {
+        switch (o.orderType) {
+            case TYPE_STOP_LOSS:
+            case TYPE_TRAILING_STOP:
+                return TYPE_MARKET;
+            case TYPE_STOP_LIMIT:
+            case TYPE_ICEBERG:
+                return TYPE_LIMIT;
+            default:
+                return o.orderType;
+        }
+    }
+
+    /** The quantity of the current CREATE: an iceberg slice works {@code sliceRemainingQty}, every other create the rest. */
+    static long createQuantity(final CoreOrder o) {
+        return o.orderType == TYPE_ICEBERG ? o.sliceRemainingQty : o.remainingQty;
     }
 
     /** Mint the next durable ME command for {@code o}: idHigh = orderId, idLow = attempt << 2 | kind. */
@@ -373,7 +473,7 @@ public final class OrderEngine {
         o.set(CoreOrder.F_DISPATCH_PENDING);
         final long idLow = ((long) o.attempt << 2) | kind.code();
         sink.onMeDispatch(dispatchSeq, o.orderId, idLow, kind, o.userId, o.orderId, oldLegId, o.marketId,
-                o.orderType, o.side, price, quantity, budget, o.timeInForce);
+                meOrderType(o), o.side, price, quantity, budget, o.timeInForce);
     }
 
     /** Mint the single cancel for a resting leg (attempt+1, kind CANCEL) and say so on the orders channel. */
@@ -426,6 +526,9 @@ public final class OrderEngine {
      */
     private void terminalize(final CoreOrder o, final int statusCode, final EventKind kind, final CoreRejectReason reason,
                              final long lastPrice, final long lastQty, final long tradeId, final long now) {
+        if (o.status == ST_PENDING_TRIGGER) {
+            triggers.remove(o); // an armed order ends without ever reaching the ME (S6 3.3)
+        }
         if (o.expiresAtMs > 0 && !o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
             ledger.deadlines().remove(o.expiresAtMs, o.orderId, DeadlineIndex.KIND_GTD);
         }
@@ -567,15 +670,19 @@ public final class OrderEngine {
                     OrderStatus.PENDING_CANCEL, true, o.holdAssetId, o.holdAmount, now, o.eventSeq);
             return;
         }
+        final boolean armed = o.status == ST_PENDING_TRIGGER;
         o.set(CoreOrder.F_CANCEL_PENDING);
         o.updatedAtMs = now;
-        final boolean mint = !o.has(CoreOrder.F_DISPATCH_PENDING) && o.currentLegId != 0;
+        final boolean mint = !armed && !o.has(CoreOrder.F_DISPATCH_PENDING) && o.currentLegId != 0;
         if (hasRequest) {
             remember(c.userId, c.requestIdHigh, c.requestIdLow, c.fingerprint(), now, RequestTable.KIND_CANCEL, orderId, 0);
         }
         sink.onOrderAck(c.correlationId, c.requestIdHigh, c.requestIdLow, orderId, c.userId, o.marketId,
                 OrderStatus.PENDING_CANCEL, false, o.holdAssetId, o.holdAmount, now, o.eventSeq);
-        if (mint) {
+        if (armed) {
+            // C8: an armed synthetic order has no ME leg; it ends here (S6 3.3)
+            terminalize(o, ST_CANCELLED, EventKind.CANCELLED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+        } else if (mint) {
             // a leg is resting at the ME: mint the cancel now (C8b); while the create is unresolved the flag
             // alone is recorded and the cancel is minted when the ACK lands (3.3)
             mintCancel(o, now);
@@ -643,6 +750,11 @@ public final class OrderEngine {
                                 final long lastTradePrice, final long lastTradeId, final long meEpoch, final long timestamp) {
         ledger.observeLogTime(timestamp);
         if (marketId < 1 || marketId > MARKETS) {
+            invalidTickCount++; // S6 3.1 #1: an unknown market is part of the validation, counted like the rest
+            return;
+        }
+        if (bestBid < 0 || bestAsk < 0 || lastTradePrice < 0 || lastTradeId < 0 || (bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk)) {
+            invalidTickCount++; // S6 3.1: a malformed or crossed quote is a counted drop, never applied
             return;
         }
         final MarketRisk m = markets[marketId];
@@ -651,13 +763,69 @@ public final class OrderEngine {
             return;
         }
         m.bookVersion = bookVersion;
-        m.bestBid = Math.max(0L, bestBid);
-        m.bestAsk = Math.max(0L, bestAsk);
+        m.bestBid = bestBid;
+        m.bestAsk = bestAsk;
         m.lastTickTs = ledger.getLastLogTime();
         if (lastTradeId > m.lastTradeId && lastTradePrice > 0) {
             m.lastTradeId = lastTradeId;
             m.lastTradePrice = lastTradePrice;
         }
+        evaluateTriggers(marketId, m.bestBid, m.bestAsk, ledger.getLastLogTime());
+    }
+
+    /** S6 3.1 step 4-5: stops and trailing orders of one market against the new quote; fire in ascending orderId. */
+    private void evaluateTriggers(final int marketId, final long bid, final long ask, final long now) {
+        final org.agrona.collections.LongArrayList fired = firedScratch;
+        fired.clear();
+        triggers.collectFiredStops(marketId, bid, ask, fired);
+        final org.agrona.collections.LongArrayList trailing = triggers.trailing(marketId);
+        for (int i = 0; i < trailing.size(); i++) {
+            final CoreOrder o = orders.get(trailing.getLong(i));
+            if (o == null) {
+                continue;
+            }
+            final long quote = o.side == SIDE_SELL ? bid : ask;
+            if (quote <= 0) {
+                continue; // no quote on the side this order watches
+            }
+            if (o.trailingArmPrice == 0) {
+                o.trailingArmPrice = quote; // first valid quote arms it; no trigger on the arming tick
+                o.updatedAtMs = now;
+            } else if (o.side == SIDE_SELL ? quote > o.trailingArmPrice : quote < o.trailingArmPrice) {
+                o.trailingArmPrice = quote; // a new extreme: the advance consumes the tick
+                o.updatedAtMs = now;
+            } else if ((o.side == SIDE_SELL ? o.trailingArmPrice - quote : quote - o.trailingArmPrice) >= o.trailingDelta) {
+                fired.addLong(o.orderId);
+            }
+        }
+        if (fired.isEmpty()) {
+            return;
+        }
+        final long[] ids = new long[fired.size()];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = fired.getLong(i);
+        }
+        Arrays.sort(ids);
+        for (final long id : ids) {
+            final CoreOrder o = orders.get(id);
+            if (o != null && o.status == ST_PENDING_TRIGGER) {
+                fire(o, now);
+            }
+        }
+    }
+
+    /** S6 3.2: the armed parent becomes the working order of its child; one CREATE with a payload derived from the record. */
+    private void fire(final CoreOrder o, final long now) {
+        triggers.remove(o);
+        o.status = (byte) ST_PENDING_NEW;
+        o.attempt++;
+        o.pendingKind = (byte) CoreOrder.PK_CREATE;
+        o.updatedAtMs = now;
+        final boolean marketChild = meOrderType(o) == TYPE_MARKET;
+        o.budget = marketChild && o.side == SIDE_BUY ? holdRemaining(o) : 0L; // K11 #1: the BUY child spends the hold
+        triggeredCount++;
+        dispatch(ledger.eventSink(), o, DispatchKind.CREATE, 0L, marketChild ? 0L : o.price, createQuantity(o), o.budget);
+        emitEvent(o, EventKind.TRIGGERED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
     }
 
     /** Read-only: the effective version for a market (the record itself has no reply template yet). */
@@ -679,6 +847,11 @@ public final class OrderEngine {
                 final CoreOrder o = orders.get(id);
                 if (o == null || o.isTerminal() || o.expiresAtMs != deadlineMs || o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
                     return;
+                }
+                if (o.status == ST_PENDING_TRIGGER && !o.has(CoreOrder.F_QUARANTINED)) {
+                    o.set(CoreOrder.F_EXPIRY_REQUESTED);
+                    terminalize(o, ST_EXPIRED, EventKind.EXPIRED, CoreRejectReason.NONE, 0L, 0L, 0L, now); // S6 3.3, R12
+                    break;
                 }
                 o.set(CoreOrder.F_EXPIRY_REQUESTED);
                 o.set(CoreOrder.F_CANCEL_PENDING);
@@ -742,6 +915,10 @@ public final class OrderEngine {
         if (!ledger.settle(sc, timestamp)) {
             return; // refused before any mutation (SettleRejected emitted); the order accounting stays untouched too
         }
+        if (marketId >= 1 && marketId <= MARKETS && tradeId > markets[marketId].lastTradeId) {
+            markets[marketId].lastTradeId = tradeId; // S6 3.5: the collar reference follows settled trades
+            markets[marketId].lastTradePrice = price;
+        }
         // 2. the two core orders (either may be a legacy hold the core does not own)
         applyFill(takerOmsOrderId, takerLegId, takerUserId, price, quantity, tradeId, now);
         applyFill(makerOmsOrderId, makerLegId, makerUserId, price, quantity, tradeId, now);
@@ -793,6 +970,17 @@ public final class OrderEngine {
         }
         o.filledQty += fillQty;
         o.remainingQty -= fillQty;
+        if (o.orderType == TYPE_ICEBERG) {
+            if (fillQty > o.sliceRemainingQty) {
+                // the ME filled past the slice (within the order): keep remaining == slice + hidden, say so
+                final long past = fillQty - o.sliceRemainingQty;
+                o.hiddenQty -= Math.min(past, o.hiddenQty);
+                o.sliceRemainingQty = 0L;
+                fault(OrderFaultKind.SETTLE, o, tradeId, past);
+            } else {
+                o.sliceRemainingQty -= fillQty;
+            }
+        }
         o.cumQuoteQty += FixedPoint.multiply(price, fillQty);
         o.lastPrice = price;
         o.lastQty = fillQty;
@@ -821,6 +1009,39 @@ public final class OrderEngine {
         if (windowClosedByTrade && orders.get(o.orderId) == o) {
             afterWindow(o, now);
         }
+        if (o.orderType == TYPE_ICEBERG && o.sliceRemainingQty == 0 && orders.get(o.orderId) == o) {
+            onSliceExhausted(o, now);
+        }
+    }
+
+    /**
+     * S6 3.4: the current slice has nothing left. A cancel in flight ends the parent now (no live slice remains to cancel);
+     * a quarantined parent waits; otherwise the next slice is released in this same apply.
+     */
+    private void onSliceExhausted(final CoreOrder o, final long now) {
+        if (o.hiddenQty <= 0 || o.isTerminal()) {
+            return;
+        }
+        if (o.has(CoreOrder.F_CANCEL_PENDING)) {
+            final boolean expired = o.has(CoreOrder.F_EXPIRY_REQUESTED);
+            terminalize(o, expired ? ST_EXPIRED : ST_CANCELLED, expired ? EventKind.EXPIRED : EventKind.CANCELLED,
+                    CoreRejectReason.NONE, 0L, 0L, 0L, now);
+            return;
+        }
+        if (o.has(CoreOrder.F_QUARANTINED) || o.has(CoreOrder.F_DISPATCH_PENDING)) {
+            return;
+        }
+        final long next = Math.min(o.displayQty, o.hiddenQty);
+        o.hiddenQty -= next;
+        o.sliceRemainingQty = next;
+        o.oldLegId = o.currentLegId;
+        o.currentLegId = 0L;
+        o.attempt++;
+        o.pendingKind = (byte) CoreOrder.PK_CREATE;
+        o.updatedAtMs = now;
+        sliceCount++;
+        dispatch(ledger.eventSink(), o, DispatchKind.CREATE, 0L, o.price, next, 0L);
+        emitEvent(o, EventKind.SLICE_SUBMITTED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
     }
 
     /** What a create ACK triggers once the leg is known: the cancel asked for meanwhile (C8b) or the IOC cancel (C13). */
@@ -862,8 +1083,23 @@ public final class OrderEngine {
             clearPending(o);
             resolveReplace(o, legId, now);
         }
+        if (!o.has(CoreOrder.F_REPLACE_PENDING) && legId != 0 && o.currentLegId == 0 && legId != o.oldLegId
+                && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE) {
+            // G9 (S6 3.6): the ME journals a terminal for a create it refused or ended before its outcome reached us.
+            // Learn the leg and apply the terminal; the later CREATE outcome is redundant. A refused leg never rested,
+            // so no ACK_NEW is announced for it.
+            o.currentLegId = legId;
+            clearPending(o);
+            implicitAckCount++;
+            if (statusCode != ST_REJECTED) {
+                if (o.status == ST_PENDING_NEW) {
+                    o.status = (byte) ST_NEW;
+                }
+                emitEvent(o, EventKind.ACK_NEW, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+            }
+        }
         if (legId != o.currentLegId) {
-            staleTerminalCount++;
+            staleTerminalCount++; // includes the previous iceberg slice (legId == oldLegId)
             return;
         }
         if (o.has(CoreOrder.F_REPLACE_PENDING)) {
@@ -878,6 +1114,16 @@ public final class OrderEngine {
         }
         switch (statusCode) {
             case ST_FILLED:
+                if (o.orderType == TYPE_ICEBERG && o.hiddenQty > 0) {
+                    // the current slice ended at the ME while the parent has more to work (S6 3.4)
+                    if (o.sliceRemainingQty > 0) {
+                        fault(OrderFaultKind.SETTLE, o, 0L, o.sliceRemainingQty);
+                        o.hiddenQty += o.sliceRemainingQty; // the unfilled part goes back to hidden: remaining == slice + hidden
+                        o.sliceRemainingQty = 0L;
+                    }
+                    onSliceExhausted(o, now);
+                    break;
+                }
                 if (o.remainingQty > 0) {
                     fault(OrderFaultKind.SETTLE, o, 0L, o.remainingQty);
                 }
@@ -1151,6 +1397,9 @@ public final class OrderEngine {
         }
         o.set(CoreOrder.F_QUARANTINED);
         o.updatedAtMs = now;
+        if (o.status == ST_PENDING_TRIGGER) {
+            triggers.remove(o); // a quarantined armed order never fires
+        }
         sink.onAdminAck(correlationId, T_QUARANTINE, AdminResult.ACCEPTED, 0, 0L);
         emitEvent(o, EventKind.QUARANTINED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
     }
@@ -1220,17 +1469,22 @@ public final class OrderEngine {
                     break;
                 default:
                     kind = DispatchKind.CREATE;
-                    price = o.price;
-                    qty = o.quantity;
+                    price = meOrderType(o) == TYPE_MARKET ? 0L : o.price;
+                    qty = createQuantity(o);
                     budget = o.budget;
                     break;
             }
             sink.onMeDispatchReply(o.pendingDispatchSeq, o.orderId, ((long) o.attempt << 2) | kind.code(), kind, o.userId, o.orderId,
-                    oldLeg, o.marketId, o.orderType, o.side, price, qty, budget, o.timeInForce);
+                    oldLeg, o.marketId, meOrderType(o), o.side, price, qty, budget, o.timeInForce);
         }
         sink.onPendingDispatchEnd(correlationId, count, ledger.getDispatchSeq());
     }
 
+    public long invalidTickCount() { return invalidTickCount; }
+    public long triggeredCount() { return triggeredCount; }
+    public long sliceCount() { return sliceCount; }
+    public int armedStopCount(final int marketId) { return triggers.stopCount(marketId); }
+    public int armedTrailingCount(final int marketId) { return triggers.trailingCount(marketId); }
     public long staleTerminalCount() { return staleTerminalCount; }
     public long staleOutcomeCount() { return staleOutcomeCount; }
     public long redundantOutcomeCount() { return redundantOutcomeCount; }
@@ -1268,6 +1522,9 @@ public final class OrderEngine {
         }
         if (o.replaceDeadlineMs > 0 && o.has(CoreOrder.F_REPLACE_PENDING)) {
             ledger.deadlines().add(o.replaceDeadlineMs, o.orderId, DeadlineIndex.KIND_REPLACE);
+        }
+        if (o.status == ST_PENDING_TRIGGER && !o.has(CoreOrder.F_QUARANTINED)) {
+            triggers.add(o); // derived from the record (S6 section 2)
         }
     }
 

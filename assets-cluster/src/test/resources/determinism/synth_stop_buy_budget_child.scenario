@@ -1,0 +1,20 @@
+# RC1 S6 (contract 1, 3.2; spec R1): a BUY STOP_LOSS without an explicit budget holds the deterministic estimate
+# stopPrice x (1 + 500 bps) x qty = 100 x 1.05 x 1 = 105 quote. A tick with best ask at the stop fires it: the
+# child is a MARKET BUY whose budget is the hold remaining (105, never 0). RequestPendingDispatch re-serves the
+# child byte-identically. Two fills spend 60 + 40.2 = 100.2; the parent ends FILLED and the 4.8 residual is
+# released in the FILLED apply (locked = sum of open holds = 0).
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=1000.0
+DEPOSIT u=2 asset=1 amt=5.0
+MARKETTICK market=1 bid=98.0 ask=99.0 ver=1
+CREATE u=1 market=1 side=0 type=3 qty=1.0 stop=100.0 rid=1      # order 1: armed, hold 105
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=0.6 rid=2        # order 2
+CREATE u=2 market=1 side=1 type=0 px=100.5 qty=0.4 rid=3        # order 3
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=201
+MEOUTCOME order=3 kind=0 attempt=0 result=0 leg=301
+MARKETTICK market=1 bid=99.0 ask=100.0 ver=2                    # ask 100 >= stop 100: child MARKET BUY budget 105
+PENDINGDISPATCH                                                 # the child payload is re-served unchanged
+MEOUTCOME order=1 kind=0 attempt=1 result=0 leg=101
+METRADE id=1 market=1 taker=1 maker=2 px=100.0 qty=0.6 takerBuy=1
+METRADE id=2 market=1 taker=1 maker=3 px=100.5 qty=0.4 takerBuy=1  # parent FILLED, residual 4.8 released

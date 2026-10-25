@@ -48,7 +48,7 @@ import java.util.Map;
  *   SET_JOURNAL 1                          arm (1) / disarm (0) the money journal, via the log
  *   GATE market=0 open=1                   order-entry gate (ADMIN); RISKCFG market= ver= [maxOpen= perSec= perMin= collarBps= slipBps= ...]
  *   BREAKER market= trip=1|0 ; MARKETTICK market= bid= ask= ver= [last= lastTradeId=]
- *   CREATE u= market= side= type= [px=] qty= [budget=] [tif=] [exp=] [cid=] [rid=] ; CANCEL u= [order=|cid=] [rid=]
+ *   CREATE u= market= side= type= [px=] qty= [budget=] [tif=] [exp=] [cid=] [rid=] [stop=] [delta=] [display=] ; CANCEL u= [order=|cid=] [rid=]
  *   METRADE id= market= taker= maker= px= qty= takerBuy= [takerLeg= makerLeg= takerUser= makerUser= seq=] ; METERMINAL order= leg= status=
  *   MEOUTCOME order= kind= attempt= result= [leg= reason= old=] ; AMEND u= order= [px=] [qty=] [rid=] ; QUARANTINE order=
  *   ORDERSNAP u= [from=] ; PENDINGDISPATCH [from=] [max=]
@@ -335,6 +335,9 @@ public final class AssetsScenarioRunner {
                 c.quantity = reqAmount(kv, "qty");
                 c.budget = kv.containsKey("budget") ? reqAmount(kv, "budget") : 0L;
                 c.expiresAtMs = kv.containsKey("exp") ? reqLong(kv, "exp") : 0L;
+                c.stopPrice = kv.containsKey("stop") ? reqAmount(kv, "stop") : 0L;
+                c.trailingDelta = kv.containsKey("delta") ? reqAmount(kv, "delta") : 0L;
+                c.displayQty = kv.containsKey("display") ? reqAmount(kv, "display") : 0L;
                 c.clientOrderIdLow = kv.containsKey("cid") ? reqLong(kv, "cid") : 0L;
                 c.requestIdLow = kv.containsKey("rid") ? reqLong(kv, "rid") : 0L;
                 c.flags = kv.containsKey("flags") ? reqInt(kv, "flags") : 0;
