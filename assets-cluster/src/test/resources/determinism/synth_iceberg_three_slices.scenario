@@ -1,0 +1,25 @@
+# RC1 S6 (contract 1, 3.4; spec R10): a BUY ICEBERG of 2.5 at limit 100 with display 1 holds 250 quote and
+# dispatches slice 1 (1.0). Slice 1 fills at 100 and slice 2 (1.0) is dispatched in that fill's apply; the
+# exhausted slice's journal FILLED terminal is a no-op. Slice 2 crosses a resting SELL at 99 and fills below the
+# limit; slice 3 is the smaller rest (0.5), dispatched in the fill apply of slice 2's last trade. Slice 3 fills
+# at 99.5: the parent ends FILLED having spent 100 + 99 + 49.75 = 248.75, and the 1.25 residual is released.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=1000.0
+DEPOSIT u=2 asset=1 amt=5.0
+MARKETTICK market=1 bid=99.0 ask=101.0 ver=1
+CREATE u=1 market=1 side=0 type=6 px=100.0 qty=2.5 display=1.0 rid=1   # order 1: slice 1 = 1.0, hidden 1.5
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=1.0 rid=2               # order 2
+MEOUTCOME order=1 kind=0 attempt=0 result=0 leg=101
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=201
+METRADE id=1 market=1 taker=2 maker=1 px=100.0 qty=1.0 takerBuy=0      # slice 1 exhausted: slice 2 (1.0) out, attempt 1
+METERMINAL order=1 leg=101 status=2                                    # previous slice FILLED: counted no-op
+CREATE u=2 market=1 side=1 type=0 px=99.0 qty=1.0 rid=3                # order 3
+MEOUTCOME order=3 kind=0 attempt=0 result=0 leg=301
+MEOUTCOME order=1 kind=0 attempt=1 result=0 leg=102
+METRADE id=2 market=1 taker=1 maker=3 px=99.0 qty=1.0 takerBuy=1       # slice 2 fills below the limit: slice 3 (0.5) out
+CREATE u=2 market=1 side=1 type=0 px=99.5 qty=0.5 rid=4                # order 4
+MEOUTCOME order=4 kind=0 attempt=0 result=0 leg=401
+MEOUTCOME order=1 kind=0 attempt=2 result=0 leg=103
+METRADE id=3 market=1 taker=1 maker=4 px=99.5 qty=0.5 takerBuy=1       # parent FILLED, residual 1.25 released
+METERMINAL order=1 leg=103 status=2                                    # stale: the record is gone
