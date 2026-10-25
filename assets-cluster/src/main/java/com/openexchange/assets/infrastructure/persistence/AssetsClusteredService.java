@@ -9,9 +9,11 @@ import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.QueryFeedPositionDecoder;
 import com.openexchange.assets.infrastructure.generated.SubscribeDecoder;
 import com.openexchange.assets.infrastructure.publisher.SessionEgressQueue;
+import io.aeron.Aeron;
 import io.aeron.Counter;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
+import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
@@ -168,6 +170,14 @@ public final class AssetsClusteredService implements ClusteredService {
             com.openexchange.cluster.SnapshotCadence.fromEnv();
     // ...and what turns the snapshot into reclaimed disk on THIS node.
     private com.openexchange.cluster.SnapshotLogPruner logPruner;
+    // Lazily connected archive client used only to confirm the snapshot recording landed on disk
+    // before onTakeSnapshot returns (see awaitSnapshotRecorded). Cloned context: never shares lock
+    // state with the cluster's own archive client. Closed in onTerminate.
+    private AeronArchive snapshotArchive;
+    /** Bounded wait for a wedged snapshot publication (all chunks share one deadline). */
+    private static final long SNAPSHOT_OFFER_DEADLINE_MS = 30_000;
+    /** Bounded wait for the archive to ingest the published snapshot bytes. */
+    private static final long SNAPSHOT_RECORD_DEADLINE_MS = 10_000;
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
@@ -511,20 +521,115 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
+        final long startNs = System.nanoTime();
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
         final int length = BalanceSnapshotCodec.serialize(engine, buffer);
+        final long serializedNs = System.nanoTime();
+
+        // Chunked, like the matching engine's A-2 fix: a single offer() throws
+        // IllegalArgumentException the moment the payload exceeds the publication's
+        // maxMessageLength (snapshot term / 8: 8 MiB at the 64m default, 128 KiB on a 1m term).
+        // Every member snapshots at the same log position, so an oversize single offer fenced ALL
+        // nodes at once and the log was never pruned again. Splitting into maxMessageLength-sized
+        // messages keeps every offer legal; a payload that fits is still one message, byte-identical
+        // to the historical path. The receiver (loadSnapshot) reassembles by raw concatenation.
+        final int chunks = offerSnapshotChunked(snapshotPublication, buffer, length, idleStrategy);
+        final long offeredNs = System.nanoTime();
+
+        // Do not return until the archive has the bytes on disk: a node killed between the offer
+        // and the archive flush would prune a snapshot the recording log already points at and
+        // fail recovery with "unknown recording id" (matching engine forensic, 2026-07-02).
+        awaitSnapshotRecorded(snapshotPublication);
+        final long recordedNs = System.nanoTime();
+
+        System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " bytes=" + length
+                + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
+                + " serializeMs=" + ((serializedNs - startNs) / 1_000_000)
+                + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
+                + " recordMs=" + ((recordedNs - offeredNs) / 1_000_000)
+                + " logPosition=" + cluster.logPosition());
+
+        // The baseline for the next snapshot, on EVERY member and whoever asked for this one.
+        snapshotCadence.snapshotTaken(cluster.logPosition(), System.nanoTime());
+    }
+
+    /**
+     * Offer a serialized snapshot as one or more Aeron messages, each no larger than the
+     * publication's {@code maxMessageLength}. Package-private and static so the multi-chunk
+     * transport path is unit-testable against a real Aeron publication
+     * ({@code SnapshotChunkingTransportTest}). One overall deadline covers every chunk, so a wedged
+     * publication fails loudly instead of parking the service thread forever (the old loop retried
+     * every negative result with no bound). Chunk count is a node-local I/O detail: each member splits
+     * with its own {@code maxMessageLength} and the receiver concatenates, so there is deliberately
+     * no cross-node framing.
+     *
+     * @return the number of messages offered
+     */
+    static int offerSnapshotChunked(final ExclusivePublication snapshotPublication,
+                                    final DirectBuffer buffer, final int length,
+                                    final IdleStrategy idleStrategy) {
+        final int maxLen = snapshotPublication.maxMessageLength();
+        final long deadlineMs = System.currentTimeMillis() + SNAPSHOT_OFFER_DEADLINE_MS;
+        int sent = 0;
+        int chunks = 0;
+        long attempts = 0;
         idleStrategy.reset();
-        while (true) {
-            final long result = snapshotPublication.offer(buffer, 0, length);
-            if (result > 0) {
-                // The baseline for the next snapshot, on EVERY member and whoever
-                // asked for this one.
-                snapshotCadence.snapshotTaken(cluster.logPosition(), System.nanoTime());
-                return;
+        while (sent < length) {
+            final int chunk = Math.min(maxLen, length - sent);
+            long result;
+            while ((result = snapshotPublication.offer(buffer, sent, chunk)) < 0) {
+                if (result == ExclusivePublication.CLOSED
+                        || result == ExclusivePublication.MAX_POSITION_EXCEEDED) {
+                    throw new IllegalStateException("failed to offer assets snapshot: result=" + result
+                            + " sent=" + sent + "/" + length + " bytes");
+                }
+                attempts++;
+                if (System.currentTimeMillis() > deadlineMs) {
+                    throw new IllegalStateException("assets snapshot offer stuck after "
+                            + SNAPSHOT_OFFER_DEADLINE_MS + "ms: lastResult=" + result
+                            + " attempts=" + attempts + " sent=" + sent + "/" + length + " bytes");
+                }
+                idleStrategy.idle();
             }
-            if (result == ExclusivePublication.CLOSED
-                    || result == ExclusivePublication.MAX_POSITION_EXCEEDED) {
-                throw new IllegalStateException("failed to offer assets snapshot: " + result);
+            sent += chunk;
+            chunks++;
+        }
+        return chunks;
+    }
+
+    /**
+     * Block until the Archive's recording of the snapshot publication has ingested every byte we
+     * offered ({@code recordingPosition >= publication.position()}), or fail after a bounded wait.
+     */
+    private void awaitSnapshotRecorded(final ExclusivePublication snapshotPublication) {
+        final long writtenPosition = snapshotPublication.position();
+        if (writtenPosition <= 0) {
+            return;
+        }
+        if (snapshotArchive == null) {
+            snapshotArchive = AeronArchive.connect(cluster.context().archiveContext().clone());
+        }
+        final String channel = snapshotPublication.channel();
+        final int streamId = snapshotPublication.streamId();
+        final int sessionId = snapshotPublication.sessionId();
+        final long deadlineMs = System.currentTimeMillis() + SNAPSHOT_RECORD_DEADLINE_MS;
+
+        long recordingId;
+        idleStrategy.reset();
+        while ((recordingId = snapshotArchive.findLastMatchingRecording(0L, channel, streamId, sessionId))
+                == Aeron.NULL_VALUE) {
+            if (System.currentTimeMillis() > deadlineMs) {
+                throw new IllegalStateException("assets snapshot recording not registered within "
+                        + SNAPSHOT_RECORD_DEADLINE_MS + "ms (channel=" + channel + " stream=" + streamId
+                        + " session=" + sessionId + ")");
+            }
+            idleStrategy.idle();
+        }
+        long observedPosition;
+        while ((observedPosition = snapshotArchive.getRecordingPosition(recordingId)) < writtenPosition) {
+            if (System.currentTimeMillis() > deadlineMs) {
+                throw new IllegalStateException("assets snapshot archive ingestion stalled: recordingId="
+                        + recordingId + " written=" + writtenPosition + " recorded=" + observedPosition);
             }
             idleStrategy.idle();
         }
@@ -591,6 +696,14 @@ public final class AssetsClusteredService implements ClusteredService {
         if (nodeEndpoint != null) {
             nodeEndpoint.stop();
         }
+        if (snapshotArchive != null) {
+            try {
+                snapshotArchive.close();
+            } catch (final RuntimeException ignored) {
+                // shutting down
+            }
+            snapshotArchive = null;
+        }
         closeQuietly(egressPendingBytes);
         closeQuietly(egressBackPressured);
         closeQuietly(egressPeakPendingBytes);
@@ -609,25 +722,52 @@ public final class AssetsClusteredService implements ClusteredService {
     private void loadSnapshot(Image snapshotImage) {
         final ExpandableArrayBuffer collector = new ExpandableArrayBuffer();
         final MutableInteger length = new MutableInteger(0);
-        // A snapshot is one logical message (possibly fragmented); reassemble it, then decode.
+        // The snapshot is one OR MORE Aeron messages (chunked on the way out to stay under
+        // maxMessageLength). FragmentAssembler reassembles each message from its MTU fragments; the
+        // messages are then ACCUMULATED, in arrival order, into one contiguous payload that is decoded
+        // once. A single ExclusivePublication wrote them, so the concatenation is byte-identical to
+        // BalanceSnapshotCodec.serialize's output. Decoding the first message alone (the old
+        // behaviour) would silently restore a truncated ledger the moment a snapshot spans two chunks.
         final FragmentHandler handler = (buffer, offset, len, header) -> {
-            collector.putBytes(0, buffer, offset, len);
-            length.value = len;
+            collector.putBytes(length.value, buffer, offset, len);
+            length.value += len;
         };
         final io.aeron.FragmentAssembler assembler = new io.aeron.FragmentAssembler(handler);
         idleStrategy.reset();
+        int polls = 0;
         while (true) {
-            final int fragments = snapshotImage.poll(assembler, 1);
-            if (length.value > 0) {
+            final int fragments = snapshotImage.poll(assembler, 64);
+            polls++;
+            if (snapshotImage.isEndOfStream()) {
+                // Drain anything the image delivered together with end-of-stream.
+                while (snapshotImage.poll(assembler, 64) > 0) {
+                    polls++;
+                }
                 break;
             }
-            if (snapshotImage.isEndOfStream()) {
-                break;
+            if (fragments == 0 && snapshotImage.isClosed()) {
+                // Same guard as Aeron's own ClusteredServiceAgent.loadState: an image that went away
+                // without end-of-stream would otherwise park the service thread here forever.
+                throw new IllegalStateException("assets snapshot image closed before end-of-stream: "
+                        + length.value + " byte(s) received at position " + snapshotImage.position());
             }
             idleStrategy.idle(fragments);
         }
+        System.out.println("[SNAPSHOT] reassembled " + length.value + " byte(s) in " + polls
+                + " poll(s) from image position " + snapshotImage.position());
         if (length.value > 0) {
-            BalanceSnapshotCodec.deserialize(collector, 0, length.value, engine);
+            final BalanceSnapshotCodec.Decoded decoded =
+                    BalanceSnapshotCodec.deserialize(collector, 0, length.value, engine);
+            if (decoded.bytesConsumed != length.value) {
+                // The codec read fewer or more bytes than the image carried: a mis-framed or foreign
+                // payload. Refusing to start beats serving a ledger assembled from part of a snapshot.
+                throw new IllegalStateException("assets snapshot length mismatch: image=" + length.value
+                        + " decoded=" + decoded.bytesConsumed + " accounts=" + decoded.accountCount
+                        + " holds=" + decoded.holdCount);
+            }
+            System.out.println("[SNAPSHOT] restored accounts=" + decoded.accountCount
+                    + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
+                    + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq);
         }
     }
 
