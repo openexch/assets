@@ -221,5 +221,6 @@ public class ReplayRecoveryTest {
         @Override public void onHoldSnapshotEnd(long correlationId, int entryCount) { }
         @Override public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId, boolean journalEnabled) { }
         @Override public void onSettleFault(long tradeId, long orderId, long userId, int assetId, long drawnFromAvailable, long uncovered) { }
+        @Override public void onSettleRejected(long tradeId, int marketId, long journalPosition, com.openexchange.assets.domain.SettleRejectReason reason, long detail) { }
     };
 }

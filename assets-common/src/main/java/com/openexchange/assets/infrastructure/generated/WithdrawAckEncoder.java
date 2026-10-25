@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class WithdrawAckEncoder
 {
-    public static final int BLOCK_LENGTH = 36;
+    public static final int BLOCK_LENGTH = 37;
     public static final int TEMPLATE_ID = 16;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final WithdrawAckEncoder parentMessage = this;
@@ -356,6 +356,42 @@ public final class WithdrawAckEncoder
         return this;
     }
 
+
+    public static int duplicateId()
+    {
+        return 7;
+    }
+
+    public static int duplicateSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int duplicateEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int duplicateEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String duplicateMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public WithdrawAckEncoder duplicate(final BoolFlag value)
+    {
+        buffer.putByte(offset + 36, (byte)value.value());
+        return this;
+    }
 
     public String toString()
     {

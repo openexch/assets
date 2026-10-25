@@ -5,16 +5,16 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Credit available balance (external boundary)
+ * Credit available balance (external boundary). v6: carries a 128-bit requestId (durable identity, replayed decision; 0/0 = MISSING_REQUEST_ID once the requestId table lands in RC1 S4).
  */
 @SuppressWarnings("all")
 public final class DepositEncoder
 {
-    public static final int BLOCK_LENGTH = 28;
+    public static final int BLOCK_LENGTH = 44;
     public static final int TEMPLATE_ID = 1;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final DepositEncoder parentMessage = this;
@@ -301,6 +301,110 @@ public final class DepositEncoder
     public DepositEncoder amount(final long value)
     {
         buffer.putLong(offset + 20, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int requestIdHighId()
+    {
+        return 5;
+    }
+
+    public static int requestIdHighSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int requestIdHighEncodingOffset()
+    {
+        return 28;
+    }
+
+    public static int requestIdHighEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String requestIdHighMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long requestIdHighNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long requestIdHighMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long requestIdHighMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public DepositEncoder requestIdHigh(final long value)
+    {
+        buffer.putLong(offset + 28, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int requestIdLowId()
+    {
+        return 6;
+    }
+
+    public static int requestIdLowSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int requestIdLowEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int requestIdLowEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String requestIdLowMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long requestIdLowNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long requestIdLowMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long requestIdLowMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public DepositEncoder requestIdLow(final long value)
+    {
+        buffer.putLong(offset + 36, value, BYTE_ORDER);
         return this;
     }
 

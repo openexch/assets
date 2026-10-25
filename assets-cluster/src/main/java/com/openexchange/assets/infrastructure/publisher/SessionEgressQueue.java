@@ -103,6 +103,7 @@ public final class SessionEgressQueue {
     private final HoldSnapshotBatchEncoder holdSnapshotBatchEncoder = new HoldSnapshotBatchEncoder();
 
     private long backPressureCount;
+    private long oversizeDrops;
     private int peakPendingBytes;
     /**
      * Which BROADCAST egress channels this session wants — replies to its own commands bypass this
@@ -146,6 +147,11 @@ public final class SessionEgressQueue {
 
     public long backPressureCount() {
         return backPressureCount;
+    }
+
+    /** Frames lost for this session because they exceeded the publication's max message length. */
+    public long oversizeDrops() {
+        return oversizeDrops;
     }
 
     public int peakPendingBytes() {
@@ -428,7 +434,24 @@ public final class SessionEgressQueue {
     }
 
     private boolean offerFrame(final DirectBuffer buffer, final int offset, final int length) {
-        final long result = session.offer(buffer, offset, length);
+        final long result;
+        try {
+            result = session.offer(buffer, offset, length);
+        } catch (final IllegalArgumentException oversize) {
+            // The frame exceeds this session publication's max message length (term length / 8, minus
+            // the 32-byte cluster session header). This offer runs inside the apply callback: letting
+            // the exception reach the apply-failure fence would halt the leader, and the next leader
+            // would re-form the same frame (ME 202789c). Count the loss and move on; the consumer
+            // resynchronises through the snapshot queries.
+            final long n = ++oversizeDrops;
+            if (n == 1 || n % 1000 == 0) {
+                System.err.println("CRITICAL: assets egress frame exceeds the session's max message length"
+                        + " (session=" + session.id() + " via=" + session.responseChannel()
+                        + " len=" + length + " totalOversize=" + n + "): " + oversize.getMessage()
+                        + " — frame lost for this session; raise the egress term length");
+            }
+            return true; // consumed (lost), so the frames behind it keep flowing
+        }
         if (result > 0) {
             return true; // delivered (also covers ClientSession.MOCKED_OFFER on a follower)
         }

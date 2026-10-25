@@ -16,6 +16,8 @@ public final class SettleCommand {
     private long price;
     private long quantity;
     private boolean takerIsBuy;
+    /** ME settlement-journal position of this trade (0 = direct ingress); carried so a refusal can name it. */
+    private long journalPosition;
 
     public void reset() {
         tradeId = 0L;
@@ -27,6 +29,7 @@ public final class SettleCommand {
         price = 0L;
         quantity = 0L;
         takerIsBuy = false;
+        journalPosition = 0L;
     }
 
     public long getTradeId() { return tradeId; }
@@ -54,5 +57,8 @@ public final class SettleCommand {
     public void setQuantity(long quantity) { this.quantity = quantity; }
 
     public boolean isTakerIsBuy() { return takerIsBuy; }
+
+    public long getJournalPosition() { return journalPosition; }
+    public void setJournalPosition(long journalPosition) { this.journalPosition = journalPosition; }
     public void setTakerIsBuy(boolean takerIsBuy) { this.takerIsBuy = takerIsBuy; }
 }

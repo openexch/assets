@@ -162,6 +162,22 @@ public final class AssetsClusteredService implements ClusteredService {
     private int applicationCallbackDepth;
     private boolean applicationCallbackFailed;
 
+    /**
+     * The fail-fast exit for an apply failure (RC1 S1, port of the ME's 23090c6 fence). The default is
+     * {@link Runtime#halt(int)}, NOT {@link System#exit(int)}: every caller runs on the cluster SERVICE
+     * thread, and this process's shutdown hooks (the Aeron teardown chain) await that very thread, so
+     * exit() from here deadlocks into a zombie (observed live on the ME, 2026-08-23: alive, HEALTHY,
+     * processing nothing, TERM-immune). halt() skips the hooks; skipping graceful teardown is correct
+     * because a node whose apply failed must not reach peers anyway, recovery is restart + replay.
+     * Callers log their evidence BEFORE invoking the seam. Package-private so tests swap a recorder in.
+     */
+    Runnable failFast = AssetsClusteredService::failFastHalt;
+
+    /** Production default of {@link #failFast}; static so the forked-JVM test runs the exact path. */
+    static void failFastHalt() {
+        Runtime.getRuntime().halt(1);
+    }
+
     /** Wired before launch; the context owns the same-process consensus evidence. */
     public void readinessConsensus(final io.aeron.cluster.ConsensusModule.Context context) {
         consensusReadiness = new com.openexchange.cluster.ConsensusReadiness(context, readiness);
@@ -186,11 +202,12 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnStart(cluster, snapshotImage);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -256,8 +273,28 @@ public final class AssetsClusteredService implements ClusteredService {
                         "Egress offers that hit back pressure (-1 until the leader counters exist)",
                         () -> egressBackPressured == null ? -1 : egressBackPressured.get())
                 .gauge("assets_application_callback_failed",
-                        "1 once a cluster callback threw on this node (apply latched, /ready 503), else 0",
-                        () -> applicationCallbackFailed ? 1 : 0);
+                        "1 once a cluster callback threw on this node (apply latched, /ready 503, process stopped), else 0",
+                        () -> applicationCallbackFailed ? 1 : 0)
+                .counter("assets_ingress_schema_rejects_total",
+                        "Ingress frames dropped for a schemaId/version outside this build's supported set (before any body decode)",
+                        demuxer::schemaRejectCount)
+                .counter("assets_ingress_decode_rejects_total",
+                        "Ingress frames dropped for frame/group bounds or an invalid enum/field byte (poison input, expected)",
+                        demuxer::decodeRejectCount)
+                .counter("assets_ingress_apply_errors_total",
+                        "Application faults after a decoded command entered the engine; nonzero fences this node until restart",
+                        demuxer::applyErrorCount)
+                .counter("assets_ingress_unknown_template_total",
+                        "Ingress frames whose templateId money-schema does not define", demuxer::unknownTemplateCount)
+                .counter("assets_ingress_unhandled_template_total",
+                        "Ingress frames whose v6 templateId this build does not serve yet (gateway ahead of the core)",
+                        demuxer::unhandledTemplateCount)
+                .counter("assets_settle_rejects_total",
+                        "Feed settles refused before any mutation (unknown market, bad amounts, overflow); MUST be alerted on",
+                        engine::getSettleRejectCount)
+                .counter("assets_egress_oversize_drops_total",
+                        "Egress frames larger than a session publication's max message length, lost for that session; should stay 0",
+                        this::egressOversizeDrops);
     }
 
     /**
@@ -457,11 +494,12 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onSessionOpen(ClientSession session, long timestamp) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnSessionOpen(session, timestamp);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -478,11 +516,12 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnSessionClose(session, timestamp, closeReason);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -498,15 +537,44 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public void onSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
                                  int offset, int length, Header header) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnSessionMessage(session, timestamp, buffer, offset, length, header);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            // The demuxer already classified this: decode poison never gets here (dropped + counted), so
+            // anything that does is an APPLICATION FAULT after a possible mutation. Close readiness in
+            // THIS callback, log the evidence (hooks will not run), stop the process, and rethrow so
+            // Aeron's own accounting sees it too. The 'latch and continue' this replaces left a node
+            // applying with /ready 503 and its snapshot cadence stopped. Recovery is restart + replay.
+            failApplicationCallback();
+            System.err.println("FATAL command application failure: logPosition=" + header.position()
+                    + " sessionId=" + (session == null ? -1 : session.id())
+                    + " templateId=" + peekTemplateId(buffer, offset, length)
+                    + " type=" + failure.getClass().getName() + " message=" + failure.getMessage());
+            failFast.run();
             throw failure;
         } finally {
             applicationCallbackDepth--;
         }
+    }
+
+    private void ensureApplicationHealthy() {
+        if (applicationCallbackFailed) {
+            throw new IllegalStateException("Application callback already failed; restart required");
+        }
+    }
+
+    /** Latch AND close readiness now, not on the next background tick. */
+    private void failApplicationCallback() {
+        applicationCallbackFailed = true;
+        readiness.unavailable("application-callback-failed");
+    }
+
+    private int peekTemplateId(DirectBuffer buffer, int offset, int length) {
+        return length >= MessageHeaderDecoder.ENCODED_LENGTH && offset >= 0
+                && length <= buffer.capacity() - offset
+                ? peekHeaderDecoder.wrap(buffer, offset).templateId() : -1;
     }
 
     private void applyOnSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
@@ -559,11 +627,12 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnTimerEvent(correlationId, timestamp);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -586,11 +655,12 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnTakeSnapshot(snapshotPublication);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -716,11 +786,12 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onRoleChange(Cluster.Role newRole) {
+        ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnRoleChange(newRole);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -760,7 +831,7 @@ public final class AssetsClusteredService implements ClusteredService {
         try {
             applyOnTerminate(cluster);
         } catch (RuntimeException | Error failure) {
-            applicationCallbackFailed = true;
+            failApplicationCallback();
             throw failure;
         } finally {
             applicationCallbackDepth--;
@@ -971,6 +1042,13 @@ public final class AssetsClusteredService implements ClusteredService {
                 || peekHeaderDecoder.schemaId() != SubscribeDecoder.SCHEMA_ID) {
             return false;
         }
+        // Behind the same gate as the engine: a short or foreign-version Subscribe must not read stale
+        // bytes past the frame; it falls through to the demuxer, which drops and counts it.
+        if (peekHeaderDecoder.version() != MessageHeaderDecoder.SCHEMA_VERSION
+                || length < MessageHeaderDecoder.ENCODED_LENGTH + SubscribeDecoder.BLOCK_LENGTH
+                || peekHeaderDecoder.blockLength() < SubscribeDecoder.BLOCK_LENGTH) {
+            return false;
+        }
         subscribeDecoder.wrapAndApplyHeader(buffer, offset, peekHeaderDecoder);
         final EgressChannelsDecoder channels = subscribeDecoder.channels();
         int mask = 0;
@@ -1146,9 +1224,24 @@ public final class AssetsClusteredService implements ClusteredService {
         drainTimerArmed = true;
     }
 
+    /** Sum over live session queues (a closed session's drops leave with its queue). */
+    private long egressOversizeDrops() {
+        long total = 0L;
+        final SessionEgressQueue[] queues = egressQueues;
+        for (int i = 0; i < queues.length; i++) {
+            total += queues[i].oversizeDrops();
+        }
+        return total;
+    }
+
     /** Exposed for tests / diagnostics. */
     public AssetsEngine engine() {
         return engine;
+    }
+
+    /** Exposed for tests / diagnostics: the ingress fence counters live on the demuxer. */
+    public AssetsSbeDemuxer demuxer() {
+        return demuxer;
     }
 
     /**
