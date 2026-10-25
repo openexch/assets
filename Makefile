@@ -21,7 +21,7 @@ update-goldens:
 # the live money stack, PIN it off the matching engine's cores, e.g.:
 #   taskset -c 20-23 mvn -pl assets-cluster test -Dtest=ClusterBootSmokeTest
 integration:
-	mvn -pl assets-cluster -am test -Dtest='ClusterBootSmokeTest,SnapshotCadenceClusterTest,SnapshotChunkedRestoreClusterTest,NodeMetricsClusterTest' -Dsurefire.failIfNoSpecifiedTests=false
+	mvn -pl assets-cluster -am test -Dtest='ClusterBootSmokeTest,SnapshotCadenceClusterTest,SnapshotChunkedRestoreClusterTest,NodeMetricsClusterTest,TimerSurvivalClusterTest' -Dsurefire.failIfNoSpecifiedTests=false
 
 clean:
 	mvn clean
