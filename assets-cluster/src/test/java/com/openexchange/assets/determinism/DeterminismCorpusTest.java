@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.determinism;
 
+import com.openexchange.cluster.testkit.GoldenAssert;
+import com.openexchange.cluster.testkit.RunTwiceAssert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -24,6 +26,7 @@ import static org.junit.Assert.assertEquals;
 public class DeterminismCorpusTest {
 
     private static final Path DIR = Path.of("src", "test", "resources", "determinism");
+    private static final GoldenAssert GOLDEN = new GoldenAssert(DIR);
 
     @Parameters(name = "{0}")
     public static Collection<Object[]> scenarios() throws IOException {
@@ -51,15 +54,19 @@ public class DeterminismCorpusTest {
     /** Same input must reproduce the committed golden output exactly. */
     @Test
     public void matchesGolden() throws IOException {
-        GoldenAssert.match(name, AssetsScenarioRunner.run(scenarioFile));
+        GOLDEN.match(name, AssetsScenarioRunner.run(scenarioFile));
     }
 
     /** Same input through two independent fresh engines must be byte-identical. */
     @Test
     public void runTwiceIsIdentical() throws IOException {
-        String a = AssetsScenarioRunner.run(scenarioFile);
-        String b = AssetsScenarioRunner.run(scenarioFile);
-        assertEquals("Run-twice divergence in '" + name + "'", a, b);
+        RunTwiceAssert.assertIdentical(name, () -> {
+            try {
+                return AssetsScenarioRunner.run(scenarioFile);
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
     }
 
     /** Output must be invariant to wall-clock time. */

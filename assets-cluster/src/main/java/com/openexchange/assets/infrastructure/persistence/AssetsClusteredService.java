@@ -81,6 +81,12 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     private static final long EGRESS_DRAIN_TIMER_ID = 1_000_000_000_000L;
     private static final long EGRESS_DRAIN_BACKSTOP_MS = 10;
+    /** RC1 S2 (K3-D): the ONE deadline sweep timer; constant id, re-armed every SWEEP_PERIOD_MS while the index is non-empty. */
+    static final long SWEEP_TIMER_ID = 1_000_000_000_001L;
+    static final long SWEEP_PERIOD_MS = 100;
+    private boolean sweepArmed;
+    private volatile long sweepTimerFires;
+    private final com.openexchange.cluster.SnapshotEnvelope snapshotEnvelope = new com.openexchange.cluster.SnapshotEnvelope();
 
     // Per-session egress queues, plus a cached array so the money path iterates without allocating
     // (cluster.clientSessions() returns a JDK unmodifiable wrapper whose iterator() allocates).
@@ -294,7 +300,13 @@ public final class AssetsClusteredService implements ClusteredService {
                         engine::getSettleRejectCount)
                 .counter("assets_egress_oversize_drops_total",
                         "Egress frames larger than a session publication's max message length, lost for that session; should stay 0",
-                        this::egressOversizeDrops);
+                        this::egressOversizeDrops)
+                .counter("assets_sweep_timer_fires_total",
+                        "Deadline sweep timer fires applied on this node (one log entry each; K3-D)", () -> sweepTimerFires)
+                .gauge("assets_deadline_index_size", "Entries in the derived deadline index (GTD, replace, requestId TTL)",
+                        () -> engine.deadlines().size())
+                .gauge("assets_last_log_time_ms", "Monotone log time last applied by this ledger (cluster epoch ms)",
+                        engine::getLastLogTime);
     }
 
     /**
@@ -512,6 +524,7 @@ public final class AssetsClusteredService implements ClusteredService {
         // Arm here as well as in onSessionMessage: a leader that has a session but has not yet been
         // asked anything should already have its idle-path belt running.
         armDrainTimerIfNeeded();
+        armSweepIfNeeded();
     }
 
     @Override
@@ -623,6 +636,7 @@ public final class AssetsClusteredService implements ClusteredService {
                     System.nanoTime() - dispatchEndNs, header.position());
         }
         armDrainTimerIfNeeded();
+        armSweepIfNeeded();
     }
 
     @Override
@@ -640,7 +654,16 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnTimerEvent(long correlationId, long timestamp) {
-        // Holds have no TTL yet (auto-expiry is a later phase); the only timer is the egress drain belt.
+        if (correlationId == SWEEP_TIMER_ID) {
+            // Replicated: a TimerEvent is a log entry, so every member pops the same entries at the same
+            // log time; only the leader re-arms, and only while something is left to sweep.
+            sweepArmed = false;
+            sweepTimerFires++;
+            engine.sweep(timestamp);
+            drainEgress();
+            armSweepIfNeeded();
+            return;
+        }
         if (correlationId == EGRESS_DRAIN_TIMER_ID) {
             drainTimerArmed = false;
             drainTimerFires++;
@@ -670,7 +693,7 @@ public final class AssetsClusteredService implements ClusteredService {
     private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
         final long startNs = System.nanoTime();
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        final int length = BalanceSnapshotCodec.serialize(engine, buffer);
+        final int length = encodeSnapshot(engine, buffer, snapshotEnvelope);
         final long serializedNs = System.nanoTime();
 
         // Chunked, like the matching engine's A-2 fix: a single offer() throws
@@ -821,8 +844,10 @@ public final class AssetsClusteredService implements ClusteredService {
         // Always re-arm from scratch. Only the leader really schedules (a follower's scheduleTimer is a
         // no-op), and a timer does not survive a snapshot recover-into-leader, so clearing the flag
         // guarantees the next onSessionMessage arms exactly one fresh belt. This is match#26's fix:
-        // missing it leaves a leader whose idle-path drain never fires.
+        // missing it leaves a leader whose idle-path drain never fires. The deadline sweep follows the
+        // same rule (K3-D): clear here, re-arm from the next legal callback while the index is non-empty.
         drainTimerArmed = false;
+        sweepArmed = false;
     }
 
     @Override
@@ -906,20 +931,57 @@ public final class AssetsClusteredService implements ClusteredService {
         }
         System.out.println("[SNAPSHOT] reassembled " + length.value + " byte(s) in " + polls
                 + " poll(s) from image position " + snapshotImage.position());
-        if (length.value > 0) {
-            final BalanceSnapshotCodec.Decoded decoded =
-                    BalanceSnapshotCodec.deserialize(collector, 0, length.value, engine);
-            if (decoded.bytesConsumed != length.value) {
-                // The codec read fewer or more bytes than the image carried: a mis-framed or foreign
-                // payload. Refusing to start beats serving a ledger assembled from part of a snapshot.
-                throw new IllegalStateException("assets snapshot length mismatch: image=" + length.value
+        restoreFromImage(collector, length.value);
+    }
+
+    /**
+     * Restore from a reassembled snapshot image: open the kit envelope (magic, version, length, CRC32C),
+     * decode the v4 payload, require it to end exactly where the envelope says, then verify the ledger
+     * invariants. Any refusal is logged with its reason and stops the node through {@link #failFast}: a
+     * node must not run on a snapshot it could not verify (hardening B1.2 step 5). A bare payload is
+     * refused like any other corruption; there is no legacy pass-through (clean genesis).
+     */
+    void restoreFromImage(final DirectBuffer image, final int imageLength) {
+        try {
+            if (imageLength <= 0) {
+                throw new IllegalStateException("assets snapshot image is empty");
+            }
+            final int payloadLength = snapshotEnvelope.open(image, imageLength);
+            final BalanceSnapshotCodec.Decoded decoded = BalanceSnapshotCodec.deserialize(
+                    image, com.openexchange.cluster.SnapshotEnvelope.payloadOffset(), payloadLength, engine);
+            if (decoded.bytesConsumed != payloadLength) {
+                // The codec read fewer or more bytes than the envelope carried: a mis-framed payload.
+                // Refusing to start beats serving a ledger assembled from part of a snapshot.
+                throw new IllegalStateException("assets snapshot payload length mismatch: envelope=" + payloadLength
                         + " decoded=" + decoded.bytesConsumed + " accounts=" + decoded.accountCount
                         + " holds=" + decoded.holdCount);
             }
+            engine.verifyRestoredInvariants();
             System.out.println("[SNAPSHOT] restored accounts=" + decoded.accountCount
                     + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
-                    + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq);
+                    + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq
+                    + " lastLogTime=" + decoded.lastLogTime + " sections=" + decoded.sectionCount
+                    + " deadlines=" + engine.deadlines().size() + " enveloped=true verified=true");
+        } catch (final RuntimeException refused) {
+            failApplicationCallback();
+            System.err.println("FATAL snapshot refused: " + refused.getMessage()
+                    + " (imageLength=" + imageLength + "); this node will not serve an unverified ledger");
+            failFast.run();
+            throw refused;
         }
+    }
+
+    /** The snapshot image as offered: the v4 payload written at the envelope's payload offset, then sealed. */
+    static int encodeSnapshot(final AssetsEngine engine, final MutableDirectBuffer buffer,
+                              final com.openexchange.cluster.SnapshotEnvelope envelope) {
+        final int payloadLength = BalanceSnapshotCodec.serialize(engine, buffer,
+                com.openexchange.cluster.SnapshotEnvelope.payloadOffset());
+        return envelope.seal(buffer, payloadLength);
+    }
+
+    /** Exposed for tests / diagnostics: deadline sweep timer fires on this node. */
+    public long sweepTimerFires() {
+        return sweepTimerFires;
     }
 
     /**
@@ -1205,6 +1267,26 @@ public final class AssetsClusteredService implements ClusteredService {
         }
         egressQueues = rebuilt;
         sessionsDirty = false;
+    }
+
+    /**
+     * Arm the deadline sweep (K3-D): one timer, constant id, {@value #SWEEP_PERIOD_MS} ms ahead, leader
+     * only, only while the index is non-empty, and only from a callback where scheduling is legal (the
+     * same rule as the drain belt). Rescheduling the same id is idempotent, so at most one sweep exists
+     * cluster-wide; a sweep armed before a snapshot may also be replayed by the consensus module after a
+     * restore, which is harmless because the sweep itself is idempotent (one-shot pops).
+     */
+    private void armSweepIfNeeded() {
+        if (sweepArmed || !isLeader || cluster == null || engine.deadlines().isEmpty()) {
+            return;
+        }
+        final long deadline = cluster.time()
+                + cluster.timeUnit().convert(SWEEP_PERIOD_MS, TimeUnit.MILLISECONDS);
+        idleStrategy.reset();
+        while (!cluster.scheduleTimer(SWEEP_TIMER_ID, deadline)) {
+            idleStrategy.idle();
+        }
+        sweepArmed = true;
     }
 
     /**

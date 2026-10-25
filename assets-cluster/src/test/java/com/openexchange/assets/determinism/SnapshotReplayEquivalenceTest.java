@@ -2,7 +2,8 @@
 package com.openexchange.assets.determinism;
 
 import com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec;
-import org.agrona.ExpandableArrayBuffer;
+import com.openexchange.cluster.testkit.ScenarioText;
+import com.openexchange.cluster.testkit.SnapshotSpliceRunner;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -12,7 +13,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -75,63 +75,23 @@ public class SnapshotReplayEquivalenceTest {
 
     @Test
     public void restoringAtAnyPointReproducesTheUninterruptedRun() throws IOException {
-        final List<String> lines = executableLines(scenarioFile);
-
-        final Run uninterrupted = run(lines);
-
-        for (int cut = 0; cut <= lines.size(); cut++) {
-            final List<String> spliced = new ArrayList<>(lines);
-            spliced.add(cut, "SNAPSHOT");
-            final Run restored = run(spliced);
-
-            final String where = "'" + name + "' restored after " + cut + " of " + lines.size()
-                    + " commands";
-            assertEquals("event stream diverged: " + where, uninterrupted.events, restored.events);
-            assertArrayEquals("state bytes diverged: " + where, uninterrupted.state, restored.state);
-        }
+        // The kit runner: for every cut, a fresh replica applies the prefix, snapshots (twice: the bytes
+        // must be reproducible), restores from those bytes (which must re-serialize identically), applies
+        // the suffix, and must end with the uninterrupted run's events and final image.
+        final SnapshotSpliceRunner.Report report = SnapshotSpliceRunner.run(AssetsReplica::new,
+                Files.readAllLines(scenarioFile, StandardCharsets.UTF_8));
+        assertEquals("every boundary is a cut", report.lines() + 1, report.cuts());
     }
 
     /**
-     * A snapshot taken twice from the same engine must be identical — the codec reads state, it must
+     * A snapshot taken twice from the same engine must be identical: the codec reads state, it must
      * not consume or reorder anything as a side effect.
      */
     @Test
     public void serializingTwiceYieldsTheSameBytes() throws IOException {
         final AssetsScenarioRunner runner = AssetsScenarioRunner.newRunner();
-        runner.execAll(executableLines(scenarioFile));
+        runner.execAll(ScenarioText.executableLines(Files.readAllLines(scenarioFile, StandardCharsets.UTF_8)));
         assertArrayEquals("serialize is not side-effect free in '" + name + "'",
-                snapshotBytes(runner), snapshotBytes(runner));
-    }
-
-    // ---- helpers ----
-
-    private record Run(String events, byte[] state) {
-    }
-
-    private static Run run(List<String> lines) {
-        final AssetsScenarioRunner runner = AssetsScenarioRunner.newRunner();
-        runner.execAll(lines);
-        return new Run(runner.output(), snapshotBytes(runner));
-    }
-
-    private static byte[] snapshotBytes(AssetsScenarioRunner runner) {
-        final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        final int length = BalanceSnapshotCodec.serialize(runner.engine(), buffer);
-        final byte[] bytes = new byte[length];
-        buffer.getBytes(0, bytes);
-        return bytes;
-    }
-
-    /** Scenario lines with comments and blanks removed, so every cut position is a real boundary. */
-    private static List<String> executableLines(Path scenarioFile) throws IOException {
-        final List<String> out = new ArrayList<>();
-        for (final String raw : Files.readAllLines(scenarioFile, StandardCharsets.UTF_8)) {
-            final int hash = raw.indexOf('#');
-            final String line = (hash >= 0 ? raw.substring(0, hash) : raw).trim();
-            if (!line.isEmpty()) {
-                out.add(line);
-            }
-        }
-        return out;
+                runner.snapshotBytes(), runner.snapshotBytes());
     }
 }
