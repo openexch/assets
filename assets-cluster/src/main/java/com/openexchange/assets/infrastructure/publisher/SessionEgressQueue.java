@@ -8,7 +8,11 @@ import com.openexchange.assets.infrastructure.generated.HoldAckDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.MeDispatchBatchEncoder;
+import com.openexchange.assets.infrastructure.generated.MeDispatchDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderEventBatchEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderEventDecoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
 import io.aeron.Publication;
@@ -90,6 +94,16 @@ public final class SessionEgressQueue {
     /** An encoded batch frame the session back-pressured: length in {@link #batchScratch}; 0 = none. */
     private int parkedBatchLength;
     private final UnsafeBuffer batchScratch = new UnsafeBuffer(new byte[BATCH_SCRATCH_CAPACITY]);
+
+    // RC1 S4 (critic G8): OrderEvent (102 -> 103, cap 48) and MeDispatch (104 -> 105, cap 64) batch by COPYING
+    // the single frame's body bytes into a raw staging area; the batch entry layout equals the single block.
+    static final int ORDER_EVENT_BATCH_CAP = 48;
+    static final int ME_DISPATCH_BATCH_CAP = 64;
+    private static final int RAW_STAGE_CAPACITY = Math.max(ORDER_EVENT_BATCH_CAP * OrderEventDecoder.BLOCK_LENGTH,
+            ME_DISPATCH_BATCH_CAP * MeDispatchDecoder.BLOCK_LENGTH);
+    private final UnsafeBuffer rawStage = new UnsafeBuffer(new byte[RAW_STAGE_CAPACITY]);
+    private final OrderEventBatchEncoder orderEventBatchEncoder = new OrderEventBatchEncoder();
+    private final MeDispatchBatchEncoder meDispatchBatchEncoder = new MeDispatchBatchEncoder();
 
     private final MessageHeaderDecoder frameHeaderDecoder = new MessageHeaderDecoder();
     private final BalanceUpdateDecoder balanceUpdateDecoder = new BalanceUpdateDecoder();
@@ -266,7 +280,7 @@ public final class SessionEgressQueue {
             if (openBatchTemplateId != 0 && openBatchTemplateId != batchable && !flushOpenBatch()) {
                 return false;
             }
-            if (openBatchCount == BATCH_CAP && !flushOpenBatch()) {
+            if (openBatchCount == capFor(batchable) && !flushOpenBatch()) {
                 return false;
             }
             stage(batchable, buffer, offset);
@@ -299,8 +313,20 @@ public final class SessionEgressQueue {
             case SettlementAppliedDecoder.TEMPLATE_ID:
             case HoldSnapshotEntryDecoder.TEMPLATE_ID:
                 return templateId;
+            case OrderEventDecoder.TEMPLATE_ID:
+                return length == MessageHeaderDecoder.ENCODED_LENGTH + OrderEventDecoder.BLOCK_LENGTH ? templateId : 0;
+            case MeDispatchDecoder.TEMPLATE_ID:
+                return length == MessageHeaderDecoder.ENCODED_LENGTH + MeDispatchDecoder.BLOCK_LENGTH ? templateId : 0;
             default:
                 return 0;
+        }
+    }
+
+    private static int capFor(final int templateId) {
+        switch (templateId) {
+            case OrderEventDecoder.TEMPLATE_ID: return ORDER_EVENT_BATCH_CAP;
+            case MeDispatchDecoder.TEMPLATE_ID: return ME_DISPATCH_BATCH_CAP;
+            default: return BATCH_CAP;
         }
     }
 
@@ -337,6 +363,10 @@ public final class SessionEgressQueue {
                 stagedFields[2][i] = holdSnapshotEntryDecoder.assetId();
                 stagedFields[3][i] = holdSnapshotEntryDecoder.remaining();
             }
+            case OrderEventDecoder.TEMPLATE_ID -> rawStage.putBytes(i * OrderEventDecoder.BLOCK_LENGTH, buffer,
+                    offset + MessageHeaderDecoder.ENCODED_LENGTH, OrderEventDecoder.BLOCK_LENGTH);
+            case MeDispatchDecoder.TEMPLATE_ID -> rawStage.putBytes(i * MeDispatchDecoder.BLOCK_LENGTH, buffer,
+                    offset + MessageHeaderDecoder.ENCODED_LENGTH, MeDispatchDecoder.BLOCK_LENGTH);
             default -> throw new IllegalStateException("not a batchable templateId: " + templateId);
         }
     }
@@ -415,6 +445,19 @@ public final class SessionEgressQueue {
                             .remaining(stagedFields[3][i]);
                 }
                 return MessageHeaderEncoder.ENCODED_LENGTH + holdSnapshotBatchEncoder.encodedLength();
+            }
+            case OrderEventDecoder.TEMPLATE_ID -> {
+                // Group header via the encoder (block length + count), entry bytes copied verbatim.
+                orderEventBatchEncoder.wrapAndApplyHeader(batchScratch, 0, batchHeaderEncoder).eventsCount(count);
+                final int body = MessageHeaderEncoder.ENCODED_LENGTH + 4;
+                batchScratch.putBytes(body, rawStage, 0, count * OrderEventDecoder.BLOCK_LENGTH);
+                return body + count * OrderEventDecoder.BLOCK_LENGTH;
+            }
+            case MeDispatchDecoder.TEMPLATE_ID -> {
+                meDispatchBatchEncoder.wrapAndApplyHeader(batchScratch, 0, batchHeaderEncoder).dispatchesCount(count);
+                final int body = MessageHeaderEncoder.ENCODED_LENGTH + 4;
+                batchScratch.putBytes(body, rawStage, 0, count * MeDispatchDecoder.BLOCK_LENGTH);
+                return body + count * MeDispatchDecoder.BLOCK_LENGTH;
             }
             default -> throw new IllegalStateException(
                     "open batch with unknown templateId: " + openBatchTemplateId);

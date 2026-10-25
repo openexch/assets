@@ -2,6 +2,7 @@
 package com.openexchange.assets.application.engine;
 
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
+import com.openexchange.assets.application.engine.order.OrderEngine;
 import com.openexchange.assets.application.engine.session.SessionAuthority;
 import com.openexchange.assets.application.engine.session.SessionRegistry;
 import com.openexchange.assets.application.engine.time.DeadlineIndex;
@@ -107,6 +108,8 @@ public final class AssetsEngine {
     private final SessionRegistry sessions = new SessionRegistry();
     /** RC1 S3 (K5 item 3): the replicated order-entry gate; snapshotted (section 5). */
     private final OrderEntryGate gate = new OrderEntryGate();
+    /** RC1 S4: order lifecycle, risk and the requestId table (sections 2, 3, 4, 6). */
+    private final OrderEngine orders = new OrderEngine(this);
     /** Commands refused for session authority (class, scope, registration). Alarm target, not snapshotted. */
     private long unauthorisedCount = 0L;
     /** The log position of the entry being applied; set by the service, carried on control egress. Transient. */
@@ -181,8 +184,34 @@ public final class AssetsEngine {
         // Validate, THEN mutate (RC1 S1, K5): a rejected command creates no account. Everything that can
         // refuse a deposit on a NEW account is decidable before the account exists (a fresh account's
         // headroom is Long.MAX_VALUE, so only the amount and the asset can reject it).
-        if (!validAsset(c.getAssetId()) || c.getAmount() <= 0) {
-            return; // client error, no money effect, no account; the demuxer already counted it
+        if (!validAsset(c.getAssetId())) {
+            return; // the demuxer already counted and refused this; defensive only
+        }
+        final long fingerprint = OrderEngine.moneyFingerprint(c.getUserId(), c.getAssetId(), c.getAmount());
+        if (c.hasRequestId()) {
+            final var seen = orders.requests().get(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow());
+            if (seen != null) {
+                if (seen.fingerprint != fingerprint) {
+                    sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                            c.getAssetId(), c.getAmount(), RejectReason.REQUEST_ID_MISMATCH);
+                    return;
+                }
+                final Account existing = accounts.get(c.getUserId());
+                sink.onDepositAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                        existing == null ? 0L : existing.available(c.getAssetId()), true);
+                return;
+            }
+        }
+        if (c.getAmount() <= 0) {
+            sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                    c.getAssetId(), c.getAmount(), RejectReason.INVALID_AMOUNT);
+            return; // no money effect, no account
+        }
+        final Account known = accounts.get(c.getUserId());
+        if (known != null && c.getAmount() > known.headroom(c.getAssetId())) {
+            sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                    c.getAssetId(), c.getAmount(), RejectReason.BALANCE_OVERFLOW);
+            return;
         }
         captureOpeningEpochIfArmed();
         Account a = getOrCreateAccount(c.getUserId());
@@ -190,20 +219,41 @@ public final class AssetsEngine {
         if (r.accepted()) {
             // Ack (echoing the correlationId) precedes the balance update, matching hold's order.
             sink.onDepositAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
-                    a.available(c.getAssetId()));
+                    a.available(c.getAssetId()), false);
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
             if (journalEnabled) {
                 emitOpeningEpochIfPending();
                 journal.onDeposit(++journalSeq, c.getUserId(), c.getAssetId(), c.getAmount(),
                         a.available(c.getAssetId()) + a.locked(c.getAssetId()), timestamp);
             }
+            if (c.hasRequestId()) {
+                orders.rememberMoney(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow(), fingerprint,
+                        com.openexchange.assets.application.engine.order.RequestTable.KIND_DEPOSIT, c.getAmount(), lastLogTime);
+            }
+        } else {
+            sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                    c.getAssetId(), c.getAmount(), r);
         }
-        // A rejected deposit (non-positive amount) is a client error with no money effect and no ack.
     }
 
     private void applyWithdraw(WithdrawCommand c, long timestamp) {
         if (!validAsset(c.getAssetId())) {
             return; // never a throw, never an account
+        }
+        final long fingerprint = OrderEngine.moneyFingerprint(c.getUserId(), c.getAssetId(), c.getAmount());
+        if (c.hasRequestId()) {
+            final var seen = orders.requests().get(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow());
+            if (seen != null) {
+                // money commands are remembered only when ACCEPTED (a refused one may be retried as-is)
+                if (seen.fingerprint != fingerprint) {
+                    sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(), RejectReason.REQUEST_ID_MISMATCH);
+                } else {
+                    final Account existing = accounts.get(c.getUserId());
+                    sink.onWithdrawAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                            existing == null ? 0L : existing.available(c.getAssetId()), true);
+                }
+                return;
+            }
         }
         Account a = accounts.get(c.getUserId());
         if (a == null) {
@@ -217,12 +267,16 @@ public final class AssetsEngine {
         RejectReason r = a.withdraw(c.getAssetId(), c.getAmount());
         if (r.accepted()) {
             sink.onWithdrawAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
-                    a.available(c.getAssetId()));
+                    a.available(c.getAssetId()), false);
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
             if (journalEnabled) {
                 emitOpeningEpochIfPending();
                 journal.onWithdraw(++journalSeq, c.getUserId(), c.getAssetId(), c.getAmount(),
                         a.available(c.getAssetId()) + a.locked(c.getAssetId()), timestamp);
+            }
+            if (c.hasRequestId()) {
+                orders.rememberMoney(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow(), fingerprint,
+                        com.openexchange.assets.application.engine.order.RequestTable.KIND_WITHDRAW, c.getAmount(), lastLogTime);
             }
         } else {
             sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(), r);
@@ -634,7 +688,7 @@ public final class AssetsEngine {
 
     // ---- RC1 S2: log time, the deadline sweep, restore verification ----
 
-    private void observeLogTime(long timestamp) {
+    public void observeLogTime(long timestamp) {
         if (timestamp > lastLogTime) {
             lastLogTime = timestamp;
         }
@@ -660,14 +714,7 @@ public final class AssetsEngine {
     }
 
     private void onDeadline(long deadlineMs, long id, int kind) {
-        switch (kind) {
-            case DeadlineIndex.KIND_GTD:
-            case DeadlineIndex.KIND_REPLACE:
-            case DeadlineIndex.KIND_REQUEST_TTL:
-            default:
-                // RC1 S2: the owning records do not exist yet; nothing to expire. S4/S5 wire the handlers.
-                break;
-        }
+        orders.onDeadline(deadlineMs, id, kind, lastLogTime);
     }
 
     public long getLastLogTime() {
@@ -752,6 +799,10 @@ public final class AssetsEngine {
 
     public OrderEntryGate gate() {
         return gate;
+    }
+
+    public OrderEngine orders() {
+        return orders;
     }
 
     public AssetsEventSink eventSink() {

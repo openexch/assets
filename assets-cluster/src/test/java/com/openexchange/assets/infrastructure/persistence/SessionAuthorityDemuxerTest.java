@@ -76,7 +76,7 @@ public class SessionAuthorityDemuxerTest {
 
         int deposit(long corr, long user, long amount) {
             final DepositEncoder e = new DepositEncoder().wrapAndApplyHeader(buf, 0, header)
-                    .correlationId(corr).userId(user).assetId(0).amount(amount).requestIdHigh(0).requestIdLow(0);
+                    .correlationId(corr).userId(user).assetId(0).amount(amount).requestIdHigh(1).requestIdLow(corr);
             return HEADER + e.encodedLength();
         }
 

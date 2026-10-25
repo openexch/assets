@@ -197,7 +197,7 @@ public class BridgeEndToEndTest {
 
         void deposit(long userId, int assetId, long amount) {
             depositEnc.wrapAndApplyHeader(buf, 0, headerEnc)
-                    .correlationId(0).userId(userId).assetId(assetId).amount(amount);
+                    .correlationId(0).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
             offer(MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength());
         }
 

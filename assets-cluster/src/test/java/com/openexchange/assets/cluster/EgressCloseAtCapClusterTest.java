@@ -221,7 +221,7 @@ public class EgressCloseAtCapClusterTest {
 
     private int encodeDeposit(long userId, int assetId, long amount) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
-                .correlationId(0L).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(0L).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
         return MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength();
     }
 

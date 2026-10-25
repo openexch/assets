@@ -364,13 +364,13 @@ public class WireRoundTripTest {
 
     private void deposit(AssetsSbeDemuxer demuxer, long corr, long userId, int assetId, long amount) {
         depositEncoder.wrapAndApplyHeader(ingress, 0, header)
-                .correlationId(corr).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(corr).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
         demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + depositEncoder.encodedLength(), 1000L);
     }
 
     private void withdraw(AssetsSbeDemuxer demuxer, long corr, long userId, int assetId, long amount) {
         withdrawEncoder.wrapAndApplyHeader(ingress, 0, header)
-                .correlationId(corr).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(corr).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
         demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + withdrawEncoder.encodedLength(), 1000L);
     }
 
@@ -439,9 +439,9 @@ public class WireRoundTripTest {
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldAck");
         p.onHoldReject(1, 2, 3, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldReject");
-        p.onDepositAck(1, 2, 0, 100, 100);
+        p.onDepositAck(1, 2, 0, 100, 100, false);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "DepositAck");
-        p.onWithdrawAck(1, 2, 0, 100, 0);
+        p.onWithdrawAck(1, 2, 0, 100, 0, false);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawAck");
         p.onWithdrawReject(1, 2, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawReject");
@@ -477,9 +477,9 @@ public class WireRoundTripTest {
         final CapturingEgress egress = new CapturingEgress();
         final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> queryReply[0]);
 
-        p.onDepositAck(1, 2, 0, 100, 100);
+        p.onDepositAck(1, 2, 0, 100, 100, false);
         assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "DepositAck");
-        p.onWithdrawAck(1, 2, 0, 100, 0);
+        p.onWithdrawAck(1, 2, 0, 100, 0, false);
         assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "WithdrawAck");
         p.onHoldAck(1, 2, 3, 0, 100);
         assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "HoldAck");

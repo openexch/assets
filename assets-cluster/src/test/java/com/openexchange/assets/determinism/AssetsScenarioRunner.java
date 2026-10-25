@@ -46,6 +46,9 @@ import java.util.Map;
  *   RELEASE  order=1 u=100 [amt=..]        (no amt = release full residual)
  *   SETTLE   tradeId=1 market=1 takerOrder=2 takerUser=200 makerOrder=1 makerUser=100 px=60000.0 qty=0.5 takerBuy=1
  *   SET_JOURNAL 1                          arm (1) / disarm (0) the money journal, via the log
+ *   GATE market=0 open=1                   order-entry gate (ADMIN); RISKCFG market= ver= [maxOpen= perSec= perMin= collarBps= slipBps= ...]
+ *   BREAKER market= trip=1|0 ; MARKETTICK market= bid= ask= ver= [last= lastTradeId=]
+ *   CREATE u= market= side= type= [px=] qty= [budget=] [tif=] [exp=] [cid=] [rid=] ; CANCEL u= [order=|cid=] [rid=]
  *   SNAPSHOT                               serialize -> restore into a fresh engine
  * </pre>
  * Amounts/prices (amt, px) are decimals converted to 8dp fixed-point; asset/market/order/user ids are
@@ -219,6 +222,76 @@ public final class AssetsScenarioRunner {
             case "SNAPSHOT":
                 snapshotRoundTrip();
                 break;
+            // ---- RC1 S4: order lifecycle verbs (admission, cancel, risk config, breaker, tick, gate) ----
+            case "GATE": {
+                final int market = reqInt(kv, "market");
+                final boolean open = reqLong(kv, "open") != 0;
+                engine.applyOrderEntryGate(0L, market, open ? com.openexchange.assets.domain.GateState.OPEN
+                        : com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.ADMIN, clock.now());
+                break;
+            }
+            case "RISKCFG": {
+                final com.openexchange.assets.domain.commands.RiskConfigSetCommand c =
+                        new com.openexchange.assets.domain.commands.RiskConfigSetCommand();
+                c.reset();
+                c.correlationId = 0L;
+                c.marketId = reqInt(kv, "market");
+                c.configVersion = reqLong(kv, "ver");
+                final com.openexchange.assets.application.engine.order.MarketRisk cur = engine.orders().market(
+                        c.marketId >= 0 && c.marketId < com.openexchange.assets.application.engine.order.UserRisk.MARKET_SLOTS ? c.marketId : 0);
+                c.minQuantity = kv.containsKey("minQty") ? reqAmount(kv, "minQty") : cur.minQuantity;
+                c.maxQuantity = kv.containsKey("maxQty") ? reqAmount(kv, "maxQty") : cur.maxQuantity;
+                c.minNotional = kv.containsKey("minNotional") ? reqAmount(kv, "minNotional") : cur.minNotional;
+                c.maxNotional = kv.containsKey("maxNotional") ? reqAmount(kv, "maxNotional") : cur.maxNotional;
+                c.priceCollarBps = kv.containsKey("collarBps") ? reqInt(kv, "collarBps") : cur.priceCollarBps;
+                c.maxOrdersPerSec = kv.containsKey("perSec") ? reqInt(kv, "perSec") : cur.maxOrdersPerSec;
+                c.maxOrdersPerMin = kv.containsKey("perMin") ? reqInt(kv, "perMin") : cur.maxOrdersPerMin;
+                c.maxOpenOrders = kv.containsKey("maxOpen") ? reqInt(kv, "maxOpen") : cur.maxOpenOrders;
+                c.maxPositionPerMarket = kv.containsKey("maxPos") ? reqAmount(kv, "maxPos") : cur.maxPositionPerMarket;
+                c.marketBuySlippageBps = kv.containsKey("slipBps") ? reqInt(kv, "slipBps") : cur.marketBuySlippageBps;
+                engine.orders().applyRiskConfigSet(c, clock.now());
+                break;
+            }
+            case "BREAKER":
+                engine.orders().applyCircuitBreaker(0L, reqInt(kv, "market"), reqLong(kv, "trip") != 0, clock.now());
+                break;
+            case "MARKETTICK":
+                engine.orders().applyMarketTick(reqInt(kv, "market"), reqLong(kv, "ver"), reqAmount(kv, "bid"), reqAmount(kv, "ask"),
+                        kv.containsKey("last") ? reqAmount(kv, "last") : 0L, kv.containsKey("lastTradeId") ? reqLong(kv, "lastTradeId") : 0L,
+                        0L, clock.now());
+                break;
+            case "CREATE": {
+                final com.openexchange.assets.domain.commands.CreateOrderCommand c =
+                        new com.openexchange.assets.domain.commands.CreateOrderCommand();
+                c.reset();
+                c.correlationId = kv.containsKey("corr") ? reqLong(kv, "corr") : 0L;
+                c.userId = reqLong(kv, "u");
+                c.marketId = reqInt(kv, "market");
+                c.side = reqInt(kv, "side");
+                c.orderType = reqInt(kv, "type");
+                c.timeInForce = kv.containsKey("tif") ? reqInt(kv, "tif") : 0;
+                c.price = kv.containsKey("px") ? reqAmount(kv, "px") : 0L;
+                c.quantity = reqAmount(kv, "qty");
+                c.budget = kv.containsKey("budget") ? reqAmount(kv, "budget") : 0L;
+                c.expiresAtMs = kv.containsKey("exp") ? reqLong(kv, "exp") : 0L;
+                c.clientOrderIdLow = kv.containsKey("cid") ? reqLong(kv, "cid") : 0L;
+                c.requestIdLow = kv.containsKey("rid") ? reqLong(kv, "rid") : 0L;
+                c.flags = kv.containsKey("flags") ? reqInt(kv, "flags") : 0;
+                engine.orders().applyCreate(c, clock.now());
+                break;
+            }
+            case "CANCEL": {
+                final com.openexchange.assets.domain.commands.CancelOrderCommand c =
+                        new com.openexchange.assets.domain.commands.CancelOrderCommand();
+                c.reset();
+                c.correlationId = kv.containsKey("corr") ? reqLong(kv, "corr") : 0L;
+                c.userId = reqLong(kv, "u");
+                c.orderId = kv.containsKey("order") ? reqLong(kv, "order") : 0L;
+                c.origClientOrderIdLow = kv.containsKey("cid") ? reqLong(kv, "cid") : 0L;
+                c.requestIdLow = kv.containsKey("rid") ? reqLong(kv, "rid") : 0L;
+                engine.orders().applyCancel(c, clock.now());
+                break;
+            }
             default:
                 throw new IllegalArgumentException("unknown verb '" + verb + "'");
         }

@@ -46,8 +46,8 @@ public class AssetsApplyFailureFenceTest {
                 }
                 throw (Error) failure;
             }
-            public void onDepositAck(long c, long u, int a, long amt, long n) { }
-            public void onWithdrawAck(long c, long u, int a, long amt, long n) { }
+            public void onDepositAck(long c, long u, int a, long amt, long n, boolean dup) { }
+            public void onWithdrawAck(long c, long u, int a, long amt, long n, boolean dup) { }
             public void onHoldAck(long c, long o, long u, int a, long amt) { }
             public void onHoldReject(long c, long o, long u, int a, long amt, RejectReason r) { }
             public void onBalanceUpdate(long u, int a, long av, long l) { fail(); }
@@ -62,6 +62,11 @@ public class AssetsApplyFailureFenceTest {
             public void onOrderReject(long c, long rh, long rl, long u, long o, int m, int ref, com.openexchange.assets.domain.CoreRejectReason r, int me, long d, long t) { }
             public void onAdminAck(long c, int ref, com.openexchange.assets.domain.AdminResult r, int reason, long cfg) { }
             public void onAdmissionState(int m, com.openexchange.assets.domain.GateState gs, com.openexchange.assets.domain.GateReason gr, boolean b, long at, long lp, boolean o) { }
+            public void onOrderAck(long c, long rh, long rl, long o, long u, int m, com.openexchange.assets.domain.OrderStatus st, boolean dup, int ha, long hm, long at, long seq) { }
+            public void onOrderEvent(long seq, long lp, com.openexchange.assets.domain.CoreOrderView o, com.openexchange.assets.domain.EventKind k, com.openexchange.assets.domain.CoreRejectReason r, long lpx, long lq, long t, long hr, long up) { }
+            public void onMeDispatch(long ds, long ih, long il, com.openexchange.assets.domain.DispatchKind k, long u, long o, long old, int m, int ot, int sd, long px, long q, long b, int tif) { }
+            public void onDepositReject(long c, long rh, long rl, long u, int a, long amt, com.openexchange.assets.domain.RejectReason r) { }
+            public void onConfigApplied(com.openexchange.assets.domain.ConfigKind k, int m, long v, long lp) { }
         };
     }
 

@@ -2,6 +2,11 @@
 package com.openexchange.assets.infrastructure.publisher;
 
 import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.ConfigKind;
+import com.openexchange.assets.domain.CoreOrderView;
+import com.openexchange.assets.domain.DispatchKind;
+import com.openexchange.assets.domain.EventKind;
+import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.CoreRejectReason;
 import com.openexchange.assets.domain.GateReason;
@@ -9,6 +14,11 @@ import com.openexchange.assets.domain.GateState;
 import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.domain.SettleRejectReason;
 import com.openexchange.assets.infrastructure.generated.AdminAckEncoder;
+import com.openexchange.assets.infrastructure.generated.ConfigAppliedEncoder;
+import com.openexchange.assets.infrastructure.generated.DepositRejectEncoder;
+import com.openexchange.assets.infrastructure.generated.MeDispatchEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderAckEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderEventEncoder;
 import com.openexchange.assets.infrastructure.generated.AdmissionStateEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.OrderRejectEncoder;
@@ -137,6 +147,11 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final OrderRejectEncoder orderRejectEncoder = new OrderRejectEncoder();
     private final AdminAckEncoder adminAckEncoder = new AdminAckEncoder();
     private final AdmissionStateEncoder admissionStateEncoder = new AdmissionStateEncoder();
+    private final OrderAckEncoder orderAckEncoder = new OrderAckEncoder();
+    private final OrderEventEncoder orderEventEncoder = new OrderEventEncoder();
+    private final MeDispatchEncoder meDispatchEncoder = new MeDispatchEncoder();
+    private final DepositRejectEncoder depositRejectEncoder = new DepositRejectEncoder();
+    private final ConfigAppliedEncoder configAppliedEncoder = new ConfigAppliedEncoder();
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
@@ -154,16 +169,18 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     }
 
     @Override
-    public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
+    public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable, boolean duplicate) {
         depositAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
-                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable);
+                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable)
+                .duplicate(duplicate ? BoolFlag.TRUE : BoolFlag.FALSE);
         flush(depositAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
     @Override
-    public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
+    public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable, boolean duplicate) {
         withdrawAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
-                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable);
+                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).newAvailable(newAvailable)
+                .duplicate(duplicate ? BoolFlag.TRUE : BoolFlag.FALSE);
         flush(withdrawAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
@@ -307,6 +324,67 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         flush(admissionStateEncoder.encodedLength(), CH_CONTROL, toOrigin ? Routing.ORIGIN : Routing.BROADCAST);
     }
 
+    @Override
+    public void onOrderAck(long correlationId, long requestIdHigh, long requestIdLow, long orderId, long userId, int marketId,
+                           OrderStatus status, boolean duplicate, int holdAssetId, long holdAmount, long acceptedAtMs, long eventSeq) {
+        orderAckEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).requestIdHigh(requestIdHigh).requestIdLow(requestIdLow)
+                .orderId(orderId).userId(userId).marketId(marketId)
+                .status(com.openexchange.assets.infrastructure.generated.OrderStatus.get((short) status.code()))
+                .duplicate(duplicate ? BoolFlag.TRUE : BoolFlag.FALSE)
+                .holdAssetId(holdAssetId).holdAmount(holdAmount).acceptedAtMs(acceptedAtMs).eventSeq(eventSeq);
+        flush(orderAckEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
+    }
+
+    @Override
+    public void onOrderEvent(long eventSeq, long logPosition, CoreOrderView o, EventKind kind, CoreRejectReason reason,
+                             long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs) {
+        orderEventEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .eventSeq(eventSeq).logPosition(logPosition).orderId(o.orderId()).userId(o.userId()).marketId(o.marketId())
+                .eventKind(com.openexchange.assets.infrastructure.generated.EventKind.get((short) kind.code()))
+                .status(com.openexchange.assets.infrastructure.generated.OrderStatus.get((short) o.statusCode()))
+                .reason(com.openexchange.assets.infrastructure.generated.CoreRejectReason.get((short) reason.code()))
+                .side(com.openexchange.assets.infrastructure.generated.Side.get((short) o.sideCode()))
+                .orderType(com.openexchange.assets.infrastructure.generated.OrderType.get((short) o.orderTypeCode()))
+                .timeInForce(com.openexchange.assets.infrastructure.generated.TimeInForce.get((short) o.timeInForceCode()))
+                .price(o.price()).stopPrice(o.stopPrice()).quantity(o.quantity()).filledQty(o.filledQty())
+                .remainingQty(o.remainingQty()).lastPrice(lastPrice).lastQty(lastQty).tradeId(tradeId)
+                .meOrderId(o.meOrderId()).holdAssetId(o.holdAssetId()).holdAmount(o.holdAmount()).holdRemaining(holdRemaining)
+                .clientOrderIdHigh(o.clientOrderIdHigh()).clientOrderIdLow(o.clientOrderIdLow())
+                .createdAtMs(o.createdAtMs()).updatedAtMs(updatedAtMs);
+        flush(orderEventEncoder.encodedLength(), CH_ORDERS, Routing.BROADCAST);
+    }
+
+    @Override
+    public void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                             long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                             long quantity, long budget, int timeInForceCode) {
+        meDispatchEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .dispatchSeq(dispatchSeq).commandIdHigh(commandIdHigh).commandIdLow(commandIdLow)
+                .kind(com.openexchange.assets.infrastructure.generated.DispatchKind.get((short) kind.code()))
+                .userId(userId).omsOrderId(omsOrderId).oldOrderId(oldOrderId).marketId(marketId)
+                .orderType((short) orderTypeCode).side((short) sideCode).price(price).quantity(quantity).budget(budget)
+                .timeInForce((short) timeInForceCode);
+        flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.BROADCAST);
+    }
+
+    @Override
+    public void onDepositReject(long correlationId, long requestIdHigh, long requestIdLow, long userId, int assetId, long amount,
+                                RejectReason reason) {
+        depositRejectEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(correlationId).requestIdHigh(requestIdHigh).requestIdLow(requestIdLow)
+                .userId(userId).assetId(assetId).amount(amount).reason(toSbe(reason));
+        flush(depositRejectEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
+    }
+
+    @Override
+    public void onConfigApplied(ConfigKind kind, int marketId, long configVersion, long logPosition) {
+        configAppliedEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .kind(com.openexchange.assets.infrastructure.generated.ConfigKind.get((short) kind.code()))
+                .marketId(marketId).configVersion(configVersion).logPosition(logPosition);
+        flush(configAppliedEncoder.encodedLength(), CH_CONTROL, Routing.BROADCAST);
+    }
+
     private void flush(int bodyLength, int channel, Routing routing) {
         egress.emit(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + bodyLength, channel, routing);
     }
@@ -317,12 +395,11 @@ public final class AssetsEventPublisher implements AssetsEventSink {
             case INSUFFICIENT_FUNDS: return com.openexchange.assets.infrastructure.generated.RejectReason.INSUFFICIENT_FUNDS;
             case INVALID_AMOUNT:     return com.openexchange.assets.infrastructure.generated.RejectReason.INVALID_AMOUNT;
             case UNKNOWN_HOLD:       return com.openexchange.assets.infrastructure.generated.RejectReason.UNKNOWN_HOLD;
-            // No wire value of its own yet, and it can only be produced by deposit, which emits no
-            // reject message at all. Mapped explicitly so it can never fall through to NONE: a
-            // rejection that decodes as "accepted" is exactly the silent-wrong-value class of bug
-            // this reason was added to close.
-            case BALANCE_OVERFLOW:   return com.openexchange.assets.infrastructure.generated.RejectReason.INVALID_AMOUNT;
-            default:                 return com.openexchange.assets.infrastructure.generated.RejectReason.NONE;
+            case BALANCE_OVERFLOW:   return com.openexchange.assets.infrastructure.generated.RejectReason.BALANCE_OVERFLOW;
+            case REQUEST_ID_MISMATCH: return com.openexchange.assets.infrastructure.generated.RejectReason.REQUEST_ID_MISMATCH;
+            // Mapped exhaustively above; a new reason without a wire value must fail loudly here, never
+            // decode as "accepted" (NONE), which is the silent-wrong-value class of bug.
+            default: throw new IllegalArgumentException("unmapped RejectReason " + r);
         }
     }
 }

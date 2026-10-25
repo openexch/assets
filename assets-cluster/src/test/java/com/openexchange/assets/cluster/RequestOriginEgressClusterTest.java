@@ -340,7 +340,7 @@ public class RequestOriginEgressClusterTest {
 
     private int encodeDeposit(long correlationId, long userId, int assetId, long amount) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
-                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
         return MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength();
     }
 

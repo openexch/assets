@@ -20,7 +20,9 @@ public enum RejectReason {
      * that asset. The alternative is a silent wrap into a negative balance, which is money state
      * corrupted with no exception, no fault event and no log line (assets#18).
      */
-    BALANCE_OVERFLOW;
+    BALANCE_OVERFLOW,
+    /** The same requestId was presented again with a different payload (RC1 S4, critic D5). */
+    REQUEST_ID_MISMATCH;
 
     public boolean accepted() {
         return this == NONE;
