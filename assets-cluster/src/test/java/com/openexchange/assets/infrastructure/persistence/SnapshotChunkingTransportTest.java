@@ -81,7 +81,8 @@ public class SnapshotChunkingTransportTest {
     public void largeLedgerSnapshotSurvivesChunkedTransportRoundTrip() {
         final AssetsEngine orig = populated();
         final ExpandableArrayBuffer payload = new ExpandableArrayBuffer();
-        final int pos = BalanceSnapshotCodec.serialize(orig, payload);
+        // What onTakeSnapshot offers: the v4 payload sealed in the kit envelope (RC1 S2).
+        final int pos = AssetsClusteredService.encodeSnapshot(orig, payload, new com.openexchange.cluster.SnapshotEnvelope());
         final byte[] expected = Arrays.copyOf(payload.byteArray(), pos);
 
         final Subscription sub = aeron.addSubscription(CHANNEL, STREAM_ID);
@@ -121,9 +122,11 @@ public class SnapshotChunkingTransportTest {
 
             final AssetsEngine restored = new AssetsEngine();
             restored.setEventSink(NOOP);
-            final BalanceSnapshotCodec.Decoded decoded =
-                    BalanceSnapshotCodec.deserialize(accum, 0, accumLen[0], restored);
-            assertEquals("bytes consumed", pos, decoded.bytesConsumed);
+            // loadSnapshot's contract: open the envelope on the reassembled image, then decode the payload.
+            final int payloadLength = new com.openexchange.cluster.SnapshotEnvelope().open(accum, accumLen[0]);
+            final BalanceSnapshotCodec.Decoded decoded = BalanceSnapshotCodec.deserialize(
+                    accum, com.openexchange.cluster.SnapshotEnvelope.payloadOffset(), payloadLength, restored);
+            assertEquals("bytes consumed", payloadLength, decoded.bytesConsumed);
             assertEquals("account count", ACCOUNTS, decoded.accountCount);
             assertEquals("hold count", ACCOUNTS * 2, decoded.holdCount);
             assertEquals("trade high-water", TRADE_HIGH_WATER, restored.getLastAppliedTradeId());

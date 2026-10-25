@@ -12,13 +12,16 @@ import com.openexchange.assets.domain.commands.SetMoneyJournalCommand;
 import com.openexchange.assets.domain.commands.SettleCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec;
+import com.openexchange.cluster.SnapshotEnvelope;
+import com.openexchange.cluster.testkit.LogicalClock;
+import com.openexchange.cluster.testkit.ScenarioText;
 import org.agrona.ExpandableArrayBuffer;
+import org.agrona.concurrent.UnsafeBuffer;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -35,6 +38,8 @@ import java.util.Map;
  * <pre>
  *   # comment                              (also: trailing  # ... is stripped)
  *   CLOCK 1000                             set absolute logical timestamp
+ *   TICK 100                               advance logical time and run the deadline sweep at the new time
+ *   SWEEP                                  run the deadline sweep at the current time
  *   DEPOSIT  u=100 asset=0 amt=1000.0
  *   WITHDRAW u=100 asset=0 amt=50.0
  *   HOLD     order=1 u=100 asset=0 amt=600.0
@@ -85,7 +90,7 @@ public final class AssetsScenarioRunner {
         int lineNo = 0;
         for (String raw : lines) {
             lineNo++;
-            String line = stripComment(raw).trim();
+            String line = ScenarioText.stripComment(raw).trim();
             if (line.isEmpty()) {
                 continue;
             }
@@ -93,9 +98,49 @@ public final class AssetsScenarioRunner {
                 exec(line);
             } catch (RuntimeException ex) {
                 throw new IllegalArgumentException(
-                        "scenario error at line " + lineNo + ": '" + raw + "' — " + ex.getMessage(), ex);
+                        "scenario error at line " + lineNo + ": '" + raw + "': " + ex.getMessage(), ex);
             }
         }
+    }
+
+    /** One executable line (the {@link com.openexchange.cluster.testkit.Replica} hook). */
+    void applyLine(String line) {
+        exec(line);
+    }
+
+    /** Rendered events so far, one per element, in emission order. */
+    List<String> renderedEvents() {
+        return sink.events().stream().map(AssetsEngineEvent::render).toList();
+    }
+
+    /**
+     * The production snapshot image of the current state: the v4 payload sealed in the kit envelope,
+     * exactly what {@code onTakeSnapshot} offers (before chunking) and {@code loadSnapshot} opens.
+     */
+    byte[] snapshotBytes() {
+        final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
+        final int payloadLength = BalanceSnapshotCodec.serialize(engine, buffer, SnapshotEnvelope.payloadOffset());
+        final int length = new SnapshotEnvelope().seal(buffer, payloadLength);
+        final byte[] bytes = new byte[length];
+        buffer.getBytes(0, bytes);
+        return bytes;
+    }
+
+    /** Restart from an image: open the envelope, restore into a FRESH engine, verify, swap it in. */
+    void restoreFrom(byte[] image) {
+        final UnsafeBuffer buffer = new UnsafeBuffer(image);
+        final int payloadLength = new SnapshotEnvelope().open(buffer, image.length);
+        final AssetsEngine fresh = new AssetsEngine();
+        final BalanceSnapshotCodec.Decoded decoded =
+                BalanceSnapshotCodec.deserialize(buffer, SnapshotEnvelope.payloadOffset(), payloadLength, fresh);
+        if (decoded.bytesConsumed != payloadLength) {
+            throw new IllegalStateException("snapshot payload length mismatch: " + decoded.bytesConsumed
+                    + " consumed of " + payloadLength);
+        }
+        fresh.verifyRestoredInvariants();
+        fresh.setEventSink(sink);
+        engine = fresh;
+        projector = new SettlementProjector(fresh);
     }
 
     /** The current engine (post-restart if a SNAPSHOT ran). */
@@ -115,6 +160,14 @@ public final class AssetsScenarioRunner {
         switch (verb) {
             case "CLOCK":
                 clock.set(Long.parseLong(tokens[1]));
+                break;
+            case "TICK":
+                // Advance logical time; the deadline sweep fires as a log entry at the new time (K3-D).
+                clock.advance(Long.parseLong(tokens[1]));
+                engine.sweep(clock.now());
+                break;
+            case "SWEEP":
+                engine.sweep(clock.now());
                 break;
             case "DEPOSIT":
                 engine.applyCommand(AssetsEngine.CMD_DEPOSIT, buildDeposit(kv), clock.now());
@@ -226,49 +279,25 @@ public final class AssetsScenarioRunner {
      * consumePosition) ride through the codec; the sink (accumulated output) persists.
      */
     private void snapshotRoundTrip() {
-        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        int length = BalanceSnapshotCodec.serialize(engine, buffer);
-
-        AssetsEngine fresh = new AssetsEngine();
-        BalanceSnapshotCodec.deserialize(buffer, 0, length, fresh);
-        fresh.setEventSink(sink);
-        engine = fresh;
-        // Re-wire the projector onto the restored engine (its consumePosition/high-water rode through).
-        projector = new SettlementProjector(fresh);
+        restoreFrom(snapshotBytes());
     }
 
-    // ---- parsing helpers ----
-
-    private static String stripComment(String line) {
-        int hash = line.indexOf('#');
-        return hash >= 0 ? line.substring(0, hash) : line;
-    }
+    // ---- parsing helpers (the text conventions live in the kit) ----
 
     private static Map<String, String> parseKv(String[] tokens) {
-        Map<String, String> kv = new LinkedHashMap<>();
-        for (int i = 1; i < tokens.length; i++) {
-            int eq = tokens[i].indexOf('=');
-            if (eq > 0) {
-                kv.put(tokens[i].substring(0, eq), tokens[i].substring(eq + 1));
-            }
-        }
-        return kv;
+        return ScenarioText.parseKv(tokens);
     }
 
     private static String req(Map<String, String> kv, String key) {
-        String v = kv.get(key);
-        if (v == null) {
-            throw new IllegalArgumentException("missing required field '" + key + "'");
-        }
-        return v;
+        return ScenarioText.req(kv, key);
     }
 
     private static long reqLong(Map<String, String> kv, String key) {
-        return Long.parseLong(req(kv, key));
+        return ScenarioText.reqLong(kv, key);
     }
 
     private static int reqInt(Map<String, String> kv, String key) {
-        return Integer.parseInt(req(kv, key));
+        return ScenarioText.reqInt(kv, key);
     }
 
     /** A decimal money amount converted to 8dp fixed-point. */

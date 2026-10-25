@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.application.engine;
 
+import com.openexchange.assets.application.engine.time.DeadlineIndex;
 import com.openexchange.assets.domain.Account;
 import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.AssetsEventSink;
@@ -74,6 +75,27 @@ public final class AssetsEngine {
     /** Feed settles refused before any mutation (SettleRejected emitted). Alarm target. */
     private long settleRejectCount = 0L;
 
+    // ---- RC1 S2: replicated v4 scalars and the derived deadline index ----
+    /**
+     * Monotone log time: {@code max(timestamp, previous)} over every applied entry (risk spec rule). The
+     * cluster timestamp is written by the leader and is not assumed never to step backwards across a
+     * leadership change; every window, GTD sweep and TTL compares against THIS value, so a backwards
+     * step can only delay a deadline, never grant one twice. Snapshotted.
+     */
+    private long lastLogTime = 0L;
+    /** Replicated dense order id counter (RC1 S4 mints from it; 0 until then). Snapshotted. */
+    private long nextOrderId = 0L;
+    /** OrderEvent dense sequence (RC1 S4). Snapshotted. */
+    private long eventSeq = 0L;
+    /** MeDispatch dense sequence (RC1 S4). Snapshotted. */
+    private long dispatchSeq = 0L;
+    /**
+     * The ONE deadline index (K3-D). DERIVED: rebuilt on restore from the records that own the deadlines
+     * (GTD orders, replace windows, requestId TTLs land in S4/S5), never serialized. The service arms the
+     * single sweep timer while it is non-empty; {@link #sweep} pops what is due.
+     */
+    private final DeadlineIndex deadlines = new DeadlineIndex();
+
     // Money journal (dark by default): a dead, perfectly-predicted branch per applied command when
     // off; when armed, every APPLIED movement is emitted through the port with a dense journalSeq.
     //
@@ -126,6 +148,7 @@ public final class AssetsEngine {
      * stays logical (does not carry it), so egress output is trivially wall-clock independent.
      */
     public void applyCommand(int type, Object command, long timestamp) {
+        observeLogTime(timestamp);
         switch (type) {
             case CMD_DEPOSIT:         applyDeposit((DepositCommand) command, timestamp); break;
             case CMD_WITHDRAW:        applyWithdraw((WithdrawCommand) command, timestamp); break;
@@ -242,6 +265,7 @@ public final class AssetsEngine {
      * {@code true}: it was consumed, just not applied again.
      */
     public boolean settle(SettleCommand c, long timestamp) {
+        observeLogTime(timestamp);
         if (c.getTradeId() <= lastAppliedTradeId) {
             return true; // already applied (monotonic, gap-free): idempotent no-op, journals nothing
         }
@@ -590,5 +614,117 @@ public final class AssetsEngine {
     /** Restore the journal sequence from a snapshot (recovery only). */
     public void setJournalSeq(long value) {
         this.journalSeq = value;
+    }
+
+    // ---- RC1 S2: log time, the deadline sweep, restore verification ----
+
+    private void observeLogTime(long timestamp) {
+        if (timestamp > lastLogTime) {
+            lastLogTime = timestamp;
+        }
+    }
+
+    /** The derived deadline index; owners add and remove entries, the sweep pops them. */
+    public DeadlineIndex deadlines() {
+        return deadlines;
+    }
+
+    /**
+     * The deadline sweep (one cluster TimerEvent, applied on every replica): pop every entry due at or
+     * before the monotone log time and apply its expiry. One-shot per entry, so a sweep that fires twice
+     * at the same time applies nothing the second time (what makes re-arming after a restore safe).
+     * Expiry semantics per kind land with their slices (GTD/replace in S5, requestId TTL in S4); this
+     * build pops and counts.
+     *
+     * @return entries popped
+     */
+    public int sweep(long timestamp) {
+        observeLogTime(timestamp);
+        return deadlines.popDue(lastLogTime, this::onDeadline);
+    }
+
+    private void onDeadline(long deadlineMs, long id, int kind) {
+        switch (kind) {
+            case DeadlineIndex.KIND_GTD:
+            case DeadlineIndex.KIND_REPLACE:
+            case DeadlineIndex.KIND_REQUEST_TTL:
+            default:
+                // RC1 S2: the owning records do not exist yet; nothing to expire. S4/S5 wire the handlers.
+                break;
+        }
+    }
+
+    public long getLastLogTime() {
+        return lastLogTime;
+    }
+
+    /** Restore only. */
+    public void setLastLogTime(long value) {
+        this.lastLogTime = value;
+    }
+
+    public long getNextOrderId() {
+        return nextOrderId;
+    }
+
+    /** Restore only. */
+    public void setNextOrderId(long value) {
+        this.nextOrderId = value;
+    }
+
+    public long getEventSeq() {
+        return eventSeq;
+    }
+
+    /** Restore only. */
+    public void setEventSeq(long value) {
+        this.eventSeq = value;
+    }
+
+    public long getDispatchSeq() {
+        return dispatchSeq;
+    }
+
+    /** Restore only. */
+    public void setDispatchSeq(long value) {
+        this.dispatchSeq = value;
+    }
+
+    /**
+     * The structural invariants a restored ledger must satisfy before this node serves (layout page §3):
+     * no negative balance, and for every (account, asset) {@code locked == Σ remaining} over that asset's
+     * holds. Bytes that break them are a corrupt or foreign snapshot; the caller stops the node.
+     *
+     * @throws IllegalStateException naming the first breach
+     */
+    public void verifyRestoredInvariants() {
+        final int assets = Asset.count();
+        final long[] sumHold = new long[assets];
+        final Account[] offender = new Account[1];
+        final String[] breach = new String[1];
+        forEachAccountByUserId(acc -> {
+            if (breach[0] != null) {
+                return;
+            }
+            java.util.Arrays.fill(sumHold, 0L);
+            acc.forEachHold((orderId, assetId, remaining, oms) -> {
+                if (assetId >= 0 && assetId < assets) {
+                    sumHold[assetId] += remaining;
+                }
+            });
+            for (int a = 0; a < assets && breach[0] == null; a++) {
+                if (acc.available(a) < 0 || acc.locked(a) < 0) {
+                    breach[0] = "negative balance user=" + acc.userId() + " asset=" + a
+                            + " available=" + acc.available(a) + " locked=" + acc.locked(a);
+                } else if (acc.locked(a) != sumHold[a]) {
+                    breach[0] = "locked != sum(holds) user=" + acc.userId() + " asset=" + a
+                            + " locked=" + acc.locked(a) + " holds=" + sumHold[a];
+                }
+                offender[0] = acc;
+            }
+        });
+        if (breach[0] != null) {
+            throw new IllegalStateException("restored ledger fails its invariants: " + breach[0]);
+        }
     }
 }
