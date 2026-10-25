@@ -1185,6 +1185,11 @@ public final class AssetsClusteredService implements ClusteredService {
         return engine;
     }
 
+    /** Exposed for tests / diagnostics: this node's own metrics state (snapshot stamps, apply histograms). */
+    public com.openexchange.assets.infrastructure.metrics.AssetsNodeMetrics nodeMetrics() {
+        return nodeMetrics;
+    }
+
     /**
      * How many times the idle-path drain belt has fired. Exposed for tests / diagnostics: a chain that
      * stops advancing is the match#25 failure mode, so it is worth being able to assert on it.
