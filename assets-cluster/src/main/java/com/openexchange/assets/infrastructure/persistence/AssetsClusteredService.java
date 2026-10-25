@@ -640,7 +640,8 @@ public final class AssetsClusteredService implements ClusteredService {
         awaitSnapshotRecorded(snapshotPublication);
         final long recordedNs = System.nanoTime();
 
-        System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " orders=" + engine.proto().openOrderCount()
+        System.out.println("[SNAPSHOT] epochMs=" + System.currentTimeMillis()
+                + " accounts=" + engine.accountCount() + " orders=" + engine.proto().openOrderCount()
                 + " bytes=" + length + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
                 + " serializeMs=" + ((serializedNs - startNs) / 1_000_000)
                 + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
