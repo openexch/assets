@@ -2,6 +2,7 @@
 package com.openexchange.assets.determinism;
 
 import com.openexchange.assets.domain.RejectReason;
+import com.openexchange.assets.domain.SettleRejectReason;
 
 /**
  * An immutable Assets Engine output event captured by {@link RecordingAssetsSink}. Each renders to a
@@ -14,7 +15,8 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.HoldAck, AssetsEngineEvent.HoldReject, AssetsEngineEvent.WithdrawReject,
                 AssetsEngineEvent.Settled, AssetsEngineEvent.BalanceSnapshotEnd,
                 AssetsEngineEvent.HoldSnapshotEntry, AssetsEngineEvent.HoldSnapshotEnd,
-                AssetsEngineEvent.FeedPositionReport, AssetsEngineEvent.SettleFault {
+                AssetsEngineEvent.FeedPositionReport, AssetsEngineEvent.SettleFault,
+                AssetsEngineEvent.SettleRejected {
 
     String render();
 
@@ -115,6 +117,15 @@ public sealed interface AssetsEngineEvent
         public String render() {
             return String.format("SETTLEFAULT trade=%d order=%d u=%d asset=%d fromAvail=%d uncovered=%d",
                     tradeId, orderId, userId, assetId, drawnFromAvailable, uncovered);
+        }
+    }
+
+    record SettleRejected(long tradeId, int marketId, long journalPosition, SettleRejectReason reason, long detail)
+            implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("SETTLEREJECTED trade=%d market=%d pos=%d reason=%s detail=%d",
+                    tradeId, marketId, journalPosition, reason.name(), detail);
         }
     }
 }

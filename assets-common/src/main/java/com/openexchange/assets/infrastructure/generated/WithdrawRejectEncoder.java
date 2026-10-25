@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class WithdrawRejectEncoder
 {
-    public static final int BLOCK_LENGTH = 29;
+    public static final int BLOCK_LENGTH = 30;
     public static final int TEMPLATE_ID = 14;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final WithdrawRejectEncoder parentMessage = this;
@@ -338,6 +338,42 @@ public final class WithdrawRejectEncoder
     public WithdrawRejectEncoder reason(final RejectReason value)
     {
         buffer.putByte(offset + 28, (byte)value.value());
+        return this;
+    }
+
+    public static int duplicateId()
+    {
+        return 6;
+    }
+
+    public static int duplicateSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int duplicateEncodingOffset()
+    {
+        return 29;
+    }
+
+    public static int duplicateEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String duplicateMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public WithdrawRejectEncoder duplicate(final BoolFlag value)
+    {
+        buffer.putByte(offset + 29, (byte)value.value());
         return this;
     }
 

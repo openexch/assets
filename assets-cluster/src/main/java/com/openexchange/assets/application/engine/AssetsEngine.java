@@ -2,11 +2,13 @@
 package com.openexchange.assets.application.engine;
 
 import com.openexchange.assets.domain.Account;
+import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.domain.Market;
 import com.openexchange.assets.domain.MoneyJournalSink;
 import com.openexchange.assets.domain.RejectReason;
+import com.openexchange.assets.domain.SettleRejectReason;
 import com.openexchange.assets.domain.SettlementService;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
@@ -69,6 +71,8 @@ public final class AssetsEngine {
     private long suppressedFeedReleaseCount = 0L;
     /** Holds exhausted by a settle (remaining hit 0) and reaped at settle time — never tombstoned. */
     private long exhaustedHoldsReaped = 0L;
+    /** Feed settles refused before any mutation (SettleRejected emitted). Alarm target. */
+    private long settleRejectCount = 0L;
 
     // Money journal (dark by default): a dead, perfectly-predicted branch per applied command when
     // off; when armed, every APPLIED movement is emitted through the port with a dense journalSeq.
@@ -135,6 +139,12 @@ public final class AssetsEngine {
     }
 
     private void applyDeposit(DepositCommand c, long timestamp) {
+        // Validate, THEN mutate (RC1 S1, K5): a rejected command creates no account. Everything that can
+        // refuse a deposit on a NEW account is decidable before the account exists (a fresh account's
+        // headroom is Long.MAX_VALUE, so only the amount and the asset can reject it).
+        if (!validAsset(c.getAssetId()) || c.getAmount() <= 0) {
+            return; // client error, no money effect, no account; the demuxer already counted it
+        }
         captureOpeningEpochIfArmed();
         Account a = getOrCreateAccount(c.getUserId());
         RejectReason r = a.deposit(c.getAssetId(), c.getAmount());
@@ -153,8 +163,18 @@ public final class AssetsEngine {
     }
 
     private void applyWithdraw(WithdrawCommand c, long timestamp) {
+        if (!validAsset(c.getAssetId())) {
+            return; // never a throw, never an account
+        }
+        Account a = accounts.get(c.getUserId());
+        if (a == null) {
+            // An unknown user holds nothing: the same reject the account itself would give, without
+            // creating the account to find that out.
+            sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                    c.getAmount() <= 0 ? RejectReason.INVALID_AMOUNT : RejectReason.INSUFFICIENT_FUNDS);
+            return;
+        }
         captureOpeningEpochIfArmed();
-        Account a = getOrCreateAccount(c.getUserId());
         RejectReason r = a.withdraw(c.getAssetId(), c.getAmount());
         if (r.accepted()) {
             sink.onWithdrawAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
@@ -171,7 +191,15 @@ public final class AssetsEngine {
     }
 
     private void applyHold(HoldCommand c) {
-        Account a = getOrCreateAccount(c.getUserId());
+        if (!validAsset(c.getAssetId())) {
+            return; // never a throw, never an account
+        }
+        Account a = accounts.get(c.getUserId());
+        if (a == null) {
+            sink.onHoldReject(c.getCorrelationId(), c.getOrderId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                    c.getAmount() <= 0 ? RejectReason.INVALID_AMOUNT : RejectReason.INSUFFICIENT_FUNDS);
+            return;
+        }
         RejectReason r = a.hold(c.getOrderId(), c.getAssetId(), c.getAmount(), c.isOmsManagedRelease());
         if (r.accepted()) {
             sink.onHoldAck(c.getCorrelationId(), c.getOrderId(), c.getUserId(), c.getAssetId(), c.getAmount());
@@ -202,11 +230,39 @@ public final class AssetsEngine {
     }
 
     private void applySettle(SettleCommand c, long timestamp) {
+        settle(c, timestamp);
+    }
+
+    /**
+     * Apply a trade. Returns {@code false} when the trade was REFUSED before any mutation (unknown market,
+     * non-positive price or quantity, notional overflow, bad party): a {@code SettleRejected} is emitted,
+     * nothing moves, and the caller must NOT advance the journal cursor past it. Every one of these
+     * used to be a throw out of the apply path, which would have latched this replica and, on replay,
+     * every replica. A duplicate (tradeId at or below the high-water) is an idempotent no-op and returns
+     * {@code true}: it was consumed, just not applied again.
+     */
+    public boolean settle(SettleCommand c, long timestamp) {
         if (c.getTradeId() <= lastAppliedTradeId) {
-            return; // already applied (monotonic, gap-free): idempotent no-op, journals nothing
+            return true; // already applied (monotonic, gap-free): idempotent no-op, journals nothing
+        }
+        final Market m = marketOrNull(c.getMarketId());
+        if (m == null) {
+            return refuseSettle(c, SettleRejectReason.UNKNOWN_MARKET, c.getMarketId());
+        }
+        if (c.getPrice() <= 0) {
+            return refuseSettle(c, SettleRejectReason.INVALID_PRICE, c.getPrice());
+        }
+        if (c.getQuantity() <= 0) {
+            return refuseSettle(c, SettleRejectReason.INVALID_QUANTITY, c.getQuantity());
+        }
+        if (c.getTakerUserId() <= 0 || c.getMakerUserId() <= 0) {
+            return refuseSettle(c, SettleRejectReason.INVALID_PARTY,
+                    c.getTakerUserId() <= 0 ? c.getTakerUserId() : c.getMakerUserId());
+        }
+        if (!FixedPoint.multiplyFits(c.getPrice(), c.getQuantity())) {
+            return refuseSettle(c, SettleRejectReason.NOTIONAL_OVERFLOW, c.getPrice());
         }
         captureOpeningEpochIfArmed();
-        Market m = Market.fromId(c.getMarketId());
         int base = m.baseAsset().id();
         int quote = m.quoteAsset().id();
         long baseAmt = c.getQuantity();
@@ -279,6 +335,25 @@ public final class AssetsEngine {
                     seller.available(base) + seller.locked(base), seller.available(quote) + seller.locked(quote),
                     timestamp);
         }
+        return true;
+    }
+
+    private boolean refuseSettle(SettleCommand c, SettleRejectReason reason, long detail) {
+        settleRejectCount++;
+        sink.onSettleRejected(c.getTradeId(), c.getMarketId(), c.getJournalPosition(), reason, detail);
+        return false;
+    }
+
+    private static boolean validAsset(int assetId) {
+        return assetId >= 0 && assetId < Asset.count();
+    }
+
+    /** Non-throwing market lookup: the apply path must never throw on input. */
+    private static Market marketOrNull(int marketId) {
+        if (marketId < 1 || marketId >= Market.ALL.length + 1) {
+            return null;
+        }
+        return Market.ALL[marketId - 1].marketId() == marketId ? Market.ALL[marketId - 1] : null;
     }
 
     // ---- money journal (movements only; holds/releases never journal: they do not change totals) ----
@@ -386,6 +461,11 @@ public final class AssetsEngine {
     /** Holds exhausted by a settle (drawn to remaining=0) and reaped at settle time since boot. */
     public long getExhaustedHoldsReaped() {
         return exhaustedHoldsReaped;
+    }
+
+    /** Feed settles refused before any mutation (SettleRejected emitted) since boot. Alarm target. */
+    public long getSettleRejectCount() {
+        return settleRejectCount;
     }
 
     /**

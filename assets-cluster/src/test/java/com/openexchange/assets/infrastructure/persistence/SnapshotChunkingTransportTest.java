@@ -204,5 +204,6 @@ public class SnapshotChunkingTransportTest {
         public void onHoldSnapshotEnd(long c, int n) { }
         public void onFeedPositionReport(long c, long p, long t, boolean j) { }
         public void onSettleFault(long t, long o, long u, int a, long d, long un) { }
+        public void onSettleRejected(long t, int m, long p, com.openexchange.assets.domain.SettleRejectReason r, long d) { }
     };
 }

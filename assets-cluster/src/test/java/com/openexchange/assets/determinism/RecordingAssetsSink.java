@@ -3,6 +3,7 @@ package com.openexchange.assets.determinism;
 
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.RejectReason;
+import com.openexchange.assets.domain.SettleRejectReason;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -99,5 +100,10 @@ public final class RecordingAssetsSink implements AssetsEventSink {
             sb.append(e.render()).append('\n');
         }
         return sb.toString();
+    }
+
+    @Override
+    public void onSettleRejected(long tradeId, int marketId, long journalPosition, SettleRejectReason reason, long detail) {
+        events.add(new AssetsEngineEvent.SettleRejected(tradeId, marketId, journalPosition, reason, detail));
     }
 }

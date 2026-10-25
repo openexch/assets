@@ -39,11 +39,17 @@ public final class SettlementProjector {
         this.engine = engine;
     }
 
-    /** A {@code TradeExecution} consumed from the ME recorded stream at {@code streamPosition}. */
-    public void onTrade(long streamPosition, long tradeId, int marketId,
+    /**
+     * A {@code TradeExecution} consumed from the ME recorded stream at {@code streamPosition}.
+     *
+     * @return true when the trade was applied or was an idempotent duplicate (cursor advanced); false
+     *         when the engine refused it before any mutation (cursor NOT advanced, SettleRejected emitted)
+     */
+    public boolean onTrade(long streamPosition, long tradeId, int marketId,
                         long takerOrderId, long takerUserId, long makerOrderId, long makerUserId,
                         long price, long quantity, boolean takerIsBuy, long timestamp) {
         settleCommand.reset();
+        settleCommand.setJournalPosition(streamPosition);
         settleCommand.setTradeId(tradeId);
         settleCommand.setMarketId(marketId);
         settleCommand.setTakerOrderId(takerOrderId);
@@ -53,8 +59,13 @@ public final class SettlementProjector {
         settleCommand.setPrice(price);
         settleCommand.setQuantity(quantity);
         settleCommand.setTakerIsBuy(takerIsBuy);
-        engine.applyCommand(AssetsEngine.CMD_SETTLE, settleCommand, timestamp);
+        // A REFUSED trade (SettleRejected: unknown market, bad amounts, overflow) must not move the
+        // cursor past itself: the feed resumes exactly there, and a replay refuses it again identically.
+        if (!engine.settle(settleCommand, timestamp)) {
+            return false;
+        }
         advance(streamPosition);
+        return true;
     }
 
     /** A terminal {@code OrderStatus} for {@code orderId} consumed at {@code streamPosition}. */

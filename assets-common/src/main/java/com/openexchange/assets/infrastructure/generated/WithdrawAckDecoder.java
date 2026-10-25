@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class WithdrawAckDecoder
 {
-    public static final int BLOCK_LENGTH = 36;
+    public static final int BLOCK_LENGTH = 37;
     public static final int TEMPLATE_ID = 16;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final WithdrawAckDecoder parentMessage = this;
@@ -387,6 +387,57 @@ public final class WithdrawAckDecoder
     }
 
 
+    public static int duplicateId()
+    {
+        return 7;
+    }
+
+    public static int duplicateSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int duplicateEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int duplicateEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String duplicateMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public short duplicateRaw()
+    {
+        if (parentMessage.actingVersion < 6)
+        {
+            return (short)255;
+        }
+
+        return ((short)(buffer.getByte(offset + 36) & 0xFF));
+    }
+
+    public BoolFlag duplicate()
+    {
+        if (parentMessage.actingVersion < 6)
+        {
+            return BoolFlag.NULL_VAL;
+        }
+
+        return BoolFlag.get(((short)(buffer.getByte(offset + 36) & 0xFF)));
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -442,6 +493,9 @@ public final class WithdrawAckDecoder
         builder.append('|');
         builder.append("newAvailable=");
         builder.append(this.newAvailable());
+        builder.append('|');
+        builder.append("duplicate=");
+        builder.append(this.duplicate());
 
         limit(originalLimit);
 

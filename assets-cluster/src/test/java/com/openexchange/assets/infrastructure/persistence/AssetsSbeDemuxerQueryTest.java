@@ -32,6 +32,11 @@ public class AssetsSbeDemuxerQueryTest {
         assertTrue(AssetsSbeDemuxer.isQuery(QueryFeedPositionDecoder.TEMPLATE_ID));
         assertTrue(AssetsSbeDemuxer.isQuery(RequestBalanceSnapshotDecoder.TEMPLATE_ID));
         assertTrue(AssetsSbeDemuxer.isQuery(RequestHoldSnapshotDecoder.TEMPLATE_ID));
+        // v6 (RC1): the three core queries, served from S4+ but classified now so their replies are
+        // origin-scoped from the first build that answers them.
+        assertTrue(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.RequestOrderSnapshotDecoder.TEMPLATE_ID));
+        assertTrue(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.RequestPendingDispatchDecoder.TEMPLATE_ID));
+        assertTrue(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.RequestRiskConfigDecoder.TEMPLATE_ID));
     }
 
     @Test
@@ -48,5 +53,10 @@ public class AssetsSbeDemuxerQueryTest {
         // Subscribe never reaches the demuxer (handled at the service boundary), but a bug that let
         // it through must not also flip the query context.
         assertFalse(AssetsSbeDemuxer.isQuery(SubscribeDecoder.TEMPLATE_ID));
+        assertFalse(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.CreateOrderDecoder.TEMPLATE_ID));
+        assertFalse(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.CancelOrderDecoder.TEMPLATE_ID));
+        assertFalse(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.MeJournalTradeDecoder.TEMPLATE_ID));
+        assertFalse(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.RegisterSessionDecoder.TEMPLATE_ID));
+        assertFalse(AssetsSbeDemuxer.isQuery(com.openexchange.assets.infrastructure.generated.OrderEntryGateDecoder.TEMPLATE_ID));
     }
 }

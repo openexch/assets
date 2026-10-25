@@ -7,8 +7,8 @@ import org.agrona.DirectBuffer;
 public final class EgressChannelsDecoder
 {
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final int ENCODED_LENGTH = 4;
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
@@ -120,6 +120,51 @@ public final class EgressChannelsDecoder
     {
         return 0 != (value & (1 << 3));
     }
+    /**
+     * OrderEvent / OrderEventBatch (gateways)
+     *
+     * @return true if orders set or false if not.
+     */
+
+    public boolean orders()
+    {
+        return 0 != (buffer.getInt(offset, BYTE_ORDER) & (1 << 4));
+    }
+
+    public static boolean orders(final int value)
+    {
+        return 0 != (value & (1 << 4));
+    }
+    /**
+     * MeDispatch / MeDispatchBatch (forwarder sessions)
+     *
+     * @return true if dispatch set or false if not.
+     */
+
+    public boolean dispatch()
+    {
+        return 0 != (buffer.getInt(offset, BYTE_ORDER) & (1 << 5));
+    }
+
+    public static boolean dispatch(final int value)
+    {
+        return 0 != (value & (1 << 5));
+    }
+    /**
+     * AdmissionState (gateways, forwarder, admin)
+     *
+     * @return true if control set or false if not.
+     */
+
+    public boolean control()
+    {
+        return 0 != (buffer.getInt(offset, BYTE_ORDER) & (1 << 6));
+    }
+
+    public static boolean control(final int value)
+    {
+        return 0 != (value & (1 << 6));
+    }
 
     public String toString()
     {
@@ -169,6 +214,33 @@ public final class EgressChannelsDecoder
                 builder.append(',');
             }
             builder.append("snapshots");
+            atLeastOne = true;
+        }
+        if (orders())
+        {
+            if (atLeastOne)
+            {
+                builder.append(',');
+            }
+            builder.append("orders");
+            atLeastOne = true;
+        }
+        if (dispatch())
+        {
+            if (atLeastOne)
+            {
+                builder.append(',');
+            }
+            builder.append("dispatch");
+            atLeastOne = true;
+        }
+        if (control())
+        {
+            if (atLeastOne)
+            {
+                builder.append(',');
+            }
+            builder.append("control");
             atLeastOne = true;
         }
         builder.append('}');

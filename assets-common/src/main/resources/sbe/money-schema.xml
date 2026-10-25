@@ -2,9 +2,9 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="com.openexchange.assets.infrastructure.generated"
                    id="2"
-                   version="5"
-                   semanticVersion="0.5"
-                   description="Assets Engine money schema — balances, holds, settlement. All amounts are 8dp fixed-point int64."
+                   version="6"
+                   semanticVersion="0.6"
+                   description="OMS + ledger core schema (money-schema v6): balances, holds, settlement, order lifecycle, ME feed, admin, session. All amounts are 8dp fixed-point int64. One schema, one demuxer, one exact-version gate (RC1 S1)."
 >
     <types>
         <composite name="messageHeader" description="Message identifiers and length of message root">
@@ -40,23 +40,191 @@
             <choice name="balances"    description="the BalanceUpdate firehose: one per changed (user, asset) line">1</choice>
             <choice name="settlements" description="SettlementApplied and SettleFault">2</choice>
             <choice name="snapshots"   description="balance/hold snapshot streams and their terminators">3</choice>
+            <!-- v6 (RC1): the three core streams. NOT part of the never-registered default (CH_ALL stays
+                 bits 0-3): a v5 bridge or tool must not receive the OrderEvent/MeDispatch firehose. -->
+            <choice name="orders"      description="OrderEvent / OrderEventBatch (gateways)">4</choice>
+            <choice name="dispatch"    description="MeDispatch / MeDispatchBatch (forwarder sessions)">5</choice>
+            <choice name="control"     description="AdmissionState (gateways, forwarder, admin)">6</choice>
         </set>
+
+        <!-- ======================= v6 (RC1) core vocabulary; see RC1-core/spec/wire-v6.md + critic C1-C5 ======================= -->
+        <!-- Numerically equal to the ME's BID/ASK so a child/slice maps without a table. -->
+        <enum name="Side" encodingType="uint8">
+            <validValue name="BUY">0</validValue>
+            <validValue name="SELL">1</validValue>
+        </enum>
+        <!-- 0..2 are the ME-native values; 3..6 are synthetic (core-owned, never sent to the ME as such). -->
+        <enum name="OrderType" encodingType="uint8">
+            <validValue name="LIMIT">0</validValue>
+            <validValue name="MARKET">1</validValue>
+            <validValue name="LIMIT_MAKER">2</validValue>
+            <validValue name="STOP_LOSS">3</validValue>
+            <validValue name="STOP_LIMIT">4</validValue>
+            <validValue name="TRAILING_STOP">5</validValue>
+            <validValue name="ICEBERG">6</validValue>
+        </enum>
+        <enum name="TimeInForce" encodingType="uint8">
+            <validValue name="GTC">0</validValue>
+            <validValue name="IOC">1</validValue>
+            <validValue name="FOK">2</validValue>
+            <validValue name="GTD">3</validValue>
+        </enum>
+        <!-- 0..4 equal the ME OrderStatus and the journal TerminalStatus values. The ONLY public state vocabulary (critic C1). -->
+        <enum name="OrderStatus" encodingType="uint8">
+            <validValue name="NEW">0</validValue>
+            <validValue name="PARTIALLY_FILLED">1</validValue>
+            <validValue name="FILLED">2</validValue>
+            <validValue name="CANCELLED">3</validValue>
+            <validValue name="REJECTED">4</validValue>
+            <validValue name="EXPIRED">5</validValue>
+            <validValue name="PENDING_NEW">6</validValue>
+            <validValue name="PENDING_TRIGGER">7</validValue>
+            <validValue name="PENDING_CANCEL">8</validValue>
+            <validValue name="PENDING_REPLACE">9</validValue>
+        </enum>
+        <enum name="EventKind" encodingType="uint8">
+            <validValue name="ACCEPTED">0</validValue>
+            <validValue name="DISPATCHED">1</validValue>
+            <validValue name="ACK_NEW">2</validValue>
+            <validValue name="FILL">3</validValue>
+            <validValue name="CANCELLED">4</validValue>
+            <validValue name="EXPIRED">5</validValue>
+            <validValue name="REJECTED">6</validValue>
+            <validValue name="REPLACED">7</validValue>
+            <validValue name="TRIGGERED">8</validValue>
+            <validValue name="HOLD_CHANGED">9</validValue>
+            <validValue name="SLICE_SUBMITTED">10</validValue>
+            <validValue name="QUARANTINED">11</validValue>
+        </enum>
+        <!-- One reject vocabulary for every ORIGIN-replyable ingress (critic C3). 1..10, 15 map one-to-one onto
+             today's OMS RiskRejectReason strings; 23..26 carry an ME outcome (the ME's own reason rides in
+             OrderReject.meReason). OVERFLOW is reported as NOTIONAL_TOO_LARGE; MARKET_HALTED was dropped. -->
+        <enum name="CoreRejectReason" encodingType="uint8">
+            <validValue name="NONE">0</validValue>
+            <validValue name="RATE_LIMIT">1</validValue>
+            <validValue name="CIRCUIT_BREAKER">2</validValue>
+            <validValue name="SIZE_TOO_SMALL">3</validValue>
+            <validValue name="SIZE_TOO_LARGE">4</validValue>
+            <validValue name="NOTIONAL_TOO_SMALL">5</validValue>
+            <validValue name="NOTIONAL_TOO_LARGE">6</validValue>
+            <validValue name="PRICE_COLLAR">7</validValue>
+            <validValue name="OPEN_ORDER_LIMIT">8</validValue>
+            <validValue name="INSUFFICIENT_FUNDS">9</validValue>
+            <validValue name="POSITION_LIMIT">10</validValue>
+            <validValue name="DUPLICATE_CLIENT_ORDER_ID">11</validValue>
+            <validValue name="REQUEST_ID_PAYLOAD_MISMATCH">12</validValue>
+            <validValue name="UNKNOWN_ORDER">13</validValue>
+            <validValue name="NOT_OWNER">14</validValue>
+            <validValue name="INVALID">15</validValue>
+            <validValue name="EXPIRED">16</validValue>
+            <validValue name="NOT_OPEN">17</validValue>
+            <validValue name="GATE_CLOSED">18</validValue>
+            <validValue name="UNKNOWN_MARKET">19</validValue>
+            <validValue name="UNAUTHORIZED_CLASS">20</validValue>
+            <validValue name="MISSING_REQUEST_ID">21</validValue>
+            <validValue name="ME_REJECTED">23</validValue>
+            <validValue name="ME_UNKNOWN_LEG">24</validValue>
+            <validValue name="ME_CAPACITY">25</validValue>
+            <validValue name="ME_CONFLICT">26</validValue>
+            <validValue name="HOLD_FAULT">27</validValue>
+            <validValue name="UNSUPPORTED_FLAGS">29</validValue>
+            <validValue name="NO_REFERENCE_PRICE">30</validValue>
+            <validValue name="AMEND_PENDING">31</validValue>
+            <validValue name="TOO_MANY_PENDING_REQUESTS">32</validValue>
+            <validValue name="STOP_WOULD_TRIGGER_IMMEDIATELY">33</validValue>
+            <validValue name="UNSUPPORTED_TIF">34</validValue>
+            <validValue name="UNREGISTERED_SESSION">35</validValue>
+            <validValue name="NOT_RESUMABLE">36</validValue>
+        </enum>
+        <!-- Session classes (K6; critic C5 + D10). The authoritative class comes from the authenticator's principal;
+             RegisterSession.sessionClass is an assertion checked against it. -->
+        <enum name="SessionClass" encodingType="uint8">
+            <validValue name="UNSET">0</validValue>
+            <validValue name="GATEWAY">1</validValue>
+            <validValue name="FORWARDER">2</validValue>
+            <validValue name="BRIDGE">3</validValue>
+            <validValue name="ADMIN">4</validValue>
+            <validValue name="TOOL">5</validValue>
+            <validValue name="TREASURY">6</validValue>
+        </enum>
+        <!-- 0..2 equal the ME commandKind. RELEASE_ID is forwarder-only (R03 ReleaseCommandId relay). -->
+        <enum name="DispatchKind" encodingType="uint8">
+            <validValue name="CREATE">0</validValue>
+            <validValue name="CANCEL">1</validValue>
+            <validValue name="AMEND">2</validValue>
+            <validValue name="RELEASE_ID">3</validValue>
+        </enum>
+        <enum name="GateState" encodingType="uint8">
+            <validValue name="OPEN">0</validValue>
+            <validValue name="SUSPENDED">1</validValue>
+        </enum>
+        <!-- Union of the K1 and hardening reason lists (critic C18). -->
+        <enum name="GateReason" encodingType="uint8">
+            <validValue name="ADMIN">0</validValue>
+            <validValue name="RETENTION_BUDGET">1</validValue>
+            <validValue name="BRIDGE_HALT">2</validValue>
+            <validValue name="RECOVERY">3</validValue>
+            <validValue name="ME_CAPACITY">4</validValue>
+            <validValue name="GENESIS">5</validValue>
+            <validValue name="APPLY_FAULT">6</validValue>
+        </enum>
+        <enum name="BreakerAction" encodingType="uint8">
+            <validValue name="RESET">0</validValue>
+            <validValue name="TRIP">1</validValue>
+        </enum>
+        <enum name="AdminResult" encodingType="uint8">
+            <validValue name="ACCEPTED">0</validValue>
+            <validValue name="DUPLICATE">1</validValue>
+            <validValue name="REJECTED">2</validValue>
+            <validValue name="ADOPTED">3</validValue>
+            <validValue name="STALE">4</validValue>
+        </enum>
+        <enum name="ConfigKind" encodingType="uint8">
+            <validValue name="CORE">0</validValue>
+            <validValue name="RISK">1</validValue>
+            <validValue name="BREAKER">2</validValue>
+            <validValue name="GATE">3</validValue>
+        </enum>
+        <enum name="OrderFaultKind" encodingType="uint8">
+            <validValue name="OVERFILL">0</validValue>
+            <validValue name="SETTLE">1</validValue>
+            <validValue name="POSITION_OVERFLOW">2</validValue>
+        </enum>
+        <!-- Why a feed Settle was refused before any mutation (hardening B2 / critic D13). The settle does NOT
+             advance consumePosition; the bridge sees the reject on its own session. -->
+        <enum name="SettleRejectReason" encodingType="uint8">
+            <validValue name="UNKNOWN_MARKET">0</validValue>
+            <validValue name="INVALID_PRICE">1</validValue>
+            <validValue name="INVALID_QUANTITY">2</validValue>
+            <validValue name="NOTIONAL_OVERFLOW">3</validValue>
+            <validValue name="INVALID_PARTY">4</validValue>
+        </enum>
+        <!-- All 32 bits RESERVED in v6; a nonzero value is rejected UNSUPPORTED_FLAGS. -->
+        <set name="OrderFlags" encodingType="uint32">
+            <choice name="reserved0" description="reserved; must be 0 in v6">0</choice>
+        </set>
+        <type name="Symbol" primitiveType="char" length="16" characterEncoding="ASCII" description="market symbol, as the ME's Symbol"/>
+        <type name="AssetCode" primitiveType="char" length="8" characterEncoding="ASCII"/>
     </types>
 
     <!-- ============================ Ingress commands (client -> AE) ============================ -->
 
-    <sbe:message name="Deposit" id="1" description="Credit available balance (external boundary)">
+    <sbe:message name="Deposit" id="1" description="Credit available balance (external boundary). v6: carries a 128-bit requestId (durable identity, replayed decision; 0/0 = MISSING_REQUEST_ID once the requestId table lands in RC1 S4).">
         <field name="correlationId" id="1" type="int64" description="client-chosen id echoed on the ack; 0 = fire-and-forget"/>
         <field name="userId"        id="2" type="int64"/>
         <field name="assetId"       id="3" type="int32"/>
         <field name="amount"        id="4" type="int64"/>
+        <field name="requestIdHigh" id="5" type="int64" sinceVersion="6"/>
+        <field name="requestIdLow"  id="6" type="int64" sinceVersion="6"/>
     </sbe:message>
 
-    <sbe:message name="Withdraw" id="2" description="Debit available balance (external boundary)">
+    <sbe:message name="Withdraw" id="2" description="Debit available balance (external boundary). v6: 128-bit requestId as on Deposit.">
         <field name="correlationId" id="1" type="int64" description="client-chosen id echoed on the ack; 0 = fire-and-forget"/>
         <field name="userId"        id="2" type="int64"/>
         <field name="assetId"       id="3" type="int32"/>
         <field name="amount"        id="4" type="int64"/>
+        <field name="requestIdHigh" id="5" type="int64" sinceVersion="6"/>
+        <field name="requestIdLow"  id="6" type="int64" sinceVersion="6"/>
     </sbe:message>
 
     <sbe:message name="Hold" id="3" description="Reserve funds for an order (available -> locked)">
@@ -142,6 +310,222 @@
         </group>
     </sbe:message>
 
+    <!-- ============================ v6 (RC1) order ingress 50-59, GATEWAY class ============================ -->
+    <!-- Validation order inside apply (wire-v6.md 2.4.1): class, gate, enum/field validity, requestId replay, rate
+         limit, circuit breaker, size, notional, collar, open-order slot, clientOrderId, position, hold. All before
+         any mutation (K5). Handlers land in RC1 S4-S6; in S1 the demuxer knows the block lengths and the class
+         table and counts these templates as unhandled. -->
+    <sbe:message name="CreateOrder" id="50" sinceVersion="6" description="Place an order in the core (replaces the OMS REST create). budget: MARKET BUY quote cap, 0 = core default from the last MarketTick; must be 0 otherwise. expiresAtMs: GTD cluster-time deadline.">
+        <field name="correlationId"      id="1"  type="int64"/>
+        <field name="userId"             id="2"  type="int64"/>
+        <field name="clientOrderIdHigh"  id="3"  type="int64"/>
+        <field name="clientOrderIdLow"   id="4"  type="int64"/>
+        <field name="requestIdHigh"      id="5"  type="int64"/>
+        <field name="requestIdLow"       id="6"  type="int64"/>
+        <field name="marketId"           id="7"  type="int32"/>
+        <field name="side"               id="8"  type="Side"/>
+        <field name="orderType"          id="9"  type="OrderType"/>
+        <field name="timeInForce"        id="10" type="TimeInForce"/>
+        <field name="price"              id="11" type="int64"/>
+        <field name="quantity"           id="12" type="int64"/>
+        <field name="budget"             id="13" type="int64"/>
+        <field name="stopPrice"          id="14" type="int64"/>
+        <field name="trailingDelta"      id="15" type="int64"/>
+        <field name="displayQty"         id="16" type="int64"/>
+        <field name="expiresAtMs"        id="17" type="int64"/>
+        <field name="flags"              id="18" type="OrderFlags"/>
+    </sbe:message>
+
+    <sbe:message name="CancelOrder" id="51" sinceVersion="6" description="Cancel by core orderId (or by origClientOrderId when orderId = 0). Owner check: order.userId == userId else NOT_OWNER.">
+        <field name="correlationId"          id="1" type="int64"/>
+        <field name="userId"                 id="2" type="int64"/>
+        <field name="orderId"                id="3" type="int64"/>
+        <field name="requestIdHigh"          id="4" type="int64"/>
+        <field name="requestIdLow"           id="5" type="int64"/>
+        <field name="origClientOrderIdHigh"  id="6" type="int64"/>
+        <field name="origClientOrderIdLow"   id="7" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="AmendOrder" id="52" sinceVersion="6" description="Cancel-and-replace with a new ME leg (lost priority). newQuantity is TOTAL quantity including prior fills; 0 = keep. At least one of newPrice/newQuantity nonzero.">
+        <field name="correlationId"  id="1" type="int64"/>
+        <field name="userId"         id="2" type="int64"/>
+        <field name="orderId"        id="3" type="int64"/>
+        <field name="requestIdHigh"  id="4" type="int64"/>
+        <field name="requestIdLow"   id="5" type="int64"/>
+        <field name="newPrice"       id="6" type="int64"/>
+        <field name="newQuantity"    id="7" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="RequestOrderSnapshot" id="53" sinceVersion="6" description="read-only: GATEWAY (own userId) / ADMIN (0 = all users). Reply OrderSnapshotBatch chunks ordered by orderId then OrderSnapshotEnd. fromOrderId = exclusive paging cursor.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="userId"        id="2" type="int64"/>
+        <field name="fromOrderId"   id="3" type="int64"/>
+    </sbe:message>
+
+    <!-- ============================ v6 (RC1) feed ingress 60-69, FORWARDER / BRIDGE class ============================ -->
+    <sbe:message name="MarketTick" id="60" sinceVersion="6" description="Forwarder-stitched top of book (K4; critic D14: 6 fields + meEpoch, quotes only). The core ignores a tick whose bookVersion is not above the stored one, so N forwarders are safe. State only, no egress.">
+        <field name="marketId"       id="1" type="int32"/>
+        <field name="bookVersion"    id="2" type="int64"/>
+        <field name="bestBid"        id="3" type="int64"/>
+        <field name="bestAsk"        id="4" type="int64"/>
+        <field name="lastTradePrice" id="5" type="int64"/>
+        <field name="lastTradeId"    id="6" type="int64"/>
+        <field name="meEpoch"        id="7" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="MeJournalTrade" id="61" sinceVersion="6" description="Every JournalTrade field from the ME settlement journal (the v5 bridge dropped the two cluster leg ids and the timestamp) plus the producer epoch (R03 IN-08). Dense tradeId: at or below the high-water = no-op; a gap = reject + gate.">
+        <field name="egressSeq"       id="1"  type="int64"/>
+        <field name="tradeId"         id="2"  type="int64"/>
+        <field name="marketId"        id="3"  type="int32"/>
+        <field name="takerOrderId"    id="4"  type="int64"/>
+        <field name="takerUserId"     id="5"  type="int64"/>
+        <field name="makerOrderId"    id="6"  type="int64"/>
+        <field name="makerUserId"     id="7"  type="int64"/>
+        <field name="price"           id="8"  type="int64"/>
+        <field name="quantity"        id="9"  type="int64"/>
+        <field name="takerIsBuy"      id="10" type="BoolFlag"/>
+        <field name="meTimestamp"     id="11" type="int64"/>
+        <field name="takerOmsOrderId" id="12" type="int64"/>
+        <field name="makerOmsOrderId" id="13" type="int64"/>
+        <field name="meEpoch"         id="14" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="MeJournalTradeBatch" id="62" sinceVersion="6" description="A run of MeJournalTrade entries (cap 64), applied strictly in group order; the bridge flushes it before any terminal or outcome.">
+        <group name="trades" id="20" dimensionType="groupSizeEncoding">
+            <field name="egressSeq"       id="1"  type="int64"/>
+            <field name="tradeId"         id="2"  type="int64"/>
+            <field name="marketId"        id="3"  type="int32"/>
+            <field name="takerOrderId"    id="4"  type="int64"/>
+            <field name="takerUserId"     id="5"  type="int64"/>
+            <field name="makerOrderId"    id="6"  type="int64"/>
+            <field name="makerUserId"     id="7"  type="int64"/>
+            <field name="price"           id="8"  type="int64"/>
+            <field name="quantity"        id="9"  type="int64"/>
+            <field name="takerIsBuy"      id="10" type="BoolFlag"/>
+            <field name="meTimestamp"     id="11" type="int64"/>
+            <field name="takerOmsOrderId" id="12" type="int64"/>
+            <field name="makerOmsOrderId" id="13" type="int64"/>
+            <field name="meEpoch"         id="14" type="int64"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="MeJournalTerminal" id="63" sinceVersion="6" description="ME journal terminal (status 2/3/4 only), with the status and marketId the v5 bridge dropped. Hold-scoped residual release + the order-state transition.">
+        <field name="egressSeq"    id="1" type="int64"/>
+        <field name="orderId"      id="2" type="int64"/>
+        <field name="userId"       id="3" type="int64"/>
+        <field name="marketId"     id="4" type="int32"/>
+        <field name="status"       id="5" type="OrderStatus"/>
+        <field name="meTimestamp"  id="6" type="int64"/>
+        <field name="omsOrderId"   id="7" type="int64"/>
+        <field name="meEpoch"      id="8" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="MeCommandOutcome" id="64" sinceVersion="6" description="All 20 fields of the ME JournalCommandOutcome (template 28) plus the epoch. result: 0 APPLIED, 1 REJECTED, 2 CONFLICT, 3 CAPACITY, 4 UNKNOWN_LEG, 5 NOT_OWNER, 6 UNKNOWN_MARKET (ME values, verbatim).">
+        <field name="egressSeq"       id="1"  type="int64"/>
+        <field name="commandIdHigh"   id="2"  type="int64"/>
+        <field name="commandIdLow"    id="3"  type="int64"/>
+        <field name="userId"          id="4"  type="int64"/>
+        <field name="omsOrderId"      id="5"  type="int64"/>
+        <field name="oldOrderId"      id="6"  type="int64"/>
+        <field name="price"           id="7"  type="int64"/>
+        <field name="quantity"        id="8"  type="int64"/>
+        <field name="budget"          id="9"  type="int64"/>
+        <field name="marketId"        id="10" type="int32"/>
+        <field name="commandKind"     id="11" type="uint8"/>
+        <field name="orderType"       id="12" type="uint8"/>
+        <field name="orderSide"       id="13" type="uint8"/>
+        <field name="appliedPosition" id="14" type="int64"/>
+        <field name="meTimestamp"     id="15" type="int64"/>
+        <field name="orderId"         id="16" type="int64"/>
+        <field name="status"          id="17" type="int32"/>
+        <field name="reason"          id="18" type="int32"/>
+        <field name="oldCancelled"    id="19" type="uint8"/>
+        <field name="result"          id="20" type="int32"/>
+        <field name="meEpoch"         id="21" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="RequestPendingDispatch" id="65" sinceVersion="6" description="read-only (FORWARDER): every pending MeDispatch with dispatchSeq above fromDispatchSeq, in order, then PendingDispatchEnd. limit 0 = 1024, max 4096.">
+        <field name="correlationId"    id="1" type="int64"/>
+        <field name="fromDispatchSeq"  id="2" type="int64"/>
+        <field name="maxEntries"       id="3" type="int32" description="0 = 1024, max 4096"/>
+    </sbe:message>
+
+    <!-- ============================ v6 (RC1) admin ingress 70-79, ADMIN class ============================ -->
+    <sbe:message name="CoreConfig" id="70" sinceVersion="6" description="Markets, assets and the behaviour version as a logged command (EngineConfig pattern). Decision table: recorded+equal = DUPLICATE, recorded+different = REJECTED, fresh = record, adopt = cross-check compiled tables and fail fast on mismatch. The assets group may change only while no account exists.">
+        <field name="correlationId"   id="1" type="int64"/>
+        <field name="configVersion"   id="2" type="uint32"/>
+        <field name="behaviorVersion" id="3" type="uint32"/>
+        <group name="markets" id="10" dimensionType="groupSizeEncoding">
+            <field name="marketId"     id="1" type="int32"/>
+            <field name="symbol"       id="2" type="Symbol"/>
+            <field name="baseAssetId"  id="3" type="int32"/>
+            <field name="quoteAssetId" id="4" type="int32"/>
+            <field name="tickSize"     id="5" type="int64"/>
+            <field name="minPrice"     id="6" type="int64"/>
+            <field name="maxPrice"     id="7" type="int64"/>
+            <field name="lotSize"      id="8" type="int64"/>
+        </group>
+        <group name="assets" id="11" dimensionType="groupSizeEncoding">
+            <field name="assetId" id="1" type="int32"/>
+            <field name="code"    id="2" type="AssetCode"/>
+            <field name="scale"   id="3" type="uint8"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="RiskConfigSet" id="71" sinceVersion="6" description="Full risk record per market (marketId 0 = INVALID; critic C10), monotonic configVersion, basis points everywhere (exact tryMultiply(x, bps) / 10000). Replicated and snapshotted. Rate state is fixed cluster-time buckets, so raising a limit resizes nothing.">
+        <field name="correlationId"        id="1"  type="int64"/>
+        <field name="configVersion"        id="2"  type="uint32"/>
+        <field name="marketId"             id="3"  type="int32"/>
+        <field name="minQuantity"          id="4"  type="int64"/>
+        <field name="maxQuantity"          id="5"  type="int64"/>
+        <field name="minNotional"          id="6"  type="int64"/>
+        <field name="maxNotional"          id="7"  type="int64"/>
+        <field name="priceCollarBps"       id="8"  type="uint32"/>
+        <field name="maxOrdersPerSec"      id="9"  type="int32"/>
+        <field name="maxOrdersPerMin"      id="10" type="int32"/>
+        <field name="maxOpenOrders"        id="11" type="int32"/>
+        <field name="maxPositionPerMarket" id="12" type="int64"/>
+        <field name="marketBuySlippageBps" id="13" type="uint32"/>
+    </sbe:message>
+
+    <sbe:message name="CircuitBreaker" id="72" sinceVersion="6" description="Manual breaker per market: Create/Amend/children/refills in a tripped market are rejected CIRCUIT_BREAKER, cancels pass. reason: 0 MANUAL, 1 AUTO (reserved).">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="marketId"      id="2" type="int32"/>
+        <field name="action"        id="3" type="BreakerAction"/>
+        <field name="reason"        id="4" type="uint8"/>
+    </sbe:message>
+
+    <sbe:message name="OrderEntryGate" id="73" sinceVersion="6" description="Replicated, snapshotted admission gate (marketId 0 = global). SUSPENDED: CreateOrder/AmendOrder/trigger children/iceberg refills are rejected GATE_CLOSED; CancelOrder, Deposit, Withdraw, MeJournal*, Settle and queries continue. Genesis = SUSPENDED/GENESIS until an ADMIN OPEN is logged.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="marketId"      id="2" type="int32"/>
+        <field name="state"         id="3" type="GateState"/>
+        <field name="reason"        id="4" type="GateReason"/>
+    </sbe:message>
+
+    <sbe:message name="QuarantineOrder" id="74" sinceVersion="6" description="RESERVED (K5 item 7): deterministic neutralisation of a poisoned order after a fix. Fields are fixed in RC1 S5; this build drops the frame as unhandled.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="orderId"       id="2" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="RequestRiskConfig" id="75" sinceVersion="6" description="read-only (ADMIN): the effective risk record for a market (0 = the default row), answered with ConfigApplied-style RiskConfigSet echo in S4.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="marketId"      id="2" type="int32"/>
+    </sbe:message>
+
+    <!-- ============================ v6 (RC1) session 80-89 ============================ -->
+    <sbe:message name="RegisterSession" id="80" sinceVersion="6" description="Transport + log: asserts the session class (checked against the authenticator principal), sets the egress mask (replaces Subscribe) and the resumable mark (replaces the QueryFeedPosition peek), names the R03 reader kind (0 = not a retention reader) and the producer epoch. Reply AdminAck + ORIGIN AdmissionState.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="sessionClass"  id="2" type="SessionClass"/>
+        <field name="channels"      id="3" type="EgressChannels"/>
+        <field name="readerKind"    id="4" type="uint8"/>
+        <field name="resumable"     id="5" type="BoolFlag"/>
+        <field name="identity"      id="6" type="int64"/>
+        <field name="sourceEpoch"   id="7" type="int64"/>
+    </sbe:message>
+
+    <!-- 90-99 reserved for the R03 reader protocol (ReaderRegister, ReaderCheckpoint, ReaderUnregister, StrandReader,
+         StrandMember, MemberPositionsObserved, RetentionConfig). 40-44 are burned (RC0 spike codecs). -->
+
     <!-- ============================ Egress events (AE -> client) ============================ -->
 
     <sbe:message name="HoldAck" id="10" description="A hold was accepted">
@@ -180,6 +564,7 @@
         <field name="assetId"       id="3" type="int32"/>
         <field name="amount"        id="4" type="int64"/>
         <field name="reason"        id="5" type="RejectReason"/>
+        <field name="duplicate"      id="6" type="BoolFlag" sinceVersion="6" description="TRUE = this is the replayed decision of an already-applied requestId (v6)"/>
     </sbe:message>
 
     <sbe:message name="DepositAck" id="15" description="A deposit was applied">
@@ -188,6 +573,7 @@
         <field name="assetId"        id="3" type="int32"/>
         <field name="amount"         id="4" type="int64"/>
         <field name="newAvailable"   id="5" type="int64"/>
+        <field name="duplicate"      id="7" type="BoolFlag" sinceVersion="6" description="TRUE = this is the replayed decision of an already-applied requestId (v6)"/>
     </sbe:message>
 
     <sbe:message name="WithdrawAck" id="16" description="A withdrawal was applied">
@@ -196,6 +582,7 @@
         <field name="assetId"        id="3" type="int32"/>
         <field name="amount"         id="4" type="int64"/>
         <field name="newAvailable"   id="5" type="int64"/>
+        <field name="duplicate"      id="7" type="BoolFlag" sinceVersion="6" description="TRUE = this is the replayed decision of an already-applied requestId (v6)"/>
     </sbe:message>
 
     <sbe:message name="FeedPositionReport" id="17" description="Answer to QueryFeedPosition: the ME journal cursor this AE has consumed">
@@ -274,5 +661,228 @@
             <field name="assetId"    id="3" type="int32"/>
             <field name="remaining"  id="4" type="int64"/>
         </group>
+    </sbe:message>
+
+    <!-- ============================ v6 (RC1) egress 100-119 ============================ -->
+    <sbe:message name="OrderAck" id="100" sinceVersion="6" description="ORIGIN reply to CreateOrder/CancelOrder/AmendOrder. duplicate = replayed requestId decision. eventSeq joins the ack to its OrderEvent.">
+        <field name="correlationId" id="1"  type="int64"/>
+        <field name="requestIdHigh" id="2"  type="int64"/>
+        <field name="requestIdLow"  id="3"  type="int64"/>
+        <field name="orderId"       id="4"  type="int64"/>
+        <field name="userId"        id="5"  type="int64"/>
+        <field name="marketId"      id="6"  type="int32"/>
+        <field name="status"        id="7"  type="OrderStatus"/>
+        <field name="duplicate"     id="8"  type="BoolFlag"/>
+        <field name="holdAssetId"   id="9"  type="int32"/>
+        <field name="holdAmount"    id="10" type="int64"/>
+        <field name="acceptedAtMs"  id="11" type="int64"/>
+        <field name="eventSeq"      id="12" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="OrderReject" id="101" sinceVersion="6" description="ORIGIN reject for every ORIGIN-replyable ingress (refTemplateId names it, incl. 1/2/3 money commands under a class/gate reject). meReason = the ME OrderRejectReason when reason = ME_REJECTED, else 255. detail = the breached limit or offending value.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="requestIdHigh" id="2" type="int64"/>
+        <field name="requestIdLow"  id="3" type="int64"/>
+        <field name="userId"        id="4" type="int64"/>
+        <field name="orderId"       id="5" type="int64"/>
+        <field name="marketId"      id="6" type="int32"/>
+        <field name="refTemplateId" id="7" type="uint16"/>
+        <field name="reason"        id="8" type="CoreRejectReason"/>
+        <field name="meReason"      id="9" type="uint8"/>
+        <field name="detail"        id="10" type="int64"/>
+        <field name="rejectedAtMs"  id="11" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="OrderEvent" id="102" sinceVersion="6" description="BROADCAST orders: one copy of every order event to every gateway (backend scoping by userId at the gateway). eventSeq is dense, replicated, snapshotted (R03 IN-06). Fat variant per critic D15 (+timeInForce/stopPrice/createdAtMs for the RC4 projector).">
+        <field name="eventSeq"          id="1"  type="int64"/>
+        <field name="logPosition"       id="2"  type="int64"/>
+        <field name="orderId"           id="3"  type="int64"/>
+        <field name="userId"            id="4"  type="int64"/>
+        <field name="marketId"          id="5"  type="int32"/>
+        <field name="eventKind"         id="6"  type="EventKind"/>
+        <field name="status"            id="7"  type="OrderStatus"/>
+        <field name="reason"            id="8"  type="CoreRejectReason"/>
+        <field name="side"              id="9"  type="Side"/>
+        <field name="orderType"         id="10" type="OrderType"/>
+        <field name="timeInForce"       id="11" type="TimeInForce"/>
+        <field name="price"             id="12" type="int64"/>
+        <field name="stopPrice"         id="13" type="int64"/>
+        <field name="quantity"          id="14" type="int64"/>
+        <field name="filledQty"         id="15" type="int64"/>
+        <field name="remainingQty"      id="16" type="int64"/>
+        <field name="lastPrice"         id="17" type="int64"/>
+        <field name="lastQty"           id="18" type="int64"/>
+        <field name="tradeId"           id="19" type="int64"/>
+        <field name="meOrderId"         id="20" type="int64"/>
+        <field name="holdAssetId"       id="21" type="int32"/>
+        <field name="holdAmount"        id="22" type="int64"/>
+        <field name="holdRemaining"     id="23" type="int64"/>
+        <field name="clientOrderIdHigh" id="24" type="int64"/>
+        <field name="clientOrderIdLow"  id="25" type="int64"/>
+        <field name="createdAtMs"       id="26" type="int64"/>
+        <field name="updatedAtMs"       id="27" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="OrderEventBatch" id="103" sinceVersion="6" description="A run of OrderEvent entries formed at drain (cap 48 keeps the frame under the 8 KiB scratch).">
+        <group name="events" id="20" dimensionType="groupSizeEncoding">
+            <field name="eventSeq"          id="1"  type="int64"/>
+            <field name="logPosition"       id="2"  type="int64"/>
+            <field name="orderId"           id="3"  type="int64"/>
+            <field name="userId"            id="4"  type="int64"/>
+            <field name="marketId"          id="5"  type="int32"/>
+            <field name="eventKind"         id="6"  type="EventKind"/>
+            <field name="status"            id="7"  type="OrderStatus"/>
+            <field name="reason"            id="8"  type="CoreRejectReason"/>
+            <field name="side"              id="9"  type="Side"/>
+            <field name="orderType"         id="10" type="OrderType"/>
+            <field name="timeInForce"       id="11" type="TimeInForce"/>
+            <field name="price"             id="12" type="int64"/>
+            <field name="stopPrice"         id="13" type="int64"/>
+            <field name="quantity"          id="14" type="int64"/>
+            <field name="filledQty"         id="15" type="int64"/>
+            <field name="remainingQty"      id="16" type="int64"/>
+            <field name="lastPrice"         id="17" type="int64"/>
+            <field name="lastQty"           id="18" type="int64"/>
+            <field name="tradeId"           id="19" type="int64"/>
+            <field name="meOrderId"         id="20" type="int64"/>
+            <field name="holdAssetId"       id="21" type="int32"/>
+            <field name="holdAmount"        id="22" type="int64"/>
+            <field name="holdRemaining"     id="23" type="int64"/>
+            <field name="clientOrderIdHigh" id="24" type="int64"/>
+            <field name="clientOrderIdLow"  id="25" type="int64"/>
+            <field name="createdAtMs"       id="26" type="int64"/>
+            <field name="updatedAtMs"       id="27" type="int64"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="MeDispatch" id="104" sinceVersion="6" description="BROADCAST dispatch (forwarder sessions) / ORIGIN when answering RequestPendingDispatch. The forwarder encodes the ME DurableOrderCommand from this one-to-one and keeps no state. kind RELEASE_ID carries only the command id.">
+        <field name="dispatchSeq"   id="1"  type="int64"/>
+        <field name="commandIdHigh" id="2"  type="int64"/>
+        <field name="commandIdLow"  id="3"  type="int64"/>
+        <field name="kind"          id="4"  type="DispatchKind"/>
+        <field name="userId"        id="5"  type="int64"/>
+        <field name="omsOrderId"    id="6"  type="int64"/>
+        <field name="oldOrderId"    id="7"  type="int64"/>
+        <field name="marketId"      id="8"  type="int32"/>
+        <field name="orderType"     id="9"  type="uint8"/>
+        <field name="side"          id="10" type="uint8"/>
+        <field name="price"         id="11" type="int64"/>
+        <field name="quantity"      id="12" type="int64"/>
+        <field name="budget"        id="13" type="int64"/>
+        <field name="timeInForce"   id="14" type="uint8"/>
+    </sbe:message>
+
+    <sbe:message name="MeDispatchBatch" id="105" sinceVersion="6" description="A run of MeDispatch entries (cap 64).">
+        <group name="dispatches" id="20" dimensionType="groupSizeEncoding">
+            <field name="dispatchSeq"   id="1"  type="int64"/>
+            <field name="commandIdHigh" id="2"  type="int64"/>
+            <field name="commandIdLow"  id="3"  type="int64"/>
+            <field name="kind"          id="4"  type="DispatchKind"/>
+            <field name="userId"        id="5"  type="int64"/>
+            <field name="omsOrderId"    id="6"  type="int64"/>
+            <field name="oldOrderId"    id="7"  type="int64"/>
+            <field name="marketId"      id="8"  type="int32"/>
+            <field name="orderType"     id="9"  type="uint8"/>
+            <field name="side"          id="10" type="uint8"/>
+            <field name="price"         id="11" type="int64"/>
+            <field name="quantity"      id="12" type="int64"/>
+            <field name="budget"        id="13" type="int64"/>
+            <field name="timeInForce"   id="14" type="uint8"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="OrderSnapshotBatch" id="106" sinceVersion="6" description="ORIGIN reply chunk to RequestOrderSnapshot (cap 56), ordered by orderId.">
+        <group name="orders" id="20" dimensionType="groupSizeEncoding">
+            <field name="orderId"           id="1"  type="int64"/>
+            <field name="userId"            id="2"  type="int64"/>
+            <field name="marketId"          id="3"  type="int32"/>
+            <field name="status"            id="4"  type="OrderStatus"/>
+            <field name="side"              id="5"  type="Side"/>
+            <field name="orderType"         id="6"  type="OrderType"/>
+            <field name="timeInForce"       id="7"  type="TimeInForce"/>
+            <field name="price"             id="8"  type="int64"/>
+            <field name="quantity"          id="9"  type="int64"/>
+            <field name="filledQty"         id="10" type="int64"/>
+            <field name="remainingQty"      id="11" type="int64"/>
+            <field name="stopPrice"         id="12" type="int64"/>
+            <field name="displayQty"        id="13" type="int64"/>
+            <field name="expiresAtMs"       id="14" type="int64"/>
+            <field name="holdAssetId"       id="15" type="int32"/>
+            <field name="holdAmount"        id="16" type="int64"/>
+            <field name="clientOrderIdHigh" id="17" type="int64"/>
+            <field name="clientOrderIdLow"  id="18" type="int64"/>
+            <field name="meOrderId"         id="19" type="int64"/>
+            <field name="trailingArm"       id="20" type="int64"/>
+            <field name="hiddenQty"         id="21" type="int64"/>
+            <field name="sliceSeq"          id="22" type="int32"/>
+            <field name="budget"            id="23" type="int64"/>
+            <field name="createdAtMs"       id="24" type="int64"/>
+            <field name="updatedAtMs"       id="25" type="int64"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="OrderSnapshotEnd" id="107" sinceVersion="6" description="Terminates an OrderSnapshotBatch stream. nextOrderId 0 = done.">
+        <field name="correlationId"   id="1" type="int64"/>
+        <field name="entryCount"      id="2" type="int32"/>
+        <field name="nextOrderId"     id="3" type="int64"/>
+        <field name="asOfLogPosition" id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="PendingDispatchEnd" id="108" sinceVersion="6" description="Terminates a RequestPendingDispatch reply.">
+        <field name="correlationId"   id="1" type="int64"/>
+        <field name="count"           id="2" type="int32"/>
+        <field name="headDispatchSeq" id="3" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="AdmissionState" id="109" sinceVersion="6" description="BROADCAST control on every gate/breaker change; ORIGIN on RegisterSession (the gateway's /ready input).">
+        <field name="marketId"       id="1" type="int32"/>
+        <field name="gateState"      id="2" type="GateState"/>
+        <field name="gateReason"     id="3" type="GateReason"/>
+        <field name="circuitBreaker" id="4" type="BoolFlag"/>
+        <field name="atMs"           id="5" type="int64"/>
+        <field name="logPosition"    id="6" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="AdminAck" id="110" sinceVersion="6" description="ORIGIN reply to every admin command and to RegisterSession (refTemplateId names it).">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="refTemplateId" id="2" type="uint16"/>
+        <field name="result"        id="3" type="AdminResult"/>
+        <field name="reason"        id="4" type="uint8"/>
+        <field name="configVersion" id="5" type="uint32"/>
+    </sbe:message>
+
+    <sbe:message name="DepositReject" id="111" sinceVersion="6" description="ORIGIN: a deposit was rejected (no state change). v5 emitted nothing, which under a requestId contract is OUTCOME UNKNOWN for the gateway.">
+        <field name="correlationId" id="1" type="int64"/>
+        <field name="requestIdHigh" id="2" type="int64"/>
+        <field name="requestIdLow"  id="3" type="int64"/>
+        <field name="userId"        id="4" type="int64"/>
+        <field name="assetId"       id="5" type="int32"/>
+        <field name="amount"        id="6" type="int64"/>
+        <field name="reason"        id="7" type="RejectReason"/>
+    </sbe:message>
+
+    <sbe:message name="ConfigApplied" id="112" sinceVersion="6" description="BROADCAST control: a config record (CORE/RISK/BREAKER/GATE) was applied at configVersion for marketId (0 = global/default).">
+        <field name="kind"          id="1" type="ConfigKind"/>
+        <field name="marketId"      id="2" type="int32"/>
+        <field name="configVersion" id="3" type="uint32"/>
+        <field name="logPosition"   id="4" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="OrderFault" id="113" sinceVersion="6" description="BROADCAST orders + MUST alert: a loud deterministic fault on one order (OVERFILL: the ME filled a budget-bound BUY past its quantity; SETTLE: a leg could not draw; POSITION_OVERFLOW). Money still moved; conservation holds.">
+        <field name="kind"        id="1" type="OrderFaultKind"/>
+        <field name="orderId"     id="2" type="int64"/>
+        <field name="userId"      id="3" type="int64"/>
+        <field name="marketId"    id="4" type="int32"/>
+        <field name="tradeId"     id="5" type="int64"/>
+        <field name="amount"      id="6" type="int64"/>
+        <field name="logPosition" id="7" type="int64"/>
+    </sbe:message>
+
+    <sbe:message name="SettleRejected" id="114" sinceVersion="6" description="ORIGIN to the feed session + MUST alert: a Settle/SettleBatch entry failed pre-validation (unknown market, non-positive price/quantity, notional overflow, bad party). Nothing mutated, consumePosition NOT advanced; the retention gate (S3) closes order entry on BRIDGE_HALT.">
+        <field name="tradeId"         id="1" type="int64"/>
+        <field name="marketId"        id="2" type="int32"/>
+        <field name="journalPosition" id="3" type="int64"/>
+        <field name="reason"          id="4" type="SettleRejectReason"/>
+        <field name="detail"          id="5" type="int64"/>
     </sbe:message>
 </sbe:messageSchema>

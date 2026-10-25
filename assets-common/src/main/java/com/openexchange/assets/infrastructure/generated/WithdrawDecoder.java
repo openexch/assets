@@ -5,16 +5,16 @@ import org.agrona.DirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * Debit available balance (external boundary). v6: 128-bit requestId as on Deposit.
  */
 @SuppressWarnings("all")
 public final class WithdrawDecoder
 {
-    public static final int BLOCK_LENGTH = 28;
+    public static final int BLOCK_LENGTH = 44;
     public static final int TEMPLATE_ID = 2;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final WithdrawDecoder parentMessage = this;
@@ -336,6 +336,118 @@ public final class WithdrawDecoder
     }
 
 
+    public static int requestIdHighId()
+    {
+        return 5;
+    }
+
+    public static int requestIdHighSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int requestIdHighEncodingOffset()
+    {
+        return 28;
+    }
+
+    public static int requestIdHighEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String requestIdHighMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long requestIdHighNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long requestIdHighMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long requestIdHighMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long requestIdHigh()
+    {
+        if (parentMessage.actingVersion < 6)
+        {
+            return -9223372036854775808L;
+        }
+
+        return buffer.getLong(offset + 28, BYTE_ORDER);
+    }
+
+
+    public static int requestIdLowId()
+    {
+        return 6;
+    }
+
+    public static int requestIdLowSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int requestIdLowEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int requestIdLowEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String requestIdLowMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long requestIdLowNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long requestIdLowMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long requestIdLowMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long requestIdLow()
+    {
+        if (parentMessage.actingVersion < 6)
+        {
+            return -9223372036854775808L;
+        }
+
+        return buffer.getLong(offset + 36, BYTE_ORDER);
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -388,6 +500,12 @@ public final class WithdrawDecoder
         builder.append('|');
         builder.append("amount=");
         builder.append(this.amount());
+        builder.append('|');
+        builder.append("requestIdHigh=");
+        builder.append(this.requestIdHigh());
+        builder.append('|');
+        builder.append("requestIdLow=");
+        builder.append(this.requestIdLow());
 
         limit(originalLimit);
 

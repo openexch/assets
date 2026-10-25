@@ -7,8 +7,8 @@ import org.agrona.MutableDirectBuffer;
 public final class EgressChannelsEncoder
 {
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final int ENCODED_LENGTH = 4;
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
@@ -131,5 +131,62 @@ public final class EgressChannelsEncoder
     public static int snapshots(final int bits, final boolean value)
     {
         return value ? bits | (1 << 3) : bits & ~(1 << 3);
+    }
+    /**
+     * OrderEvent / OrderEventBatch (gateways)
+     *
+     * @param value true if orders is set or false if not.
+     * @return this for a fluent API.
+     */
+
+    public EgressChannelsEncoder orders(final boolean value)
+    {
+        int bits = buffer.getInt(offset, BYTE_ORDER);
+        bits = value ? bits | (1 << 4) : bits & ~(1 << 4);
+        buffer.putInt(offset, bits, BYTE_ORDER);
+        return this;
+    }
+
+    public static int orders(final int bits, final boolean value)
+    {
+        return value ? bits | (1 << 4) : bits & ~(1 << 4);
+    }
+    /**
+     * MeDispatch / MeDispatchBatch (forwarder sessions)
+     *
+     * @param value true if dispatch is set or false if not.
+     * @return this for a fluent API.
+     */
+
+    public EgressChannelsEncoder dispatch(final boolean value)
+    {
+        int bits = buffer.getInt(offset, BYTE_ORDER);
+        bits = value ? bits | (1 << 5) : bits & ~(1 << 5);
+        buffer.putInt(offset, bits, BYTE_ORDER);
+        return this;
+    }
+
+    public static int dispatch(final int bits, final boolean value)
+    {
+        return value ? bits | (1 << 5) : bits & ~(1 << 5);
+    }
+    /**
+     * AdmissionState (gateways, forwarder, admin)
+     *
+     * @param value true if control is set or false if not.
+     * @return this for a fluent API.
+     */
+
+    public EgressChannelsEncoder control(final boolean value)
+    {
+        int bits = buffer.getInt(offset, BYTE_ORDER);
+        bits = value ? bits | (1 << 6) : bits & ~(1 << 6);
+        buffer.putInt(offset, bits, BYTE_ORDER);
+        return this;
+    }
+
+    public static int control(final int bits, final boolean value)
+    {
+        return value ? bits | (1 << 6) : bits & ~(1 << 6);
     }
 }

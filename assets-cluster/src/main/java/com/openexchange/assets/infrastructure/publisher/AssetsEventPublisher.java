@@ -3,6 +3,7 @@ package com.openexchange.assets.infrastructure.publisher;
 
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.RejectReason;
+import com.openexchange.assets.domain.SettleRejectReason;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
@@ -14,6 +15,7 @@ import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.SettleFaultEncoder;
+import com.openexchange.assets.infrastructure.generated.SettleRejectedEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawRejectEncoder;
@@ -115,6 +117,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     private final BalanceSnapshotEndEncoder balanceSnapshotEndEncoder = new BalanceSnapshotEndEncoder();
     private final FeedPositionReportEncoder feedPositionReportEncoder = new FeedPositionReportEncoder();
     private final SettleFaultEncoder settleFaultEncoder = new SettleFaultEncoder();
+    private final SettleRejectedEncoder settleRejectedEncoder = new SettleRejectedEncoder();
     private final HoldSnapshotEntryEncoder holdSnapshotEntryEncoder = new HoldSnapshotEntryEncoder();
     private final HoldSnapshotEndEncoder holdSnapshotEndEncoder = new HoldSnapshotEndEncoder();
 
@@ -230,6 +233,26 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .tradeId(tradeId).orderId(orderId).userId(userId).assetId(assetId)
                 .drawnFromAvailable(drawnFromAvailable).uncovered(uncovered);
         flush(settleFaultEncoder.encodedLength(), CH_SETTLEMENTS, Routing.BROADCAST);
+    }
+
+    @Override
+    public void onSettleRejected(long tradeId, int marketId, long journalPosition, SettleRejectReason reason, long detail) {
+        settleRejectedEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .tradeId(tradeId).marketId(marketId).journalPosition(journalPosition)
+                .reason(toWire(reason)).detail(detail);
+        // ORIGIN: the feed session that delivered the refused trade is the one that has to act on it.
+        flush(settleRejectedEncoder.encodedLength(), CH_SETTLEMENTS, Routing.ORIGIN);
+    }
+
+    private static com.openexchange.assets.infrastructure.generated.SettleRejectReason toWire(SettleRejectReason r) {
+        switch (r) {
+            case UNKNOWN_MARKET:    return com.openexchange.assets.infrastructure.generated.SettleRejectReason.UNKNOWN_MARKET;
+            case INVALID_PRICE:     return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_PRICE;
+            case INVALID_QUANTITY:  return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_QUANTITY;
+            case NOTIONAL_OVERFLOW: return com.openexchange.assets.infrastructure.generated.SettleRejectReason.NOTIONAL_OVERFLOW;
+            case INVALID_PARTY:     return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_PARTY;
+            default: throw new IllegalArgumentException("unmapped SettleRejectReason " + r);
+        }
     }
 
     private void flush(int bodyLength, int channel, Routing routing) {

@@ -75,4 +75,12 @@ public interface AssetsEventSink {
      */
     void onSettleFault(long tradeId, long orderId, long userId, int assetId,
                        long drawnFromAvailable, long uncovered);
+
+    /**
+     * EXCEPTIONAL (RC1 S1): a feed settle failed pre-validation and was refused with NO mutation and NO
+     * journal-cursor advance ({@code journalPosition} is the refused entry's position so the feed can
+     * see exactly where it stopped). {@code detail} is the offending value (marketId, price, quantity).
+     * MUST be alerted on: the feed is delivering trades this ledger cannot book.
+     */
+    void onSettleRejected(long tradeId, int marketId, long journalPosition, SettleRejectReason reason, long detail);
 }

@@ -5,16 +5,16 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * Debit available balance (external boundary)
+ * Debit available balance (external boundary). v6: 128-bit requestId as on Deposit.
  */
 @SuppressWarnings("all")
 public final class WithdrawEncoder
 {
-    public static final int BLOCK_LENGTH = 28;
+    public static final int BLOCK_LENGTH = 44;
     public static final int TEMPLATE_ID = 2;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 5;
-    public static final String SEMANTIC_VERSION = "0.5";
+    public static final int SCHEMA_VERSION = 6;
+    public static final String SEMANTIC_VERSION = "0.6";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final WithdrawEncoder parentMessage = this;
@@ -301,6 +301,110 @@ public final class WithdrawEncoder
     public WithdrawEncoder amount(final long value)
     {
         buffer.putLong(offset + 20, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int requestIdHighId()
+    {
+        return 5;
+    }
+
+    public static int requestIdHighSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int requestIdHighEncodingOffset()
+    {
+        return 28;
+    }
+
+    public static int requestIdHighEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String requestIdHighMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long requestIdHighNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long requestIdHighMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long requestIdHighMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public WithdrawEncoder requestIdHigh(final long value)
+    {
+        buffer.putLong(offset + 28, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int requestIdLowId()
+    {
+        return 6;
+    }
+
+    public static int requestIdLowSinceVersion()
+    {
+        return 6;
+    }
+
+    public static int requestIdLowEncodingOffset()
+    {
+        return 36;
+    }
+
+    public static int requestIdLowEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String requestIdLowMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long requestIdLowNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long requestIdLowMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long requestIdLowMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public WithdrawEncoder requestIdLow(final long value)
+    {
+        buffer.putLong(offset + 36, value, BYTE_ORDER);
         return this;
     }
 

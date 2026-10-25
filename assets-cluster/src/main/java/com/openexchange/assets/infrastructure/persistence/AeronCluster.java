@@ -36,6 +36,9 @@ public final class AeronCluster {
     private static final Logger log = Logger.getLogger(AeronCluster.class);
     public static final AtomicLong AERON_ERROR_COUNT = new AtomicLong();
     private static final AtomicBoolean FATAL_EXIT_STARTED = new AtomicBoolean();
+    /** See {@link IdenticalErrorStreak}: the hot-loop fail-fast the ME has had since match#35. */
+    private static final int IDENTICAL_ERROR_EXIT_THRESHOLD = 200;
+    private static final IdenticalErrorStreak IDENTICAL_ERRORS = new IdenticalErrorStreak(IDENTICAL_ERROR_EXIT_THRESHOLD);
 
     /**
      * Loud startup warning when the resolved cluster/archive state dir (the money ledger's snapshot +
@@ -89,6 +92,20 @@ public final class AeronCluster {
             final StringWriter sw = new StringWriter();
             t.printStackTrace(new PrintWriter(sw));
             log.error("Aeron error #%d: %s", AERON_ERROR_COUNT.get(), sw.toString());
+            // Hot-loop fail-fast: a deterministic apply fault or a broken replay throws the IDENTICAL
+            // error on every poll. Exit loudly (hookless, like the service fence) instead of spinning
+            // with /ready 503 forever; local state likely needs restore + replay.
+            if (IDENTICAL_ERRORS.record(String.valueOf(t)) && FATAL_EXIT_STARTED.compareAndSet(false, true)) {
+                log.error("FAIL-FAST: %d consecutive identical Aeron errors (hot-loop): %s - node exiting in 5s",
+                        IDENTICAL_ERROR_EXIT_THRESHOLD, String.valueOf(t));
+                barrier.signal();
+                final Thread hotLoopExit = new Thread(() -> {
+                    quietSleep(5000);
+                    Runtime.getRuntime().halt(2);
+                }, "hot-loop-exit");
+                hotLoopExit.setDaemon(true);
+                hotLoopExit.start();
+            }
             // In EXTERNAL mode a dead media driver surfaces as a FATAL AeronException; guarantee process
             // death so the process manager restarts a clean node.
             if (driverMode == DriverMode.EXTERNAL
