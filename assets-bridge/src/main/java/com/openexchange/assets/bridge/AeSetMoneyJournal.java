@@ -76,6 +76,7 @@ public final class AeSetMoneyJournal {
         AeronCluster cluster = null;
         try {
             cluster = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(toolCredentials().supplier())
                     .messageTimeoutNs(TimeUnit.SECONDS.toNanos(8))
                     .aeronDirectoryName(driver.aeronDirectoryName())
                     .ingressChannel("aeron:udp?term-length=4m")
@@ -174,5 +175,15 @@ public final class AeSetMoneyJournal {
             journalEnabled = reportDecoder.journalEnabled() == BoolFlag.TRUE;
             answered = true;
         }
+    }
+
+    /** RC1 S3 (K6): an ADMIN or TOOL credential from AE_AUTH_CREDENTIAL / -Dassets.auth.credential. */
+    private static com.openexchange.assets.auth.CoreCredentials toolCredentials() {
+        final com.openexchange.assets.auth.CoreCredentials c = com.openexchange.assets.auth.CoreCredentials.fromEnvironment();
+        if (c == null) {
+            throw new IllegalStateException("AE credentials missing: set " + com.openexchange.assets.auth.CoreCredentials.ENV
+                    + " to keyId:ADMIN:secretHex (or keyId:TOOL:...)");
+        }
+        return c;
     }
 }

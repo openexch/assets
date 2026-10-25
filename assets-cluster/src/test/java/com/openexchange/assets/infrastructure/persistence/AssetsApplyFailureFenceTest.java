@@ -59,6 +59,9 @@ public class AssetsApplyFailureFenceTest {
             public void onFeedPositionReport(long c, long p, long t, boolean j) { }
             public void onSettleFault(long t, long o, long u, int a, long d, long un) { }
             public void onSettleRejected(long t, int m, long p, SettleRejectReason r, long d) { }
+            public void onOrderReject(long c, long rh, long rl, long u, long o, int m, int ref, com.openexchange.assets.domain.CoreRejectReason r, int me, long d, long t) { }
+            public void onAdminAck(long c, int ref, com.openexchange.assets.domain.AdminResult r, int reason, long cfg) { }
+            public void onAdmissionState(int m, com.openexchange.assets.domain.GateState gs, com.openexchange.assets.domain.GateReason gr, boolean b, long at, long lp, boolean o) { }
         };
     }
 
@@ -71,6 +74,10 @@ public class AssetsApplyFailureFenceTest {
     private static AssetsClusteredService failingService(final Throwable failure) {
         final AssetsClusteredService service = new AssetsClusteredService();
         service.engine().setEventSink(failingSink(failure));
+        // The in-process dispatch has no ClientSession (id -1): give that id a TOOL authority so the
+        // command reaches the engine and the fence, not the session-authority reject (RC1 S3).
+        service.engine().sessions().open(-1L, com.openexchange.assets.auth.CorePrincipal.anyUser(
+                com.openexchange.assets.infrastructure.generated.SessionClass.TOOL, 0).encode());
         return service;
     }
 

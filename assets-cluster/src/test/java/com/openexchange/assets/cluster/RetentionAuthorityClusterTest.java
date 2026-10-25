@@ -10,6 +10,7 @@ import io.aeron.Image;
 import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.RecordingLog;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
@@ -418,6 +419,7 @@ public class RetentionAuthorityClusterTest {
     private static Member boot(final int id, final List<String> hosts, final File tmp) {
         final Member m = new Member(id);
         m.service = new RetentionProbeService(id);
+        TestAuth.install();
         m.cfg = ClusterConfig.create(id, hosts, hosts, PORT_BASE, m.service);
         m.cfg.baseDir(new File(tmp, "node" + id));
         m.cfg.aeronDirectoryName(new File(tmp, "driver" + id).getAbsolutePath());
@@ -454,6 +456,7 @@ public class RetentionAuthorityClusterTest {
         while (System.currentTimeMillis() < deadline) {
             try {
                 return AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                         .egressListener(seen)
                         .egressChannel("aeron:udp?endpoint=localhost:0")
                         .ingressChannel("aeron:udp?term-length=64k")

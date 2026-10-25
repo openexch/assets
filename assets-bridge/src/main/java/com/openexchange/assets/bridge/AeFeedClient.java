@@ -52,8 +52,8 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     private final SettlementAppliedBatchDecoder settlementAppliedBatchDecoder = new SettlementAppliedBatchDecoder();
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
     private final QueryFeedPositionEncoder queryEncoder = new QueryFeedPositionEncoder();
-    private final com.openexchange.assets.infrastructure.generated.SubscribeEncoder subscribeEncoder =
-            new com.openexchange.assets.infrastructure.generated.SubscribeEncoder();
+    private final com.openexchange.assets.infrastructure.generated.RegisterSessionEncoder registerEncoder =
+            new com.openexchange.assets.infrastructure.generated.RegisterSessionEncoder();
     private final org.agrona.concurrent.UnsafeBuffer subscribeBuffer =
             new org.agrona.concurrent.UnsafeBuffer(new byte[64]);
     private final UnsafeBuffer queryBuffer = new UnsafeBuffer(new byte[64]);
@@ -87,6 +87,9 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     static AeFeedClient connect(final BridgeConfig config, final String aeronDirectoryName) {
         final DelegatingListener holder = new DelegatingListener();
         final AeronCluster cluster = AeronCluster.connect(new AeronCluster.Context()
+                // RC1 S3 (K6): the core authenticates every session. The bridge presents its BRIDGE key
+                // (AE_AUTH_CREDENTIAL / -Dassets.auth.credential); without one the connect is rejected.
+                .credentialsSupplier(requireCredentials().supplier())
                 .aeronDirectoryName(aeronDirectoryName)
                 // mtu MUST match the AE cluster ingress (TransportConfig.mtuLength(), default 8192)
                 // and every other AE client (see MoneyLoadGenerator's 8k). At the default 1408 a full
@@ -118,14 +121,36 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
      * rather than assumed. Losing it only costs traffic, never correctness.</p>
      */
     private void subscribeToWhatWeActuallyRead() {
-        offerBlocking(subscribeBuffer, encodeSubscribe());
+        offerBlocking(subscribeBuffer, encodeRegisterSession());
     }
 
-    private int encodeSubscribe() {
-        subscribeEncoder.wrapAndApplyHeader(subscribeBuffer, 0, headerEncoder)
+    private static com.openexchange.assets.auth.CoreCredentials requireCredentials() {
+        final com.openexchange.assets.auth.CoreCredentials c = com.openexchange.assets.auth.CoreCredentials.fromEnvironment();
+        if (c == null) {
+            throw new IllegalStateException("AE credentials missing: set " + com.openexchange.assets.auth.CoreCredentials.ENV
+                    + " (or -D" + com.openexchange.assets.auth.CoreCredentials.PROPERTY + ") to keyId:BRIDGE:secretHex");
+        }
+        if (c.sessionClass() != com.openexchange.assets.infrastructure.generated.SessionClass.BRIDGE) {
+            throw new IllegalStateException("the bridge must present a BRIDGE credential, got " + c.sessionClass());
+        }
+        return c;
+    }
+
+    /**
+     * RegisterSession (RC1 S3): one replicated declaration replaces the Subscribe narrowing and the
+     * QueryFeedPosition resumable side effect. Class BRIDGE (asserted, checked against the principal),
+     * resumable (this client owns a resume protocol), channels acks + settlements (what the bridge reads).
+     */
+    private int encodeRegisterSession() {
+        registerEncoder.wrapAndApplyHeader(subscribeBuffer, 0, headerEncoder)
                 .correlationId(0L)
-                .channels().clear().acks(true).settlements(true);
-        return MessageHeaderEncoder.ENCODED_LENGTH + subscribeEncoder.encodedLength();
+                .sessionClass(com.openexchange.assets.infrastructure.generated.SessionClass.BRIDGE)
+                .readerKind((short) 0)
+                .resumable(com.openexchange.assets.infrastructure.generated.BoolFlag.TRUE)
+                .identity(0L)
+                .sourceEpoch(0L);
+        registerEncoder.channels().clear().acks(true).settlements(true);
+        return MessageHeaderEncoder.ENCODED_LENGTH + registerEncoder.encodedLength();
     }
 
     /**
@@ -140,20 +165,15 @@ final class AeFeedClient implements AutoCloseable, EgressListener {
     public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
                             final int leaderMemberId, final String ingressEndpoints) {
         System.out.println("[BRIDGE] AE new leader member=" + leaderMemberId + " term=" + leadershipTermId
-                + " — re-declaring transport state (subscription + feed-consumer mark)");
+                + ": re-declaring the session registration (egress mask + resumable mark)");
         pendingRedeclare = true;
     }
 
     /** @return true when both transport-state frames were accepted by the new leader. */
     private boolean redeclareTransportState() {
-        if (!tryOffer(subscribeBuffer, encodeSubscribe())) {
-            return false; // re-sending Subscribe twice is idempotent; retry both next duty
-        }
-        // correlationId 0 can never match awaitedCorrelationId (random >= 1): the engine's
-        // FeedPositionReport answer is ignored here, the query's only wanted effect is the
-        // leader-side feed-consumer mark.
-        queryEncoder.wrapAndApplyHeader(queryBuffer, 0, headerEncoder).correlationId(0L);
-        return tryOffer(queryBuffer, MessageHeaderEncoder.ENCODED_LENGTH + queryEncoder.encodedLength());
+        // Re-sending RegisterSession is idempotent (DUPLICATE on the replicated side); the new leader
+        // re-applies the egress mask and the resumable mark from it.
+        return tryOffer(subscribeBuffer, encodeRegisterSession());
     }
 
     /** One non-blocking offer attempt; terminal codes throw exactly like {@link #offerOnce}. */

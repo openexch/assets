@@ -10,6 +10,7 @@ import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.cluster.ClusteredMediaDriver;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import org.agrona.CloseHelper;
@@ -57,6 +58,7 @@ public class NodeMetricsClusterTest {
         final String aeronDir = new File(tmp, "driver").getAbsolutePath();
         final List<String> hosts = List.of("localhost");
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(new File(tmp, "node0"));
         cfg.aeronDirectoryName(aeronDir);
@@ -80,6 +82,7 @@ public class NodeMetricsClusterTest {
                     cfg.archiveContext(), cfg.consensusModuleContext());
             container = ClusteredServiceContainer.launch(cfg.clusteredServiceContext());
             client = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                     .egressListener((sessionId, timestamp, buffer, offset, length, header) -> {
                         if (length >= MessageHeaderDecoder.ENCODED_LENGTH
                                 && headerDec.wrap(buffer, offset).templateId() == DepositAckDecoder.TEMPLATE_ID) {

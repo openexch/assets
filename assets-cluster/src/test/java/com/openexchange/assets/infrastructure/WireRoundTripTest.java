@@ -273,7 +273,7 @@ public class WireRoundTripTest {
                 .takerOrderId(2).takerUserId(200).makerOrderId(1).makerUserId(100)
                 .price(FixedPoint.fromDouble(60000.0)).quantity(FixedPoint.fromDouble(1.0))
                 .takerIsBuy(BoolFlag.TRUE).journalPosition(6_000L);
-        demuxer.dispatch(ingress, 0,
+        demuxer.dispatchTrusted(ingress, 0,
                 MessageHeaderEncoder.ENCODED_LENGTH + batchEncoder.encodedLength(), 1000L);
 
         // Only trade 2 applied: exactly one settle's egress (4 balance lines + 1 SETTLED).
@@ -365,19 +365,19 @@ public class WireRoundTripTest {
     private void deposit(AssetsSbeDemuxer demuxer, long corr, long userId, int assetId, long amount) {
         depositEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .correlationId(corr).userId(userId).assetId(assetId).amount(amount);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + depositEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + depositEncoder.encodedLength(), 1000L);
     }
 
     private void withdraw(AssetsSbeDemuxer demuxer, long corr, long userId, int assetId, long amount) {
         withdrawEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .correlationId(corr).userId(userId).assetId(assetId).amount(amount);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + withdrawEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + withdrawEncoder.encodedLength(), 1000L);
     }
 
     private void hold(AssetsSbeDemuxer demuxer, long corr, long orderId, long userId, int assetId, long amount) {
         holdEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .correlationId(corr).orderId(orderId).userId(userId).assetId(assetId).amount(amount);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdEncoder.encodedLength(), 1000L);
     }
 
     private void settle(AssetsSbeDemuxer demuxer, long tradeId, int marketId, long takerOrder, long takerUser,
@@ -395,33 +395,33 @@ public class WireRoundTripTest {
                 .price(price).quantity(qty)
                 .takerIsBuy(takerIsBuy ? BoolFlag.TRUE : BoolFlag.FALSE)
                 .journalPosition(journalPosition);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + settleEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + settleEncoder.encodedLength(), 1000L);
     }
 
     private void terminalRelease(AssetsSbeDemuxer demuxer, long journalPosition, long orderId, long userId) {
         terminalReleaseEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .journalPosition(journalPosition).orderId(orderId).userId(userId).timestamp(1000L);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + terminalReleaseEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + terminalReleaseEncoder.encodedLength(), 1000L);
     }
 
     private void queryFeedPosition(AssetsSbeDemuxer demuxer, long corr) {
         queryFeedPosEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + queryFeedPosEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + queryFeedPosEncoder.encodedLength(), 1000L);
     }
 
     private void initTradeHighWater(AssetsSbeDemuxer demuxer, long tradeId, long consumePosition) {
         initEncoder.wrapAndApplyHeader(ingress, 0, header).tradeId(tradeId).consumePosition(consumePosition);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + initEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + initEncoder.encodedLength(), 1000L);
     }
 
     private void requestBalanceSnapshot(AssetsSbeDemuxer demuxer, long corr) {
         balSnapReqEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + balSnapReqEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + balSnapReqEncoder.encodedLength(), 1000L);
     }
 
     private void requestHoldSnapshot(AssetsSbeDemuxer demuxer, long corr) {
         holdSnapReqEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdSnapReqEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdSnapReqEncoder.encodedLength(), 1000L);
     }
 
     /**

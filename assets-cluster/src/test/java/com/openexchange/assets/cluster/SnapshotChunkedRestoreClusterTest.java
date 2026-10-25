@@ -18,6 +18,7 @@ import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.RecordingLog;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -277,6 +278,7 @@ public class SnapshotChunkedRestoreClusterTest {
 
     private static Node boot(final List<String> hosts, final File baseDir, final String aeronDir) {
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
@@ -308,6 +310,7 @@ public class SnapshotChunkedRestoreClusterTest {
         while (System.currentTimeMillis() < deadline) {
             try {
                 return AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                         .egressListener(listener)
                         .egressChannel("aeron:udp?endpoint=localhost:0")
                         .ingressChannel("aeron:udp?term-length=64k")

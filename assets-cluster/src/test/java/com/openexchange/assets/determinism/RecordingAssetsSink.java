@@ -2,6 +2,10 @@
 package com.openexchange.assets.determinism;
 
 import com.openexchange.assets.domain.AssetsEventSink;
+import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
 import com.openexchange.assets.domain.RejectReason;
 import com.openexchange.assets.domain.SettleRejectReason;
 
@@ -105,5 +109,23 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     @Override
     public void onSettleRejected(long tradeId, int marketId, long journalPosition, SettleRejectReason reason, long detail) {
         events.add(new AssetsEngineEvent.SettleRejected(tradeId, marketId, journalPosition, reason, detail));
+    }
+
+    @Override
+    public void onOrderReject(long correlationId, long requestIdHigh, long requestIdLow, long userId, long orderId,
+                              int marketId, int refTemplateId, CoreRejectReason reason, int meReason, long detail,
+                              long rejectedAtMs) {
+        events.add(new AssetsEngineEvent.OrderReject(correlationId, userId, orderId, marketId, refTemplateId, reason, detail));
+    }
+
+    @Override
+    public void onAdminAck(long correlationId, int refTemplateId, AdminResult result, int reason, long configVersion) {
+        events.add(new AssetsEngineEvent.AdminAck(correlationId, refTemplateId, result, reason, configVersion));
+    }
+
+    @Override
+    public void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                                 long atMs, long logPosition, boolean toOrigin) {
+        events.add(new AssetsEngineEvent.AdmissionState(marketId, gateState, gateReason, circuitBreaker, toOrigin));
     }
 }

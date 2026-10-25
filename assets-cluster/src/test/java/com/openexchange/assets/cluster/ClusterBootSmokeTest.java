@@ -14,6 +14,7 @@ import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import io.aeron.cluster.ClusteredMediaDriver;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -113,6 +114,7 @@ public class ClusterBootSmokeTest {
 
         final List<String> hosts = List.of("localhost");
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
@@ -139,6 +141,7 @@ public class ClusterBootSmokeTest {
             container = ClusteredServiceContainer.launch(cfg.clusteredServiceContext());
 
             client = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                     .egressListener(egress)
                     .egressChannel("aeron:udp?endpoint=localhost:0")
                     .ingressChannel("aeron:udp?term-length=16m|mtu=8192")
