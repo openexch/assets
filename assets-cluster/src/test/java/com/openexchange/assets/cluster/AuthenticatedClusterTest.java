@@ -119,7 +119,7 @@ public class AuthenticatedClusterTest {
     private int encodeDeposit(final long corr, final long userId) {
         final DepositEncoder e = new DepositEncoder().wrapAndApplyHeader(ingress, 0, headerEnc)
                 .correlationId(corr).userId(userId).assetId(Asset.USD.id()).amount(FixedPoint.fromDouble(10.0))
-                .requestIdHigh(0).requestIdLow(0);
+                .requestIdHigh(1).requestIdLow(corr); // TREASURY money commands must carry a requestId (S4, D5)
         return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
     }
 
@@ -246,7 +246,7 @@ public class AuthenticatedClusterTest {
             try {
                 final UnsafeBuffer reg = new UnsafeBuffer(new byte[128]);
                 final int len = TestAuth.encodeRegisterSession(reg, 0x55L, SessionClass.FORWARDER, false,
-                        true, false, false, false, false, true);
+                        true, false, false, false, false, true, false);
                 while (nonResumable.offer(reg, 0, len) <= 0) {
                     nonResumable.pollEgress();
                     Thread.onSpinWait();

@@ -12,6 +12,10 @@ public enum RejectReason
 
     UNKNOWN_HOLD((short)3),
 
+    BALANCE_OVERFLOW((short)4),
+
+    REQUEST_ID_MISMATCH((short)5),
+
     /**
      * To be used to represent not present or null.
      */
@@ -48,6 +52,8 @@ public enum RejectReason
             case 1: return INSUFFICIENT_FUNDS;
             case 2: return INVALID_AMOUNT;
             case 3: return UNKNOWN_HOLD;
+            case 4: return BALANCE_OVERFLOW;
+            case 5: return REQUEST_ID_MISMATCH;
             case 255: return NULL_VAL;
         }
 

@@ -157,7 +157,7 @@ public class NodeMetricsClusterTest {
     private void deposit(final AeronCluster client, final long correlationId) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
                 .correlationId(correlationId).userId(USER).assetId(Asset.USD.id())
-                .amount(FixedPoint.fromDouble(1.0));
+                .amount(FixedPoint.fromDouble(1.0)).requestIdHigh(0).requestIdLow(0);
         final int length = MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength();
         final long deadline = System.currentTimeMillis() + 10_000;
         final BackoffIdleStrategy idle = new BackoffIdleStrategy();

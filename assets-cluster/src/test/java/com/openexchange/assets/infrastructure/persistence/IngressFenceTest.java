@@ -13,6 +13,7 @@ import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.CreateOrderEncoder;
+import com.openexchange.assets.infrastructure.generated.RequestOrderSnapshotEncoder;
 import com.openexchange.assets.infrastructure.generated.DepositEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -330,6 +331,8 @@ public class IngressFenceTest {
         d.setAmount(0);
         r.engine.applyCommand(AssetsEngine.CMD_DEPOSIT, d, TS);
         assertEquals("rejected deposit must not create an account", 0, r.engine.accountCount());
+        assertEquals("S4 (D13): the refusal is typed, not silent", RejectReason.INVALID_AMOUNT,
+                ((AssetsEngineEvent.DepositReject) r.events().get(0)).reason());
 
         final WithdrawCommand w = new WithdrawCommand();
         w.reset();
@@ -339,7 +342,7 @@ public class IngressFenceTest {
         w.setAmount(100);
         r.engine.applyCommand(AssetsEngine.CMD_WITHDRAW, w, TS);
         assertEquals(0, r.engine.accountCount());
-        assertEquals(RejectReason.INSUFFICIENT_FUNDS, ((AssetsEngineEvent.WithdrawReject) r.events().get(0)).reason());
+        assertEquals(RejectReason.INSUFFICIENT_FUNDS, ((AssetsEngineEvent.WithdrawReject) r.events().get(1)).reason());
 
         final HoldCommand h = new HoldCommand();
         h.reset();
@@ -350,7 +353,7 @@ public class IngressFenceTest {
         h.setAmount(100);
         r.engine.applyCommand(AssetsEngine.CMD_HOLD, h, TS);
         assertEquals(0, r.engine.accountCount());
-        assertEquals(RejectReason.INSUFFICIENT_FUNDS, ((AssetsEngineEvent.HoldReject) r.events().get(1)).reason());
+        assertEquals(RejectReason.INSUFFICIENT_FUNDS, ((AssetsEngineEvent.HoldReject) r.events().get(2)).reason());
         assertNull(r.engine.account(5));
         assertNull(r.engine.account(6));
         assertNull(r.engine.account(7));
@@ -371,12 +374,10 @@ public class IngressFenceTest {
 
     @Test
     public void knownButUnservedV6TemplateIsCountedNotApplied() {
+        // CreateOrder (50) is served since S4; RequestOrderSnapshot (53) lands in S5 and is the unserved probe now.
         final Rig r = new Rig();
-        final CreateOrderEncoder e = new CreateOrderEncoder().wrapAndApplyHeader(r.buf, 0, r.header)
-                .correlationId(1).userId(1).clientOrderIdHigh(0).clientOrderIdLow(1).requestIdHigh(0).requestIdLow(1)
-                .marketId(1).side(Side.BUY).orderType(OrderType.LIMIT).timeInForce(TimeInForce.GTC)
-                .price(100).quantity(100).budget(0).stopPrice(0).trailingDelta(0).displayQty(0).expiresAtMs(0);
-        e.flags().clear();
+        final RequestOrderSnapshotEncoder e = new RequestOrderSnapshotEncoder().wrapAndApplyHeader(r.buf, 0, r.header)
+                .correlationId(1).userId(1).fromOrderId(0);
         r.dispatch(HEADER + e.encodedLength());
         assertEquals(1, r.demuxer.unhandledTemplateCount());
         assertEquals(0, r.demuxer.unknownTemplateCount());
@@ -394,8 +395,8 @@ public class IngressFenceTest {
                 }
                 throw (Error) failure;
             }
-            public void onDepositAck(long c, long u, int a, long amt, long n) { }
-            public void onWithdrawAck(long c, long u, int a, long amt, long n) { }
+            public void onDepositAck(long c, long u, int a, long amt, long n, boolean dup) { }
+            public void onWithdrawAck(long c, long u, int a, long amt, long n, boolean dup) { }
             public void onHoldAck(long c, long o, long u, int a, long amt) { }
             public void onHoldReject(long c, long o, long u, int a, long amt, RejectReason r) { }
             public void onBalanceUpdate(long u, int a, long av, long l) { fail(); }
@@ -410,6 +411,11 @@ public class IngressFenceTest {
             public void onOrderReject(long c, long rh, long rl, long u, long o, int m, int ref, com.openexchange.assets.domain.CoreRejectReason r, int me, long d, long t) { }
             public void onAdminAck(long c, int ref, com.openexchange.assets.domain.AdminResult r, int reason, long cfg) { }
             public void onAdmissionState(int m, com.openexchange.assets.domain.GateState gs, com.openexchange.assets.domain.GateReason gr, boolean b, long at, long lp, boolean o) { }
+            public void onOrderAck(long c, long rh, long rl, long o, long u, int m, com.openexchange.assets.domain.OrderStatus st, boolean dup, int ha, long hm, long at, long seq) { }
+            public void onOrderEvent(long seq, long lp, com.openexchange.assets.domain.CoreOrderView o, com.openexchange.assets.domain.EventKind k, com.openexchange.assets.domain.CoreRejectReason r, long lpx, long lq, long t, long hr, long up) { }
+            public void onMeDispatch(long ds, long ih, long il, com.openexchange.assets.domain.DispatchKind k, long u, long o, long old, int m, int ot, int sd, long px, long q, long b, int tif) { }
+            public void onDepositReject(long c, long rh, long rl, long u, int a, long amt, com.openexchange.assets.domain.RejectReason r) { }
+            public void onConfigApplied(com.openexchange.assets.domain.ConfigKind k, int m, long v, long lp) { }
         };
     }
 

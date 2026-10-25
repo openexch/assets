@@ -24,6 +24,10 @@
             <validValue name="INSUFFICIENT_FUNDS">1</validValue>
             <validValue name="INVALID_AMOUNT">2</validValue>
             <validValue name="UNKNOWN_HOLD">3</validValue>
+            <!-- v6 (RC1 S4): a credit that would push available+locked past Long.MAX_VALUE; previously folded into INVALID_AMOUNT because deposits emitted no reject -->
+            <validValue name="BALANCE_OVERFLOW">4</validValue>
+            <!-- v6 (RC1 S4): same requestId presented with a different payload (critic D5) -->
+            <validValue name="REQUEST_ID_MISMATCH">5</validValue>
         </enum>
         <!-- Boolean-as-uint8 for taker side on a settlement (1 = taker is the buyer). -->
         <enum name="BoolFlag" encodingType="uint8">

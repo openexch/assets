@@ -4,6 +4,11 @@ package com.openexchange.assets.infrastructure.persistence;
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.domain.Account;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
+import com.openexchange.assets.application.engine.order.CoreOrder;
+import com.openexchange.assets.application.engine.order.MarketRisk;
+import com.openexchange.assets.application.engine.order.OrderEngine;
+import com.openexchange.assets.application.engine.order.RequestTable;
+import com.openexchange.assets.application.engine.order.UserRisk;
 import com.openexchange.assets.application.engine.session.SessionAuthority;
 import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.GateReason;
@@ -132,11 +137,16 @@ public final class BalanceSnapshotCodec {
         dst.putByte(pos[0], (byte) (engine.isMoneyJournalEnabled() ? FLAG_JOURNAL_ENABLED : 0));
         pos[0] += 1;
 
-        // Sections, ascending by id: 1 ACCOUNTS, 5 GATES, 9 SESSIONS on this build; later slices append theirs.
-        dst.putInt(pos[0], 3);
+        // Sections, ascending by id: 1 ACCOUNTS, 2 ORDERS, 3 USER_RISK, 4 MARKET_STATE, 5 GATES, 6 REQUEST_IDS,
+        // 9 SESSIONS on this build (RC1 S4); 7 and 8 land with their slices.
+        dst.putInt(pos[0], 7);
         pos[0] += 4;
         pos[0] = writeAccountsSection(engine, dst, pos[0]);
+        pos[0] = writeOrdersSection(engine, dst, pos[0]);
+        pos[0] = writeUserRiskSection(engine, dst, pos[0]);
+        pos[0] = writeMarketStateSection(engine, dst, pos[0]);
         pos[0] = writeGatesSection(engine, dst, pos[0]);
+        pos[0] = writeRequestsSection(engine, dst, pos[0]);
         pos[0] = writeSessionsSection(engine, dst, pos[0]);
 
         return pos[0] - offset;
@@ -180,6 +190,245 @@ public final class BalanceSnapshotCodec {
         });
         dst.putInt(lengthSlot, pos[0] - bodyStart);
         return pos[0];
+    }
+
+    /** Section 2: live order records, ascending orderId, CoreOrder.SNAPSHOT_BYTES each (layout page). */
+    private static int writeOrdersSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final int[] pos = {start};
+        dst.putShort(pos[0], SECTION_ORDERS);
+        pos[0] += 2;
+        final int lengthSlot = pos[0];
+        pos[0] += 4;
+        final int bodyStart = pos[0];
+        dst.putInt(pos[0], engine.orders().orders().size());
+        pos[0] += 4;
+        engine.orders().orders().forEachByOrderId(o -> pos[0] = writeOrder(dst, pos[0], o));
+        dst.putInt(lengthSlot, pos[0] - bodyStart);
+        return pos[0];
+    }
+
+    private static int writeOrder(MutableDirectBuffer dst, int p, CoreOrder o) {
+        final long[] longs = {o.orderId, o.userId, o.clientOrderIdHigh, o.clientOrderIdLow, o.requestIdHigh, o.requestIdLow,
+                o.price, o.quantity, o.budget, o.stopPrice, o.trailingDelta, o.trailingArmPrice, o.displayQty, o.hiddenQty,
+                o.sliceRemainingQty, o.expiresAtMs, o.filledQty, o.remainingQty, o.cumQuoteQty, o.lastPrice, o.lastQty,
+                o.holdAmount, o.createdAtMs, o.updatedAtMs, o.eventSeq, o.currentLegId, o.pendingPrice, o.pendingQuantity,
+                o.pendingHoldDelta, o.pendingHoldTarget, o.oldLegId};
+        for (final long v : longs) {
+            dst.putLong(p, v);
+            p += 8;
+        }
+        dst.putInt(p, o.marketId); p += 4;
+        dst.putInt(p, o.flags); p += 4;
+        dst.putInt(p, o.holdAssetId); p += 4;
+        dst.putInt(p, o.attempt); p += 4;
+        dst.putShort(p, (short) o.stateFlags); p += 2;
+        dst.putByte(p, o.side); p += 1;
+        dst.putByte(p, o.orderType); p += 1;
+        dst.putByte(p, o.timeInForce); p += 1;
+        dst.putByte(p, o.status); p += 1;
+        dst.putByte(p, o.rejectReason); p += 1;
+        dst.putByte(p, o.pendingKind); p += 1;
+        return p;
+    }
+
+    private static int readOrder(DirectBuffer src, int p, CoreOrder o) {
+        final long[] longs = new long[31];
+        for (int i = 0; i < longs.length; i++) {
+            longs[i] = src.getLong(p);
+            p += 8;
+        }
+        o.orderId = longs[0]; o.userId = longs[1]; o.clientOrderIdHigh = longs[2]; o.clientOrderIdLow = longs[3];
+        o.requestIdHigh = longs[4]; o.requestIdLow = longs[5]; o.price = longs[6]; o.quantity = longs[7]; o.budget = longs[8];
+        o.stopPrice = longs[9]; o.trailingDelta = longs[10]; o.trailingArmPrice = longs[11]; o.displayQty = longs[12];
+        o.hiddenQty = longs[13]; o.sliceRemainingQty = longs[14]; o.expiresAtMs = longs[15]; o.filledQty = longs[16];
+        o.remainingQty = longs[17]; o.cumQuoteQty = longs[18]; o.lastPrice = longs[19]; o.lastQty = longs[20];
+        o.holdAmount = longs[21]; o.createdAtMs = longs[22]; o.updatedAtMs = longs[23]; o.eventSeq = longs[24];
+        o.currentLegId = longs[25]; o.pendingPrice = longs[26]; o.pendingQuantity = longs[27]; o.pendingHoldDelta = longs[28];
+        o.pendingHoldTarget = longs[29]; o.oldLegId = longs[30];
+        o.marketId = src.getInt(p); p += 4;
+        o.flags = src.getInt(p); p += 4;
+        o.holdAssetId = src.getInt(p); p += 4;
+        o.attempt = src.getInt(p); p += 4;
+        o.stateFlags = src.getShort(p) & 0xFFFF; p += 2;
+        o.side = src.getByte(p); p += 1;
+        o.orderType = src.getByte(p); p += 1;
+        o.timeInForce = src.getByte(p); p += 1;
+        o.status = src.getByte(p); p += 1;
+        o.rejectReason = src.getByte(p); p += 1;
+        o.pendingKind = src.getByte(p); p += 1;
+        return p;
+    }
+
+    /** Section 3: per-user risk, ascending userId, UserRisk.SNAPSHOT_BYTES each. */
+    private static int writeUserRiskSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final int[] pos = {start};
+        dst.putShort(pos[0], SECTION_USER_RISK);
+        pos[0] += 2;
+        final int lengthSlot = pos[0];
+        pos[0] += 4;
+        final int bodyStart = pos[0];
+        dst.putInt(pos[0], engine.orders().userCount());
+        pos[0] += 4;
+        engine.orders().forEachUserByUserId(u -> {
+            dst.putLong(pos[0], u.userId); pos[0] += 8;
+            dst.putLong(pos[0], u.secBucket); pos[0] += 8;
+            dst.putInt(pos[0], u.secCount); pos[0] += 4;
+            dst.putLong(pos[0], u.minBucket); pos[0] += 8;
+            dst.putInt(pos[0], u.minCount); pos[0] += 4;
+            for (int m = 0; m < UserRisk.MARKET_SLOTS; m++) {
+                dst.putLong(pos[0], u.position[m]); pos[0] += 8;
+            }
+        });
+        dst.putInt(lengthSlot, pos[0] - bodyStart);
+        return pos[0];
+    }
+
+    /** Section 4: per-market state for marketId 0..MARKETS (slot 0 carries the defaults), MarketRisk.SNAPSHOT_BYTES each. */
+    private static int writeMarketStateSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        int p = start;
+        dst.putShort(p, SECTION_MARKET_STATE); p += 2;
+        final int lengthSlot = p; p += 4;
+        final int bodyStart = p;
+        dst.putInt(p, UserRisk.MARKET_SLOTS); p += 4;
+        for (int id = 0; id < UserRisk.MARKET_SLOTS; id++) {
+            final MarketRisk m = engine.orders().market(id);
+            dst.putLong(p, m.configVersion); p += 8;
+            dst.putLong(p, m.minQuantity); p += 8;
+            dst.putLong(p, m.maxQuantity); p += 8;
+            dst.putLong(p, m.minNotional); p += 8;
+            dst.putLong(p, m.maxNotional); p += 8;
+            dst.putLong(p, m.maxPositionPerMarket); p += 8;
+            dst.putLong(p, m.lastTradePrice); p += 8;
+            dst.putLong(p, m.lastTradeId); p += 8;
+            dst.putLong(p, m.bestBid); p += 8;
+            dst.putLong(p, m.bestAsk); p += 8;
+            dst.putLong(p, m.bookVersion); p += 8;
+            dst.putLong(p, m.lastTickTs); p += 8;
+            dst.putInt(p, m.priceCollarBps); p += 4;
+            dst.putInt(p, m.maxOrdersPerSec); p += 4;
+            dst.putInt(p, m.maxOrdersPerMin); p += 4;
+            dst.putInt(p, m.maxOpenOrders); p += 4;
+            dst.putInt(p, m.marketBuySlippageBps); p += 4;
+            dst.putByte(p, (byte) (m.breakerTripped ? 1 : 0)); p += 1;
+        }
+        dst.putInt(lengthSlot, p - bodyStart);
+        return p;
+    }
+
+    /** Section 6: the request table, [nextRequestSeq] then rows ascending (userId, high, low). */
+    private static int writeRequestsSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final int[] pos = {start};
+        dst.putShort(pos[0], SECTION_REQUEST_IDS);
+        pos[0] += 2;
+        final int lengthSlot = pos[0];
+        pos[0] += 4;
+        final int bodyStart = pos[0];
+        final RequestTable t = engine.orders().requests();
+        dst.putLong(pos[0], t.nextRequestSeq()); pos[0] += 8;
+        dst.putInt(pos[0], t.size()); pos[0] += 4;
+        t.forEachOrdered(e -> {
+            dst.putLong(pos[0], e.userId); pos[0] += 8;
+            dst.putLong(pos[0], e.high); pos[0] += 8;
+            dst.putLong(pos[0], e.low); pos[0] += 8;
+            dst.putLong(pos[0], e.requestSeq); pos[0] += 8;
+            dst.putLong(pos[0], e.fingerprint); pos[0] += 8;
+            dst.putLong(pos[0], e.expiresAtMs); pos[0] += 8;
+            dst.putLong(pos[0], e.orderId); pos[0] += 8;
+            dst.putByte(pos[0], e.kind); pos[0] += 1;
+            dst.putByte(pos[0], e.reason); pos[0] += 1;
+        });
+        dst.putInt(lengthSlot, pos[0] - bodyStart);
+        return pos[0];
+    }
+
+    private static int readOrdersSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        final int count = src.getInt(pos);
+        pos += 4;
+        if (count < 0 || (long) count * CoreOrder.SNAPSHOT_BYTES != limit - pos) {
+            throw new IllegalStateException("balance snapshot ORDERS section declares " + count + " orders");
+        }
+        final OrderEngine oe = engine.orders();
+        for (int i = 0; i < count; i++) {
+            final CoreOrder o = oe.orders().acquire();
+            pos = readOrder(src, pos, o);
+            oe.restoreOrder(o);
+        }
+        return pos;
+    }
+
+    private static int readUserRiskSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        final int count = src.getInt(pos);
+        pos += 4;
+        if (count < 0 || (long) count * UserRisk.SNAPSHOT_BYTES != limit - pos) {
+            throw new IllegalStateException("balance snapshot USER_RISK section declares " + count + " users");
+        }
+        for (int i = 0; i < count; i++) {
+            final UserRisk u = engine.orders().userOrCreate(src.getLong(pos)); pos += 8;
+            u.secBucket = src.getLong(pos); pos += 8;
+            u.secCount = src.getInt(pos); pos += 4;
+            u.minBucket = src.getLong(pos); pos += 8;
+            u.minCount = src.getInt(pos); pos += 4;
+            for (int m = 0; m < UserRisk.MARKET_SLOTS; m++) {
+                u.position[m] = src.getLong(pos); pos += 8;
+            }
+        }
+        return pos;
+    }
+
+    private static int readMarketStateSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        final int count = src.getInt(pos);
+        pos += 4;
+        if (count != UserRisk.MARKET_SLOTS || (long) count * MarketRisk.SNAPSHOT_BYTES != limit - pos) {
+            throw new IllegalStateException("balance snapshot MARKET_STATE section declares " + count + " markets");
+        }
+        for (int id = 0; id < count; id++) {
+            final MarketRisk m = engine.orders().market(id);
+            m.configVersion = src.getLong(pos); pos += 8;
+            m.minQuantity = src.getLong(pos); pos += 8;
+            m.maxQuantity = src.getLong(pos); pos += 8;
+            m.minNotional = src.getLong(pos); pos += 8;
+            m.maxNotional = src.getLong(pos); pos += 8;
+            m.maxPositionPerMarket = src.getLong(pos); pos += 8;
+            m.lastTradePrice = src.getLong(pos); pos += 8;
+            m.lastTradeId = src.getLong(pos); pos += 8;
+            m.bestBid = src.getLong(pos); pos += 8;
+            m.bestAsk = src.getLong(pos); pos += 8;
+            m.bookVersion = src.getLong(pos); pos += 8;
+            m.lastTickTs = src.getLong(pos); pos += 8;
+            m.priceCollarBps = src.getInt(pos); pos += 4;
+            m.maxOrdersPerSec = src.getInt(pos); pos += 4;
+            m.maxOrdersPerMin = src.getInt(pos); pos += 4;
+            m.maxOpenOrders = src.getInt(pos); pos += 4;
+            m.marketBuySlippageBps = src.getInt(pos); pos += 4;
+            m.breakerTripped = src.getByte(pos) != 0; pos += 1;
+        }
+        return pos;
+    }
+
+    private static int readRequestsSection(DirectBuffer src, int start, int limit, AssetsEngine engine) {
+        int pos = start;
+        engine.orders().requests().setNextRequestSeq(src.getLong(pos)); pos += 8;
+        final int count = src.getInt(pos); pos += 4;
+        if (count < 0 || (long) count * RequestTable.ENTRY_BYTES != limit - pos) {
+            throw new IllegalStateException("balance snapshot REQUEST_IDS section declares " + count + " rows");
+        }
+        for (int i = 0; i < count; i++) {
+            final RequestTable.Entry e = new RequestTable.Entry();
+            e.userId = src.getLong(pos); pos += 8;
+            e.high = src.getLong(pos); pos += 8;
+            e.low = src.getLong(pos); pos += 8;
+            e.requestSeq = src.getLong(pos); pos += 8;
+            e.fingerprint = src.getLong(pos); pos += 8;
+            e.expiresAtMs = src.getLong(pos); pos += 8;
+            e.orderId = src.getLong(pos); pos += 8;
+            e.kind = src.getByte(pos); pos += 1;
+            e.reason = src.getByte(pos); pos += 1;
+            engine.orders().restoreRequest(e);
+        }
+        return pos;
     }
 
     /** Section 5: the order-entry gate, marketId 0 (global) .. MARKETS, {marketId:int, state:u8, reason:u8}. */
@@ -327,6 +576,35 @@ public final class BalanceSnapshotCodec {
                     if (counts[2] != sectionEnd) {
                         throw new IllegalStateException("balance snapshot ACCOUNTS section declares " + sectionLength
                                 + " bytes but decodes " + (counts[2] - pos));
+                    }
+                    break;
+                }
+                case SECTION_ORDERS: {
+                    final int endPos = readOrdersSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot ORDERS section declares " + sectionLength
+                                + " bytes but decodes " + (endPos - pos));
+                    }
+                    break;
+                }
+                case SECTION_USER_RISK: {
+                    final int endPos = readUserRiskSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot USER_RISK section length mismatch");
+                    }
+                    break;
+                }
+                case SECTION_MARKET_STATE: {
+                    final int endPos = readMarketStateSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot MARKET_STATE section length mismatch");
+                    }
+                    break;
+                }
+                case SECTION_REQUEST_IDS: {
+                    final int endPos = readRequestsSection(src, pos, sectionEnd, engine);
+                    if (endPos != sectionEnd) {
+                        throw new IllegalStateException("balance snapshot REQUEST_IDS section length mismatch");
                     }
                     break;
                 }

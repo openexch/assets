@@ -13,7 +13,10 @@ import com.openexchange.assets.infrastructure.generated.RegisterSessionDecoder;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.domain.Asset;
+import com.openexchange.assets.domain.commands.CancelOrderCommand;
+import com.openexchange.assets.domain.commands.CreateOrderCommand;
 import com.openexchange.assets.domain.commands.DepositCommand;
+import com.openexchange.assets.domain.commands.RiskConfigSetCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.InitTradeHighWaterCommand;
 import com.openexchange.assets.domain.commands.ReleaseCommand;
@@ -279,6 +282,15 @@ public final class AssetsSbeDemuxer {
     }
 
     private final RegisterSessionDecoder registerSessionDecoder = new RegisterSessionDecoder();
+    private final CreateOrderDecoder createOrderDecoder = new CreateOrderDecoder();
+    private final CancelOrderDecoder cancelOrderDecoder = new CancelOrderDecoder();
+    private final MarketTickDecoder marketTickDecoder = new MarketTickDecoder();
+    private final RiskConfigSetDecoder riskConfigSetDecoder = new RiskConfigSetDecoder();
+    private final CircuitBreakerDecoder circuitBreakerDecoder = new CircuitBreakerDecoder();
+    private final RequestRiskConfigDecoder requestRiskConfigDecoder = new RequestRiskConfigDecoder();
+    private final CreateOrderCommand createOrderCommand = new CreateOrderCommand();
+    private final CancelOrderCommand cancelOrderCommand = new CancelOrderCommand();
+    private final RiskConfigSetCommand riskConfigSetCommand = new RiskConfigSetCommand();
     private final OrderEntryGateDecoder orderEntryGateDecoder = new OrderEntryGateDecoder();
     /** A session this registry never saw (or whose principal was unreadable): authorises nothing. */
     private final SessionAuthority unknownSession = new SessionAuthority(-2L, null);
@@ -388,8 +400,14 @@ public final class AssetsSbeDemuxer {
         //    deterministically; any failure after `applying = true` latches and escapes to the service.
         try {
             switch (templateId) {
-                case DepositDecoder.TEMPLATE_ID:                handleDeposit(timestamp); break;
-                case WithdrawDecoder.TEMPLATE_ID:               handleWithdraw(timestamp); break;
+                case DepositDecoder.TEMPLATE_ID:                handleDeposit(authority, timestamp); break;
+                case WithdrawDecoder.TEMPLATE_ID:               handleWithdraw(authority, timestamp); break;
+                case CreateOrderDecoder.TEMPLATE_ID:            handleCreateOrder(timestamp); break;
+                case CancelOrderDecoder.TEMPLATE_ID:            handleCancelOrder(timestamp); break;
+                case MarketTickDecoder.TEMPLATE_ID:             handleMarketTick(timestamp); break;
+                case RiskConfigSetDecoder.TEMPLATE_ID:          handleRiskConfigSet(timestamp); break;
+                case CircuitBreakerDecoder.TEMPLATE_ID:         handleCircuitBreaker(timestamp); break;
+                case RequestRiskConfigDecoder.TEMPLATE_ID:      handleRequestRiskConfig(); break;
                 case HoldDecoder.TEMPLATE_ID:                   handleHold(timestamp); break;
                 case ReleaseDecoder.TEMPLATE_ID:                handleRelease(timestamp); break;
                 case SettleDecoder.TEMPLATE_ID:                 handleSettle(timestamp); break;
@@ -408,9 +426,9 @@ public final class AssetsSbeDemuxer {
                     rejectDecode("Subscribe frame reached the engine");
                     break;
                 default:
-                    // v6 order / feed / admin templates defined by this schema and served from RC1 S4+
-                    // (orders, feed, config). Counted so a gateway speaking ahead of this build is
-                    // visible, never silent.
+                    // v6 templates defined by this schema and served from later slices (AmendOrder,
+                    // RequestOrderSnapshot, MeJournal*, RequestPendingDispatch, CoreConfig, QuarantineOrder).
+                    // Counted so a gateway speaking ahead of this build is visible, never silent.
                     unhandled(templateId);
                     break;
             }
@@ -435,11 +453,25 @@ public final class AssetsSbeDemuxer {
 
     // ---- handlers: validate the raw bytes, THEN mark applying, THEN enter the engine ----
 
-    private void handleDeposit(long timestamp) {
+    /** The production money boundaries (GATEWAY, TREASURY) must carry a requestId (critic D5); tools may omit it. */
+    private static boolean requestIdMandatory(final SessionAuthority authority) {
+        return !authority.isTrusted() && (authority.sessionClass() == SessionClass.GATEWAY
+                || authority.sessionClass() == SessionClass.TREASURY);
+    }
+
+    private void handleDeposit(final SessionAuthority authority, long timestamp) {
         depositDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int assetId = depositDecoder.assetId();
         if (!validAsset(assetId)) {
             rejectDecode("Deposit assetId " + assetId);
+            return;
+        }
+        final long rh = depositDecoder.requestIdHigh();
+        final long rl = depositDecoder.requestIdLow();
+        if (rh == 0 && rl == 0 && requestIdMandatory(authority)) {
+            applying = true;
+            engine.rejectUnauthorised(DepositDecoder.TEMPLATE_ID, depositDecoder.correlationId(), depositDecoder.userId(),
+                    CoreRejectReason.MISSING_REQUEST_ID, 0L);
             return;
         }
         depositCommand.reset();
@@ -447,15 +479,25 @@ public final class AssetsSbeDemuxer {
         depositCommand.setUserId(depositDecoder.userId());
         depositCommand.setAssetId(assetId);
         depositCommand.setAmount(depositDecoder.amount());
+        depositCommand.setRequestIdHigh(rh);
+        depositCommand.setRequestIdLow(rl);
         applying = true;
         engine.applyCommand(AssetsEngine.CMD_DEPOSIT, depositCommand, timestamp);
     }
 
-    private void handleWithdraw(long timestamp) {
+    private void handleWithdraw(final SessionAuthority authority, long timestamp) {
         withdrawDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int assetId = withdrawDecoder.assetId();
         if (!validAsset(assetId)) {
             rejectDecode("Withdraw assetId " + assetId);
+            return;
+        }
+        final long rh = withdrawDecoder.requestIdHigh();
+        final long rl = withdrawDecoder.requestIdLow();
+        if (rh == 0 && rl == 0 && requestIdMandatory(authority)) {
+            applying = true;
+            engine.rejectUnauthorised(WithdrawDecoder.TEMPLATE_ID, withdrawDecoder.correlationId(), withdrawDecoder.userId(),
+                    CoreRejectReason.MISSING_REQUEST_ID, 0L);
             return;
         }
         withdrawCommand.reset();
@@ -463,8 +505,107 @@ public final class AssetsSbeDemuxer {
         withdrawCommand.setUserId(withdrawDecoder.userId());
         withdrawCommand.setAssetId(assetId);
         withdrawCommand.setAmount(withdrawDecoder.amount());
+        withdrawCommand.setRequestIdHigh(rh);
+        withdrawCommand.setRequestIdLow(rl);
         applying = true;
         engine.applyCommand(AssetsEngine.CMD_WITHDRAW, withdrawCommand, timestamp);
+    }
+
+    // ---- RC1 S4: order ingress (wire validity here, semantics in the order engine) ----
+
+    private void handleCreateOrder(long timestamp) {
+        createOrderDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int side = createOrderDecoder.sideRaw();
+        final int type = createOrderDecoder.orderTypeRaw();
+        final int tif = createOrderDecoder.timeInForceRaw();
+        if (side < 0 || side > 1 || type < 0 || type > 6 || tif < 0 || tif > 3) {
+            rejectDecode("CreateOrder side " + side + " type " + type + " tif " + tif);
+            return;
+        }
+        final CreateOrderCommand c = createOrderCommand;
+        c.reset();
+        c.correlationId = createOrderDecoder.correlationId();
+        c.userId = createOrderDecoder.userId();
+        c.clientOrderIdHigh = createOrderDecoder.clientOrderIdHigh();
+        c.clientOrderIdLow = createOrderDecoder.clientOrderIdLow();
+        c.requestIdHigh = createOrderDecoder.requestIdHigh();
+        c.requestIdLow = createOrderDecoder.requestIdLow();
+        c.marketId = createOrderDecoder.marketId();
+        c.side = side;
+        c.orderType = type;
+        c.timeInForce = tif;
+        c.price = createOrderDecoder.price();
+        c.quantity = createOrderDecoder.quantity();
+        c.budget = createOrderDecoder.budget();
+        c.stopPrice = createOrderDecoder.stopPrice();
+        c.trailingDelta = createOrderDecoder.trailingDelta();
+        c.displayQty = createOrderDecoder.displayQty();
+        c.expiresAtMs = createOrderDecoder.expiresAtMs();
+        c.flags = (int) frame.getInt(HEADER + CreateOrderDecoder.flagsEncodingOffset());
+        applying = true;
+        engine.orders().applyCreate(c, timestamp);
+    }
+
+    private void handleCancelOrder(long timestamp) {
+        cancelOrderDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final CancelOrderCommand c = cancelOrderCommand;
+        c.reset();
+        c.correlationId = cancelOrderDecoder.correlationId();
+        c.userId = cancelOrderDecoder.userId();
+        c.orderId = cancelOrderDecoder.orderId();
+        c.requestIdHigh = cancelOrderDecoder.requestIdHigh();
+        c.requestIdLow = cancelOrderDecoder.requestIdLow();
+        c.origClientOrderIdHigh = cancelOrderDecoder.origClientOrderIdHigh();
+        c.origClientOrderIdLow = cancelOrderDecoder.origClientOrderIdLow();
+        applying = true;
+        engine.orders().applyCancel(c, timestamp);
+    }
+
+    private void handleMarketTick(long timestamp) {
+        marketTickDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        applying = true;
+        engine.orders().applyMarketTick(marketTickDecoder.marketId(), marketTickDecoder.bookVersion(),
+                marketTickDecoder.bestBid(), marketTickDecoder.bestAsk(), marketTickDecoder.lastTradePrice(),
+                marketTickDecoder.lastTradeId(), marketTickDecoder.meEpoch(), timestamp);
+    }
+
+    private void handleRiskConfigSet(long timestamp) {
+        riskConfigSetDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final RiskConfigSetCommand c = riskConfigSetCommand;
+        c.reset();
+        c.correlationId = riskConfigSetDecoder.correlationId();
+        c.configVersion = riskConfigSetDecoder.configVersion();
+        c.marketId = riskConfigSetDecoder.marketId();
+        c.minQuantity = riskConfigSetDecoder.minQuantity();
+        c.maxQuantity = riskConfigSetDecoder.maxQuantity();
+        c.minNotional = riskConfigSetDecoder.minNotional();
+        c.maxNotional = riskConfigSetDecoder.maxNotional();
+        c.priceCollarBps = (int) riskConfigSetDecoder.priceCollarBps();
+        c.maxOrdersPerSec = riskConfigSetDecoder.maxOrdersPerSec();
+        c.maxOrdersPerMin = riskConfigSetDecoder.maxOrdersPerMin();
+        c.maxOpenOrders = riskConfigSetDecoder.maxOpenOrders();
+        c.maxPositionPerMarket = riskConfigSetDecoder.maxPositionPerMarket();
+        c.marketBuySlippageBps = (int) riskConfigSetDecoder.marketBuySlippageBps();
+        applying = true;
+        engine.orders().applyRiskConfigSet(c, timestamp);
+    }
+
+    private void handleCircuitBreaker(long timestamp) {
+        circuitBreakerDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int action = circuitBreakerDecoder.actionRaw();
+        if (action < 0 || action > 1) {
+            rejectDecode("CircuitBreaker action " + action);
+            return;
+        }
+        applying = true;
+        engine.orders().applyCircuitBreaker(circuitBreakerDecoder.correlationId(), circuitBreakerDecoder.marketId(),
+                action == 1, timestamp);
+    }
+
+    private void handleRequestRiskConfig() {
+        requestRiskConfigDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        applying = true;
+        engine.orders().applyRequestRiskConfig(requestRiskConfigDecoder.correlationId(), requestRiskConfigDecoder.marketId());
     }
 
     private void handleHold(long timestamp) {

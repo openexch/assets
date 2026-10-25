@@ -18,14 +18,14 @@ public interface AssetsEventSink {
      * {@code correlationId} echoes the request's client-chosen id (0 = fire-and-forget). Emitted before
      * the resulting {@link #onBalanceUpdate}. {@code newAvailable} is the post-credit available balance.
      */
-    void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable);
+    void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable, boolean duplicate);
 
     /**
      * A withdrawal was applied: {@code amount} of {@code assetId} debited from the user's available
      * balance. {@code correlationId} echoes the request's client-chosen id. Emitted before the resulting
      * {@link #onBalanceUpdate}. {@code newAvailable} is the post-debit available balance.
      */
-    void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable);
+    void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable, boolean duplicate);
 
     /** A hold was accepted: {@code amount} of {@code assetId} moved available -> locked for the user. */
     void onHoldAck(long correlationId, long orderId, long userId, int assetId, long amount);
@@ -97,4 +97,26 @@ public interface AssetsEventSink {
     /** Gate state for one market (0 = global); BROADCAST on control, or ORIGIN when answering RegisterSession. */
     void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
                           long atMs, long logPosition, boolean toOrigin);
+
+    // ---- RC1 S4: order admission, dispatch, money requestId outcomes, config ----
+
+    /** ORIGIN reply to CreateOrder/CancelOrder/AmendOrder (wire OrderAck). */
+    void onOrderAck(long correlationId, long requestIdHigh, long requestIdLow, long orderId, long userId, int marketId,
+                    OrderStatus status, boolean duplicate, int holdAssetId, long holdAmount, long acceptedAtMs, long eventSeq);
+
+    /** BROADCAST orders channel (wire OrderEvent): one per transition, dense eventSeq. */
+    void onOrderEvent(long eventSeq, long logPosition, CoreOrderView order, EventKind kind, CoreRejectReason reason,
+                      long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs);
+
+    /** BROADCAST dispatch channel (wire MeDispatch): one durable ME command the forwarder relays verbatim. */
+    void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                      long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                      long quantity, long budget, int timeInForceCode);
+
+    /** ORIGIN: a deposit was refused (wire DepositReject); v5 emitted nothing here (critic D13). */
+    void onDepositReject(long correlationId, long requestIdHigh, long requestIdLow, long userId, int assetId, long amount,
+                         RejectReason reason);
+
+    /** BROADCAST control: a config record was applied (wire ConfigApplied). */
+    void onConfigApplied(ConfigKind kind, int marketId, long configVersion, long logPosition);
 }

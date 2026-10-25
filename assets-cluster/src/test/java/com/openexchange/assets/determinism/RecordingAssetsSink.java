@@ -3,6 +3,11 @@ package com.openexchange.assets.determinism;
 
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.ConfigKind;
+import com.openexchange.assets.domain.CoreOrderView;
+import com.openexchange.assets.domain.DispatchKind;
+import com.openexchange.assets.domain.EventKind;
+import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.CoreRejectReason;
 import com.openexchange.assets.domain.GateReason;
 import com.openexchange.assets.domain.GateState;
@@ -25,13 +30,13 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     private final List<AssetsEngineEvent> events = new ArrayList<>();
 
     @Override
-    public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
-        events.add(new AssetsEngineEvent.DepositAck(correlationId, userId, assetId, amount, newAvailable));
+    public void onDepositAck(long correlationId, long userId, int assetId, long amount, long newAvailable, boolean duplicate) {
+        events.add(new AssetsEngineEvent.DepositAck(correlationId, userId, assetId, amount, newAvailable, duplicate));
     }
 
     @Override
-    public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable) {
-        events.add(new AssetsEngineEvent.WithdrawAck(correlationId, userId, assetId, amount, newAvailable));
+    public void onWithdrawAck(long correlationId, long userId, int assetId, long amount, long newAvailable, boolean duplicate) {
+        events.add(new AssetsEngineEvent.WithdrawAck(correlationId, userId, assetId, amount, newAvailable, duplicate));
     }
 
     @Override
@@ -127,5 +132,38 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     public void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
                                  long atMs, long logPosition, boolean toOrigin) {
         events.add(new AssetsEngineEvent.AdmissionState(marketId, gateState, gateReason, circuitBreaker, toOrigin));
+    }
+
+    @Override
+    public void onOrderAck(long correlationId, long requestIdHigh, long requestIdLow, long orderId, long userId, int marketId,
+                           OrderStatus status, boolean duplicate, int holdAssetId, long holdAmount, long acceptedAtMs, long eventSeq) {
+        events.add(new AssetsEngineEvent.OrderAck(correlationId, orderId, userId, marketId, status, duplicate, holdAssetId, holdAmount, eventSeq));
+    }
+
+    @Override
+    public void onOrderEvent(long eventSeq, long logPosition, CoreOrderView o, EventKind kind, CoreRejectReason reason,
+                             long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs) {
+        events.add(new AssetsEngineEvent.OrderEvent(eventSeq, o.orderId(), o.userId(), o.marketId(), kind,
+                OrderStatus.fromCode(o.statusCode()), reason, o.price(), o.quantity(), o.filledQty(), o.remainingQty(),
+                lastPrice, lastQty, tradeId, o.meOrderId(), o.holdAssetId(), o.holdAmount(), holdRemaining));
+    }
+
+    @Override
+    public void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                             long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                             long quantity, long budget, int timeInForceCode) {
+        events.add(new AssetsEngineEvent.MeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId,
+                oldOrderId, marketId, orderTypeCode, sideCode, price, quantity, budget, timeInForceCode));
+    }
+
+    @Override
+    public void onDepositReject(long correlationId, long requestIdHigh, long requestIdLow, long userId, int assetId, long amount,
+                                RejectReason reason) {
+        events.add(new AssetsEngineEvent.DepositReject(correlationId, userId, assetId, amount, reason));
+    }
+
+    @Override
+    public void onConfigApplied(ConfigKind kind, int marketId, long configVersion, long logPosition) {
+        events.add(new AssetsEngineEvent.ConfigApplied(kind, marketId, configVersion));
     }
 }

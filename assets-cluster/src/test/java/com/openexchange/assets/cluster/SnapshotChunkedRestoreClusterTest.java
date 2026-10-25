@@ -328,7 +328,7 @@ public class SnapshotChunkedRestoreClusterTest {
 
     private void deposit(final AeronCluster client, final long user, final long amount, final long correlationId) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
-                .correlationId(correlationId).userId(user).assetId(Asset.USD.id()).amount(amount);
+                .correlationId(correlationId).userId(user).assetId(Asset.USD.id()).amount(amount).requestIdHigh(0).requestIdLow(0);
         offer(client, MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength());
     }
 

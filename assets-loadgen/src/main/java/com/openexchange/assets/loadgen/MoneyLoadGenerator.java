@@ -502,7 +502,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
 
     private void sendDeposit(final long corrId, final long userId, final int assetId, final long amountFp) {
         depositEnc.wrapAndApplyHeader(aeBuffer, 0, aeHeaderEnc)
-                .correlationId(corrId).userId(userId).assetId(assetId).amount(amountFp);
+                .correlationId(corrId).userId(userId).assetId(assetId).amount(amountFp).requestIdHigh(0).requestIdLow(0);
         final int len = aeHeaderEnc.encodedLength() + depositEnc.encodedLength();
         offerWithRetry(ae, aeBuffer, len, true);
     }
