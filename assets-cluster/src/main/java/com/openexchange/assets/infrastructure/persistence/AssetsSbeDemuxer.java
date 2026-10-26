@@ -674,9 +674,12 @@ public final class AssetsSbeDemuxer {
     private void handleMeJournalTradeBatch(long timestamp) {
         meJournalTradeBatchDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         // Raw enum bytes are validated for the WHOLE group before the first entry is applied (K5: no partial batch).
-        final int count = meJournalTradeBatchDecoder.trades().count();
-        final int blockLength = MeJournalTradeBatchDecoder.TradesDecoder.sbeBlockLength();
-        final int groupStart = HEADER + MeJournalTradeBatchDecoder.BLOCK_LENGTH + MeJournalTradeBatchDecoder.TradesDecoder.sbeHeaderSize();
+        // The frame's OWN dimensions (root block, group entry block) locate the bytes, exactly as the generated decoder
+        // will read them (RC1 S8 fuzz finding: the generated constants misread a widened block).
+        final int groupOffset = HEADER + headerDecoder.blockLength();
+        final int blockLength = Short.toUnsignedInt(frame.getShort(groupOffset, ByteOrder.LITTLE_ENDIAN));
+        final int count = Short.toUnsignedInt(frame.getShort(groupOffset + 2, ByteOrder.LITTLE_ENDIAN));
+        final int groupStart = groupOffset + GROUP_HEADER;
         for (int i = 0; i < count; i++) {
             final int raw = frame.getByte(groupStart + i * blockLength + MeJournalTradeBatchDecoder.TradesDecoder.takerIsBuyEncodingOffset()) & 0xFF;
             if (!validBool(raw)) {
