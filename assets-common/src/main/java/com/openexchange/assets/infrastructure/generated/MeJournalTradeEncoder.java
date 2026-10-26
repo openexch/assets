@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class MeJournalTradeEncoder
 {
-    public static final int BLOCK_LENGTH = 101;
+    public static final int BLOCK_LENGTH = 109;
     public static final int TEMPLATE_ID = 61;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeJournalTradeEncoder parentMessage = this;
@@ -805,6 +805,58 @@ public final class MeJournalTradeEncoder
     public MeJournalTradeEncoder meEpoch(final long value)
     {
         buffer.putLong(offset + 93, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int journalSeqId()
+    {
+        return 15;
+    }
+
+    public static int journalSeqSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int journalSeqEncodingOffset()
+    {
+        return 101;
+    }
+
+    public static int journalSeqEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String journalSeqMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long journalSeqNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long journalSeqMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long journalSeqMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public MeJournalTradeEncoder journalSeq(final long value)
+    {
+        buffer.putLong(offset + 101, value, BYTE_ORDER);
         return this;
     }
 

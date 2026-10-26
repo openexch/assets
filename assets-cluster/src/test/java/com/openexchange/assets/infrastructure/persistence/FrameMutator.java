@@ -119,15 +119,18 @@ final class FrameMutator {
                     new Field("orderType", CreateOrderDecoder.orderTypeEncodingOffset(), 1, 0, 6),
                     new Field("timeInForce", CreateOrderDecoder.timeInForceEncodingOffset(), 1, 0, 3));
             case MeJournalTradeDecoder.TEMPLATE_ID -> List.of(new Field("takerIsBuy", MeJournalTradeDecoder.takerIsBuyEncodingOffset(), 1, 0, 1));
-            case MeJournalTerminalDecoder.TEMPLATE_ID -> List.of(new Field("status", MeJournalTerminalDecoder.statusEncodingOffset(), 1, 2, 5));
+            // v7 (RC2 S1 4.7): rejectReason 0..254 on 63; result 0..8 and timeInForce 0..2 on 64
+            case MeJournalTerminalDecoder.TEMPLATE_ID -> List.of(new Field("status", MeJournalTerminalDecoder.statusEncodingOffset(), 1, 2, 5),
+                    new Field("rejectReason", MeJournalTerminalDecoder.rejectReasonEncodingOffset(), 1, 0, 254));
             case MeCommandOutcomeDecoder.TEMPLATE_ID -> List.of(
                     new Field("commandKind", MeCommandOutcomeDecoder.commandKindEncodingOffset(), 1, 0, 2),
-                    new Field("result", MeCommandOutcomeDecoder.resultEncodingOffset(), 4, 0, 6));
+                    new Field("result", MeCommandOutcomeDecoder.resultEncodingOffset(), 4, 0, 8),
+                    new Field("timeInForce", MeCommandOutcomeDecoder.timeInForceEncodingOffset(), 1, 0, 2));
             case CircuitBreakerDecoder.TEMPLATE_ID -> List.of(new Field("action", CircuitBreakerDecoder.actionEncodingOffset(), 1, 0, 1));
             case OrderEntryGateDecoder.TEMPLATE_ID -> List.of(new Field("state", OrderEntryGateDecoder.stateEncodingOffset(), 1, 0, 1),
-                    new Field("reason", OrderEntryGateDecoder.reasonEncodingOffset(), 1, 0, 6));
+                    new Field("reason", OrderEntryGateDecoder.reasonEncodingOffset(), 1, 0, 8)); // v7: GateReason 0..8
             case RegisterSessionDecoder.TEMPLATE_ID -> List.of(
-                    new Field("sessionClass", RegisterSessionDecoder.sessionClassEncodingOffset(), 1, 0, 6),
+                    new Field("sessionClass", RegisterSessionDecoder.sessionClassEncodingOffset(), 1, 0, 7), // v7: 7 REPLICA
                     new Field("resumable", RegisterSessionDecoder.resumableEncodingOffset(), 1, 0, 1));
             default -> List.of();
         };

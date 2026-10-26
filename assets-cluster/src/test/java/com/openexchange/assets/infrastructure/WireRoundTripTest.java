@@ -39,6 +39,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * End-to-end validation of the cluster seams (not just compilation): an SBE ingress message decoded by
@@ -509,6 +510,297 @@ public class WireRoundTripTest {
         queryReply[0] = false;
         p.onBalanceUpdate(2, 0, 100, 0);
         assertRouting(egress, AssetsEventPublisher.Routing.BROADCAST, "live BalanceUpdate after the reply");
+    }
+
+    // ---- RC2 S1 (contract 8.1 assets, 8.3): money-schema v7 templates and tails ----
+
+    /** Copies every emitted frame (the publisher reuses one scratch buffer). */
+    private static final class RawEgress implements AssetsEventPublisher.Egress {
+        final List<byte[]> frames = new ArrayList<>();
+
+        @Override
+        public void emit(MutableDirectBuffer buffer, int offset, int length, int channel, AssetsEventPublisher.Routing routing) {
+            final byte[] copy = new byte[length];
+            buffer.getBytes(offset, copy);
+            frames.add(copy);
+        }
+
+        UnsafeBuffer last() {
+            return new UnsafeBuffer(frames.get(frames.size() - 1));
+        }
+    }
+
+    private static MessageHeaderDecoder headerOf(final UnsafeBuffer b) {
+        return new MessageHeaderDecoder().wrap(b, 0);
+    }
+
+    /** An OrderEvent whose body is all 0xFF where the order carries a long: dirties the publisher scratch. */
+    private static UnsafeBuffer dirtyScratch(final AssetsEventPublisher p, final RawEgress egress) {
+        final com.openexchange.assets.application.engine.order.CoreOrder o = new com.openexchange.assets.application.engine.order.CoreOrder();
+        o.clear();
+        o.orderId = -1; o.userId = -1; o.price = -1; o.stopPrice = -1; o.quantity = -1; o.filledQty = -1; o.remainingQty = -1;
+        o.holdAmount = -1; o.clientOrderIdHigh = -1; o.clientOrderIdLow = -1; o.createdAtMs = -1; o.currentLegId = -1;
+        o.marketId = -1;
+        o.timeInForce = 1;
+        p.onOrderEvent(-1L, -1L, o, com.openexchange.assets.domain.EventKind.ACK_NEW,
+                com.openexchange.assets.domain.CoreRejectReason.NONE, -1L, -1L, -1L, -1L, -1L);
+        return egress.last();
+    }
+
+    @Test
+    public void v7NewTemplatesRoundTrip() {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[2048]);
+        final MessageHeaderEncoder he = new MessageHeaderEncoder();
+        final MessageHeaderDecoder hd = new MessageHeaderDecoder();
+
+        new com.openexchange.assets.infrastructure.generated.FeedHaltEncoder().wrapAndApplyHeader(b, 0, he).correlationId(1)
+                .reason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.SETTLE_REFUSED).meEpochSeen(2)
+                .expectedJournalSeq(3).seenJournalSeq(4).bridgeIdentity(5);
+        final var fh = new com.openexchange.assets.infrastructure.generated.FeedHaltDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(66, hd.templateId());
+        assertEquals(7, hd.version());
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L), List.of(fh.correlationId(), fh.meEpochSeen(), fh.expectedJournalSeq(),
+                fh.seenJournalSeq(), fh.bridgeIdentity()));
+        assertEquals(com.openexchange.assets.infrastructure.generated.FeedHaltReason.SETTLE_REFUSED, fh.reason());
+
+        for (final int n : new int[] {0, 1, 48}) {
+            final var re = new com.openexchange.assets.infrastructure.generated.MeCommandReleaseEncoder().wrapAndApplyHeader(b, 0, he)
+                    .egressSeq(10).journalSeq(11).meEpoch(12).releaseSeq(13).ledgerSize(14).ledgerCapacity(15).tombstoneRanges(16);
+            final var g = re.releasesCount(n);
+            for (int i = 0; i < n; i++) {
+                g.next().commandIdHigh(100 + i).idLowFloor(4 * i)
+                        .scope(i % 2 == 0 ? com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO
+                                : com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER)
+                        .result(com.openexchange.assets.infrastructure.generated.ReleaseResult.get((short) (i % 3)))
+                        .removed(i);
+            }
+            assertEquals(MessageHeaderEncoder.ENCODED_LENGTH + 44 + 4 + 22 * n, MessageHeaderEncoder.ENCODED_LENGTH + re.encodedLength());
+            final var rd = new com.openexchange.assets.infrastructure.generated.MeCommandReleaseDecoder().wrapAndApplyHeader(b, 0, hd);
+            assertEquals(List.of(10L, 11L, 12L, 13L), List.of(rd.egressSeq(), rd.journalSeq(), rd.meEpoch(), rd.releaseSeq()));
+            assertEquals(List.of(14, 15, 16), List.of(rd.ledgerSize(), rd.ledgerCapacity(), rd.tombstoneRanges()));
+            int i = 0;
+            for (final var e : rd.releases()) {
+                assertEquals(100 + i, e.commandIdHigh());
+                assertEquals(4L * i, e.idLowFloor());
+                assertEquals(i % 2, e.scopeRaw());
+                assertEquals(i % 3, e.resultRaw());
+                assertEquals(i, e.removed());
+                i++;
+            }
+            assertEquals(n, i);
+        }
+
+        new com.openexchange.assets.infrastructure.generated.MeEngineConfigEncoder().wrapAndApplyHeader(b, 0, he)
+                .egressSeq(20).journalSeq(1).meEpoch(21).configVersion(3).behaviorVersion(2).ledgerCapacity(100_000L)
+                .maxWireVersion(12).decision(com.openexchange.assets.infrastructure.generated.ConfigDecision.BUMP);
+        final var ec = new com.openexchange.assets.infrastructure.generated.MeEngineConfigDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(List.of(20L, 1L, 21L, 3L, 2L, 100_000L), List.of(ec.egressSeq(), ec.journalSeq(), ec.meEpoch(),
+                ec.configVersion(), ec.behaviorVersion(), ec.ledgerCapacity()));
+        assertEquals(12, ec.maxWireVersion());
+        assertEquals(com.openexchange.assets.infrastructure.generated.ConfigDecision.BUMP, ec.decision());
+
+        new com.openexchange.assets.infrastructure.generated.FeedLatchClearEncoder().wrapAndApplyHeader(b, 0, he).correlationId(30)
+                .haltReason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.GAP).journalSeq(31);
+        final var lc = new com.openexchange.assets.infrastructure.generated.FeedLatchClearDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(76, hd.templateId());
+        assertEquals(30, lc.correlationId());
+        assertEquals(com.openexchange.assets.infrastructure.generated.FeedHaltReason.GAP, lc.haltReason());
+        assertEquals(31, lc.journalSeq());
+
+        new com.openexchange.assets.infrastructure.generated.RegisterSessionEncoder().wrapAndApplyHeader(b, 0, he).correlationId(40)
+                .sessionClass(com.openexchange.assets.infrastructure.generated.SessionClass.REPLICA).readerKind((short) 0)
+                .resumable(BoolFlag.TRUE).identity(0).sourceEpoch(0);
+        final var rs = new com.openexchange.assets.infrastructure.generated.RegisterSessionDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(7, rs.sessionClassRaw());
+        assertEquals(com.openexchange.assets.infrastructure.generated.SessionClass.REPLICA, rs.sessionClass());
+    }
+
+    @Test
+    public void v7FeedAndBatchTailsRoundTrip() {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[8192]);
+        final MessageHeaderEncoder he = new MessageHeaderEncoder();
+        final MessageHeaderDecoder hd = new MessageHeaderDecoder();
+        new com.openexchange.assets.infrastructure.generated.MeCommandOutcomeEncoder().wrapAndApplyHeader(b, 0, he)
+                .result(8).meEpoch(1).journalSeq(2).timeInForce((short) 2).expectedOldRemaining(3).ledgerSize(4)
+                .ledgerCapacity(5).behaviorVersion(6);
+        final var oc = new com.openexchange.assets.infrastructure.generated.MeCommandOutcomeDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(List.of(8L, 1L, 2L, 2L, 3L, 4L, 5L, 6L), List.of((long) oc.result(), oc.meEpoch(), oc.journalSeq(),
+                (long) oc.timeInForce(), oc.expectedOldRemaining(), (long) oc.ledgerSize(), (long) oc.ledgerCapacity(),
+                oc.behaviorVersion()));
+
+        new com.openexchange.assets.infrastructure.generated.MeJournalTerminalEncoder().wrapAndApplyHeader(b, 0, he)
+                .journalSeq(9).rejectReason((short) 254);
+        final var jt = new com.openexchange.assets.infrastructure.generated.MeJournalTerminalDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(9, jt.journalSeq());
+        assertEquals(254, jt.rejectReason());
+
+        final var tb = new com.openexchange.assets.infrastructure.generated.MeJournalTradeBatchEncoder().wrapAndApplyHeader(b, 0, he);
+        final var tg = tb.tradesCount(64);
+        for (int i = 0; i < 64; i++) {
+            tg.next().tradeId(i).journalSeq(1_000 + i);
+        }
+        assertEquals(6988, MessageHeaderEncoder.ENCODED_LENGTH + tb.encodedLength());
+        int i = 0;
+        for (final var t : new com.openexchange.assets.infrastructure.generated.MeJournalTradeBatchDecoder().wrapAndApplyHeader(b, 0, hd).trades()) {
+            assertEquals(1_000 + i, t.journalSeq());
+            i++;
+        }
+        assertEquals(64, i);
+
+        final var ob = new com.openexchange.assets.infrastructure.generated.OrderEventBatchEncoder().wrapAndApplyHeader(b, 0, he);
+        final var og = ob.eventsCount(48);
+        for (int k = 0; k < 48; k++) {
+            og.next().orderId(k).meReason((short) (k == 0 ? 255 : k));
+        }
+        assertEquals(8028, MessageHeaderEncoder.ENCODED_LENGTH + ob.encodedLength());
+        i = 0;
+        for (final var e : new com.openexchange.assets.infrastructure.generated.OrderEventBatchDecoder().wrapAndApplyHeader(b, 0, hd).events()) {
+            assertEquals(i == 0 ? 255 : i, e.meReason());
+            i++;
+        }
+        assertEquals(48, i);
+
+        final var db = new com.openexchange.assets.infrastructure.generated.MeDispatchBatchEncoder().wrapAndApplyHeader(b, 0, he);
+        final var dg = db.dispatchesCount(64);
+        for (int k = 0; k < 64; k++) {
+            dg.next().dispatchSeq(k).releaseScope(com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER)
+                    .expectedOldRemaining(k * 10L);
+        }
+        i = 0;
+        for (final var d : new com.openexchange.assets.infrastructure.generated.MeDispatchBatchDecoder().wrapAndApplyHeader(b, 0, hd).dispatches()) {
+            assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER, d.releaseScope());
+            assertEquals(i * 10L, d.expectedOldRemaining());
+            i++;
+        }
+        assertEquals(64, i);
+    }
+
+    /** 4.6: the publisher writes the S1 value of every appended egress field, over a dirty scratch buffer. */
+    @Test
+    public void publisherWritesTheS1ValuesOfTheV7Tails() {
+        final RawEgress egress = new RawEgress();
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> false);
+
+        // 17 FeedPositionReport: 0, 0, FALSE, NONE
+        UnsafeBuffer dirty = dirtyScratch(p, egress);
+        // precondition: every v7 field of 17 (meEpoch @25, lastAppliedJournalSeq @33, feedHalted @41, haltReason @42)
+        // starts over nonzero scratch bytes
+        assertTrue(dirty.getLong(MessageHeaderEncoder.ENCODED_LENGTH + 25) != 0);
+        assertTrue(dirty.getLong(MessageHeaderEncoder.ENCODED_LENGTH + 33) != 0);
+        assertTrue(dirty.getByte(MessageHeaderEncoder.ENCODED_LENGTH + 41) != 0);
+        assertTrue(dirty.getByte(MessageHeaderEncoder.ENCODED_LENGTH + 42) != 0);
+        assertTrue(dirty.getInt(MessageHeaderEncoder.ENCODED_LENGTH + 23) != 0); // 109 gateReasons @23
+        p.onFeedPositionReport(1L, 2L, 3L, true);
+        UnsafeBuffer f = egress.last();
+        final FeedPositionReportDecoder fp = new FeedPositionReportDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(43, headerOf(f).blockLength());
+        assertEquals(0L, fp.meEpoch());
+        assertEquals(0L, fp.lastAppliedJournalSeq());
+        assertEquals(BoolFlag.FALSE, fp.feedHalted());
+        assertEquals(com.openexchange.assets.infrastructure.generated.FeedHaltReason.NONE, fp.haltReason());
+
+        // 109 AdmissionState: OPEN -> 0, SUSPENDED -> 1 << gateReason
+        final Object[][] gates = {
+            {com.openexchange.assets.domain.GateState.OPEN, com.openexchange.assets.domain.GateReason.ADMIN, 0L},
+            {com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.ADMIN, 1L},
+            {com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.GENESIS, 1L << 5},
+            {com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.ME_BEHAVIOR, 1L << 8},
+        };
+        for (final Object[] g : gates) {
+            dirtyScratch(p, egress);
+            p.onAdmissionState(1, (com.openexchange.assets.domain.GateState) g[0], (com.openexchange.assets.domain.GateReason) g[1],
+                    false, 5L, 6L, false);
+            f = egress.last();
+            final var as = new com.openexchange.assets.infrastructure.generated.AdmissionStateDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+            assertEquals(g[0] + "/" + g[1], (long) g[2], as.gateReasons().getRaw());
+            assertEquals(((com.openexchange.assets.domain.GateReason) g[1]).code(), as.gateReasonRaw());
+        }
+
+        // 102 OrderEvent: meReason 255 (not ME-sourced)
+        dirtyScratch(p, egress);
+        f = egress.last();
+        final OrderEventDecoderView oe = new OrderEventDecoderView(f);
+        assertEquals(255, oe.meReason());
+
+        // 104 MeDispatch (broadcast and the ORIGIN reply): releaseScope 0, expectedOldRemaining 0
+        dirty = dirtyScratch(p, egress);
+        assertTrue(dirty.getLong(MessageHeaderEncoder.ENCODED_LENGTH + 81) != 0);
+        p.onMeDispatch(1L, 2L, 3L, com.openexchange.assets.domain.DispatchKind.CREATE, 4L, 5L, 6L, 1, 0, 0, 7L, 8L, 9L, 0);
+        f = egress.last();
+        var md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(89, headerOf(f).blockLength());
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+        assertEquals(0L, md.expectedOldRemaining());
+        dirtyScratch(p, egress);
+        p.onMeDispatchReply(1L, 2L, 3L, com.openexchange.assets.domain.DispatchKind.CANCEL, 4L, 5L, 6L, 1, 0, 0, 7L, 8L, 9L, 0);
+        f = egress.last();
+        md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+        assertEquals(0L, md.expectedOldRemaining());
+    }
+
+    private static final class OrderEventDecoderView {
+        private final com.openexchange.assets.infrastructure.generated.OrderEventDecoder d;
+
+        OrderEventDecoderView(final UnsafeBuffer f) {
+            d = new com.openexchange.assets.infrastructure.generated.OrderEventDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        }
+
+        int meReason() {
+            return d.meReason();
+        }
+    }
+
+    /** 4.4 row 70: genesisId is decoded, excluded from the DUPLICATE equality and not recorded in S1. */
+    @Test
+    public void coreConfigGenesisIdIsNeitherComparedNorRecorded() {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[2048]);
+        final MessageHeaderEncoder he = new MessageHeaderEncoder();
+        final MessageHeaderDecoder hd = new MessageHeaderDecoder();
+        final int len = coreConfig(b, he, 0x1234_5678_9ABCL);
+        final var cd = new com.openexchange.assets.infrastructure.generated.CoreConfigDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals("round trip", 0x1234_5678_9ABCL, cd.genesisId());
+
+        final AssetsEngine engine = new AssetsEngine();
+        final com.openexchange.assets.determinism.RecordingAssetsSink sink = new com.openexchange.assets.determinism.RecordingAssetsSink();
+        engine.setEventSink(sink);
+        engine.setConfigFailFast(() -> { throw new AssertionError("the compiled tables must pass the cross-check"); });
+        final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
+        demuxer.dispatchTrusted(b, 0, len, 1_000L);
+        assertEquals(1, engine.coreConfig().adoptedCount());
+        assertEquals("not recorded in S1", 0L, engine.coreConfig().recorded().genesisId);
+        final org.agrona.ExpandableArrayBuffer img = new org.agrona.ExpandableArrayBuffer();
+        final int imgLen = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, img);
+
+        // the same config under another nonce is a DUPLICATE in S1 (S7 makes it a re-genesis REJECT)
+        demuxer.dispatchTrusted(b, 0, coreConfig(b, he, 42L), 1_000L);
+        assertEquals(1, engine.coreConfig().duplicateCount());
+        assertEquals(0, demuxer.decodeRejectCount());
+        final var ack = (com.openexchange.assets.determinism.AssetsEngineEvent.AdminAck) sink.events().get(sink.events().size() - 1);
+        assertEquals(com.openexchange.assets.domain.AdminResult.DUPLICATE, ack.result());
+        final org.agrona.ExpandableArrayBuffer img2 = new org.agrona.ExpandableArrayBuffer();
+        final int imgLen2 = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, img2);
+        final byte[] a = new byte[imgLen];
+        final byte[] c = new byte[imgLen2];
+        img.getBytes(0, a);
+        img2.getBytes(0, c);
+        org.junit.Assert.assertArrayEquals("the nonce leaves no trace in the image", a, c);
+    }
+
+    /** The compiled market and asset tables as a behaviour-1 CoreConfig (what the cross-check accepts). */
+    private static int coreConfig(final UnsafeBuffer b, final MessageHeaderEncoder he, final long genesisId) {
+        final var e = new com.openexchange.assets.infrastructure.generated.CoreConfigEncoder().wrapAndApplyHeader(b, 0, he)
+                .correlationId(1).configVersion(1).behaviorVersion(1).genesisId(genesisId);
+        final var m = e.marketsCount(com.openexchange.assets.domain.Market.ALL.length);
+        for (final com.openexchange.assets.domain.Market d : com.openexchange.assets.domain.Market.ALL) {
+            m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id()).quoteAssetId(d.quoteAsset().id())
+                    .tickSize(1).minPrice(1).maxPrice(Long.MAX_VALUE / 4).lotSize(1);
+        }
+        final var a = e.assetsCount(Asset.values().length);
+        for (final Asset d : Asset.values()) {
+            a.next().assetId(d.id()).code(d.name()).scale((short) 8);
+        }
+        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
     }
 
     private static void assertChannel(CapturingEgress egress, int expected, String what) {

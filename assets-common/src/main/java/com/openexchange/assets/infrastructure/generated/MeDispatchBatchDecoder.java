@@ -13,8 +13,8 @@ public final class MeDispatchBatchDecoder
     public static final int BLOCK_LENGTH = 0;
     public static final int TEMPLATE_ID = 105;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeDispatchBatchDecoder parentMessage = this;
@@ -211,7 +211,7 @@ public final class MeDispatchBatchDecoder
 
         public static int sbeBlockLength()
         {
-            return 80;
+            return 89;
         }
 
         public int actingBlockLength()
@@ -948,6 +948,113 @@ public final class MeDispatchBatchDecoder
         }
 
 
+        public static int releaseScopeId()
+        {
+            return 15;
+        }
+
+        public static int releaseScopeSinceVersion()
+        {
+            return 7;
+        }
+
+        public static int releaseScopeEncodingOffset()
+        {
+            return 80;
+        }
+
+        public static int releaseScopeEncodingLength()
+        {
+            return 1;
+        }
+
+        public static String releaseScopeMetaAttribute(final MetaAttribute metaAttribute)
+        {
+            if (MetaAttribute.PRESENCE == metaAttribute)
+            {
+                return "required";
+            }
+
+            return "";
+        }
+
+        public short releaseScopeRaw()
+        {
+            if (parentMessage.actingVersion < 7)
+            {
+                return (short)255;
+            }
+
+            return ((short)(buffer.getByte(offset + 80) & 0xFF));
+        }
+
+        public ReleaseScope releaseScope()
+        {
+            if (parentMessage.actingVersion < 7)
+            {
+                return ReleaseScope.NULL_VAL;
+            }
+
+            return ReleaseScope.get(((short)(buffer.getByte(offset + 80) & 0xFF)));
+        }
+
+
+        public static int expectedOldRemainingId()
+        {
+            return 16;
+        }
+
+        public static int expectedOldRemainingSinceVersion()
+        {
+            return 7;
+        }
+
+        public static int expectedOldRemainingEncodingOffset()
+        {
+            return 81;
+        }
+
+        public static int expectedOldRemainingEncodingLength()
+        {
+            return 8;
+        }
+
+        public static String expectedOldRemainingMetaAttribute(final MetaAttribute metaAttribute)
+        {
+            if (MetaAttribute.PRESENCE == metaAttribute)
+            {
+                return "required";
+            }
+
+            return "";
+        }
+
+        public static long expectedOldRemainingNullValue()
+        {
+            return -9223372036854775808L;
+        }
+
+        public static long expectedOldRemainingMinValue()
+        {
+            return -9223372036854775807L;
+        }
+
+        public static long expectedOldRemainingMaxValue()
+        {
+            return 9223372036854775807L;
+        }
+
+        public long expectedOldRemaining()
+        {
+            if (parentMessage.actingVersion < 7)
+            {
+                return -9223372036854775808L;
+            }
+
+            return buffer.getLong(offset + 81, BYTE_ORDER);
+        }
+
+
         public StringBuilder appendTo(final StringBuilder builder)
         {
             if (null == buffer)
@@ -997,6 +1104,12 @@ public final class MeDispatchBatchDecoder
             builder.append('|');
             builder.append("timeInForce=");
             builder.append(this.timeInForce());
+            builder.append('|');
+            builder.append("releaseScope=");
+            builder.append(this.releaseScope());
+            builder.append('|');
+            builder.append("expectedOldRemaining=");
+            builder.append(this.expectedOldRemaining());
             builder.append(')');
 
             return builder;

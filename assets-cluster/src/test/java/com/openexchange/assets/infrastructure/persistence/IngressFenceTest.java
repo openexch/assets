@@ -12,6 +12,14 @@ import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
 import com.openexchange.assets.domain.commands.WithdrawCommand;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
+import com.openexchange.assets.infrastructure.generated.ConfigDecision;
+import com.openexchange.assets.infrastructure.generated.FeedHaltEncoder;
+import com.openexchange.assets.infrastructure.generated.FeedHaltReason;
+import com.openexchange.assets.infrastructure.generated.FeedLatchClearEncoder;
+import com.openexchange.assets.infrastructure.generated.MeCommandReleaseEncoder;
+import com.openexchange.assets.infrastructure.generated.MeEngineConfigEncoder;
+import com.openexchange.assets.infrastructure.generated.ReleaseResult;
+import com.openexchange.assets.infrastructure.generated.ReleaseScope;
 import com.openexchange.assets.infrastructure.generated.CreateOrderEncoder;
 import com.openexchange.assets.infrastructure.generated.CoreConfigEncoder;
 import com.openexchange.assets.infrastructure.generated.DepositEncoder;
@@ -25,12 +33,14 @@ import com.openexchange.assets.infrastructure.generated.SettleEncoder;
 import com.openexchange.assets.infrastructure.generated.Side;
 import com.openexchange.assets.infrastructure.generated.TimeInForce;
 import com.openexchange.assets.infrastructure.generated.WithdrawEncoder;
+import org.agrona.ExpandableArrayBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.Test;
 
 import java.nio.ByteOrder;
 import java.util.List;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
@@ -179,18 +189,18 @@ public class IngressFenceTest {
     }
 
     @Test
-    public void versionOutsideExactSixIsDropped() {
-        // D12: the core speaks exactly v6 from RC1; a v5 producer (the v0.5.0-beta bridge/tools) is not
-        // silently decoded with absent fields, it is dropped and counted.
+    public void versionOutsideExactSevenIsDropped() {
+        // D12 / RC2 D2: the core speaks exactly v7 from RC2 S1; a v6 producer is not silently decoded with absent
+        // fields, it is dropped and counted, and so is a v8 one.
         final Rig r = new Rig();
-        for (final int version : new int[] {0, 5, 7}) {
+        for (final int version : new int[] {0, 6, 8}) {
             final int len = r.deposit(1, 0, 100);
             r.buf.putShort(6, (short) version, ByteOrder.LITTLE_ENDIAN);
             r.dispatch(len);
         }
         assertEquals(3, r.demuxer.schemaRejectCount());
         assertEquals(0, r.engine.accountCount());
-        r.dispatch(r.deposit(1, 0, 100)); // version 6 applies
+        r.dispatch(r.deposit(1, 0, 100)); // version 7 applies
         assertEquals(1, r.engine.accountCount());
     }
 
@@ -388,6 +398,44 @@ public class IngressFenceTest {
         assertEquals(0, r.demuxer.applyErrorCount());
         assertEquals(0, r.engine.accountCount());
         assertEquals("served: the engine took a decision", 1, r.engine.coreConfig().adoptedCount() + r.engine.coreConfig().rejectCount());
+    }
+
+    @Test
+    public void knownButUnservedTemplateIsCountedNotApplied() {
+        // RC2 S1 (section 7): FeedHalt 66, MeCommandRelease 67, MeEngineConfig 68 and FeedLatchClear 76 are defined in
+        // money-schema v7 and served by RC2 S7/S8. Each well-formed frame is counted unhandled: no state, no egress.
+        final Rig r = funded();
+        final byte[] before = snapshot(r.engine);
+        int len = HEADER + new FeedHaltEncoder().wrapAndApplyHeader(r.buf, 0, r.header).correlationId(1)
+                .reason(FeedHaltReason.GAP).meEpochSeen(1).expectedJournalSeq(5).seenJournalSeq(7).bridgeIdentity(9)
+                .encodedLength();
+        r.dispatch(len);
+        final MeCommandReleaseEncoder rel = new MeCommandReleaseEncoder().wrapAndApplyHeader(r.buf, 0, r.header)
+                .egressSeq(1).journalSeq(2).meEpoch(1).releaseSeq(3).ledgerSize(4).ledgerCapacity(5).tombstoneRanges(0);
+        rel.releasesCount(1).next().commandIdHigh(11).idLowFloor(4).scope(ReleaseScope.ORDER).result(ReleaseResult.APPLIED)
+                .removed(1);
+        r.dispatch(HEADER + rel.encodedLength());
+        len = HEADER + new MeEngineConfigEncoder().wrapAndApplyHeader(r.buf, 0, r.header).egressSeq(1).journalSeq(1)
+                .meEpoch(1).configVersion(1).behaviorVersion(1).ledgerCapacity(100_000).maxWireVersion(12)
+                .decision(ConfigDecision.FRESH).encodedLength();
+        r.dispatch(len);
+        len = HEADER + new FeedLatchClearEncoder().wrapAndApplyHeader(r.buf, 0, r.header).correlationId(2)
+                .haltReason(FeedHaltReason.GAP).journalSeq(0).encodedLength();
+        r.dispatch(len);
+        assertEquals(4, r.demuxer.unhandledTemplateCount());
+        assertEquals(0, r.demuxer.decodeRejectCount());
+        assertEquals(0, r.demuxer.unknownTemplateCount());
+        assertEquals(0, r.demuxer.applyErrorCount());
+        assertEquals("no egress", 0, r.events().size());
+        assertArrayEquals("no state", before, snapshot(r.engine));
+    }
+
+    private static byte[] snapshot(final AssetsEngine engine) {
+        final ExpandableArrayBuffer b = new ExpandableArrayBuffer();
+        final int len = BalanceSnapshotCodec.serialize(engine, b);
+        final byte[] out = new byte[len];
+        b.getBytes(0, out);
+        return out;
     }
 
     // ---- RED-F11 / F12: mutation then throw is an apply failure, never poison ----

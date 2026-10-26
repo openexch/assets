@@ -92,6 +92,24 @@ public enum CoreRejectReason
      */
     QTY_OFF_LOT((short)39),
 
+
+    /**
+     * v7: ADMIN OPEN refused while the feed is latched (RC2 S7)
+     */
+    FEED_HALTED((short)40),
+
+
+    /**
+     * v7: ADMIN OPEN refused while meBehaviorVersion &lt; 2 under core behaviour v3 (RC2 S7/S8)
+     */
+    ME_LANE_INACTIVE((short)41),
+
+
+    /**
+     * v7: terminal REJECTED after an INVALID 8 outcome on a pending command (RC2 S8)
+     */
+    ME_INVALID((short)42),
+
     /**
      * To be used to represent not present or null.
      */
@@ -162,6 +180,9 @@ public enum CoreRejectReason
             case 37: return PRICE_OUT_OF_BAND;
             case 38: return PRICE_OFF_TICK;
             case 39: return QTY_OFF_LOT;
+            case 40: return FEED_HALTED;
+            case 41: return ME_LANE_INACTIVE;
+            case 42: return ME_INVALID;
             case 255: return NULL_VAL;
         }
 

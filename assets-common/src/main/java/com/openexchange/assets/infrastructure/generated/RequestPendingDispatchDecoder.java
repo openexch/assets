@@ -5,7 +5,7 @@ import org.agrona.DirectBuffer;
 
 
 /**
- * read-only (FORWARDER): every pending MeDispatch with dispatchSeq above fromDispatchSeq, in order, then PendingDispatchEnd. limit 0 = 1024, max 4096.
+ * read-only (FORWARDER): every pending MeDispatch with dispatchSeq above fromDispatchSeq, in order, then PendingDispatchEnd. maxEntries (frozen v7; behaviour lands in S8): 0 = head probe, reply is PendingDispatchEnd{0, headDispatchSeq} with no entries and no scan; 1..4096 = page size; above 4096 clamped to 4096.
  */
 @SuppressWarnings("all")
 public final class RequestPendingDispatchDecoder
@@ -13,8 +13,8 @@ public final class RequestPendingDispatchDecoder
     public static final int BLOCK_LENGTH = 20;
     public static final int TEMPLATE_ID = 65;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final RequestPendingDispatchDecoder parentMessage = this;

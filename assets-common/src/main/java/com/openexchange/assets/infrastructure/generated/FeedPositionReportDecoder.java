@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class FeedPositionReportDecoder
 {
-    public static final int BLOCK_LENGTH = 25;
+    public static final int BLOCK_LENGTH = 43;
     public static final int TEMPLATE_ID = 17;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final FeedPositionReportDecoder parentMessage = this;
@@ -336,6 +336,220 @@ public final class FeedPositionReportDecoder
     }
 
 
+    public static int meEpochId()
+    {
+        return 5;
+    }
+
+    public static int meEpochSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int meEpochEncodingOffset()
+    {
+        return 25;
+    }
+
+    public static int meEpochEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String meEpochMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long meEpochNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long meEpochMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long meEpochMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long meEpoch()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return -9223372036854775808L;
+        }
+
+        return buffer.getLong(offset + 25, BYTE_ORDER);
+    }
+
+
+    public static int lastAppliedJournalSeqId()
+    {
+        return 6;
+    }
+
+    public static int lastAppliedJournalSeqSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int lastAppliedJournalSeqEncodingOffset()
+    {
+        return 33;
+    }
+
+    public static int lastAppliedJournalSeqEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String lastAppliedJournalSeqMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long lastAppliedJournalSeqNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long lastAppliedJournalSeqMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long lastAppliedJournalSeqMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long lastAppliedJournalSeq()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return -9223372036854775808L;
+        }
+
+        return buffer.getLong(offset + 33, BYTE_ORDER);
+    }
+
+
+    public static int feedHaltedId()
+    {
+        return 7;
+    }
+
+    public static int feedHaltedSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int feedHaltedEncodingOffset()
+    {
+        return 41;
+    }
+
+    public static int feedHaltedEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String feedHaltedMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public short feedHaltedRaw()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return (short)255;
+        }
+
+        return ((short)(buffer.getByte(offset + 41) & 0xFF));
+    }
+
+    public BoolFlag feedHalted()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return BoolFlag.NULL_VAL;
+        }
+
+        return BoolFlag.get(((short)(buffer.getByte(offset + 41) & 0xFF)));
+    }
+
+
+    public static int haltReasonId()
+    {
+        return 8;
+    }
+
+    public static int haltReasonSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int haltReasonEncodingOffset()
+    {
+        return 42;
+    }
+
+    public static int haltReasonEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String haltReasonMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public short haltReasonRaw()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return (short)255;
+        }
+
+        return ((short)(buffer.getByte(offset + 42) & 0xFF));
+    }
+
+    public FeedHaltReason haltReason()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return FeedHaltReason.NULL_VAL;
+        }
+
+        return FeedHaltReason.get(((short)(buffer.getByte(offset + 42) & 0xFF)));
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -388,6 +602,18 @@ public final class FeedPositionReportDecoder
         builder.append('|');
         builder.append("journalEnabled=");
         builder.append(this.journalEnabled());
+        builder.append('|');
+        builder.append("meEpoch=");
+        builder.append(this.meEpoch());
+        builder.append('|');
+        builder.append("lastAppliedJournalSeq=");
+        builder.append(this.lastAppliedJournalSeq());
+        builder.append('|');
+        builder.append("feedHalted=");
+        builder.append(this.feedHalted());
+        builder.append('|');
+        builder.append("haltReason=");
+        builder.append(this.haltReason());
 
         limit(originalLimit);
 

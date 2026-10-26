@@ -18,6 +18,18 @@ public enum GateReason
 
     APPLY_FAULT((short)6),
 
+
+    /**
+     * v7: set by RC2 S8; bitmask semantics land in S7
+     */
+    ME_LEG_LIVE((short)7),
+
+
+    /**
+     * v7: set by RC2 S8; bitmask semantics land in S7
+     */
+    ME_BEHAVIOR((short)8),
+
     /**
      * To be used to represent not present or null.
      */
@@ -57,6 +69,8 @@ public enum GateReason
             case 4: return ME_CAPACITY;
             case 5: return GENESIS;
             case 6: return APPLY_FAULT;
+            case 7: return ME_LEG_LIVE;
+            case 8: return ME_BEHAVIOR;
             case 255: return NULL_VAL;
         }
 

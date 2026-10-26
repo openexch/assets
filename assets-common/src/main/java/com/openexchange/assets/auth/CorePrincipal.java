@@ -115,7 +115,11 @@ public final class CorePrincipal {
         return new CorePrincipal(sessionClass, flags, identity, users);
     }
 
-    /** Wire class code to enum; unknown codes map to UNSET (no authority). */
+    /**
+     * Wire class code to enum; unknown codes map to UNSET (no authority). 7 is REPLICA from money-schema v7 (RC2 S1):
+     * the RCS replica process, which registers but is authorised for no other ingress template (key provisioning is
+     * RCS S5).
+     */
     public static SessionClass classOf(final int code) {
         switch (code) {
             case 1: return SessionClass.GATEWAY;
@@ -124,6 +128,7 @@ public final class CorePrincipal {
             case 4: return SessionClass.ADMIN;
             case 5: return SessionClass.TOOL;
             case 6: return SessionClass.TREASURY;
+            case 7: return SessionClass.REPLICA;
             default: return SessionClass.UNSET;
         }
     }

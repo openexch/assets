@@ -64,7 +64,11 @@ public class CorePrincipalTest {
     public void classCodesFollowTheWireEnum() {
         assertEquals(SessionClass.GATEWAY, CorePrincipal.classOf(1));
         assertEquals(SessionClass.TREASURY, CorePrincipal.classOf(6));
-        assertEquals(SessionClass.UNSET, CorePrincipal.classOf(7));
+        // money-schema v7 (RC2 S1 4.1, W5): 7 is REPLICA; 8 and above stay UNSET
+        assertEquals(SessionClass.REPLICA, CorePrincipal.classOf(7));
+        assertEquals(SessionClass.UNSET, CorePrincipal.classOf(8));
         assertEquals(SessionClass.UNSET, CorePrincipal.classOf(0));
+        final CorePrincipal replica = CorePrincipal.anyUser(SessionClass.REPLICA, 3);
+        assertEquals(SessionClass.REPLICA, CorePrincipal.decode(replica.encode()).sessionClass());
     }
 }

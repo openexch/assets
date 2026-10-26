@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.domain;
 
-/** The one reject vocabulary for every ORIGIN-replyable ingress command (money-schema v6, critic C3). Codes equal the wire values, so the publisher maps by {@link #code()}. */
+/** The one reject vocabulary for every ORIGIN-replyable ingress command (money-schema v6, v7 additions 40..42; critic C3). Codes equal the wire values, so the publisher maps by {@link #code()}. */
 public enum CoreRejectReason {
     NONE(0),
     RATE_LIMIT(1),
@@ -43,7 +43,13 @@ public enum CoreRejectReason {
     /** RC1 S7, behaviour v2: price not a multiple of the recorded tick size. */
     PRICE_OFF_TICK(38),
     /** RC1 S7, behaviour v2: quantity not a multiple of the recorded lot size. */
-    QTY_OFF_LOT(39);
+    QTY_OFF_LOT(39),
+    /** v7 (RC2 S1, served by S7): ADMIN OPEN refused while the feed is latched. */
+    FEED_HALTED(40),
+    /** v7 (RC2 S1, served by S7/S8): ADMIN OPEN refused while meBehaviorVersion &lt; 2 under core behaviour v3. */
+    ME_LANE_INACTIVE(41),
+    /** v7 (RC2 S1, served by S8): terminal REJECTED after an INVALID 8 outcome on a pending command. */
+    ME_INVALID(42);
 
     private final int code;
 

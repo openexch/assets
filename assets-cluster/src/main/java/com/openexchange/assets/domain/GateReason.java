@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.domain;
 
-/** Why an order-entry gate is in its state (money-schema v6 GateReason). Codes equal the wire values, so the publisher maps by {@link #code()}. */
+/**
+ * Why an order-entry gate is in its state (money-schema GateReason). Codes equal the wire values, so the publisher maps by
+ * {@link #code()}. v7 (RC2 S1) adds ME_LEG_LIVE 7 and ME_BEHAVIOR 8: set by RC2 S8, bitmask semantics land in S7; nothing in
+ * S1 sets them.
+ */
 public enum GateReason {
     ADMIN(0),
     RETENTION_BUDGET(1),
@@ -9,7 +13,11 @@ public enum GateReason {
     RECOVERY(3),
     ME_CAPACITY(4),
     GENESIS(5),
-    APPLY_FAULT(6);
+    APPLY_FAULT(6),
+    /** v7: set by RC2 S8. */
+    ME_LEG_LIVE(7),
+    /** v7: set by RC2 S8. */
+    ME_BEHAVIOR(8);
 
     private final int code;
 

@@ -5,16 +5,16 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * All 20 fields of the ME JournalCommandOutcome (template 28) plus the epoch. result: 0 APPLIED, 1 REJECTED, 2 CONFLICT, 3 CAPACITY, 4 UNKNOWN_LEG, 5 NOT_OWNER, 6 UNKNOWN_MARKET (ME values, verbatim).
+ * All 20 fields of the ME JournalCommandOutcome (template 28) plus the epoch. result: 0 APPLIED, 1 REJECTED, 2 CONFLICT, 3 CAPACITY, 4 UNKNOWN_LEG, 5 NOT_OWNER, 6 UNKNOWN_MARKET (ME values, verbatim). v7: 7 RELEASED and 8 INVALID join (decode range 0..8; applied by S8).
  */
 @SuppressWarnings("all")
 public final class MeCommandOutcomeEncoder
 {
-    public static final int BLOCK_LENGTH = 124;
+    public static final int BLOCK_LENGTH = 153;
     public static final int TEMPLATE_ID = 64;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeCommandOutcomeEncoder parentMessage = this;
@@ -1185,6 +1185,318 @@ public final class MeCommandOutcomeEncoder
     public MeCommandOutcomeEncoder meEpoch(final long value)
     {
         buffer.putLong(offset + 116, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int journalSeqId()
+    {
+        return 22;
+    }
+
+    public static int journalSeqSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int journalSeqEncodingOffset()
+    {
+        return 124;
+    }
+
+    public static int journalSeqEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String journalSeqMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long journalSeqNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long journalSeqMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long journalSeqMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public MeCommandOutcomeEncoder journalSeq(final long value)
+    {
+        buffer.putLong(offset + 124, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int timeInForceId()
+    {
+        return 23;
+    }
+
+    public static int timeInForceSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int timeInForceEncodingOffset()
+    {
+        return 132;
+    }
+
+    public static int timeInForceEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String timeInForceMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static short timeInForceNullValue()
+    {
+        return (short)255;
+    }
+
+    public static short timeInForceMinValue()
+    {
+        return (short)0;
+    }
+
+    public static short timeInForceMaxValue()
+    {
+        return (short)254;
+    }
+
+    public MeCommandOutcomeEncoder timeInForce(final short value)
+    {
+        buffer.putByte(offset + 132, (byte)value);
+        return this;
+    }
+
+
+    public static int expectedOldRemainingId()
+    {
+        return 24;
+    }
+
+    public static int expectedOldRemainingSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int expectedOldRemainingEncodingOffset()
+    {
+        return 133;
+    }
+
+    public static int expectedOldRemainingEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String expectedOldRemainingMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long expectedOldRemainingNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long expectedOldRemainingMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long expectedOldRemainingMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public MeCommandOutcomeEncoder expectedOldRemaining(final long value)
+    {
+        buffer.putLong(offset + 133, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int ledgerSizeId()
+    {
+        return 25;
+    }
+
+    public static int ledgerSizeSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int ledgerSizeEncodingOffset()
+    {
+        return 141;
+    }
+
+    public static int ledgerSizeEncodingLength()
+    {
+        return 4;
+    }
+
+    public static String ledgerSizeMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static int ledgerSizeNullValue()
+    {
+        return -2147483648;
+    }
+
+    public static int ledgerSizeMinValue()
+    {
+        return -2147483647;
+    }
+
+    public static int ledgerSizeMaxValue()
+    {
+        return 2147483647;
+    }
+
+    public MeCommandOutcomeEncoder ledgerSize(final int value)
+    {
+        buffer.putInt(offset + 141, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int ledgerCapacityId()
+    {
+        return 26;
+    }
+
+    public static int ledgerCapacitySinceVersion()
+    {
+        return 7;
+    }
+
+    public static int ledgerCapacityEncodingOffset()
+    {
+        return 145;
+    }
+
+    public static int ledgerCapacityEncodingLength()
+    {
+        return 4;
+    }
+
+    public static String ledgerCapacityMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static int ledgerCapacityNullValue()
+    {
+        return -2147483648;
+    }
+
+    public static int ledgerCapacityMinValue()
+    {
+        return -2147483647;
+    }
+
+    public static int ledgerCapacityMaxValue()
+    {
+        return 2147483647;
+    }
+
+    public MeCommandOutcomeEncoder ledgerCapacity(final int value)
+    {
+        buffer.putInt(offset + 145, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int behaviorVersionId()
+    {
+        return 27;
+    }
+
+    public static int behaviorVersionSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int behaviorVersionEncodingOffset()
+    {
+        return 149;
+    }
+
+    public static int behaviorVersionEncodingLength()
+    {
+        return 4;
+    }
+
+    public static String behaviorVersionMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long behaviorVersionNullValue()
+    {
+        return 4294967295L;
+    }
+
+    public static long behaviorVersionMinValue()
+    {
+        return 0L;
+    }
+
+    public static long behaviorVersionMaxValue()
+    {
+        return 4294967294L;
+    }
+
+    public MeCommandOutcomeEncoder behaviorVersion(final long value)
+    {
+        buffer.putInt(offset + 149, (int)value, BYTE_ORDER);
         return this;
     }
 

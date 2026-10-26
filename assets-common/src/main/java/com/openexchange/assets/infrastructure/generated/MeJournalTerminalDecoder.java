@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class MeJournalTerminalDecoder
 {
-    public static final int BLOCK_LENGTH = 53;
+    public static final int BLOCK_LENGTH = 62;
     public static final int TEMPLATE_ID = 63;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeJournalTerminalDecoder parentMessage = this;
@@ -530,6 +530,118 @@ public final class MeJournalTerminalDecoder
     }
 
 
+    public static int journalSeqId()
+    {
+        return 9;
+    }
+
+    public static int journalSeqSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int journalSeqEncodingOffset()
+    {
+        return 53;
+    }
+
+    public static int journalSeqEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String journalSeqMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long journalSeqNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long journalSeqMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long journalSeqMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long journalSeq()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return -9223372036854775808L;
+        }
+
+        return buffer.getLong(offset + 53, BYTE_ORDER);
+    }
+
+
+    public static int rejectReasonId()
+    {
+        return 10;
+    }
+
+    public static int rejectReasonSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int rejectReasonEncodingOffset()
+    {
+        return 61;
+    }
+
+    public static int rejectReasonEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String rejectReasonMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static short rejectReasonNullValue()
+    {
+        return (short)255;
+    }
+
+    public static short rejectReasonMinValue()
+    {
+        return (short)0;
+    }
+
+    public static short rejectReasonMaxValue()
+    {
+        return (short)254;
+    }
+
+    public short rejectReason()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return (short)255;
+        }
+
+        return ((short)(buffer.getByte(offset + 61) & 0xFF));
+    }
+
+
     public String toString()
     {
         if (null == buffer)
@@ -594,6 +706,12 @@ public final class MeJournalTerminalDecoder
         builder.append('|');
         builder.append("meEpoch=");
         builder.append(this.meEpoch());
+        builder.append('|');
+        builder.append("journalSeq=");
+        builder.append(this.journalSeq());
+        builder.append('|');
+        builder.append("rejectReason=");
+        builder.append(this.rejectReason());
 
         limit(originalLimit);
 

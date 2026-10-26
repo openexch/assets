@@ -13,8 +13,8 @@ public final class MeJournalTradeBatchEncoder
     public static final int BLOCK_LENGTH = 0;
     public static final int TEMPLATE_ID = 62;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeJournalTradeBatchEncoder parentMessage = this;
@@ -142,7 +142,7 @@ public final class MeJournalTradeBatchEncoder
             final int limit = parentMessage.limit();
             initialLimit = limit;
             parentMessage.limit(limit + HEADER_SIZE);
-            buffer.putShort(limit + 0, (short)101, BYTE_ORDER);
+            buffer.putShort(limit + 0, (short)109, BYTE_ORDER);
             buffer.putShort(limit + 2, (short)count, BYTE_ORDER);
         }
 
@@ -185,7 +185,7 @@ public final class MeJournalTradeBatchEncoder
 
         public static int sbeBlockLength()
         {
-            return 101;
+            return 109;
         }
 
         public static int egressSeqId()
@@ -896,6 +896,58 @@ public final class MeJournalTradeBatchEncoder
         public TradesEncoder meEpoch(final long value)
         {
             buffer.putLong(offset + 93, value, BYTE_ORDER);
+            return this;
+        }
+
+
+        public static int journalSeqId()
+        {
+            return 15;
+        }
+
+        public static int journalSeqSinceVersion()
+        {
+            return 7;
+        }
+
+        public static int journalSeqEncodingOffset()
+        {
+            return 101;
+        }
+
+        public static int journalSeqEncodingLength()
+        {
+            return 8;
+        }
+
+        public static String journalSeqMetaAttribute(final MetaAttribute metaAttribute)
+        {
+            if (MetaAttribute.PRESENCE == metaAttribute)
+            {
+                return "required";
+            }
+
+            return "";
+        }
+
+        public static long journalSeqNullValue()
+        {
+            return -9223372036854775808L;
+        }
+
+        public static long journalSeqMinValue()
+        {
+            return -9223372036854775807L;
+        }
+
+        public static long journalSeqMaxValue()
+        {
+            return 9223372036854775807L;
+        }
+
+        public TradesEncoder journalSeq(final long value)
+        {
+            buffer.putLong(offset + 101, value, BYTE_ORDER);
             return this;
         }
 
