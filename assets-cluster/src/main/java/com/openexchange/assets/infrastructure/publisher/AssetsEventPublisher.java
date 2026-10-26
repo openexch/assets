@@ -140,6 +140,8 @@ public final class AssetsEventPublisher implements AssetsEventSink {
      */
     private final BooleanSupplier queryReplyContext;
     private final MutableDirectBuffer buffer = new UnsafeBuffer(new byte[BUFFER_CAPACITY]);
+    /** {@code OrderEvent.meReason} for an event that is not ME-sourced (the v6 {@code OrderReject.meReason} convention). */
+    static final short NOT_ME_SOURCED = 255;
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
 
     private final DepositAckEncoder depositAckEncoder = new DepositAckEncoder();
@@ -274,7 +276,10 @@ public final class AssetsEventPublisher implements AssetsEventSink {
         feedPositionReportEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).consumePosition(consumePosition)
                 .lastAppliedTradeId(lastAppliedTradeId)
-                .journalEnabled(journalEnabled ? BoolFlag.TRUE : BoolFlag.FALSE);
+                .journalEnabled(journalEnabled ? BoolFlag.TRUE : BoolFlag.FALSE)
+                // v7 tail, S1 values (RC2 S1 4.4); RC2 S7 fills them from FeedState
+                .meEpoch(0L).lastAppliedJournalSeq(0L).feedHalted(BoolFlag.FALSE)
+                .haltReason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.NONE);
         flush(feedPositionReportEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
@@ -304,6 +309,9 @@ public final class AssetsEventPublisher implements AssetsEventSink {
             case NOTIONAL_OVERFLOW: return com.openexchange.assets.infrastructure.generated.SettleRejectReason.NOTIONAL_OVERFLOW;
             case TRADE_GAP:         return com.openexchange.assets.infrastructure.generated.SettleRejectReason.TRADE_GAP;
             case INVALID_PARTY:     return com.openexchange.assets.infrastructure.generated.SettleRejectReason.INVALID_PARTY;
+            case FEED_GAP:          return com.openexchange.assets.infrastructure.generated.SettleRejectReason.FEED_GAP;
+            case ME_EPOCH_MISMATCH: return com.openexchange.assets.infrastructure.generated.SettleRejectReason.ME_EPOCH_MISMATCH;
+            case FEED_UNBOUND:      return com.openexchange.assets.infrastructure.generated.SettleRejectReason.FEED_UNBOUND;
             default: throw new IllegalArgumentException("unmapped SettleRejectReason " + r);
         }
     }
@@ -338,7 +346,15 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .gateReason(com.openexchange.assets.infrastructure.generated.GateReason.get((short) gateReason.code()))
                 .circuitBreaker(circuitBreaker ? BoolFlag.TRUE : BoolFlag.FALSE)
                 .atMs(atMs).logPosition(logPosition);
+        // v7 (RC2 S1 4.4): the D4 bitmask's wire form. S1 holds one reason: OPEN -> 0, SUSPENDED -> 1 << gateReason.
+        buffer.putInt(admissionStateEncoder.offset() + AdmissionStateEncoder.gateReasonsEncodingOffset(),
+                gateReasonsOf(gateState, gateReason), java.nio.ByteOrder.LITTLE_ENDIAN);
         flush(admissionStateEncoder.encodedLength(), CH_CONTROL, toOrigin ? Routing.ORIGIN : Routing.BROADCAST);
+    }
+
+    /** {@code AdmissionState.gateReasons} for the single-reason gate of S1: 0 when OPEN, else the reason's bit. */
+    static int gateReasonsOf(final GateState gateState, final GateReason gateReason) {
+        return gateState == GateState.OPEN ? 0 : 1 << gateReason.code();
     }
 
     @Override
@@ -368,7 +384,8 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .remainingQty(o.remainingQty()).lastPrice(lastPrice).lastQty(lastQty).tradeId(tradeId)
                 .meOrderId(o.meOrderId()).holdAssetId(o.holdAssetId()).holdAmount(o.holdAmount()).holdRemaining(holdRemaining)
                 .clientOrderIdHigh(o.clientOrderIdHigh()).clientOrderIdLow(o.clientOrderIdLow())
-                .createdAtMs(o.createdAtMs()).updatedAtMs(updatedAtMs);
+                .createdAtMs(o.createdAtMs()).updatedAtMs(updatedAtMs)
+                .meReason(NOT_ME_SOURCED); // v7: S1 always writes 255 (RC2 S1 4.4); S7 writes the ME code
         flush(orderEventEncoder.encodedLength(), CH_ORDERS, Routing.BROADCAST);
     }
 
@@ -381,7 +398,9 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .kind(com.openexchange.assets.infrastructure.generated.DispatchKind.get((short) kind.code()))
                 .userId(userId).omsOrderId(omsOrderId).oldOrderId(oldOrderId).marketId(marketId)
                 .orderType((short) orderTypeCode).side((short) sideCode).price(price).quantity(quantity).budget(budget)
-                .timeInForce((short) timeInForceCode);
+                .timeInForce((short) timeInForceCode)
+                // v7 (RC2 S1 4.4): 0, 0 in S1; S8 fills them (RELEASE_ID scope, AMEND old remaining)
+                .releaseScope(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO).expectedOldRemaining(0L);
         flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.BROADCAST);
     }
 
@@ -459,7 +478,8 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .kind(com.openexchange.assets.infrastructure.generated.DispatchKind.get((short) kind.code()))
                 .userId(userId).omsOrderId(omsOrderId).oldOrderId(oldOrderId).marketId(marketId)
                 .orderType((short) orderTypeCode).side((short) sideCode).price(price).quantity(quantity).budget(budget)
-                .timeInForce((short) timeInForceCode);
+                .timeInForce((short) timeInForceCode)
+                .releaseScope(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO).expectedOldRemaining(0L);
         flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.ORIGIN);
     }
 

@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class MeDispatchEncoder
 {
-    public static final int BLOCK_LENGTH = 80;
+    public static final int BLOCK_LENGTH = 89;
     public static final int TEMPLATE_ID = 104;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeDispatchEncoder parentMessage = this;
@@ -805,6 +805,94 @@ public final class MeDispatchEncoder
     public MeDispatchEncoder timeInForce(final short value)
     {
         buffer.putByte(offset + 79, (byte)value);
+        return this;
+    }
+
+
+    public static int releaseScopeId()
+    {
+        return 15;
+    }
+
+    public static int releaseScopeSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int releaseScopeEncodingOffset()
+    {
+        return 80;
+    }
+
+    public static int releaseScopeEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String releaseScopeMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public MeDispatchEncoder releaseScope(final ReleaseScope value)
+    {
+        buffer.putByte(offset + 80, (byte)value.value());
+        return this;
+    }
+
+    public static int expectedOldRemainingId()
+    {
+        return 16;
+    }
+
+    public static int expectedOldRemainingSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int expectedOldRemainingEncodingOffset()
+    {
+        return 81;
+    }
+
+    public static int expectedOldRemainingEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String expectedOldRemainingMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long expectedOldRemainingNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long expectedOldRemainingMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long expectedOldRemainingMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public MeDispatchEncoder expectedOldRemaining(final long value)
+    {
+        buffer.putLong(offset + 81, value, BYTE_ORDER);
         return this;
     }
 

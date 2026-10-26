@@ -13,8 +13,8 @@ public final class MeJournalTradeBatchDecoder
     public static final int BLOCK_LENGTH = 0;
     public static final int TEMPLATE_ID = 62;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final MeJournalTradeBatchDecoder parentMessage = this;
@@ -211,7 +211,7 @@ public final class MeJournalTradeBatchDecoder
 
         public static int sbeBlockLength()
         {
-            return 101;
+            return 109;
         }
 
         public int actingBlockLength()
@@ -948,6 +948,62 @@ public final class MeJournalTradeBatchDecoder
         }
 
 
+        public static int journalSeqId()
+        {
+            return 15;
+        }
+
+        public static int journalSeqSinceVersion()
+        {
+            return 7;
+        }
+
+        public static int journalSeqEncodingOffset()
+        {
+            return 101;
+        }
+
+        public static int journalSeqEncodingLength()
+        {
+            return 8;
+        }
+
+        public static String journalSeqMetaAttribute(final MetaAttribute metaAttribute)
+        {
+            if (MetaAttribute.PRESENCE == metaAttribute)
+            {
+                return "required";
+            }
+
+            return "";
+        }
+
+        public static long journalSeqNullValue()
+        {
+            return -9223372036854775808L;
+        }
+
+        public static long journalSeqMinValue()
+        {
+            return -9223372036854775807L;
+        }
+
+        public static long journalSeqMaxValue()
+        {
+            return 9223372036854775807L;
+        }
+
+        public long journalSeq()
+        {
+            if (parentMessage.actingVersion < 7)
+            {
+                return -9223372036854775808L;
+            }
+
+            return buffer.getLong(offset + 101, BYTE_ORDER);
+        }
+
+
         public StringBuilder appendTo(final StringBuilder builder)
         {
             if (null == buffer)
@@ -997,6 +1053,9 @@ public final class MeJournalTradeBatchDecoder
             builder.append('|');
             builder.append("meEpoch=");
             builder.append(this.meEpoch());
+            builder.append('|');
+            builder.append("journalSeq=");
+            builder.append(this.journalSeq());
             builder.append(')');
 
             return builder;

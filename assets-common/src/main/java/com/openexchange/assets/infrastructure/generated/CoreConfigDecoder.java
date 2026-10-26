@@ -10,11 +10,11 @@ import org.agrona.DirectBuffer;
 @SuppressWarnings("all")
 public final class CoreConfigDecoder
 {
-    public static final int BLOCK_LENGTH = 16;
+    public static final int BLOCK_LENGTH = 24;
     public static final int TEMPLATE_ID = 70;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final CoreConfigDecoder parentMessage = this;
@@ -282,6 +282,62 @@ public final class CoreConfigDecoder
     public long behaviorVersion()
     {
         return (buffer.getInt(offset + 12, BYTE_ORDER) & 0xFFFF_FFFFL);
+    }
+
+
+    public static int genesisIdId()
+    {
+        return 4;
+    }
+
+    public static int genesisIdSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int genesisIdEncodingOffset()
+    {
+        return 16;
+    }
+
+    public static int genesisIdEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String genesisIdMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long genesisIdNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long genesisIdMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long genesisIdMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public long genesisId()
+    {
+        if (parentMessage.actingVersion < 7)
+        {
+            return -9223372036854775808L;
+        }
+
+        return buffer.getLong(offset + 16, BYTE_ORDER);
     }
 
 
@@ -1330,6 +1386,9 @@ public final class CoreConfigDecoder
         builder.append('|');
         builder.append("behaviorVersion=");
         builder.append(this.behaviorVersion());
+        builder.append('|');
+        builder.append("genesisId=");
+        builder.append(this.genesisId());
         builder.append('|');
         builder.append("markets=[");
         final int marketsOriginalOffset = markets.offset;

@@ -109,7 +109,7 @@ public class MeJournalBatchDemuxerTest {
                     .egressSeq(1_000 + tradeId).tradeId(tradeId).marketId(MKT)
                     .takerOrderId(LEG_SELL).takerUserId(2).makerOrderId(LEG_BUY).makerUserId(1)
                     .price(PX).quantity(qty).takerIsBuy(BoolFlag.FALSE).meTimestamp(TS)
-                    .takerOmsOrderId(2).makerOmsOrderId(1).meEpoch(1);
+                    .takerOmsOrderId(2).makerOmsOrderId(1).meEpoch(1).journalSeq(tradeId); // v7: decoded, not consumed (S7)
             return HEADER + e.encodedLength();
         }
 
@@ -122,7 +122,7 @@ public class MeJournalBatchDemuxerTest {
                 g.next().egressSeq(1_000 + id).tradeId(id).marketId(MKT)
                         .takerOrderId(LEG_SELL).takerUserId(2).makerOrderId(LEG_BUY).makerUserId(1)
                         .price(PX).quantity(qty).takerIsBuy(BoolFlag.FALSE).meTimestamp(TS)
-                        .takerOmsOrderId(2).makerOmsOrderId(1).meEpoch(1);
+                        .takerOmsOrderId(2).makerOmsOrderId(1).meEpoch(1).journalSeq(id); // v7: decoded, not consumed (S7)
             }
             return HEADER + e.encodedLength();
         }

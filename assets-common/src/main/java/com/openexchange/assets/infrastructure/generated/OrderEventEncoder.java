@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class OrderEventEncoder
 {
-    public static final int BLOCK_LENGTH = 166;
+    public static final int BLOCK_LENGTH = 167;
     public static final int TEMPLATE_ID = 102;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final OrderEventEncoder parentMessage = this;
@@ -1401,6 +1401,58 @@ public final class OrderEventEncoder
     public OrderEventEncoder updatedAtMs(final long value)
     {
         buffer.putLong(offset + 158, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int meReasonId()
+    {
+        return 28;
+    }
+
+    public static int meReasonSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int meReasonEncodingOffset()
+    {
+        return 166;
+    }
+
+    public static int meReasonEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String meReasonMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static short meReasonNullValue()
+    {
+        return (short)255;
+    }
+
+    public static short meReasonMinValue()
+    {
+        return (short)0;
+    }
+
+    public static short meReasonMaxValue()
+    {
+        return (short)254;
+    }
+
+    public OrderEventEncoder meReason(final short value)
+    {
+        buffer.putByte(offset + 166, (byte)value);
         return this;
     }
 

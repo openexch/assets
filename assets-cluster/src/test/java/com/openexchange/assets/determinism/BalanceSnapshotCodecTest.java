@@ -164,6 +164,35 @@ public class BalanceSnapshotCodecTest {
     }
 
     @Test
+    public void theReservedFeedStateAndMeLinkSectionsAreRefusedAndNeverWritten() {
+        // RC2 S1 (contract 4.9): ids 10 and 11 are reserved constants; content lands with S7 / S8.
+        assertEquals(10, BalanceSnapshotCodec.SECTION_FEED_STATE);
+        assertEquals(11, BalanceSnapshotCodec.SECTION_ME_LINK);
+        for (final short reserved : new short[] {BalanceSnapshotCodec.SECTION_FEED_STATE, BalanceSnapshotCodec.SECTION_ME_LINK}) {
+            ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+            int len = serialize(engineWithState(), buf);
+            // the serializer writes neither: walk the section headers
+            final int count = buf.getInt(sectionCountOffset());
+            int pos = sectionCountOffset() + 4;
+            for (int i = 0; i < count; i++) {
+                final short id = buf.getShort(pos);
+                assertTrue("section " + id + " is below the reserved ids", id < BalanceSnapshotCodec.SECTION_FEED_STATE);
+                pos += 6 + buf.getInt(pos + 2);
+            }
+            assertEquals("the walk covers the whole image", len, pos);
+            // an image carrying the reserved section (ascending, well-formed length) is refused
+            buf.putInt(sectionCountOffset(), count + 1);
+            buf.putShort(len, reserved);
+            buf.putInt(len + 2, 8);
+            buf.putLong(len + 6, 0L);
+            final int total = len + 6 + 8;
+            final IllegalStateException e = assertThrows(IllegalStateException.class,
+                    () -> BalanceSnapshotCodec.deserialize(buf, 0, total, new AssetsEngine()));
+            assertTrue(e.getMessage(), e.getMessage().contains("section id " + reserved));
+        }
+    }
+
+    @Test
     public void aSectionWhoseLengthDoesNotMatchItsContentIsRefused() {
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int len = serialize(engineWithState(), buf);

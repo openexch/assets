@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class FeedPositionReportEncoder
 {
-    public static final int BLOCK_LENGTH = 25;
+    public static final int BLOCK_LENGTH = 43;
     public static final int TEMPLATE_ID = 17;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final FeedPositionReportEncoder parentMessage = this;
@@ -286,6 +286,182 @@ public final class FeedPositionReportEncoder
     public FeedPositionReportEncoder journalEnabled(final BoolFlag value)
     {
         buffer.putByte(offset + 24, (byte)value.value());
+        return this;
+    }
+
+    public static int meEpochId()
+    {
+        return 5;
+    }
+
+    public static int meEpochSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int meEpochEncodingOffset()
+    {
+        return 25;
+    }
+
+    public static int meEpochEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String meEpochMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long meEpochNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long meEpochMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long meEpochMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public FeedPositionReportEncoder meEpoch(final long value)
+    {
+        buffer.putLong(offset + 25, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int lastAppliedJournalSeqId()
+    {
+        return 6;
+    }
+
+    public static int lastAppliedJournalSeqSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int lastAppliedJournalSeqEncodingOffset()
+    {
+        return 33;
+    }
+
+    public static int lastAppliedJournalSeqEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String lastAppliedJournalSeqMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long lastAppliedJournalSeqNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long lastAppliedJournalSeqMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long lastAppliedJournalSeqMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public FeedPositionReportEncoder lastAppliedJournalSeq(final long value)
+    {
+        buffer.putLong(offset + 33, value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int feedHaltedId()
+    {
+        return 7;
+    }
+
+    public static int feedHaltedSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int feedHaltedEncodingOffset()
+    {
+        return 41;
+    }
+
+    public static int feedHaltedEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String feedHaltedMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public FeedPositionReportEncoder feedHalted(final BoolFlag value)
+    {
+        buffer.putByte(offset + 41, (byte)value.value());
+        return this;
+    }
+
+    public static int haltReasonId()
+    {
+        return 8;
+    }
+
+    public static int haltReasonSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int haltReasonEncodingOffset()
+    {
+        return 42;
+    }
+
+    public static int haltReasonEncodingLength()
+    {
+        return 1;
+    }
+
+    public static String haltReasonMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public FeedPositionReportEncoder haltReason(final FeedHaltReason value)
+    {
+        buffer.putByte(offset + 42, (byte)value.value());
         return this;
     }
 

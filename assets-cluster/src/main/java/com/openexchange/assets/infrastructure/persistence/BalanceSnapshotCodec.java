@@ -71,6 +71,16 @@ public final class BalanceSnapshotCodec {
     public static final short SECTION_CORE_CONFIG = 8;
     /** Live session authorities (RC1 S3, K6): replicated-derived, so a restored member agrees with its peers. */
     public static final short SECTION_SESSIONS = 9;
+    /**
+     * RESERVED (RC2 S1 4.9): the feed cursor state (B 2.3 {@code FeedState}), content owned by RC2 S7. Neither written
+     * nor read by this build: the deserializer refuses it as an unknown section until S7 lands.
+     */
+    public static final short SECTION_FEED_STATE = 10;
+    /**
+     * RESERVED (RC2 S1 4.9): the ME link (release backlog, meBehaviorVersion, meLedgerSize, meLedgerCapacity), content
+     * owned by RC2 S8. Neither written nor read by this build: refused as an unknown section until S8 lands.
+     */
+    public static final short SECTION_ME_LINK = 11;
 
     private static final int FLAG_JOURNAL_ENABLED = 1;
     private static final int KNOWN_FLAGS = FLAG_JOURNAL_ENABLED;

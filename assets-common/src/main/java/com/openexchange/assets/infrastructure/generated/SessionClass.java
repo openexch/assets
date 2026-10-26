@@ -18,6 +18,12 @@ public enum SessionClass
 
     TREASURY((short)6),
 
+
+    /**
+     * v7: RCS replica process; no ingress template carries the REPLICA class bit except RegisterSession (key provisioning is RCS S5)
+     */
+    REPLICA((short)7),
+
     /**
      * To be used to represent not present or null.
      */
@@ -57,6 +63,7 @@ public enum SessionClass
             case 4: return ADMIN;
             case 5: return TOOL;
             case 6: return TREASURY;
+            case 7: return REPLICA;
             case 255: return NULL_VAL;
         }
 

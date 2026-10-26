@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class CoreConfigEncoder
 {
-    public static final int BLOCK_LENGTH = 16;
+    public static final int BLOCK_LENGTH = 24;
     public static final int TEMPLATE_ID = 70;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final CoreConfigEncoder parentMessage = this;
@@ -249,6 +249,58 @@ public final class CoreConfigEncoder
     public CoreConfigEncoder behaviorVersion(final long value)
     {
         buffer.putInt(offset + 12, (int)value, BYTE_ORDER);
+        return this;
+    }
+
+
+    public static int genesisIdId()
+    {
+        return 4;
+    }
+
+    public static int genesisIdSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int genesisIdEncodingOffset()
+    {
+        return 16;
+    }
+
+    public static int genesisIdEncodingLength()
+    {
+        return 8;
+    }
+
+    public static String genesisIdMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    public static long genesisIdNullValue()
+    {
+        return -9223372036854775808L;
+    }
+
+    public static long genesisIdMinValue()
+    {
+        return -9223372036854775807L;
+    }
+
+    public static long genesisIdMaxValue()
+    {
+        return 9223372036854775807L;
+    }
+
+    public CoreConfigEncoder genesisId(final long value)
+    {
+        buffer.putLong(offset + 16, value, BYTE_ORDER);
         return this;
     }
 

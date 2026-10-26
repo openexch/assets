@@ -30,10 +30,14 @@ import com.openexchange.assets.infrastructure.generated.CircuitBreakerDecoder;
 import com.openexchange.assets.infrastructure.generated.CoreConfigDecoder;
 import com.openexchange.assets.infrastructure.generated.CreateOrderDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositDecoder;
+import com.openexchange.assets.infrastructure.generated.FeedHaltDecoder;
+import com.openexchange.assets.infrastructure.generated.FeedLatchClearDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldDecoder;
 import com.openexchange.assets.infrastructure.generated.InitTradeHighWaterDecoder;
 import com.openexchange.assets.infrastructure.generated.MarketTickDecoder;
 import com.openexchange.assets.infrastructure.generated.MeCommandOutcomeDecoder;
+import com.openexchange.assets.infrastructure.generated.MeCommandReleaseDecoder;
+import com.openexchange.assets.infrastructure.generated.MeEngineConfigDecoder;
 import com.openexchange.assets.infrastructure.generated.MeJournalTerminalDecoder;
 import com.openexchange.assets.infrastructure.generated.MeJournalTradeBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.MeJournalTradeDecoder;
@@ -81,11 +85,11 @@ import java.nio.ByteOrder;
 public final class AssetsSbeDemuxer {
 
     /**
-     * The wire identity every ingress frame must carry. The version gate is EXACT (critic D12): the core
-     * speaks v6 from RC1 on; a v5 producer (the v0.5.0-beta bridge and tools) is dropped and counted
-     * rather than decoded with its {@code sinceVersion="6"} fields silently absent. A later additive
-     * bump turns this into a range again, with the ME's rule: the floor advances only when pre-floor
-     * producers and pre-floor frames in any replayable log are provably gone.
+     * The wire identity every ingress frame must carry. The version gate is EXACT (critic D12, RC2 D2): the core
+     * speaks v7 from RC2 S1 on (single-manifest clean-genesis cut); a v6 producer is dropped and counted rather
+     * than decoded with its {@code sinceVersion="7"} fields silently absent, and no v7 frame reaches a v6 core.
+     * A later additive bump turns this into a range again, with the ME's rule: the floor advances only when
+     * pre-floor producers and pre-floor frames in any replayable log are provably gone.
      */
     static final int EXPECTED_SCHEMA_ID = MessageHeaderDecoder.SCHEMA_ID;
     static final int EXPECTED_SCHEMA_VERSION = MessageHeaderDecoder.SCHEMA_VERSION;
@@ -127,7 +131,7 @@ public final class AssetsSbeDemuxer {
     private long schemaRejectCount;    // header schemaId/version outside this build's supported set
     private long decodeRejectCount;    // frame bounds / group bounds / invalid enum or field byte
     private long unknownTemplateCount; // templateId not in this schema at all
-    private long unhandledTemplateCount; // in the schema, not served by this build (v6 order/feed/admin, RC1 S4+)
+    private long unhandledTemplateCount; // in the schema, not served by this build (v7 66/67/68/76 until RC2 S7/S8)
     private long applyErrorCount;
     // Service-thread only. Once a command may have partially applied, this instance cannot establish
     // another applied prefix. Decode-only poison never enters this state.
@@ -195,6 +199,11 @@ public final class AssetsSbeDemuxer {
             case QuarantineOrderDecoder.TEMPLATE_ID:        return QuarantineOrderDecoder.BLOCK_LENGTH;
             case RequestRiskConfigDecoder.TEMPLATE_ID:      return RequestRiskConfigDecoder.BLOCK_LENGTH;
             case RegisterSessionDecoder.TEMPLATE_ID:        return RegisterSessionDecoder.BLOCK_LENGTH;
+            // v7 (RC2 S1 4.3/4.3a): defined and bounds-checked here, served by S7/S8.
+            case FeedHaltDecoder.TEMPLATE_ID:               return FeedHaltDecoder.BLOCK_LENGTH;
+            case MeCommandReleaseDecoder.TEMPLATE_ID:       return MeCommandReleaseDecoder.BLOCK_LENGTH;
+            case MeEngineConfigDecoder.TEMPLATE_ID:         return MeEngineConfigDecoder.BLOCK_LENGTH;
+            case FeedLatchClearDecoder.TEMPLATE_ID:         return FeedLatchClearDecoder.BLOCK_LENGTH;
             default: return -1;
         }
     }
@@ -224,6 +233,8 @@ public final class AssetsSbeDemuxer {
     private static final int BIT_ADMIN = 1 << SessionClass.ADMIN.value();
     private static final int BIT_TOOL = 1 << SessionClass.TOOL.value();
     private static final int BIT_TREASURY = 1 << SessionClass.TREASURY.value();
+    // REPLICA (7, money-schema v7) has no bit in any template's mask, ANY_CLASS included: every ingress but
+    // RegisterSession (judged by the registry, never by this table) from a REPLICA session is UNAUTHORIZED_CLASS.
     private static final int ANY_CLASS = BIT_GATEWAY | BIT_FORWARDER | BIT_BRIDGE | BIT_ADMIN | BIT_TOOL | BIT_TREASURY;
     private static final int[] CLASS_MASK = new int[256];
     /** Templates a production-class session may send BEFORE it has registered (queries and the registration itself). */
@@ -264,6 +275,11 @@ public final class AssetsSbeDemuxer {
         CLASS_MASK[QuarantineOrderDecoder.TEMPLATE_ID] = BIT_ADMIN;
         CLASS_MASK[RequestRiskConfigDecoder.TEMPLATE_ID] = BIT_ADMIN;
         CLASS_MASK[RegisterSessionDecoder.TEMPLATE_ID] = ANY_CLASS;
+        // v7 (RC2 S1 4.5): feed templates 66-68 are BRIDGE (registration required), the latch exit 76 is ADMIN.
+        CLASS_MASK[FeedHaltDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[MeCommandReleaseDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[MeEngineConfigDecoder.TEMPLATE_ID] = BIT_BRIDGE;
+        CLASS_MASK[FeedLatchClearDecoder.TEMPLATE_ID] = BIT_ADMIN;
         PRE_REGISTRATION[QueryFeedPositionDecoder.TEMPLATE_ID] = true;
         PRE_REGISTRATION[SubscribeDecoder.TEMPLATE_ID] = true;
         PRE_REGISTRATION[RegisterSessionDecoder.TEMPLATE_ID] = true;
@@ -272,7 +288,8 @@ public final class AssetsSbeDemuxer {
                 AmendOrderDecoder.TEMPLATE_ID, RequestOrderSnapshotDecoder.TEMPLATE_ID}) {
             USER_SCOPED[t] = true;
         }
-        for (final int t : new int[] {1, 2, 3, 7, 8, 9, 32, 50, 51, 52, 53, 65, 70, 71, 72, 73, 74, 75, 80}) {
+        // v7: 66 FeedHalt and 76 FeedLatchClear start with a correlationId; 67 and 68 do not (correlationIdOf = 0).
+        for (final int t : new int[] {1, 2, 3, 7, 8, 9, 32, 50, 51, 52, 53, 65, 66, 70, 71, 72, 73, 74, 75, 76, 80}) {
             HAS_CORRELATION[t] = true;
         }
     }
@@ -299,6 +316,10 @@ public final class AssetsSbeDemuxer {
     private final RequestPendingDispatchDecoder requestPendingDispatchDecoder = new RequestPendingDispatchDecoder();
     private final QuarantineOrderDecoder quarantineOrderDecoder = new QuarantineOrderDecoder();
     private final CoreConfigDecoder coreConfigDecoder = new CoreConfigDecoder();
+    // RC2 S1 (v7), decoded for range checks only
+    private final FeedHaltDecoder feedHaltDecoder = new FeedHaltDecoder();
+    private final MeEngineConfigDecoder meEngineConfigDecoder = new MeEngineConfigDecoder();
+    private final FeedLatchClearDecoder feedLatchClearDecoder = new FeedLatchClearDecoder();
     private final AmendOrderCommand amendOrderCommand = new AmendOrderCommand();
     private final CreateOrderCommand createOrderCommand = new CreateOrderCommand();
     private final CancelOrderCommand cancelOrderCommand = new CancelOrderCommand();
@@ -391,6 +412,11 @@ public final class AssetsSbeDemuxer {
             rejectFrameBounds();
             return;
         }
+        if (templateId == MeCommandReleaseDecoder.TEMPLATE_ID
+                && !releaseGroupWithinFrame(HEADER + block, length)) {
+            rejectFrameBounds(); // v7: bounds as 62, plus the frozen cap of 48 entries (RC2 S1 4.3)
+            return;
+        }
 
         // 5. Session authority (K6): class mask, registration-first, user scope. RegisterSession itself is
         //    judged by the registry (so a session with no usable principal gets a REJECTED ack, not silence).
@@ -450,14 +476,19 @@ public final class AssetsSbeDemuxer {
                 case SetMoneyJournalDecoder.TEMPLATE_ID:        handleSetMoneyJournal(timestamp); break;
                 case RegisterSessionDecoder.TEMPLATE_ID:     handleRegisterSession(authority, timestamp); break;
                 case OrderEntryGateDecoder.TEMPLATE_ID:      handleOrderEntryGate(timestamp); break;
+                // v7 (RC2 S1): raw ranges validated, then counted unserved (no mutation, no egress) until S7/S8.
+                case FeedHaltDecoder.TEMPLATE_ID:            handleFeedHalt(); break;
+                case MeCommandReleaseDecoder.TEMPLATE_ID:    handleMeCommandRelease(); break;
+                case MeEngineConfigDecoder.TEMPLATE_ID:      handleMeEngineConfig(); break;
+                case FeedLatchClearDecoder.TEMPLATE_ID:      handleFeedLatchClear(); break;
                 case SubscribeDecoder.TEMPLATE_ID:
                     // Transport-level; consumed at the service boundary before dispatch. Reaching
                     // here means the service peek declined it (bad length/version): drop, count.
                     rejectDecode("Subscribe frame reached the engine");
                     break;
                 default:
-                    // v6 templates defined by this schema and not served by this build (none after RC1 S7 in 50-114).
-                    // Counted so a gateway speaking ahead of this build is visible, never silent.
+                    // Templates defined by this schema and not served by this build. Counted so a producer speaking
+                    // ahead of this build is visible, never silent. Every known template has a case above today.
                     unhandled(templateId);
                     break;
             }
@@ -656,6 +687,7 @@ public final class AssetsSbeDemuxer {
                 requestOrderSnapshotDecoder.fromOrderId(), allUsers);
     }
 
+    /** 61 (and 62 per entry). v7 {@code journalSeq} is accepted with any value and not passed to the engine until RC2 S7. */
     private void handleMeJournalTrade(long timestamp) {
         meJournalTradeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int buy = meJournalTradeDecoder.takerIsBuyRaw();
@@ -696,11 +728,16 @@ public final class AssetsSbeDemuxer {
         }
     }
 
+    /**
+     * 63. v7 {@code rejectReason} is the ME code verbatim ({@code 0 = NONE}); 255 is never written by the bridge and is
+     * decode poison. It and {@code journalSeq} are not passed to the engine until RC2 S7.
+     */
     private void handleMeJournalTerminal(long timestamp) {
         meJournalTerminalDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int status = meJournalTerminalDecoder.statusRaw();
-        if (status < 2 || status > 5) {
-            rejectDecode("MeJournalTerminal status " + status);
+        final int meReject = meJournalTerminalDecoder.rejectReason();
+        if (status < 2 || status > 5 || meReject < 0 || meReject > 254) {
+            rejectDecode("MeJournalTerminal status " + status + " rejectReason " + meReject);
             return;
         }
         applying = true;
@@ -709,12 +746,18 @@ public final class AssetsSbeDemuxer {
                 meJournalTerminalDecoder.meEpoch(), timestamp);
     }
 
+    /**
+     * 64. v7 ranges: {@code commandKind 0..2}, {@code result 0..8} (7 RELEASED and 8 INVALID reach applyOutcome and land
+     * in its default branch, counted stale with no mutation, until RC2 S8), {@code timeInForce 0..2}. The v7 tail
+     * (journalSeq, timeInForce, expectedOldRemaining, ledgerSize, ledgerCapacity, behaviorVersion) is not passed (S8).
+     */
     private void handleMeCommandOutcome(long timestamp) {
         meCommandOutcomeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int kind = meCommandOutcomeDecoder.commandKind();
         final int result = meCommandOutcomeDecoder.result();
-        if (kind < 0 || kind > 2 || result < 0 || result > 6) {
-            rejectDecode("MeCommandOutcome kind " + kind + " result " + result);
+        final int tif = meCommandOutcomeDecoder.timeInForce();
+        if (kind < 0 || kind > 2 || result < 0 || result > 8 || tif < 0 || tif > 2) {
+            rejectDecode("MeCommandOutcome kind " + kind + " result " + result + " timeInForce " + tif);
             return;
         }
         applying = true;
@@ -740,6 +783,8 @@ public final class AssetsSbeDemuxer {
         c.correlationId = coreConfigDecoder.correlationId();
         c.configVersion = coreConfigDecoder.configVersion();
         c.behaviorVersion = coreConfigDecoder.behaviorVersion();
+        // v7 (RC2 S1 4.4): decoded only; excluded from the DUPLICATE equality and not recorded until RC2 S7.
+        c.genesisId = coreConfigDecoder.genesisId();
         final java.util.List<com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef> markets = new java.util.ArrayList<>();
         for (final CoreConfigDecoder.MarketsDecoder m : coreConfigDecoder.markets()) {
             final String symbol = fixedAscii(m::symbol, CoreConfigDecoder.MarketsDecoder.symbolLength());
@@ -941,7 +986,7 @@ public final class AssetsSbeDemuxer {
         registerSessionDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int classRaw = registerSessionDecoder.sessionClassRaw();
         final int resumableRaw = registerSessionDecoder.resumableRaw();
-        if (classRaw < 0 || classRaw > 6 || !validBool(resumableRaw)) {
+        if (classRaw < 0 || classRaw > 7 || !validBool(resumableRaw)) { // v7: 7 = REPLICA
             rejectDecode("RegisterSession class " + classRaw + " resumable " + resumableRaw);
             return;
         }
@@ -980,6 +1025,62 @@ public final class AssetsSbeDemuxer {
         }
         applying = true;
         engine.applyOrderEntryGate(orderEntryGateDecoder.correlationId(), orderEntryGateDecoder.marketId(), state, reason, timestamp);
+    }
+
+    // ---- v7 (RC2 S1 4.3 / 4.3a): defined, bounds- and range-checked, not served (S7 / S8) ----
+
+    /** FeedHalt (66, BRIDGE): {@code reason 1..5}; NONE (0) is not a halt. Served by RC2 S7. */
+    private void handleFeedHalt() {
+        feedHaltDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int reason = feedHaltDecoder.reasonRaw();
+        if (reason < 1 || reason > 5) {
+            rejectDecode("FeedHalt reason " + reason);
+            return;
+        }
+        unhandled(FeedHaltDecoder.TEMPLATE_ID);
+    }
+
+    /**
+     * MeCommandRelease (67, BRIDGE): every entry's {@code scope 0..1} and {@code result 0..2}, located by the frame's
+     * own dimensions as for 62. Served by RC2 S8.
+     */
+    private void handleMeCommandRelease() {
+        final int groupOffset = HEADER + headerDecoder.blockLength();
+        final int entryBlock = Short.toUnsignedInt(frame.getShort(groupOffset, ByteOrder.LITTLE_ENDIAN));
+        final int count = Short.toUnsignedInt(frame.getShort(groupOffset + 2, ByteOrder.LITTLE_ENDIAN));
+        final int groupStart = groupOffset + GROUP_HEADER;
+        for (int i = 0; i < count; i++) {
+            final int at = groupStart + i * entryBlock;
+            final int scope = frame.getByte(at + MeCommandReleaseDecoder.ReleasesDecoder.scopeEncodingOffset()) & 0xFF;
+            final int result = frame.getByte(at + MeCommandReleaseDecoder.ReleasesDecoder.resultEncodingOffset()) & 0xFF;
+            if (scope > 1 || result > 2) {
+                rejectDecode("MeCommandRelease scope " + scope + " result " + result + " at " + i);
+                return;
+            }
+        }
+        unhandled(MeCommandReleaseDecoder.TEMPLATE_ID);
+    }
+
+    /** MeEngineConfig (68, BRIDGE): {@code decision 0..3}. Served by RC2 S7. */
+    private void handleMeEngineConfig() {
+        meEngineConfigDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int decision = meEngineConfigDecoder.decisionRaw();
+        if (decision > 3) {
+            rejectDecode("MeEngineConfig decision " + decision);
+            return;
+        }
+        unhandled(MeEngineConfigDecoder.TEMPLATE_ID);
+    }
+
+    /** FeedLatchClear (76, ADMIN): {@code haltReason 1..5}. Served by RC2 S7. */
+    private void handleFeedLatchClear() {
+        feedLatchClearDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int reason = feedLatchClearDecoder.haltReasonRaw();
+        if (reason < 1 || reason > 5) {
+            rejectDecode("FeedLatchClear haltReason " + reason);
+            return;
+        }
+        unhandled(FeedLatchClearDecoder.TEMPLATE_ID);
     }
 
     /** The frame's correlationId when its template starts with one, else 0. Frame already bounds-checked. */
@@ -1022,6 +1123,17 @@ public final class AssetsSbeDemuxer {
         final int count = Short.toUnsignedInt(frame.getShort(marketsOffset + 2, ByteOrder.LITTLE_ENDIAN));
         final int assetsOffset = marketsOffset + GROUP_HEADER + block * count;
         return groupWithinFrame(assetsOffset, CoreConfigDecoder.AssetsDecoder.sbeBlockLength(), length);
+    }
+
+    /** Frozen v7 cap of MeCommandRelease (67) entries per frame (RC2 S1 4.3; keeps the journal frame unfragmented). */
+    static final int RELEASE_GROUP_CAP = 48;
+
+    /** MeCommandRelease's group inside the frame (as 62) and at most {@link #RELEASE_GROUP_CAP} entries. */
+    private boolean releaseGroupWithinFrame(final int groupOffset, final int length) {
+        if (!groupWithinFrame(groupOffset, MeCommandReleaseDecoder.ReleasesDecoder.sbeBlockLength(), length)) {
+            return false;
+        }
+        return Short.toUnsignedInt(frame.getShort(groupOffset + 2, ByteOrder.LITTLE_ENDIAN)) <= RELEASE_GROUP_CAP;
     }
 
     /** A fixed-length SBE char field as a String up to the first NUL; null when a byte is not printable ASCII. */
@@ -1073,8 +1185,8 @@ public final class AssetsSbeDemuxer {
     private void unhandled(final int templateId) {
         final long n = ++unhandledTemplateCount;
         if (shouldLogReject(n)) {
-            System.err.println("INGRESS DROP (unhandled v6 template): templateId=" + templateId
-                    + " is in money-schema v6 but not served by this build; unhandledTemplates=" + n);
+            System.err.println("INGRESS DROP (unhandled template): templateId=" + templateId + " is in money-schema v"
+                    + EXPECTED_SCHEMA_VERSION + " but not served by this build; unhandledTemplates=" + n);
         }
     }
 

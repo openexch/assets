@@ -10,11 +10,11 @@ import org.agrona.MutableDirectBuffer;
 @SuppressWarnings("all")
 public final class AdmissionStateEncoder
 {
-    public static final int BLOCK_LENGTH = 23;
+    public static final int BLOCK_LENGTH = 27;
     public static final int TEMPLATE_ID = 109;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final AdmissionStateEncoder parentMessage = this;
@@ -360,6 +360,44 @@ public final class AdmissionStateEncoder
         return this;
     }
 
+
+    public static int gateReasonsId()
+    {
+        return 7;
+    }
+
+    public static int gateReasonsSinceVersion()
+    {
+        return 7;
+    }
+
+    public static int gateReasonsEncodingOffset()
+    {
+        return 23;
+    }
+
+    public static int gateReasonsEncodingLength()
+    {
+        return 4;
+    }
+
+    public static String gateReasonsMetaAttribute(final MetaAttribute metaAttribute)
+    {
+        if (MetaAttribute.PRESENCE == metaAttribute)
+        {
+            return "required";
+        }
+
+        return "";
+    }
+
+    private final GateReasonsEncoder gateReasons = new GateReasonsEncoder();
+
+    public GateReasonsEncoder gateReasons()
+    {
+        gateReasons.wrap(buffer, offset + 23);
+        return gateReasons;
+    }
 
     public String toString()
     {

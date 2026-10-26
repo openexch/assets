@@ -13,8 +13,8 @@ public final class OrderEventBatchDecoder
     public static final int BLOCK_LENGTH = 0;
     public static final int TEMPLATE_ID = 103;
     public static final int SCHEMA_ID = 2;
-    public static final int SCHEMA_VERSION = 6;
-    public static final String SEMANTIC_VERSION = "0.6";
+    public static final int SCHEMA_VERSION = 7;
+    public static final String SEMANTIC_VERSION = "0.7";
     public static final java.nio.ByteOrder BYTE_ORDER = java.nio.ByteOrder.LITTLE_ENDIAN;
 
     private final OrderEventBatchDecoder parentMessage = this;
@@ -211,7 +211,7 @@ public final class OrderEventBatchDecoder
 
         public static int sbeBlockLength()
         {
-            return 166;
+            return 167;
         }
 
         public int actingBlockLength()
@@ -1561,6 +1561,62 @@ public final class OrderEventBatchDecoder
         }
 
 
+        public static int meReasonId()
+        {
+            return 28;
+        }
+
+        public static int meReasonSinceVersion()
+        {
+            return 7;
+        }
+
+        public static int meReasonEncodingOffset()
+        {
+            return 166;
+        }
+
+        public static int meReasonEncodingLength()
+        {
+            return 1;
+        }
+
+        public static String meReasonMetaAttribute(final MetaAttribute metaAttribute)
+        {
+            if (MetaAttribute.PRESENCE == metaAttribute)
+            {
+                return "required";
+            }
+
+            return "";
+        }
+
+        public static short meReasonNullValue()
+        {
+            return (short)255;
+        }
+
+        public static short meReasonMinValue()
+        {
+            return (short)0;
+        }
+
+        public static short meReasonMaxValue()
+        {
+            return (short)254;
+        }
+
+        public short meReason()
+        {
+            if (parentMessage.actingVersion < 7)
+            {
+                return (short)255;
+            }
+
+            return ((short)(buffer.getByte(offset + 166) & 0xFF));
+        }
+
+
         public StringBuilder appendTo(final StringBuilder builder)
         {
             if (null == buffer)
@@ -1649,6 +1705,9 @@ public final class OrderEventBatchDecoder
             builder.append('|');
             builder.append("updatedAtMs=");
             builder.append(this.updatedAtMs());
+            builder.append('|');
+            builder.append("meReason=");
+            builder.append(this.meReason());
             builder.append(')');
 
             return builder;

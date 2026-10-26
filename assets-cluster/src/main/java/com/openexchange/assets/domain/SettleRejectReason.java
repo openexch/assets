@@ -14,5 +14,11 @@ public enum SettleRejectReason {
     NOTIONAL_OVERFLOW,
     INVALID_PARTY,
     /** RC1 S5: tradeId &gt; lastApplied + 1 on the MeJournalTrade path; trades were skipped upstream. */
-    TRADE_GAP
+    TRADE_GAP,
+    /** v7 (RC2 S1, served by S7): a refusal of 61-64 under the journalSeq cursor (B 2.3): journalSeq gap. */
+    FEED_GAP,
+    /** v7 (RC2 S1, served by S7): the entry's meEpoch is not the bound epoch. */
+    ME_EPOCH_MISMATCH,
+    /** v7 (RC2 S1, served by S7): no epoch is bound yet. */
+    FEED_UNBOUND
 }

@@ -20,6 +20,24 @@ public enum SettleRejectReason
      */
     TRADE_GAP((short)5),
 
+
+    /**
+     * v7
+     */
+    FEED_GAP((short)6),
+
+
+    /**
+     * v7
+     */
+    ME_EPOCH_MISMATCH((short)7),
+
+
+    /**
+     * v7
+     */
+    FEED_UNBOUND((short)8),
+
     /**
      * To be used to represent not present or null.
      */
@@ -58,6 +76,9 @@ public enum SettleRejectReason
             case 3: return NOTIONAL_OVERFLOW;
             case 4: return INVALID_PARTY;
             case 5: return TRADE_GAP;
+            case 6: return FEED_GAP;
+            case 7: return ME_EPOCH_MISMATCH;
+            case 8: return FEED_UNBOUND;
             case 255: return NULL_VAL;
         }
 
