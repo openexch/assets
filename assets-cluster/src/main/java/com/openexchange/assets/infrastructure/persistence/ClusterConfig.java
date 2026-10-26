@@ -169,6 +169,7 @@ public final class ClusterConfig {
                 .clusterDir(new File(baseDir, CLUSTER_SUB_DIR))
                 .archiveContext(aeronArchiveContext.clone())
                 .serviceCount(1 + additionalServices.length)
+                .acceptStandbySnapshots(false)
                 .replicationChannel("aeron:udp?endpoint=" + hostname + ":0")
                 .snapshotChannel(snapshotChannel)
                 .idleStrategySupplier(org.agrona.concurrent.BusySpinIdleStrategy::new)
@@ -266,6 +267,11 @@ public final class ClusterConfig {
         this.archiveContext.archiveDir(new File(baseDir, ARCHIVE_SUB_DIR));
         this.consensusModuleContext.clusterDir(new File(baseDir, CLUSTER_SUB_DIR));
         this.clusteredServiceContexts.forEach((ctx) -> ctx.clusterDir(new File(baseDir, CLUSTER_SUB_DIR)));
+    }
+
+    /** RCS S1: refuses boot on any STANDBY_SNAPSHOT state; see {@link StandbySnapshotBootGuard}. */
+    public void enforceBootGuards() {
+        StandbySnapshotBootGuard.enforce(consensusModuleContext);
     }
 
     public MediaDriver.Context mediaDriverContext() {
