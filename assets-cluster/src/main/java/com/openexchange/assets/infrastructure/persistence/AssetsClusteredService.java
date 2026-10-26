@@ -2,7 +2,6 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
-import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.infrastructure.generated.EgressChannelsDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -62,21 +61,17 @@ import java.util.concurrent.TimeUnit;
  */
 public final class AssetsClusteredService implements ClusteredService {
 
-    private final AssetsEngine engine = new AssetsEngine();
-    // The projector owns the feed-forward translation (Settle/TerminalRelease -> money mutation +
-    // consumePosition advance). It wraps the same engine instance for the life of the service:
-    // loadSnapshot restores INTO that instance, so the projector needs no re-wiring on recovery.
-    private final SettlementProjector projector = new SettlementProjector(engine);
-    private final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, projector);
-
-    {
-        // RC1 S7: a CoreConfig cross-check failure stops this node (A-9 rule), through the same seam as the apply fence.
-        engine.setConfigFailFast(() -> this.failFast.run());
-    }
+    // RCS S1: every replicated-state mutation goes through the applier (engine, projector, demuxer, envelope). RC1 S7:
+    // a CoreConfig cross-check failure stops this node (A-9 rule), through the same seam as the apply fence; failFast
+    // is read lazily, so a test's recorder swapped in later is the one that runs.
+    private final AssetsLogApplier applier = new AssetsLogApplier(() -> this.failFast.run());
+    // Read-only aliases of the applier's instances (declared after it: field order matters).
+    private final AssetsEngine engine = applier.engine();
+    private final AssetsSbeDemuxer demuxer = applier.demuxer();
 
     {
         // RC1 S3 (K6): the replicated registration decides; these are its leader-local transport effects.
-        demuxer.setTransportHooks(new AssetsSbeDemuxer.TransportHooks() {
+        applier.setTransportHooks(new AssetsSbeDemuxer.TransportHooks() {
             public void onSessionRegistered(final long sessionId, final int channelMask, final boolean resumable) {
                 if (!isLeader || cluster == null) {
                     return;
@@ -128,8 +123,8 @@ public final class AssetsClusteredService implements ClusteredService {
      * term starts at count 0 on the new leader, the same id is safe within the term (the live leader never feeds the
      * counter), and the map grows by one key per term, not per tick. Anything at or above a base is that timer kind.
      */
-    private static final long EGRESS_DRAIN_TIMER_BASE = 1_000_000_000_000L;
-    static final long SWEEP_TIMER_BASE = 2_000_000_000_000_000L;
+    private static final long EGRESS_DRAIN_TIMER_BASE = AssetsLogApplier.EGRESS_DRAIN_TIMER_BASE;
+    static final long SWEEP_TIMER_BASE = AssetsLogApplier.SWEEP_TIMER_BASE;
     /** The ids term 0 would use; kept for the in-process service test. */
     static final long EGRESS_DRAIN_TIMER_ID = EGRESS_DRAIN_TIMER_BASE;
     static final long SWEEP_TIMER_ID = SWEEP_TIMER_BASE;
@@ -137,15 +132,15 @@ public final class AssetsClusteredService implements ClusteredService {
     private long leadershipTermId = -1L;
 
     static boolean isSweepTimerId(final long correlationId) {
-        return correlationId >= SWEEP_TIMER_BASE;
+        return AssetsLogApplier.isSweepTimerId(correlationId);
     }
 
     static boolean isDrainTimerId(final long correlationId) {
-        return correlationId >= EGRESS_DRAIN_TIMER_BASE && correlationId < SWEEP_TIMER_BASE;
+        return AssetsLogApplier.isDrainTimerId(correlationId);
     }
 
     /** Terms are spaced by {@link #TIMER_ID_TERM_STRIDE} so consecutive terms never use adjacent ids (control runs). */
-    static final long TIMER_ID_TERM_STRIDE = 1_000_000L;
+    static final long TIMER_ID_TERM_STRIDE = AssetsLogApplier.TIMER_ID_TERM_STRIDE;
 
     private long termTimerId(final long base) {
         return base + Math.max(0L, leadershipTermId) * TIMER_ID_TERM_STRIDE;
@@ -156,7 +151,6 @@ public final class AssetsClusteredService implements ClusteredService {
     static final long SWEEP_PERIOD_MS = 100;
     private boolean sweepArmed;
     private volatile long sweepTimerFires;
-    private final com.openexchange.cluster.SnapshotEnvelope snapshotEnvelope = new com.openexchange.cluster.SnapshotEnvelope();
 
     // Per-session egress queues, plus a cached array so the money path iterates without allocating
     // (cluster.clientSessions() returns a JDK unmodifiable wrapper whose iterator() allocates).
@@ -202,7 +196,7 @@ public final class AssetsClusteredService implements ClusteredService {
      * set by a SetMoneyJournal command through the log.
      */
     public void setMoneyJournalSink(com.openexchange.assets.domain.MoneyJournalSink journalSink) {
-        engine.setMoneyJournalSink(journalSink);
+        applier.setMoneyJournalSink(journalSink);
     }
 
     /**
@@ -295,7 +289,7 @@ public final class AssetsClusteredService implements ClusteredService {
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
         nodeMetrics.setRole(cluster.role().code());
-        engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
+        applier.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
                 balanceFeed != null ? balanceFeed::onBalanceUpdate
                         : AssetsEventPublisher.LiveBalanceTap.NONE));
         if (snapshotImage != null) {
@@ -599,7 +593,8 @@ public final class AssetsClusteredService implements ClusteredService {
         if (session != null) {
             // The principal the authenticator minted rides the SessionOpen log event: every member parses the
             // same bytes into the same authority (K6). Null only in in-process unit tests.
-            engine.sessions().open(session.id(), session.encodedPrincipal());
+            applier.onSessionOpen(session.id(), cluster == null ? -1L : cluster.logPosition(), timestamp,
+                    session.encodedPrincipal());
         }
         sessionsDirty = true;
         drainEgress();
@@ -624,7 +619,7 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
-        engine.sessions().close(session.id());
+        applier.onSessionClose(session.id(), cluster == null ? -1L : cluster.logPosition(), timestamp, closeReason);
         egressBySessionId.remove(session.id());
         sessionsDirty = true;
         drainEgress();
@@ -685,7 +680,9 @@ public final class AssetsClusteredService implements ClusteredService {
         int templateId = -1;
         long dispatchStartNs = 0L;
         long dispatchEndNs = 0L;
-        if (!applyIfSubscribe(session, buffer, offset, length)) {
+        if (applier.isTransportSubscribe(buffer, offset, length)) {
+            subscribeTransport(session, buffer, offset, length);
+        } else {
             // The origin context: while the engine applies this command, request-scoped egress goes to
             // THIS session (and, for a query, so does every emission — see isQueryIngress). Cleared in
             // a finally so a throwing apply cannot leak one command's origin onto the next.
@@ -701,8 +698,8 @@ public final class AssetsClusteredService implements ClusteredService {
                 // Deterministic on every replica: decode -> domain command -> engine mutation. The apply
                 // only queues its egress; the offers happen in the drain below, off the apply's critical
                 // section.
-                engine.setLogPosition(header.position());
-                demuxer.dispatch(session == null ? -1L : session.id(), buffer, offset, length, timestamp);
+                applier.onSessionMessage(session == null ? -1L : session.id(), header.position(), timestamp,
+                        buffer, offset, length);
             } finally {
                 originSession = null;
                 originIsQuery = false;
@@ -735,17 +732,20 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnTimerEvent(long correlationId, long timestamp) {
-        if (isSweepTimerId(correlationId)) {
+        final int kind = AssetsLogApplier.timerKind(correlationId);
+        final long logPosition = cluster == null ? -1L : cluster.logPosition();
+        if (kind == AssetsLogApplier.TIMER_SWEEP) {
             // Replicated: a TimerEvent is a log entry, so every member pops the same entries at the same
             // log time; only the leader re-arms, and only while something is left to sweep.
             sweepArmed = false;
             sweepTimerFires++;
-            engine.sweep(timestamp);
+            applier.onTimerEvent(correlationId, logPosition, timestamp);
             drainEgress();
             armSweepIfNeeded();
             return;
         }
-        if (isDrainTimerId(correlationId)) {
+        applier.onTimerEvent(correlationId, logPosition, timestamp);
+        if (kind == AssetsLogApplier.TIMER_DRAIN) {
             drainTimerArmed = false;
             drainTimerFires++;
             final long drainStartNs = System.nanoTime();
@@ -774,7 +774,7 @@ public final class AssetsClusteredService implements ClusteredService {
     private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
         final long startNs = System.nanoTime();
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        final int length = encodeSnapshot(engine, buffer, snapshotEnvelope);
+        final int length = applier.serialize(buffer);
         final long serializedNs = System.nanoTime();
 
         // Chunked, like the matching engine's A-2 fix: a single offer() throws
@@ -893,6 +893,10 @@ public final class AssetsClusteredService implements ClusteredService {
                                          int leaderMemberId, int logSessionId, TimeUnit timeUnit, int appVersion) {
         // Seen live and during replay (in log order): the latest term names the timer ids this node arms as leader.
         this.leadershipTermId = leadershipTermId;
+        // Never fenced at the base: a latched applier refuses every entry, so a term event on a stopped node stays silent.
+        if (!applier.failed()) {
+            applier.onNewLeadershipTermEvent(leadershipTermId, logPosition, timestamp, timeUnit);
+        }
     }
 
     @Override
@@ -1031,20 +1035,9 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     void restoreFromImage(final DirectBuffer image, final int imageLength) {
         try {
-            if (imageLength <= 0) {
-                throw new IllegalStateException("assets snapshot image is empty");
-            }
-            final int payloadLength = snapshotEnvelope.open(image, imageLength);
-            final BalanceSnapshotCodec.Decoded decoded = BalanceSnapshotCodec.deserialize(
-                    image, com.openexchange.cluster.SnapshotEnvelope.payloadOffset(), payloadLength, engine);
-            if (decoded.bytesConsumed != payloadLength) {
-                // The codec read fewer or more bytes than the envelope carried: a mis-framed payload.
-                // Refusing to start beats serving a ledger assembled from part of a snapshot.
-                throw new IllegalStateException("assets snapshot payload length mismatch: envelope=" + payloadLength
-                        + " decoded=" + decoded.bytesConsumed + " accounts=" + decoded.accountCount
-                        + " holds=" + decoded.holdCount);
-            }
-            engine.verifyRestoredInvariants();
+            // Empty image, envelope, decode, framing and invariants are all checked by the applier.
+            applier.restore(image, imageLength);
+            final BalanceSnapshotCodec.Decoded decoded = applier.lastRestored();
             System.out.println("[SNAPSHOT] restored orders=" + engine.orders().orders().size() + " accounts=" + decoded.accountCount
                     + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
                     + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq
@@ -1062,9 +1055,7 @@ public final class AssetsClusteredService implements ClusteredService {
     /** The snapshot image as offered: the v4 payload written at the envelope's payload offset, then sealed. */
     static int encodeSnapshot(final AssetsEngine engine, final MutableDirectBuffer buffer,
                               final com.openexchange.cluster.SnapshotEnvelope envelope) {
-        final int payloadLength = BalanceSnapshotCodec.serialize(engine, buffer,
-                com.openexchange.cluster.SnapshotEnvelope.payloadOffset());
-        return envelope.seal(buffer, payloadLength);
+        return AssetsLogApplier.encode(engine, buffer, envelope);
     }
 
     /** Exposed for tests / diagnostics: deadline sweep timer fires on this node. */
@@ -1179,26 +1170,12 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     /**
-     * Handle a Subscribe message if that is what this is.
-     *
-     * @return true when the message was a Subscribe and must NOT be dispatched to the engine
+     * The transport effect of a well-formed Subscribe ({@link AssetsLogApplier#isTransportSubscribe} said so): decode
+     * the channel mask and, on the leader, narrow this session's broadcast streams. Never the engine, never a
+     * snapshot. A short or foreign-version Subscribe is not classified as one: it goes to the applier, whose demuxer
+     * drops and counts it without reading stale bytes past the frame.
      */
-    private boolean applyIfSubscribe(ClientSession session, DirectBuffer buffer, int offset, int length) {
-        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
-            return false;
-        }
-        peekHeaderDecoder.wrap(buffer, offset);
-        if (peekHeaderDecoder.templateId() != SubscribeDecoder.TEMPLATE_ID
-                || peekHeaderDecoder.schemaId() != SubscribeDecoder.SCHEMA_ID) {
-            return false;
-        }
-        // Behind the same gate as the engine: a short or foreign-version Subscribe must not read stale
-        // bytes past the frame; it falls through to the demuxer, which drops and counts it.
-        if (peekHeaderDecoder.version() != MessageHeaderDecoder.SCHEMA_VERSION
-                || length < MessageHeaderDecoder.ENCODED_LENGTH + SubscribeDecoder.BLOCK_LENGTH
-                || peekHeaderDecoder.blockLength() < SubscribeDecoder.BLOCK_LENGTH) {
-            return false;
-        }
+    private void subscribeTransport(ClientSession session, DirectBuffer buffer, int offset, int length) {
         subscribeDecoder.wrapAndApplyHeader(buffer, offset, peekHeaderDecoder);
         final EgressChannelsDecoder channels = subscribeDecoder.channels();
         int mask = 0;
@@ -1213,7 +1190,6 @@ public final class AssetsClusteredService implements ClusteredService {
                 queue.subscribe(mask);
             }
         }
-        return true;
     }
 
     /**
@@ -1355,6 +1331,11 @@ public final class AssetsClusteredService implements ClusteredService {
     /** Exposed for tests / diagnostics: the ingress fence counters live on the demuxer. */
     public AssetsSbeDemuxer demuxer() {
         return demuxer;
+    }
+
+    /** The log applier this service wraps (RCS S1); package-private for tests and later RCS slices. */
+    AssetsLogApplier applier() {
+        return applier;
     }
 
     /**

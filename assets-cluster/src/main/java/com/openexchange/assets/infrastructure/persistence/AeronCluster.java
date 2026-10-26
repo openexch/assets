@@ -140,6 +140,14 @@ public final class AeronCluster {
                 .terminationTimeoutNs(TimeUnit.SECONDS.toNanos(2))
                 .sessionTimeoutNs(InfrastructureConstants.SESSION_TIMEOUT_NS);
 
+        // RCS S1: refuse to boot on standby-snapshot state before any driver/archive/CM thread starts.
+        try {
+            clusterConfig.enforceBootGuards();
+        } catch (final StandbySnapshotBootGuard.Refused refused) {
+            barrier.close();
+            throw refused;
+        }
+
         log.info("Assets Engine node %d starting: portBase=%d driverMode=%s idle=%s",
                 nodeId, portBase, driverMode, TransportConfig.idleMode());
 
