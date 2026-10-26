@@ -1045,7 +1045,7 @@ public final class AssetsClusteredService implements ClusteredService {
                         + " holds=" + decoded.holdCount);
             }
             engine.verifyRestoredInvariants();
-            System.out.println("[SNAPSHOT] restored accounts=" + decoded.accountCount
+            System.out.println("[SNAPSHOT] restored orders=" + engine.orders().orders().size() + " accounts=" + decoded.accountCount
                     + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
                     + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq
                     + " lastLogTime=" + decoded.lastLogTime + " sections=" + decoded.sectionCount
