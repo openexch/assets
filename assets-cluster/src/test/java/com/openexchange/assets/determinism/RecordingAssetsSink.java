@@ -7,6 +7,7 @@ import com.openexchange.assets.domain.ConfigKind;
 import com.openexchange.assets.domain.CoreOrderView;
 import com.openexchange.assets.domain.DispatchKind;
 import com.openexchange.assets.domain.EventKind;
+import com.openexchange.assets.domain.FeedHaltReason;
 import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.CoreRejectReason;
@@ -88,6 +89,23 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     }
 
     @Override
+    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId, boolean journalEnabled,
+                                     long meEpoch, long lastAppliedJournalSeq, boolean feedHalted, FeedHaltReason haltReason) {
+        events.add(new AssetsEngineEvent.FeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled,
+                meEpoch, lastAppliedJournalSeq, feedHalted, haltReason));
+    }
+
+    @Override
+    public void onFeedLatch(FeedHaltReason reason, long expected, long seen, long skip, long rawTradeId) {
+        events.add(new AssetsEngineEvent.FeedLatch(reason, expected, seen, skip, rawTradeId));
+    }
+
+    @Override
+    public void onFeedLatchCleared(FeedHaltReason reason, long journalSeq, boolean auto) {
+        events.add(new AssetsEngineEvent.FeedLatchCleared(reason, journalSeq, auto));
+    }
+
+    @Override
     public void onSettleFault(long tradeId, long orderId, long userId, int assetId,
                               long drawnFromAvailable, long uncovered) {
         events.add(new AssetsEngineEvent.SettleFault(tradeId, orderId, userId, assetId,
@@ -136,6 +154,12 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     }
 
     @Override
+    public void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                                 long atMs, long logPosition, boolean toOrigin, int gateReasons) {
+        events.add(new AssetsEngineEvent.AdmissionState(marketId, gateState, gateReason, circuitBreaker, toOrigin, gateReasons));
+    }
+
+    @Override
     public void onOrderAck(long correlationId, long requestIdHigh, long requestIdLow, long orderId, long userId, int marketId,
                            OrderStatus status, boolean duplicate, int holdAssetId, long holdAmount, long acceptedAtMs, long eventSeq) {
         events.add(new AssetsEngineEvent.OrderAck(correlationId, orderId, userId, marketId, status, duplicate, holdAssetId, holdAmount, eventSeq));
@@ -147,6 +171,14 @@ public final class RecordingAssetsSink implements AssetsEventSink {
         events.add(new AssetsEngineEvent.OrderEvent(eventSeq, o.orderId(), o.userId(), o.marketId(), kind,
                 OrderStatus.fromCode(o.statusCode()), reason, o.price(), o.quantity(), o.filledQty(), o.remainingQty(),
                 lastPrice, lastQty, tradeId, o.meOrderId(), o.holdAssetId(), o.holdAmount(), holdRemaining));
+    }
+
+    @Override
+    public void onOrderEvent(long eventSeq, long logPosition, CoreOrderView o, EventKind kind, CoreRejectReason reason,
+                             long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs, int meReason) {
+        events.add(new AssetsEngineEvent.OrderEvent(eventSeq, o.orderId(), o.userId(), o.marketId(), kind,
+                OrderStatus.fromCode(o.statusCode()), reason, o.price(), o.quantity(), o.filledQty(), o.remainingQty(),
+                lastPrice, lastQty, tradeId, o.meOrderId(), o.holdAssetId(), o.holdAmount(), holdRemaining, meReason));
     }
 
     @Override

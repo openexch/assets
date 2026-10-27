@@ -5,6 +5,7 @@ import com.openexchange.assets.domain.AdminResult;
 import com.openexchange.assets.domain.ConfigKind;
 import com.openexchange.assets.domain.DispatchKind;
 import com.openexchange.assets.domain.EventKind;
+import com.openexchange.assets.domain.FeedHaltReason;
 import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.CoreRejectReason;
@@ -29,7 +30,8 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.AdmissionState, AssetsEngineEvent.OrderAck, AssetsEngineEvent.OrderEvent,
                 AssetsEngineEvent.MeDispatch, AssetsEngineEvent.DepositReject, AssetsEngineEvent.ConfigApplied,
         AssetsEngineEvent.OrderFault, AssetsEngineEvent.OrderSnapshotEntry, AssetsEngineEvent.OrderSnapshotEnd,
-        AssetsEngineEvent.PendingDispatchEnd, AssetsEngineEvent.MeDispatchReply {
+        AssetsEngineEvent.PendingDispatchEnd, AssetsEngineEvent.MeDispatchReply,
+        AssetsEngineEvent.FeedLatch, AssetsEngineEvent.FeedLatchCleared {
 
     String render();
 
@@ -114,13 +116,24 @@ public sealed interface AssetsEngineEvent
         }
     }
 
+    /** RC2 S7 3.6: the v7 tail renders only when it is not S1's {@code 0 0 FALSE NONE} (so the v1/v2 goldens hold). */
     record FeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId,
-                              boolean journalEnabled)
+                              boolean journalEnabled, long meEpoch, long lastAppliedJournalSeq, boolean feedHalted,
+                              FeedHaltReason haltReason)
             implements AssetsEngineEvent {
+        public FeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId, boolean journalEnabled) {
+            this(correlationId, consumePosition, lastAppliedTradeId, journalEnabled, 0L, 0L, false, FeedHaltReason.NONE);
+        }
+
         @Override
         public String render() {
-            return String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d journal=%s",
+            final String base = String.format("FEEDPOS corr=%d consumePos=%d lastTradeId=%d journal=%s",
                     correlationId, consumePosition, lastAppliedTradeId, journalEnabled ? "on" : "off");
+            if (meEpoch == 0L && lastAppliedJournalSeq == 0L && !feedHalted && haltReason == FeedHaltReason.NONE) {
+                return base;
+            }
+            return base + String.format(" epoch=%d jseq=%d halted=%s haltReason=%s", meEpoch, lastAppliedJournalSeq,
+                    feedHalted ? "TRUE" : "FALSE", haltReason.name());
         }
     }
 
@@ -160,13 +173,25 @@ public sealed interface AssetsEngineEvent
         }
     }
 
+    /** RC2 S7 6.2: {@code reasons=} renders only when the bitmask is not S1's single-reason derivation. */
     record AdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
-                          boolean toOrigin) implements AssetsEngineEvent {
+                          boolean toOrigin, int gateReasons) implements AssetsEngineEvent {
+        public AdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                              boolean toOrigin) {
+            this(marketId, gateState, gateReason, circuitBreaker, toOrigin, derivedReasons(gateState, gateReason));
+        }
+
+        static int derivedReasons(final GateState gateState, final GateReason gateReason) {
+            return gateState == GateState.OPEN ? 0 : 1 << gateReason.code();
+        }
+
         @Override
         public String render() {
-            return String.format("ADMISSION market=%d gate=%s reason=%s breaker=%s %s",
+            final String base = String.format("ADMISSION market=%d gate=%s reason=%s breaker=%s %s",
                     marketId, gateState.name(), gateReason.name(), circuitBreaker ? "on" : "off",
                     toOrigin ? "origin" : "broadcast");
+            return gateReasons == derivedReasons(gateState, gateReason) ? base
+                    : base + String.format(" reasons=0x%x", gateReasons);
         }
     }
 
@@ -179,12 +204,25 @@ public sealed interface AssetsEngineEvent
         }
     }
 
+    /** RC2 S7 D9b: {@code meReason=} renders only when it is not 255 (never under v1/v2). */
     record OrderEvent(long eventSeq, long orderId, long userId, int marketId, EventKind kind, OrderStatus status,
                       CoreRejectReason reason, long price, long quantity, long filledQty, long remainingQty, long lastPrice,
-                      long lastQty, long tradeId, long meOrderId, int holdAssetId, long holdAmount, long holdRemaining)
+                      long lastQty, long tradeId, long meOrderId, int holdAssetId, long holdAmount, long holdRemaining,
+                      int meReason)
             implements AssetsEngineEvent {
+        public OrderEvent(long eventSeq, long orderId, long userId, int marketId, EventKind kind, OrderStatus status,
+                          CoreRejectReason reason, long price, long quantity, long filledQty, long remainingQty, long lastPrice,
+                          long lastQty, long tradeId, long meOrderId, int holdAssetId, long holdAmount, long holdRemaining) {
+            this(eventSeq, orderId, userId, marketId, kind, status, reason, price, quantity, filledQty, remainingQty, lastPrice,
+                    lastQty, tradeId, meOrderId, holdAssetId, holdAmount, holdRemaining, 255);
+        }
+
         @Override
         public String render() {
+            return renderBase() + (meReason == 255 ? "" : " meReason=" + meReason);
+        }
+
+        private String renderBase() {
             return String.format("ORDEREVENT seq=%d order=%d u=%d market=%d kind=%s status=%s reason=%s px=%d qty=%d filled=%d remaining=%d lastPx=%d lastQty=%d trade=%d leg=%d holdAsset=%d hold=%d holdRemaining=%d",
                     eventSeq, orderId, userId, marketId, kind.name(), status == null ? "?" : status.name(), reason.name(), price, quantity,
                     filledQty, remainingQty, lastPrice, lastQty, tradeId, meOrderId, holdAssetId, holdAmount, holdRemaining);
@@ -258,6 +296,23 @@ public sealed interface AssetsEngineEvent
             return String.format("DISPATCHREPLY seq=%d id=%d/%d kind=%s u=%d order=%d old=%d market=%d type=%d side=%d px=%d qty=%d budget=%d tif=%d",
                     dispatchSeq, commandIdHigh, commandIdLow, kind.name(), userId, omsOrderId, oldOrderId, marketId, orderType, side, price,
                     quantity, budget, timeInForce);
+        }
+    }
+
+    // ---- RC2 S7 (node-local sink methods, rendered by the recording sink only; never wire bytes) ----
+
+    record FeedLatch(FeedHaltReason reason, long expected, long seen, long skip, long rawTradeId) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("FEEDLATCH reason=%s expected=%d seen=%d skip=%d rawTradeId=%d", reason.name(), expected, seen,
+                    skip, rawTradeId);
+        }
+    }
+
+    record FeedLatchCleared(FeedHaltReason reason, long journalSeq, boolean auto) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("FEEDCLEAR reason=%s jseq=%d auto=%d", reason.name(), journalSeq, auto ? 1 : 0);
         }
     }
 }

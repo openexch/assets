@@ -5,7 +5,7 @@ import org.agrona.MutableDirectBuffer;
 
 
 /**
- * ADMIN: the latch exit (RC2 S1 4.3a). haltReason is the latched reason being cleared (1..5; 0 is a decode reject); journalSeq is the entry to skip: the cursor becomes journalSeq, so the next accepted entry is journalSeq + 1 (0 = clear without moving the cursor, legal only for GAP). ORIGIN AdminAck{refTemplateId 76, ACCEPTED | DUPLICATE (not latched, or a different reason) | REJECTED reason INVALID} + BROADCAST OrderFault{FEED_HALT, orderId 0, tradeId = journalSeq, amount = 0}. GAP clears automatically when the cursor passes haltSeenSeq - 1 or by 76; EPOCH_MISMATCH and SOURCE_UNBOUND clear only by a new genesis; SETTLE_REFUSED and SOURCE_SCHEMA clear only by 76 naming the refused journalSeq. Served by S7.
+ * ADMIN: the latch exit (RC2 S1 4.3a). haltReason is the latched reason being cleared (1..5; 0 is a decode reject); journalSeq is the entry to skip: the cursor becomes journalSeq, so the next accepted entry is journalSeq + 1 (0 = clear without moving the cursor, legal for GAP and for a latch with nothing skippable). ORIGIN AdminAck{refTemplateId 76, ACCEPTED | DUPLICATE (not latched, or a different reason) | REJECTED reason INVALID} + BROADCAST OrderFault{FEED_HALT, orderId 0, tradeId = journalSeq, amount = 0}. GAP clears automatically when the cursor passes haltSeenSeq - 1 or by 76; EPOCH_MISMATCH and SOURCE_UNBOUND clear only by a new genesis; SETTLE_REFUSED and SOURCE_SCHEMA clear only by 76 naming the refused journalSeq. Served by S7.
  */
 @SuppressWarnings("all")
 public final class FeedLatchClearEncoder

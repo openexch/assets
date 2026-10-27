@@ -101,6 +101,15 @@ public final class SessionAuthority {
         return changed;
     }
 
+    /**
+     * RC2 S7 D8b: revoke a FORWARDER/BRIDGE registration whose declared {@code sourceEpoch} is not the epoch the core
+     * bound (replicated, recorded in section 9 through the existing fields). Its later frames are UNREGISTERED_SESSION.
+     */
+    void revoke() {
+        this.registered = false;
+        this.channelMask = 0;
+    }
+
     /** Restore only (snapshot section 9). */
     void restore(final boolean registered, final int channelMask, final boolean resumable, final int readerKind,
                  final long identity, final long sourceEpoch) {

@@ -5,6 +5,10 @@ import com.openexchange.assets.infrastructure.generated.CircuitBreakerDecoder;
 import com.openexchange.assets.infrastructure.generated.CoreConfigDecoder;
 import com.openexchange.assets.infrastructure.generated.CreateOrderDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositDecoder;
+import com.openexchange.assets.infrastructure.generated.FeedHaltDecoder;
+import com.openexchange.assets.infrastructure.generated.FeedLatchClearDecoder;
+import com.openexchange.assets.infrastructure.generated.MeCommandReleaseDecoder;
+import com.openexchange.assets.infrastructure.generated.MeEngineConfigDecoder;
 import com.openexchange.assets.infrastructure.generated.MeCommandOutcomeDecoder;
 import com.openexchange.assets.infrastructure.generated.MeJournalTerminalDecoder;
 import com.openexchange.assets.infrastructure.generated.MeJournalTradeBatchDecoder;
@@ -74,6 +78,7 @@ final class FrameMutator {
 
     private static final int T_BATCH = MeJournalTradeBatchDecoder.TEMPLATE_ID;
     private static final int T_CONFIG = CoreConfigDecoder.TEMPLATE_ID;
+    private static final int T_RELEASE = MeCommandReleaseDecoder.TEMPLATE_ID;
     private static final int[] KNOWN = knownTemplates();
 
     private final Random rnd;
@@ -132,12 +137,17 @@ final class FrameMutator {
             case RegisterSessionDecoder.TEMPLATE_ID -> List.of(
                     new Field("sessionClass", RegisterSessionDecoder.sessionClassEncodingOffset(), 1, 0, 7), // v7: 7 REPLICA
                     new Field("resumable", RegisterSessionDecoder.resumableEncodingOffset(), 1, 0, 1));
+            // RC2 S7 16.4 (S1/review-assets.md FIX-1): the v7 feed templates' raw-validated root fields
+            case FeedHaltDecoder.TEMPLATE_ID -> List.of(new Field("reason", FeedHaltDecoder.reasonEncodingOffset(), 1, 1, 5));
+            case MeEngineConfigDecoder.TEMPLATE_ID -> List.of(new Field("decision", MeEngineConfigDecoder.decisionEncodingOffset(), 1, 0, 3));
+            case FeedLatchClearDecoder.TEMPLATE_ID -> List.of(
+                    new Field("haltReason", FeedLatchClearDecoder.haltReasonEncodingOffset(), 1, 1, 5));
             default -> List.of();
         };
     }
 
     private static int groupCount(final int template) {
-        return template == T_BATCH ? 1 : template == T_CONFIG ? 2 : 0;
+        return template == T_BATCH || template == T_RELEASE ? 1 : template == T_CONFIG ? 2 : 0;
     }
 
     /** {groupHeaderOffset, entryBlock, count} for every group of the frame, from the frame's own dimensions. */
@@ -255,6 +265,18 @@ final class FrameMutator {
             final int v = invalidValue(new Field("takerIsBuy", 0, 1, 0, 1));
             m[g[0] + GROUP_HEADER + k * g[1] + MeJournalTradeBatchDecoder.TradesDecoder.takerIsBuyEncodingOffset()] = (byte) v;
             return "trades[" + k + "].takerIsBuy=" + v;
+        }
+        if (t == T_RELEASE) {
+            final int[] g = gs.get(0);
+            if (g[2] == 0) {
+                return "empty release group (nothing to poison)";
+            }
+            final int k = rnd.nextInt(g[2]);
+            final boolean scope = rnd.nextBoolean();
+            final int v = invalidValue(new Field(scope ? "scope" : "result", 0, 1, 0, scope ? 1 : 2));
+            m[g[0] + GROUP_HEADER + k * g[1] + (scope ? MeCommandReleaseDecoder.ReleasesDecoder.scopeEncodingOffset()
+                    : MeCommandReleaseDecoder.ReleasesDecoder.resultEncodingOffset())] = (byte) v;
+            return "releases[" + k + "]." + (scope ? "scope" : "result") + "=" + v;
         }
         final boolean market = rnd.nextBoolean() && gs.get(0)[2] > 0;
         final int[] g = market ? gs.get(0) : gs.get(1);

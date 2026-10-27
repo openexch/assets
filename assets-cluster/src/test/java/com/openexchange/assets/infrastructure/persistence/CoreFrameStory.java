@@ -44,8 +44,23 @@ final class CoreFrameStory {
     }
 
     static List<Step> build(final long seed, final int frames) {
-        return new CoreFrameStory(seed).run(frames);
+        return build(seed, frames, false);
     }
+
+    /**
+     * RC2 S7 (review F-1/F-2): {@code v3} boots behaviour 3 (CoreConfig 1 -> 2 -> 3 with genesisId {@link #GENESIS}, then
+     * the ME FRESH EngineConfig at journalSeq 1 binds the epoch), every ME-sourced frame carries the bound epoch and a dense
+     * journalSeq, and two v3 beats join the story: a lost 67 delivered after its successor (GAP latch, redelivery,
+     * reach-clear, ADMIN OPEN) and a poisoned 67 skipped by FeedLatchClear 76 (then ADMIN OPEN). The v1/v2 story
+     * ({@code v3 = false}) is byte-identical to RC1's.
+     */
+    static List<Step> build(final long seed, final int frames, final boolean v3) {
+        return new CoreFrameStory(seed, v3).run(frames);
+    }
+
+    static final long GENESIS = 0x5EEDL;
+    /** The v3 story's deliberate ingress drops (the poisoned 67 of beat B). */
+    static final int V3_DELIBERATE_DROPS = 1;
 
     private final Random rnd;
     private final FrameReplica model = new FrameReplica();
@@ -67,8 +82,16 @@ final class CoreFrameStory {
     private CoreFrameEncoders.Trade lastTrade;
     private int scheduled;
 
-    private CoreFrameStory(final long seed) {
+    private final boolean v3;
+    private long jseq;
+
+    private CoreFrameStory(final long seed, final boolean v3) {
         this.rnd = new Random(seed);
+        this.v3 = v3;
+        if (v3) {
+            enc.meEpoch = GENESIS;
+            enc.genesisId = GENESIS;
+        }
         for (int m = 1; m <= 5; m++) {
             mid0[m] = mid[m] = 100L * m * ONE;
         }
@@ -104,6 +127,11 @@ final class CoreFrameStory {
 
     private void advance(final long ms) {
         now += ms;
+    }
+
+    /** The next journalSeq of the fake ME (v3), 0 in the v1/v2 story. */
+    private long js() {
+        return v3 ? ++jseq : 0L;
     }
 
     // ---------------------------------------------------------------- the story
@@ -153,6 +181,12 @@ final class CoreFrameStory {
     private void setup() {
         frame(enc.coreConfig(corr++, 1, 1, 1, 1, 1_000_000_000_000_000L, 0)); // ADOPT
         frame(enc.coreConfig(corr++, 1, 1, 1, 1, 1_000_000_000_000_000L, 0)); // DUPLICATE
+        if (v3) {
+            // RC2 S7: switch to 3 while GLOBAL is SUSPENDED, then the FRESH record binds the epoch (the gate opens after it)
+            frame(enc.coreConfig(corr++, 2, 2, 1, 1, 1_000_000_000_000_000L, 0));
+            frame(enc.coreConfig(corr++, 3, 3, 1, 1, 1_000_000_000_000_000L, 0));
+            frame(enc.meEngineConfig(++egress, js(), GENESIS, 1, 0));
+        }
         frame(enc.gate(corr++, 0, true));
         for (int m = 1; m <= 5; m++) {
             frame(enc.riskConfig(corr++, 1, m, 200, 40, 2_000));
@@ -177,9 +211,21 @@ final class CoreFrameStory {
         }
     }
 
+    /**
+     * RC2 S7 16.4 (S1/review-assets.md FIX-1): one well-formed frame of each v7 feed template (66, 67 with one release
+     * entry, 68, 76), the corpus rows the adversarial fuzzer derives hostile frames from. They are not story steps: at the
+     * story's behaviour 1/2 they are unserved (counted), and the story's replica-equivalence and parity rigs pin a
+     * drop-free log; the fuzzer judges every mutant in a sandbox restored from the replica's image.
+     */
+    static List<byte[]> v7FeedFrames() {
+        final CoreFrameEncoders enc = new CoreFrameEncoders();
+        return List.of(enc.feedHalt(9_001, 1, 0, 1, 3), enc.meCommandRelease(1, 1, 1, 1), enc.meEngineConfig(2, 1, 1, 1, 0),
+                enc.feedLatchClear(9_002, 1, 0));
+    }
+
     /** One forced story beat per threshold, so every lifecycle path appears whatever the seed. */
     private void schedule() {
-        final int[] at = {40, 55, 70, 90, 100, 104, 120, 125, 140, 141, 150, 165, 170, 185, 200, 205, 215, 230};
+        final int[] at = {40, 55, 70, 90, 100, 104, 120, 125, 140, 141, 150, 165, 170, 185, 200, 205, 215, 230, 240, 260};
         if (scheduled >= at.length || frameCount < at[scheduled]) {
             return;
         }
@@ -202,8 +248,38 @@ final class CoreFrameStory {
             case 15 -> create(0, 4, false);                 // GATE_CLOSED
             case 16 -> frame(enc.gate(corr++, 4, true));
             case 17 -> { create(5, 1, false); tick(1, 3); tick(1, -8); }
+            case 18 -> lostAndRedelivered();                // v3 only
+            case 19 -> poisonedAndSkipped();                // v3 only
             default -> { }
         }
+    }
+
+    /** v3 beat A: entry j+2 arrives before j+1 (GAP latch), then j+1 and j+2 again (reach-clear), a BUMP, ADMIN OPEN. */
+    private void lostAndRedelivered() {
+        if (!v3) {
+            return;
+        }
+        final byte[] lost = enc.meCommandRelease(++egress, ++jseq, GENESIS, 1);
+        final byte[] next = enc.meCommandRelease(++egress, ++jseq, GENESIS, 2);
+        frame(next);
+        frame(lost);
+        frame(next);
+        frame(enc.meEngineConfig(++egress, js(), GENESIS, 2, 3)); // BUMP
+        frame(enc.gate(corr++, 0, true));
+    }
+
+    /** v3 beat B: a 67 with a poisoned scope at the exactly-next journalSeq (SOURCE_SCHEMA skip s), the 76 skip, ADMIN OPEN. */
+    private void poisonedAndSkipped() {
+        if (!v3) {
+            return;
+        }
+        final long s = ++jseq;
+        final byte[] bad = enc.meCommandRelease(++egress, s, GENESIS, 3);
+        bad[CoreFrameEncoders.HEADER + com.openexchange.assets.infrastructure.generated.MeCommandReleaseEncoder.BLOCK_LENGTH + 4
+                + com.openexchange.assets.infrastructure.generated.MeCommandReleaseEncoder.ReleasesEncoder.scopeEncodingOffset()] = 9;
+        frame(bad);
+        frame(enc.feedLatchClear(corr++, 3, s));
+        frame(enc.gate(corr++, 0, true));
     }
 
     // ---------------------------------------------------------------- order entry
@@ -340,13 +416,13 @@ final class CoreFrameStory {
             } else if (p < 95) {
                 frame(outcome(o, cmdLow, kind, 0L, 0L, 3, 1)); // REJECTED by the ME
             } else {
-                frame(enc.terminal(++egress, ++legSeq, o.userId, o.marketId, 4, now, o.orderId)); // terminal first (G9)
+                frame(enc.terminal(++egress, ++legSeq, o.userId, o.marketId, 4, now, o.orderId, js())); // terminal first (G9)
             }
         } else if (kind == 1) {
             if (p < 70) {
                 frame(outcome(o, cmdLow, kind, o.currentLegId, o.currentLegId, 0, 0));
             } else if (p < 90) {
-                frame(enc.terminal(++egress, o.currentLegId, o.userId, o.marketId, 3, now, o.orderId));
+                frame(enc.terminal(++egress, o.currentLegId, o.userId, o.marketId, 3, now, o.orderId, js()));
             } else {
                 frame(outcome(o, cmdLow, kind, o.currentLegId, o.currentLegId, 2, 1)); // refused: flag kept
             }
@@ -358,7 +434,7 @@ final class CoreFrameStory {
     private byte[] outcome(final CoreOrder o, final long cmdLow, final int kind, final long old, final long leg, final int reason,
                            final int result) {
         return enc.outcome(++egress, o.orderId, cmdLow, o.userId, o.orderId, old, o.price, o.remainingQty, o.budget, o.marketId,
-                kind, o.orderType, o.side, now, leg, reason, result);
+                kind, o.orderType, o.side, now, leg, reason, result, js());
     }
 
     /** A cancel the ME settles by its journal terminal (after a refused cancel), or a stale terminal for a gone leg. */
@@ -367,9 +443,9 @@ final class CoreFrameStory {
                 && o.currentLegId != 0);
         if (!c.isEmpty()) {
             final CoreOrder o = c.get(0);
-            frame(enc.terminal(++egress, o.currentLegId, o.userId, o.marketId, 3, now, o.orderId));
+            frame(enc.terminal(++egress, o.currentLegId, o.userId, o.marketId, 3, now, o.orderId, js()));
         } else {
-            frame(enc.terminal(++egress, 10_000 + rnd.nextInt(50), 1, 1, 2, now, 800_000 + rnd.nextInt(50)));
+            frame(enc.terminal(++egress, 10_000 + rnd.nextInt(50), 1, 1, 2, now, 800_000 + rnd.nextInt(50), js()));
         }
     }
 
@@ -401,9 +477,9 @@ final class CoreFrameStory {
             final CoreOrder o = model.engine.orders().orders().get(oms);
             final long leg = oms == t.takerOms() ? t.takerLeg() : t.makerLeg();
             if (o == null && rnd.nextInt(3) == 0) {
-                frame(enc.terminal(++egress, leg, 1, t.marketId(), 2, now, oms)); // stale FILLED: the record is gone
+                frame(enc.terminal(++egress, leg, 1, t.marketId(), 2, now, oms, js())); // stale FILLED: the record is gone
             } else if (o != null && limitOf(o) == 0 && o.currentLegId == leg && rnd.nextBoolean()) {
-                frame(enc.terminal(++egress, leg, o.userId, o.marketId, 3, now, oms)); // ME cancels the market remainder
+                frame(enc.terminal(++egress, leg, o.userId, o.marketId, 3, now, oms, js())); // ME cancels the market remainder
             }
         }
     }
@@ -439,7 +515,7 @@ final class CoreFrameStory {
                 continue;
             }
             return new CoreFrameEncoders.Trade(++egress, ++tradeId, m, taker.currentLegId, taker.userId, maker.currentLegId,
-                    maker.userId, px, q, taker == b, now, taker.orderId, maker.orderId);
+                    maker.userId, px, q, taker == b, now, taker.orderId, maker.orderId, js());
         }
         return null;
     }

@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.application.engine;
 
+import com.openexchange.assets.application.engine.feed.FeedState;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
 import com.openexchange.assets.application.engine.order.OrderEngine;
 import com.openexchange.assets.application.engine.session.SessionAuthority;
 import com.openexchange.assets.application.engine.session.SessionRegistry;
 import com.openexchange.assets.application.engine.time.DeadlineIndex;
 import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.ConfigDecision;
 import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.FeedHaltReason;
+import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.GateReason;
 import com.openexchange.assets.domain.GateState;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
@@ -33,6 +37,7 @@ import org.agrona.collections.Long2ObjectHashMap;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 /**
  * Application-layer orchestrator for the Assets Engine — the deterministic state machine that turns a
@@ -311,6 +316,12 @@ public final class AssetsEngine {
         if (assetId < 0) {
             return; // no such hold: idempotent no-op (already released / never held)
         }
+        if (behaviorV3() && orders.orders().get(c.getOrderId()) != null) {
+            // RC2 S7 7.2 row 4: a live core order's hold has ONE release owner, terminalize (S5 3.2); a v5 Release naming
+            // it is a counted no-op
+            coreOwnedReleaseRefusedCount++;
+            return;
+        }
         if (c.isFromFeed() && a.isOmsManagedRelease(c.getOrderId())) {
             // Iceberg/stop PARENT hold: slices share the parent's omsOrderId, so a slice FILLED on
             // the feed must not release the parent's residual. The OMS owns this hold's terminal
@@ -498,6 +509,12 @@ public final class AssetsEngine {
      */
     private void applyInitHighWater(InitTradeHighWaterCommand c) {
         boolean virgin = lastAppliedTradeId == 0L && consumePosition == 0L && accounts.isEmpty();
+        if (behaviorV3()) {
+            // RC2 S7 7.2 row 5: the primer would break the dense tradeId the v3 cursor relies on (3.4)
+            LOG.warn("InitTradeHighWater REFUSED (behaviour v3): requested tradeId=%d consumePosition=%d",
+                    c.getTradeId(), c.getConsumePosition());
+            return;
+        }
         if (!virgin) {
             LOG.warn("InitTradeHighWater REFUSED (ledger not virgin): requested tradeId=%d consumePosition=%d; "
                             + "current lastAppliedTradeId=%d consumePosition=%d accountCount=%d",
@@ -539,7 +556,9 @@ public final class AssetsEngine {
      * through the sink. Read-only; deterministic on every replica (egress is leader-gated downstream).
      */
     public void reportFeedPosition(long correlationId) {
-        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled);
+        // RC2 S7 3.6: the v7 tail is the FeedState (all zero under v1/v2: S1's 0, 0, FALSE, NONE)
+        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled, feed.boundMeEpoch(),
+                feed.lastAppliedJournalSeq(), feed.latched(), feed.latchReason());
     }
 
     /** Settle legs that faulted (drew from available / left an uncovered residue) since boot. */
@@ -789,6 +808,32 @@ public final class AssetsEngine {
         if (breach[0] != null) {
             throw new IllegalStateException("restored ledger fails its invariants: " + breach[0]);
         }
+        // RC2 S7 6.3 and 2.1: the gate reason sets and the feed state
+        final boolean v3 = behaviorV3();
+        for (int m = 0; m <= OrderEntryGate.MARKETS; m++) {
+            final String g = gate.restoreBreach(m, v3);
+            if (g != null) {
+                throw new IllegalStateException("restored gates fail their invariants: " + g);
+            }
+        }
+        final String f = feed.invariantBreach(lastAppliedTradeId);
+        if (f != null) {
+            throw new IllegalStateException("restored feed state fails its invariants: " + f);
+        }
+        if (!v3 && (feed.boundMeEpoch() != 0 || feed.lastAppliedJournalSeq() != 0 || feed.latched())) {
+            throw new IllegalStateException("restored feed state is not empty below behaviour 3");
+        }
+        if (v3 && feed.boundMeEpoch() == 0 && gate.state(OrderEntryGate.GLOBAL) != GateState.SUSPENDED) {
+            throw new IllegalStateException("restored v3 core is unbound with GLOBAL " + gate.state(OrderEntryGate.GLOBAL));
+        }
+        // review F-3: every latch adds BRIDGE_HALT on GLOBAL and only ADMIN OPEN clears it, refused while latched
+        if (v3 && feed.latched() && (gate.reasons(OrderEntryGate.GLOBAL) & (1 << GateReason.BRIDGE_HALT.code())) == 0) {
+            throw new IllegalStateException("restored v3 core is latched " + feed.latchReason() + " without BRIDGE_HALT on GLOBAL");
+        }
+        // review F-3: EPOCH_MISMATCH is raised only against a bound epoch (D1 row 3, a non-stale 66)
+        if (feed.latchReason() == FeedHaltReason.EPOCH_MISMATCH && feed.boundMeEpoch() == 0) {
+            throw new IllegalStateException("restored EPOCH_MISMATCH latch on an unbound feed");
+        }
     }
 
     // ---- RC1 S3: session authority and the order-entry gate ----
@@ -823,8 +868,12 @@ public final class AssetsEngine {
     /** CoreConfig (70), ADMIN class: contract S7 section 3, then the node-local cross-check (section 4). */
     public void applyCoreConfig(com.openexchange.assets.domain.commands.CoreConfigCommand c, long timestamp) {
         observeLogTime(timestamp);
-        final var decision = coreConfig.decide(c);
+        final var decision = coreConfig.decide(c, gate.state(OrderEntryGate.GLOBAL) == GateState.OPEN, feedVirgin());
         final long version = coreConfig.apply(decision, c);
+        if (decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.SWITCH
+                && c.behaviorVersion == 3) {
+            gate.convertToReasonSet(); // RC2 S7 6.1: same apply as the switch, no egress
+        }
         final AdminResult result;
         switch (decision) {
             case ADOPT: result = AdminResult.ADOPTED; break;
@@ -875,8 +924,9 @@ public final class AssetsEngine {
 
     /** An internal gate transition (no AdminAck): MeCommandOutcome CAPACITY, bridge halt, apply fault. */
     public void suspendGateInternally(int marketId, GateReason reason) {
-        if (gate.set(marketId, GateState.SUSPENDED, reason)) {
-            sink.onAdmissionState(marketId, GateState.SUSPENDED, reason, false, lastLogTime, logPosition, false);
+        // v3 (D4): add the bit, AdmissionState only when it is new; v1/v2: the RC1 overwrite
+        if (behaviorV3() ? gate.addReason(marketId, reason) : gate.set(marketId, GateState.SUSPENDED, reason)) {
+            emitAdmission(marketId, false);
         }
     }
 
@@ -916,15 +966,555 @@ public final class AssetsEngine {
                                                               int channelMask, boolean resumable, int readerKind,
                                                               long identity, long sourceEpoch, long timestamp) {
         observeLogTime(timestamp);
+        if (behaviorV3() && feed.boundMeEpoch() != 0 && sourceEpoch != 0 && sourceEpoch != feed.boundMeEpoch()) {
+            // RC2 S7 D8a: a FORWARDER/BRIDGE declaring another ME epoch after the bind; the registry is not called
+            final SessionAuthority a = sessions.get(sessionId);
+            if (a != null && (a.sessionClass() == SessionClass.FORWARDER || a.sessionClass() == SessionClass.BRIDGE)) {
+                final SessionRegistry.Registration refused =
+                        new SessionRegistry.Registration(AdminResult.REJECTED, CoreRejectReason.INVALID, false);
+                sink.onAdminAck(correlationId, 80, refused.result(), refused.reason().code(), 0L);
+                return refused;
+            }
+        }
         final SessionRegistry.Registration r = sessions.register(sessionId, assertedClass, channelMask, resumable,
                 readerKind, identity, sourceEpoch);
         sink.onAdminAck(correlationId, 80, r.result(), r.reason().code(), 0L);
         if (r.result() != AdminResult.REJECTED) {
-            sink.onAdmissionState(OrderEntryGate.GLOBAL, gate.state(OrderEntryGate.GLOBAL), gate.reason(OrderEntryGate.GLOBAL),
-                    false, lastLogTime, logPosition, true);
+            emitAdmission(OrderEntryGate.GLOBAL, true);
         }
         return r;
     }
+
+    // ---- RC2 S7: behaviour v3, the ME feed (contract RC2-me-link/S7/contract.md sections 2-5, 10) ----
+
+    private final FeedState feed = new FeedState();
+    /** v5 money templates refused under v3 (7.2 row 3). Node-local. */
+    private long v5MoneyRefusedCount;
+    /** Release 4 naming a live core order under v3 (7.2 row 4). Node-local. */
+    private long coreOwnedReleaseRefusedCount;
+
+    private static final int V_APPLY = 0;
+    private static final int V_DUPLICATE = 1;
+    private static final int V_REFUSED = 2;
+    private static final int L_WRITE = 0;
+    private static final int L_MERGE = 1;
+    private static final int L_SUPPRESS = 2;
+    private static final long MAX_LEDGER_CAPACITY = (1L << 31) - 1;
+    private static final int MIN_WIRE = 12;
+    private static final int MAX_WIRE = 65534;
+
+    /** The replicated feed view of behaviour v3 (all zero under v1/v2). */
+    public FeedState feed() {
+        return feed;
+    }
+
+    /** {@code coreConfig().behaviorVersion() >= 3}: every S7 rule is active only then (section 0). */
+    public boolean behaviorV3() {
+        return coreConfig.behaviorVersion() >= 3;
+    }
+
+    public long v5MoneyRefusedCount() {
+        return v5MoneyRefusedCount;
+    }
+
+    public long coreOwnedReleaseRefusedCount() {
+        return coreOwnedReleaseRefusedCount;
+    }
+
+    /** The demuxer's 7.2 row 3 step: a v5 money template refused under v3, for every authority. */
+    public void refuseV5Money(final int templateId, final long correlationId, final long userId, final int classCode) {
+        v5MoneyRefusedCount++;
+        rejectUnauthorised(templateId, correlationId, userId, CoreRejectReason.UNAUTHORIZED_CLASS, classCode);
+    }
+
+    /** MeJournalTrade 61. Returns true on APPLY and DUPLICATE, false on REFUSE (a 62 batch stops at the first false). */
+    public boolean onMeTrade(long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId, long takerUserId,
+                             long makerLegId, long makerUserId, long price, long quantity, boolean takerIsBuy, long meTimestamp,
+                             long takerOmsOrderId, long makerOmsOrderId, long meEpoch, long timestamp) {
+        return onMeTradeEntry(61, egressSeq, journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId,
+                price, quantity, takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch, timestamp);
+    }
+
+    /** One 61, or one 62 entry ({@code templateId} names which, for the duplicate counter). */
+    public boolean onMeTradeEntry(int templateId, long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId,
+                                  long takerUserId, long makerLegId, long makerUserId, long price, long quantity, boolean takerIsBuy,
+                                  long meTimestamp, long takerOmsOrderId, long makerOmsOrderId, long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyTrade(egressSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price, quantity,
+                    takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch, timestamp);
+            return true;
+        }
+        observeLogTime(timestamp);
+        final long digest = tradeDigest(egressSeq, journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId,
+                price, quantity, takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch);
+        final int verdict = admit(templateId, journalSeq, meEpoch, egressSeq, tradeId, marketId, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        // 3.4: the second invariant (dense tradeId) and the S5 apply; a refusal latches SETTLE_REFUSED, skip s,
+        // latchTradeId = L + 1 (never the frame's tradeId, review 2 BLOCKER-A)
+        final long nextTradeId = lastAppliedTradeId + 1;
+        if (!orders.applyTradeV3(journalSeq, egressSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId,
+                price, quantity, takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch, timestamp)) {
+            feed.countSettleRefused();
+            latch(FeedHaltReason.SETTLE_REFUSED, journalSeq, journalSeq, journalSeq, nextTradeId, 0L, 0L, tradeId);
+            return false;
+        }
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /** MeJournalTerminal 63. Under v1/v2 the RC1 apply (meReason unused). */
+    public boolean onMeTerminal(long egressSeq, long journalSeq, long legId, long userId, int marketId, int statusCode,
+                                int meRejectReason, long meTimestamp, long omsOrderId, long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyTerminal(egressSeq, legId, userId, marketId, statusCode, meTimestamp, omsOrderId, meEpoch, timestamp);
+            return true;
+        }
+        observeLogTime(timestamp);
+        final long digest = terminalDigest(egressSeq, journalSeq, legId, userId, marketId, statusCode, meRejectReason, meTimestamp,
+                omsOrderId, meEpoch);
+        final int verdict = admit(63, journalSeq, meEpoch, egressSeq, 0L, marketId, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        orders.applyTerminal(egressSeq, legId, userId, marketId, statusCode, meTimestamp, omsOrderId, meEpoch, timestamp,
+                meRejectReason);
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /** MeCommandOutcome 64. Under v1/v2 the RC1 apply ({@code oldCancelled} unused). */
+    public boolean onMeOutcome(long egressSeq, long journalSeq, long commandIdHigh, long commandIdLow, long userId,
+                               long omsOrderId, long oldOrderId, long price, long quantity, long budget, int marketId,
+                               int commandKind, int result, long legId, int reason, boolean oldCancelled, long meTimestamp,
+                               long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyOutcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget,
+                    marketId, commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp);
+            return true;
+        }
+        observeLogTime(timestamp);
+        final long digest = outcomeDigest(egressSeq, journalSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price,
+                quantity, budget, marketId, commandKind, result, legId, reason, oldCancelled, meTimestamp, meEpoch);
+        final int verdict = admit(64, journalSeq, meEpoch, egressSeq, 0L, marketId, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        orders.applyOutcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget,
+                marketId, commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, oldCancelled);
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /** MeCommandRelease 67, v3 only: S7 consumes the cursor and counts the content unserved (S8 serves it). */
+    public boolean onMeRelease(long egressSeq, long journalSeq, long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            return false; // not served below v3 (the demuxer counts it unhandled)
+        }
+        observeLogTime(timestamp);
+        final long digest = releaseDigest(egressSeq, journalSeq, meEpoch);
+        final int verdict = admit(67, journalSeq, meEpoch, egressSeq, 0L, 0, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        feed.countUnservedRelease();
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /**
+     * MeEngineConfig 68, v3 only (D2 row 1 and 4.2): the FRESH record at journalSeq 1 binds the epoch (trust on first use),
+     * is applied and committed, then every FORWARDER/BRIDGE registration with a foreign sourceEpoch is revoked (10.2);
+     * later records must be valid BUMPs.
+     */
+    public boolean onMeEngineConfig(long egressSeq, long journalSeq, long meEpoch, long configVersion, long behaviorVersion,
+                                    long ledgerCapacity, int maxWireVersion, ConfigDecision decision, long timestamp,
+                                    LongConsumer revokedSession) {
+        if (!behaviorV3()) {
+            return false;
+        }
+        observeLogTime(timestamp);
+        final boolean values = configVersion >= 1 && behaviorVersion >= 2 && ledgerCapacity >= 1
+                && ledgerCapacity <= MAX_LEDGER_CAPACITY && maxWireVersion >= MIN_WIRE && maxWireVersion <= MAX_WIRE;
+        final long digest = configDigest(egressSeq, journalSeq, meEpoch, configVersion, behaviorVersion, ledgerCapacity,
+                maxWireVersion, decision);
+        // D2 row 1 with the 3.8 belt: the epoch must be the recorded genesisId (S2: meEpoch := genesisId), so a core
+        // re-genesised without its ME never binds the old ME's retained FRESH (4.4, review 2 NOTE-I)
+        if (feed.boundMeEpoch() == 0 && journalSeq == 1 && meEpoch > 0 && decision == ConfigDecision.FRESH && values
+                && meEpoch == coreConfig.recorded().genesisId) {
+            feed.bind(meEpoch);
+            feed.recordMeConfig(configVersion, behaviorVersion, ledgerCapacity, maxWireVersion);
+            commit(journalSeq, egressSeq, digest);
+            feed.countEpochRevoked(sessions.revokeForeignEpoch(meEpoch, revokedSession));
+            return true;
+        }
+        final int verdict = admit(68, journalSeq, meEpoch, egressSeq, 0L, 0, digest, decision == ConfigDecision.FRESH);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        // 4.2 (bound, s >= 2): only a BUMP of the record the ME journaled before, mirroring S2 rows 9, 11, 13, 14
+        if (!values || decision != ConfigDecision.BUMP || configVersion <= feed.meConfigVersion()
+                || behaviorVersion != feed.meBehaviorVersion() || ledgerCapacity != feed.meLedgerCapacity()
+                || maxWireVersion < feed.meMaxWireVersion()) {
+            latch(FeedHaltReason.SOURCE_SCHEMA, journalSeq, journalSeq, journalSeq, 0L, 0L, 0L, 0L);
+            return false;
+        }
+        feed.recordMeConfig(configVersion, behaviorVersion, ledgerCapacity, maxWireVersion);
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /**
+     * 5.4: a feed frame that passed the header, bounds and class gates but failed a value range, v3 only. Returns true
+     * when the frame latched (rows 1 and 2): a 62 batch stops there. {@code rawTradeId} is diagnostic only.
+     */
+    public boolean onFeedPoison(int templateId, long journalSeq, long meEpoch, long rawTradeId, long timestamp) {
+        if (!behaviorV3()) {
+            return false;
+        }
+        // no observeLogTime: a frame that failed its value ranges is decode poison, it leaves no trace but the latch (5.4)
+        final long bound = feed.boundMeEpoch();
+        if (bound == 0 && journalSeq == 1) {
+            latch(FeedHaltReason.SOURCE_SCHEMA, 1L, 1L, 0L, 0L, 0L, 0L, rawTradeId);
+            return true;
+        }
+        if (bound != 0 && meEpoch == bound && journalSeq == feed.lastAppliedJournalSeq() + 1) {
+            final long tradeId = templateId == 61 || templateId == 62 ? lastAppliedTradeId + 1 : 0L;
+            latch(FeedHaltReason.SOURCE_SCHEMA, journalSeq, journalSeq, journalSeq, tradeId, 0L, 0L, rawTradeId);
+            return true;
+        }
+        feed.countSourceSchema(); // a corrupt duplicate or gap entry does not stall the cursor
+        return false;
+    }
+
+    /** FeedHalt 66 (D3a), BRIDGE, v3 only. */
+    public void applyFeedHalt(long sessionId, long correlationId, FeedHaltReason reason, long meEpochSeen,
+                              long expectedJournalSeq, long seenJournalSeq, long bridgeIdentity, long timestamp) {
+        if (!behaviorV3()) {
+            return;
+        }
+        observeLogTime(timestamp);
+        final long c = feed.lastAppliedJournalSeq();
+        final long bound = feed.boundMeEpoch();
+        final boolean invalid;
+        switch (reason) {
+            case GAP: invalid = !(expectedJournalSeq >= 1 && expectedJournalSeq < seenJournalSeq); break;
+            case EPOCH_MISMATCH: invalid = meEpochSeen == 0; break;
+            case SOURCE_SCHEMA: invalid = expectedJournalSeq < 1; break;
+            case SOURCE_UNBOUND:
+            case SETTLE_REFUSED: invalid = false; break;
+            default: invalid = true; break;
+        }
+        if (invalid) {
+            sink.onAdminAck(correlationId, 66, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
+            return;
+        }
+        if (reason == FeedHaltReason.SOURCE_UNBOUND || reason == FeedHaltReason.SETTLE_REFUSED) {
+            feed.countHaltDuplicate(); // binding and refusal are the core's judgment only
+            sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        final boolean stale = reason == FeedHaltReason.GAP ? c >= seenJournalSeq - 1
+                : reason == FeedHaltReason.EPOCH_MISMATCH ? bound == 0 || meEpochSeen == bound
+                : c >= expectedJournalSeq;
+        if (stale) {
+            feed.countHaltStale();
+            sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        if (feed.latchReason() == reason || latchDecision(reason, 0L) != L_WRITE) {
+            if (feed.latchReason() != reason && latchDecision(reason, 0L) == L_SUPPRESS) {
+                feed.countLatchSuppressed();
+            }
+            feed.countHaltDuplicate();
+            sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        feed.countHaltApplied();
+        sink.onAdminAck(correlationId, 66, AdminResult.ACCEPTED, 0, 0L);
+        final long expected = reason == FeedHaltReason.EPOCH_MISMATCH && expectedJournalSeq < 1 ? Math.max(1L, c + 1)
+                : expectedJournalSeq;
+        writeLatch(reason, expected, seenJournalSeq, 0L, 0L,
+                reason == FeedHaltReason.EPOCH_MISMATCH ? meEpochSeen : 0L, bridgeIdentity, 0L);
+    }
+
+    /** FeedLatchClear 76 (D3b, total), ADMIN, v3 only. */
+    public void applyFeedLatchClear(long correlationId, FeedHaltReason reason, long journalSeq, long timestamp) {
+        if (!behaviorV3()) {
+            return;
+        }
+        observeLogTime(timestamp);
+        if (reason == FeedHaltReason.EPOCH_MISMATCH || reason == FeedHaltReason.SOURCE_UNBOUND || reason == FeedHaltReason.NONE) {
+            sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L); // genesis only
+            return;
+        }
+        if (!feed.latched() || feed.latchReason() != reason) {
+            sink.onAdminAck(correlationId, 76, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        final long skip = feed.latchSkipSeq();
+        final boolean clearOnly = journalSeq == 0 && (reason == FeedHaltReason.GAP || skip == 0);
+        final boolean skipIt = reason != FeedHaltReason.GAP && skip != 0 && journalSeq == skip;
+        if (!clearOnly && !skipIt) {
+            sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
+            return;
+        }
+        if (skipIt) {
+            // row 5: exactly the one entry the core refused or found poisoned at c + 1, and exactly one tradeId
+            final long tradeId = feed.latchTradeId();
+            feed.advanceCursorTo(journalSeq);
+            feed.recordDigest(journalSeq, 0L); // content unknown: a later copy of it cannot be byte-checked
+            if (tradeId != 0) {
+                lastAppliedTradeId = tradeId;
+            }
+            feed.setLastSkippedJournalSeq(journalSeq);
+        }
+        feed.zeroLatch();
+        feed.countLatchClear();
+        sink.onAdminAck(correlationId, 76, AdminResult.ACCEPTED, 0, 0L);
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, journalSeq, 0L, logPosition);
+        sink.onFeedLatchCleared(reason, journalSeq, false);
+    }
+
+    /** D4 internal clear of one engine-owned bit (S8's D4 auto-clear; no S7 caller). Only under v3. */
+    public void clearGateInternally(int marketId, GateReason reason) {
+        if (behaviorV3() && gate.clearReason(marketId, reason)) {
+            emitAdmission(marketId, false);
+        }
+    }
+
+    // ---- D1, the commit, the latch slot ----
+
+    /** D1 (and D2 rows 2-3 for a non-binding entry while unbound). Every refusal latches through {@link #latch}. */
+    private int admit(final int templateId, final long s, final long m, final long g, final long tradeId, final int marketId,
+                      final long digest, final boolean freshRecord) {
+        final long bound = feed.boundMeEpoch();
+        final long c = feed.lastAppliedJournalSeq();
+        if (s < 1 || m <= 0) {
+            latch(FeedHaltReason.SOURCE_SCHEMA, Math.max(1L, c + 1), s, 0L, 0L, 0L, 0L, tradeId); // D1 row 1, decode-grade
+            return V_REFUSED;
+        }
+        if (bound == 0) {
+            feed.countUnbound();
+            refuseFeed(tradeId, marketId, s, SettleRejectReason.FEED_UNBOUND, 1L);
+            if (s == 1) {
+                latch(FeedHaltReason.SOURCE_UNBOUND, 1L, 1L, 0L, 0L, 0L, 0L, tradeId); // D2 row 2: ME content, genesis only
+            } else {
+                latch(FeedHaltReason.GAP, 1L, s, 0L, 0L, 0L, 0L, tradeId); // D2 row 3: a hole at 1
+            }
+            return V_REFUSED;
+        }
+        if (m != bound) {
+            feed.countEpochMismatch();
+            refuseFeed(tradeId, marketId, s, SettleRejectReason.ME_EPOCH_MISMATCH, bound);
+            latch(FeedHaltReason.EPOCH_MISMATCH, Math.max(1L, c + 1), s, 0L, 0L, m, 0L, tradeId);
+            return V_REFUSED;
+        }
+        if (s <= c) {
+            // 3.8 (the duplicate belt): an entry at or below the cursor must byte-match what was applied there. The FRESH
+            // record is kept for the epoch's life, the last DIGEST_WINDOW entries in a ring; a 76-skipped entry is unknown.
+            final boolean held = s == 1 || feed.digestHeld(s);
+            final long applied = s == 1 ? feed.freshDigest() : held ? feed.digestAt(s) : 0L;
+            if (held && applied != 0 && applied != digest) {
+                feed.countDuplicateMismatch();
+                if (s == 1 && freshRecord) {
+                    // another FRESH under the bound epoch: the ME was re-genesised (or restored) reusing the epoch, genesis only
+                    // (belt review D-1: only a 68 FRESH; any other template labelled seq 1 is the SOURCE_SCHEMA row below)
+                    latch(FeedHaltReason.EPOCH_MISMATCH, Math.max(1L, c + 1), s, 0L, 0L, m, 0L, tradeId);
+                } else {
+                    // the source served other content at an applied seq (an in-epoch ME rewind, or a corrupt copy): loud,
+                    // skip 0 (nothing to skip: the cursor is past it), reach-cleared by the next exactly-next entry
+                    latch(FeedHaltReason.SOURCE_SCHEMA, c + 1, s, 0L, 0L, 0L, 0L, tradeId);
+                }
+                return V_REFUSED;
+            }
+            if (!held) {
+                feed.countDuplicateUnverified(); // older than the window: cannot be compared (counted, contract 3.8)
+            }
+            feed.countDuplicate(templateId);
+            if (s == feed.lastSkippedJournalSeq()) {
+                feed.countSkippedEntryRedelivered(); // FIX-G: a valid copy of an entry a 76 skipped
+            }
+            return V_DUPLICATE;
+        }
+        if (s > c + 1) {
+            feed.countGap();
+            refuseFeed(tradeId, marketId, s, SettleRejectReason.FEED_GAP, c + 1);
+            latch(FeedHaltReason.GAP, c + 1, s, 0L, 0L, 0L, 0L, tradeId);
+            return V_REFUSED;
+        }
+        if (g < consumePosition) {
+            feed.countEgressRegression(); // D1 row 6: the ME rewound inside its epoch (4.4); skip 0, never consumable
+            latch(FeedHaltReason.SOURCE_SCHEMA, c + 1, s, 0L, 0L, 0L, 0L, tradeId);
+            return V_REFUSED;
+        }
+        return V_APPLY;
+    }
+
+    /** ORIGIN SettleRejected for a v3 feed refusal: journalPosition = journalSeq (S1 4.1). */
+    private void refuseFeed(final long tradeId, final int marketId, final long s, final SettleRejectReason reason, final long detail) {
+        settleRejectCount++;
+        sink.onSettleRejected(tradeId, marketId, s, reason, detail);
+    }
+
+    /** 3.3: {@code c := s}, {@code P := max(P, g)}, the entry's digest (3.8), then the reach-clear. */
+    private void commit(final long s, final long g, final long digest) {
+        feed.advanceCursorTo(s);
+        feed.recordDigest(s, digest);
+        if (g > consumePosition) {
+            consumePosition = g;
+        }
+        reachClear();
+    }
+
+    /** 3.3 reach-clear: the only automatic exit; it never moves the cursor and never reopens the gate. */
+    private void reachClear() {
+        if (!feed.latched()) {
+            return;
+        }
+        final long c = feed.lastAppliedJournalSeq();
+        final FeedHaltReason reason = feed.latchReason();
+        final boolean reached;
+        switch (reason) {
+            case GAP: reached = c >= feed.latchSeenSeq() - 1; break;
+            case SOURCE_SCHEMA:
+            case SETTLE_REFUSED: reached = feed.latchSkipSeq() != 0 ? c >= feed.latchSkipSeq() : c >= feed.latchExpectedSeq(); break;
+            default: reached = false; break;
+        }
+        if (!reached) {
+            return;
+        }
+        feed.zeroLatch();
+        feed.countLatchAutoClear();
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, c, 0L, logPosition);
+        sink.onFeedLatchCleared(reason, 0L, true);
+    }
+
+    /** Exit class of a latch reason (5.1): 1 auto, 2 admin, 3 genesis. */
+    private static int exitClass(final FeedHaltReason r) {
+        switch (r) {
+            case GAP: return 1;
+            case SOURCE_SCHEMA:
+            case SETTLE_REFUSED: return 2;
+            case EPOCH_MISMATCH:
+            case SOURCE_UNBOUND: return 3;
+            default: return 0;
+        }
+    }
+
+    /** 5.1 precedence of a new latch against the one slot. */
+    private int latchDecision(final FeedHaltReason reason, final long skip) {
+        if (!feed.latched()) {
+            return L_WRITE;
+        }
+        final int next = exitClass(reason);
+        final int current = exitClass(feed.latchReason());
+        if (next > current) {
+            return L_WRITE;
+        }
+        if (next == current && skip != 0 && feed.latchSkipSeq() == 0) {
+            return L_WRITE; // review NOTE-1: a skippable latch replaces a skip-0 one of its class
+        }
+        if (skip != 0 && feed.latchSkipSeq() == skip) {
+            return L_MERGE; // latchTradeId is L + 1 on both sides by construction: nothing changes
+        }
+        return L_SUPPRESS;
+    }
+
+    /** 5.1 / 5.2: raise, replace, merge or suppress a latch. */
+    private void latch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
+                       final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {
+        switch (latchDecision(reason, skip)) {
+            case L_WRITE:
+                writeLatch(reason, expected, seen, skip, tradeId, meEpochSeen, bridgeIdentity, rawTradeId);
+                break;
+            case L_MERGE:
+                break;
+            default:
+                feed.countLatchSuppressed();
+                break;
+        }
+    }
+
+    /** 5.2 latching effects: the fields, the BRIDGE_HALT bit, the FeedHaltApplied OrderFault, the node-local sink call. */
+    private void writeLatch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
+                            final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {
+        feed.writeLatch(reason, expected, seen, skip, tradeId, meEpochSeen, bridgeIdentity, logPosition);
+        suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, seen, expected, logPosition);
+        sink.onFeedLatch(reason, expected, seen, skip, rawTradeId);
+    }
+
+    /** The AdmissionState of one gate with its reason set (all four emission sites go through here or pass it). */
+    private void emitAdmission(final int marketId, final boolean toOrigin) {
+        sink.onAdmissionState(marketId, gate.state(marketId), gate.reason(marketId), false, lastLogTime, logPosition, toOrigin,
+                gate.reasons(marketId));
+    }
+
+    // 3.8: the entry digest, over the decoded fields the core applies (a 62 entry and the same 61 digest alike)
+    private static final long K_TRADE = 0x61L;
+    private static final long K_TERMINAL = 0x63L;
+    private static final long K_OUTCOME = 0x64L;
+    private static final long K_RELEASE = 0x67L;
+    private static final long K_CONFIG = 0x68L;
+
+    // The digest definition is part of behaviour 3 (contract 3.8): pinned by DigestVectorTest; once 3 is in the production
+    // set it may change only under a new behaviour version.
+
+    /** 3.8 digest of a 61 or of one 62 entry. */
+    public static long tradeDigest(long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId, long takerUserId,
+                                   long makerLegId, long makerUserId, long price, long quantity, boolean takerIsBuy,
+                                   long meTimestamp, long takerOmsOrderId, long makerOmsOrderId, long meEpoch) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(
+                digest(K_TRADE, egressSeq), journalSeq), tradeId), marketId), takerLegId), takerUserId), makerLegId), makerUserId),
+                price), quantity), takerIsBuy ? 1 : 0), meTimestamp), takerOmsOrderId), makerOmsOrderId), meEpoch);
+    }
+
+    /** 3.8 digest of a 63. */
+    public static long terminalDigest(long egressSeq, long journalSeq, long legId, long userId, int marketId, int statusCode,
+                                      int meRejectReason, long meTimestamp, long omsOrderId, long meEpoch) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(K_TERMINAL, egressSeq),
+                journalSeq), legId), userId), marketId), statusCode), meRejectReason), meTimestamp), omsOrderId), meEpoch), 0);
+    }
+
+    /** 3.8 digest of a 64 (the fields the S7 core applies; S8 widens it, contract 21). */
+    public static long outcomeDigest(long egressSeq, long journalSeq, long commandIdHigh, long commandIdLow, long userId,
+                                     long omsOrderId, long oldOrderId, long price, long quantity, long budget, int marketId,
+                                     int commandKind, int result, long legId, int reason, boolean oldCancelled, long meTimestamp,
+                                     long meEpoch) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(
+                digest(digest(digest(digest(K_OUTCOME, egressSeq), journalSeq), commandIdHigh), commandIdLow), userId), omsOrderId),
+                oldOrderId), price), quantity), budget), marketId), commandKind), result), legId), reason), oldCancelled ? 1 : 0),
+                meTimestamp), meEpoch);
+    }
+
+    /** 3.8 digest of a 67 (the cursor fields only in S7; S8 widens it to the content it serves, contract 21). */
+    public static long releaseDigest(long egressSeq, long journalSeq, long meEpoch) {
+        return digest(digest(digest(digest(K_RELEASE, egressSeq), journalSeq), meEpoch), 0);
+    }
+
+    /** 3.8 digest of a 68. */
+    public static long configDigest(long egressSeq, long journalSeq, long meEpoch, long configVersion, long behaviorVersion,
+                                    long ledgerCapacity, int maxWireVersion, ConfigDecision decision) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(K_CONFIG, egressSeq), journalSeq),
+                meEpoch), configVersion), behaviorVersion), ledgerCapacity), maxWireVersion), decision.code()), 0);
+    }
+
+    /** One step of the deterministic 64-bit entry digest; never 0 (0 means "content unknown"). */
+    static long digest(final long h, final long v) {
+        long x = (h ^ 0x9E3779B97F4A7C15L) * 0xBF58476D1CE4E5B9L + v;
+        x = (x ^ (x >>> 30)) * 0xBF58476D1CE4E5B9L;
+        x = (x ^ (x >>> 27)) * 0x94D049BB133111EBL;
+        x ^= x >>> 31;
+        return x == 0 ? 1 : x;
+    }
+
+    /** Feed-virgin (7.1): nothing the RC1 feed rules did can have moved money or minted an ME command. */
+    private boolean feedVirgin() {
+        return lastAppliedTradeId == 0L && consumePosition == 0L && dispatchSeq == 0L;
+    }
+
 
     /** OrderEntryGate (ADMIN, replicated): set one gate; DUPLICATE when unchanged; broadcast the new state. */
     public void applyOrderEntryGate(long correlationId, int marketId, GateState state, GateReason reason, long timestamp) {
@@ -933,10 +1523,41 @@ public final class AssetsEngine {
             sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.UNKNOWN_MARKET.code(), 0L);
             return;
         }
+        if (behaviorV3()) {
+            applyOrderEntryGateV3(correlationId, marketId, state, reason);
+            return;
+        }
         final boolean changed = gate.set(marketId, state, reason);
         sink.onAdminAck(correlationId, 73, changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, 0, 0L);
         if (changed) {
-            sink.onAdmissionState(marketId, state, reason, false, lastLogTime, logPosition, false);
+            emitAdmission(marketId, false);
+        }
+    }
+
+    /** RC2 S7 D4 under v3: ADMIN sets only ADMIN-owned bits; OPEN clears every bit once the two refusals pass. */
+    private void applyOrderEntryGateV3(final long correlationId, final int marketId, final GateState state, final GateReason reason) {
+        final boolean changed;
+        if (state == GateState.SUSPENDED) {
+            if (!OrderEntryGate.adminOwned(reason)) {
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
+                return;
+            }
+            changed = gate.addReason(marketId, reason);
+        } else {
+            final int bits = gate.reasons(marketId);
+            if ((bits & (1 << GateReason.BRIDGE_HALT.code())) != 0 && feed.latched()) {
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.FEED_HALTED.code(), 0L);
+                return;
+            }
+            if (marketId == OrderEntryGate.GLOBAL && (feed.boundMeEpoch() == 0 || feed.meBehaviorVersion() < 2)) {
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.ME_LANE_INACTIVE.code(), 0L);
+                return; // X13: GLOBAL stays closed until the ME epoch is bound
+            }
+            changed = gate.clearAll(marketId);
+        }
+        sink.onAdminAck(correlationId, 73, changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, 0, 0L);
+        if (changed) {
+            emitAdmission(marketId, false);
         }
     }
 }

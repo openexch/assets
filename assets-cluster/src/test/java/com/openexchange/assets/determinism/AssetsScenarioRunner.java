@@ -52,6 +52,11 @@ import java.util.Map;
  *   METRADE id= market= taker= maker= px= qty= takerBuy= [takerLeg= makerLeg= takerUser= makerUser= seq=] ; METERMINAL order= leg= status=
  *   MEOUTCOME order= kind= attempt= result= [leg= reason= old=] ; AMEND u= order= [px=] [qty=] [rid=] ; QUARANTINE order=
  *   ORDERSNAP u= [from=] ; PENDINGDISPATCH [from=] [max=]
+ *   RC2 S7 (behaviour v3 feed; seq= stays the egressSeq): METRADE/METERMINAL/MEOUTCOME [jseq=] [epoch=],
+ *   METERMINAL [meReason=], MEOUTCOME [oldCancelled=], MARKETTICK [epoch=], GATE [reason=] [corr=],
+ *   V3GENESIS [bind=0], MECONFIG jseq= epoch= cfg= behavior= cap= maxWire= decision=, MERELEASE jseq= epoch=,
+ *   FEEDHALT reason= expected= seen= [epoch=] [bridge=] [corr=], LATCHCLEAR reason= jseq= [corr=],
+ *   FEEDPOISON tpl= jseq= epoch= [tradeId=]
  *   SNAPSHOT                               serialize -> restore into a fresh engine
  * </pre>
  * Amounts/prices (amt, px) are decimals converted to 8dp fixed-point; asset/market/order/user ids are
@@ -137,6 +142,8 @@ public final class AssetsScenarioRunner {
         final UnsafeBuffer buffer = new UnsafeBuffer(image);
         final int payloadLength = new SnapshotEnvelope().open(buffer, image.length);
         final AssetsEngine fresh = new AssetsEngine();
+        // the jar's supported behaviour set is node-local (the V3Genesis test seam); a restarted node keeps its own
+        fresh.coreConfig().setSupportedBehaviorVersions(engine.coreConfig().supportedBehaviorVersions());
         final BalanceSnapshotCodec.Decoded decoded =
                 BalanceSnapshotCodec.deserialize(buffer, SnapshotEnvelope.payloadOffset(), payloadLength, fresh);
         if (decoded.bytesConsumed != payloadLength) {
@@ -242,18 +249,22 @@ public final class AssetsScenarioRunner {
                 final long makerUser = kv.containsKey("makerUser") ? reqLong(kv, "makerUser") : (mo == null ? 0L : mo.userId);
                 final long takerLeg = kv.containsKey("takerLeg") ? reqLong(kv, "takerLeg") : (to == null ? 0L : to.currentLegId);
                 final long makerLeg = kv.containsKey("makerLeg") ? reqLong(kv, "makerLeg") : (mo == null ? 0L : mo.currentLegId);
-                engine.orders().applyTrade(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "id"), reqInt(kv, "market"),
+                // RC2 S7: through the 2.4 entry point (under v1/v2 it delegates to the unchanged applyTrade)
+                engine.onMeTrade(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, optLong(kv, "jseq", 0L),
+                        reqLong(kv, "id"), reqInt(kv, "market"),
                         takerLeg, takerUser, makerLeg, makerUser, reqAmount(kv, "px"), reqAmount(kv, "qty"), reqLong(kv, "takerBuy") != 0,
-                        clock.now(), taker, maker, 0L, clock.now());
+                        clock.now(), taker, maker, optLong(kv, "epoch", 0L), clock.now());
                 break;
             }
             case "METERMINAL": {
                 final long order = reqLong(kv, "order");
                 final com.openexchange.assets.application.engine.order.CoreOrder o = engine.orders().orders().get(order);
-                engine.orders().applyTerminal(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "leg"),
+                engine.onMeTerminal(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, optLong(kv, "jseq", 0L),
+                        reqLong(kv, "leg"),
                         kv.containsKey("u") ? reqLong(kv, "u") : (o == null ? 0L : o.userId),
                         kv.containsKey("market") ? reqInt(kv, "market") : (o == null ? 0 : o.marketId),
-                        reqInt(kv, "status"), clock.now(), order, 0L, clock.now());
+                        reqInt(kv, "status"), (int) optLong(kv, "meReason", 0L), clock.now(), order, optLong(kv, "epoch", 0L),
+                        clock.now());
                 break;
             }
             case "MEOUTCOME": {
@@ -261,10 +272,12 @@ public final class AssetsScenarioRunner {
                 final int kind = reqInt(kv, "kind");
                 final int attempt = reqInt(kv, "attempt");
                 final com.openexchange.assets.application.engine.order.CoreOrder o = engine.orders().orders().get(order);
-                engine.orders().applyOutcome(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, order, ((long) attempt << 2) | kind,
+                engine.onMeOutcome(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, optLong(kv, "jseq", 0L), order,
+                        ((long) attempt << 2) | kind,
                         o == null ? 0L : o.userId, order, kv.containsKey("old") ? reqLong(kv, "old") : 0L, 0L, 0L, 0L,
                         o == null ? 0 : o.marketId, kind, reqInt(kv, "result"), kv.containsKey("leg") ? reqLong(kv, "leg") : 0L,
-                        kv.containsKey("reason") ? reqInt(kv, "reason") : 0, clock.now(), 0L, clock.now());
+                        kv.containsKey("reason") ? reqInt(kv, "reason") : 0, optLong(kv, "oldCancelled", 0L) != 0, clock.now(),
+                        optLong(kv, "epoch", 0L), clock.now());
                 break;
             }
             case "AMEND": {
@@ -279,6 +292,38 @@ public final class AssetsScenarioRunner {
                 engine.orders().applyAmend(c, clock.now());
                 break;
             }
+            // ---- RC2 S7: the v3 feed verbs (contract section 15) ----
+            case "V3GENESIS":
+                // CoreConfig 1 -> 2 -> 3 (genesisId 0x5EED, test seam widened) and, unless bind=0, 68 FRESH jseq 1
+                if (optLong(kv, "bind", 1L) != 0) {
+                    V3Genesis.boot(engine, clock.now());
+                } else {
+                    V3Genesis.switchTo3(engine, clock.now());
+                }
+                break;
+            case "MECONFIG":
+                engine.onMeEngineConfig(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "jseq"),
+                        reqLong(kv, "epoch"), reqLong(kv, "cfg"), reqLong(kv, "behavior"), reqLong(kv, "cap"),
+                        reqInt(kv, "maxWire"), com.openexchange.assets.domain.ConfigDecision.valueOf(req(kv, "decision")),
+                        clock.now(), id -> { });
+                break;
+            case "MERELEASE":
+                engine.onMeRelease(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "jseq"),
+                        reqLong(kv, "epoch"), clock.now());
+                break;
+            case "FEEDHALT":
+                engine.applyFeedHalt(optLong(kv, "session", 0L), optLong(kv, "corr", 0L),
+                        com.openexchange.assets.domain.FeedHaltReason.valueOf(req(kv, "reason")), optLong(kv, "epoch", 0L),
+                        reqLong(kv, "expected"), reqLong(kv, "seen"), optLong(kv, "bridge", 0L), clock.now());
+                break;
+            case "LATCHCLEAR":
+                engine.applyFeedLatchClear(optLong(kv, "corr", 0L),
+                        com.openexchange.assets.domain.FeedHaltReason.valueOf(req(kv, "reason")), reqLong(kv, "jseq"), clock.now());
+                break;
+            case "FEEDPOISON":
+                engine.onFeedPoison(reqInt(kv, "tpl"), reqLong(kv, "jseq"), reqLong(kv, "epoch"), optLong(kv, "tradeId", 0L),
+                        clock.now());
+                break;
             case "QUARANTINE":
                 engine.orders().applyQuarantine(kv.containsKey("corr") ? reqLong(kv, "corr") : 0L, reqLong(kv, "order"), clock.now());
                 break;
@@ -294,8 +339,10 @@ public final class AssetsScenarioRunner {
             case "GATE": {
                 final int market = reqInt(kv, "market");
                 final boolean open = reqLong(kv, "open") != 0;
-                engine.applyOrderEntryGate(0L, market, open ? com.openexchange.assets.domain.GateState.OPEN
-                        : com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.ADMIN, clock.now());
+                engine.applyOrderEntryGate(optLong(kv, "corr", 0L), market, open ? com.openexchange.assets.domain.GateState.OPEN
+                        : com.openexchange.assets.domain.GateState.SUSPENDED, kv.containsKey("reason")
+                        ? com.openexchange.assets.domain.GateReason.valueOf(req(kv, "reason"))
+                        : com.openexchange.assets.domain.GateReason.ADMIN, clock.now());
                 break;
             }
             case "RISKCFG": {
@@ -326,7 +373,7 @@ public final class AssetsScenarioRunner {
             case "MARKETTICK":
                 engine.orders().applyMarketTick(reqInt(kv, "market"), reqLong(kv, "ver"), reqAmount(kv, "bid"), reqAmount(kv, "ask"),
                         kv.containsKey("last") ? reqAmount(kv, "last") : 0L, kv.containsKey("lastTradeId") ? reqLong(kv, "lastTradeId") : 0L,
-                        0L, clock.now());
+                        optLong(kv, "epoch", 0L), clock.now());
                 break;
             case "CREATE": {
                 final com.openexchange.assets.domain.commands.CreateOrderCommand c =
@@ -460,6 +507,10 @@ public final class AssetsScenarioRunner {
 
     private static long reqLong(Map<String, String> kv, String key) {
         return ScenarioText.reqLong(kv, key);
+    }
+
+    private static long optLong(Map<String, String> kv, String key, long fallback) {
+        return kv.containsKey(key) ? reqLong(kv, key) : fallback;
     }
 
     private static int reqInt(Map<String, String> kv, String key) {

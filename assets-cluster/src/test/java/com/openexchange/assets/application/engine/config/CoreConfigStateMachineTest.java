@@ -224,6 +224,51 @@ public final class CoreConfigStateMachineTest {
         assertCounters(1, 0, 0, 0, 1, 0);
     }
 
+    // ------------------------------------------------------------------ RC2 S7 7.1 row 2b: genesisId equality
+
+    @Test public void row2b_sameConfigWithAnotherGenesisIdIsInvalid() {
+        final CoreConfigCommand first = base(1, 1);
+        first.genesisId = 0x5EEDL;
+        engine.applyCoreConfig(first, now);
+        assertEquals("row 2: the genesisId is recorded as sent", 0x5EEDL, sm.recorded().genesisId);
+        mark();
+        final CoreConfigCommand c = base(1, 1);
+        c.genesisId = 0x5EEEL;
+        engine.applyCoreConfig(c, now);
+        assertOnlyAck(c.correlationId, AdminResult.REJECTED, INVALID);
+        assertEquals(0x5EEDL, sm.recorded().genesisId);
+        final CoreConfigCommand none = base(2, 2); // genesisId 0 against a recorded 0x5EED: a re-genesis attempt too
+        engine.applyCoreConfig(none, now);
+        assertEquals(1L, sm.behaviorVersion());
+    }
+
+    // ------------------------------------------------------------------ RC2 S7 7.1 row 7: the switch to behaviour 3
+
+    @Test public void row7_targetThreeNeedsGenesisIdFeedVirginAndGlobalSuspended() {
+        sm.setSupportedBehaviorVersions(1, 2, 3);
+        adoptV1();
+        engine.applyCoreConfig(base(2, 2), now);
+        mark();
+        final CoreConfigCommand c = base(3, 3);
+        engine.applyCoreConfig(c, now);
+        assertOnlyAck(c.correlationId, AdminResult.REJECTED, INVALID);
+        assertEquals("recorded genesisId 0: no switch to 3", 2L, sm.behaviorVersion());
+        assertEquals("decide reads the GLOBAL state and the feed-virgin scalars as arguments",
+                CoreConfigStateMachine.Decision.INVALID, sm.decide(withGenesis(base(3, 3), 0L), false, true));
+        final CoreConfigStateMachine fresh = new CoreConfigStateMachine();
+        fresh.setSupportedBehaviorVersions(1, 2, 3);
+        fresh.apply(fresh.decide(withGenesis(base(1, 1), 9L), false, true), withGenesis(base(1, 1), 9L));
+        fresh.apply(fresh.decide(withGenesis(base(2, 2), 9L), false, true), withGenesis(base(2, 2), 9L));
+        assertEquals(CoreConfigStateMachine.Decision.INVALID, fresh.decide(withGenesis(base(3, 3), 9L), true, true));
+        assertEquals(CoreConfigStateMachine.Decision.INVALID, fresh.decide(withGenesis(base(3, 3), 9L), false, false));
+        assertEquals(CoreConfigStateMachine.Decision.SWITCH, fresh.decide(withGenesis(base(3, 3), 9L), false, true));
+    }
+
+    private static CoreConfigCommand withGenesis(final CoreConfigCommand c, final long genesisId) {
+        c.genesisId = genesisId;
+        return c;
+    }
+
     // ------------------------------------------------------------------ section 3 row 3: DUPLICATE
 
     @Test public void row3_identicalResendIsDuplicateNoOp() {

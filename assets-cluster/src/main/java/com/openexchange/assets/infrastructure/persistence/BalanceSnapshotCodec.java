@@ -2,6 +2,8 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
+import com.openexchange.assets.application.engine.feed.FeedState;
+import com.openexchange.assets.domain.FeedHaltReason;
 import com.openexchange.assets.domain.Account;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
 import com.openexchange.assets.application.engine.order.CoreOrder;
@@ -72,8 +74,9 @@ public final class BalanceSnapshotCodec {
     /** Live session authorities (RC1 S3, K6): replicated-derived, so a restored member agrees with its peers. */
     public static final short SECTION_SESSIONS = 9;
     /**
-     * RESERVED (RC2 S1 4.9): the feed cursor state (B 2.3 {@code FeedState}), content owned by RC2 S7. Neither written
-     * nor read by this build: the deserializer refuses it as an unknown section until S7 lands.
+     * RC2 S7 (contract 3.7, 14): the feed state ({@code FeedState}), exactly {@link FeedState#SNAPSHOT_BYTES} bytes. Written
+     * iff the recorded behaviour is 3 or more, and mandatory then; an image below behaviour 3 that carries it is refused.
+     * Presence is tracked by the codec, because an absent section and a present all-zero one restore the same state.
      */
     public static final short SECTION_FEED_STATE = 10;
     /**
@@ -150,7 +153,8 @@ public final class BalanceSnapshotCodec {
         // Sections, ascending by id: 1 ACCOUNTS, 2 ORDERS, 3 USER_RISK, 4 MARKET_STATE, 5 GATES, 6 REQUEST_IDS,
         // 9 SESSIONS on this build (RC1 S4); 7 and 8 land with their slices.
         final boolean withConfig = engine.coreConfig().recorded() != null;
-        dst.putInt(pos[0], withConfig ? 8 : 7);
+        final boolean withFeed = engine.behaviorV3(); // RC2 S7 3.7: section 10 iff behaviour >= 3
+        dst.putInt(pos[0], (withConfig ? 8 : 7) + (withFeed ? 1 : 0));
         pos[0] += 4;
         pos[0] = writeAccountsSection(engine, dst, pos[0]);
         pos[0] = writeOrdersSection(engine, dst, pos[0]);
@@ -162,6 +166,9 @@ public final class BalanceSnapshotCodec {
             pos[0] = writeCoreConfigSection(engine, dst, pos[0]); // RC1 S7: only when a config is recorded
         }
         pos[0] = writeSessionsSection(engine, dst, pos[0]);
+        if (withFeed) {
+            pos[0] = writeFeedStateSection(engine, dst, pos[0]);
+        }
 
         return pos[0] - offset;
     }
@@ -445,7 +452,10 @@ public final class BalanceSnapshotCodec {
         return pos;
     }
 
-    /** Section 5: the order-entry gate, marketId 0 (global) .. MARKETS, {marketId:int, state:u8, reason:u8}. */
+    /**
+     * Section 5 (layout v2, RC2 S7 6.3): the order-entry gate, marketId 0 (global) .. MARKETS,
+     * {marketId:int, state:u8, reason:u8, reasons:u32}. Every behaviour (v7 is a clean genesis).
+     */
     private static int writeGatesSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
         int pos = start;
         dst.putShort(pos, SECTION_GATES);
@@ -463,9 +473,80 @@ public final class BalanceSnapshotCodec {
             pos += 1;
             dst.putByte(pos, (byte) gate.reason(m).code());
             pos += 1;
+            dst.putInt(pos, gate.reasons(m));
+            pos += 4;
         }
         dst.putInt(lengthSlot, pos - bodyStart);
         return pos;
+    }
+
+    /**
+     * Section 10 FEED_STATE (contract 14, layout v2 with 3.8): the 92-byte head, native order, reserved bytes zero; then
+     * {@code freshDigest i64 @92}, {@code digestCount u32 @100} ({@code = min(cursor, DIGEST_WINDOW)}) and the digests of
+     * journalSeq {@code (cursor - digestCount, cursor]} in order, 8 bytes each.
+     */
+    private static int writeFeedStateSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final FeedState f = engine.feed();
+        final int count = f.digestCount();
+        int p = start;
+        dst.putShort(p, SECTION_FEED_STATE); p += 2;
+        dst.putInt(p, FeedState.DIGEST_HEAD_BYTES + 8 * count); p += 4;
+        final int body = p;
+        dst.putLong(body, f.boundMeEpoch());
+        dst.putLong(body + 8, f.lastAppliedJournalSeq());
+        dst.putByte(body + 16, (byte) f.latchReason().code());
+        dst.putByte(body + 17, (byte) 0);
+        dst.putShort(body + 18, (short) 0);
+        dst.putLong(body + 20, f.latchExpectedSeq());
+        dst.putLong(body + 28, f.latchSeenSeq());
+        dst.putLong(body + 36, f.latchSkipSeq());
+        dst.putLong(body + 44, f.latchTradeId());
+        dst.putLong(body + 52, f.latchMeEpochSeen());
+        dst.putLong(body + 60, f.latchBridgeIdentity());
+        dst.putLong(body + 68, f.latchLogPosition());
+        dst.putInt(body + 76, (int) f.meConfigVersion());
+        dst.putInt(body + 80, (int) f.meBehaviorVersion());
+        dst.putInt(body + 84, (int) f.meLedgerCapacity());
+        dst.putShort(body + 88, (short) f.meMaxWireVersion());
+        dst.putShort(body + 90, (short) 0);
+        dst.putLong(body + 92, f.freshDigest());
+        dst.putInt(body + 100, count);
+        final long c = f.lastAppliedJournalSeq();
+        int q = body + FeedState.DIGEST_HEAD_BYTES;
+        for (long seq = c - count + 1; seq <= c; seq++) {
+            dst.putLong(q, f.digestAt(seq));
+            q += 8;
+        }
+        return q;
+    }
+
+    private static void readFeedStateSection(DirectBuffer src, int start, int length, AssetsEngine engine) {
+        if (length < FeedState.DIGEST_HEAD_BYTES) {
+            throw new IllegalStateException("balance snapshot FEED_STATE section is " + length + " bytes, below its "
+                    + FeedState.DIGEST_HEAD_BYTES + "-byte head");
+        }
+        final long cursor = src.getLong(start + 8);
+        final int count = src.getInt(start + 100);
+        if (cursor < 0 || count != Math.min(cursor, FeedState.DIGEST_WINDOW)
+                || length != FeedState.DIGEST_HEAD_BYTES + 8L * count) {
+            throw new IllegalStateException("balance snapshot FEED_STATE section: " + count + " digests for cursor " + cursor
+                    + " in " + length + " bytes");
+        }
+        final int reasonCode = src.getByte(start + 16) & 0xFF;
+        final FeedHaltReason reason = FeedHaltReason.fromCode(reasonCode);
+        if (reason == null || src.getByte(start + 17) != 0 || src.getShort(start + 18) != 0 || src.getShort(start + 90) != 0) {
+            throw new IllegalStateException("balance snapshot FEED_STATE section: latchReason " + reasonCode
+                    + " or a reserved byte this build does not know");
+        }
+        engine.feed().restore(src.getLong(start), src.getLong(start + 8), reason, src.getLong(start + 20), src.getLong(start + 28),
+                src.getLong(start + 36), src.getLong(start + 44), src.getLong(start + 52), src.getLong(start + 60),
+                src.getLong(start + 68), src.getInt(start + 76) & 0xFFFFFFFFL, src.getInt(start + 80) & 0xFFFFFFFFL,
+                src.getInt(start + 84) & 0xFFFFFFFFL, src.getShort(start + 88) & 0xFFFF);
+        final long[] window = new long[count];
+        for (int i = 0; i < count; i++) {
+            window[i] = src.getLong(start + FeedState.DIGEST_HEAD_BYTES + 8 * i);
+        }
+        engine.feed().restoreDigests(src.getLong(start + 92), window);
     }
 
     /**
@@ -476,7 +557,10 @@ public final class BalanceSnapshotCodec {
     private static final int CORE_MARKET_BYTES = 4 + 16 + 4 + 4 + 8 * 4;
     private static final int CORE_ASSET_BYTES = 4 + 8 + 1;
 
-    /** Section 8 CORE_CONFIG (layout page): versions, then markets and assets ascending by id, fixed-size rows. */
+    /**
+     * Section 8 CORE_CONFIG (layout v2, RC2 S7 7.3): configVersion, behaviorVersion, genesisId, then markets and assets
+     * ascending by id, fixed-size rows.
+     */
     private static int writeCoreConfigSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
         final com.openexchange.assets.domain.commands.CoreConfigCommand c = engine.coreConfig().recorded();
         int p = start;
@@ -485,6 +569,7 @@ public final class BalanceSnapshotCodec {
         final int bodyStart = p;
         dst.putLong(p, c.configVersion); p += 8;
         dst.putLong(p, c.behaviorVersion); p += 8;
+        dst.putLong(p, c.genesisId); p += 8; // layout v2 (RC2 S7 7.3)
         dst.putInt(p, c.markets.length); p += 4;
         for (final com.openexchange.assets.domain.commands.CoreConfigCommand.MarketDef m : c.markets) {
             dst.putInt(p, m.marketId()); p += 4;
@@ -531,6 +616,7 @@ public final class BalanceSnapshotCodec {
         c.reset();
         c.configVersion = src.getLong(pos); pos += 8;
         c.behaviorVersion = src.getLong(pos); pos += 8;
+        c.genesisId = src.getLong(pos); pos += 8;
         final int nm = src.getInt(pos); pos += 4;
         if (nm < 0 || (long) nm * CORE_MARKET_BYTES > limit - pos) {
             throw new IllegalStateException("balance snapshot CORE_CONFIG declares " + nm + " markets");
@@ -655,6 +741,7 @@ public final class BalanceSnapshotCodec {
         int accounts = 0;
         int holds = 0;
         int previousId = 0;
+        boolean feedSection = false;
         for (int s = 0; s < sectionCount; s++) {
             if (end - pos < SECTION_HEADER) {
                 throw new IllegalStateException("balance snapshot section " + s + " header runs past the payload");
@@ -735,12 +822,25 @@ public final class BalanceSnapshotCodec {
                     }
                     break;
                 }
+                case SECTION_FEED_STATE:
+                    readFeedStateSection(src, pos, sectionLength, engine);
+                    feedSection = true;
+                    break;
                 default:
                     throw new IllegalStateException("balance snapshot section id " + id
                             + " is not known to this build (layout page sections 2..8 land with their slices)");
             }
             pos = sectionEnd;
             previousId = id;
+        }
+        // RC2 S7 3.7 (review 2 FIX-B): section 10 is mandatory under a recorded behaviour of 3 and refused below it
+        final boolean v3 = engine.behaviorV3();
+        if (v3 && !feedSection) {
+            throw new IllegalStateException("balance snapshot of a behaviour-" + engine.coreConfig().behaviorVersion()
+                    + " core has no FEED_STATE section (10)");
+        }
+        if (!v3 && feedSection) {
+            throw new IllegalStateException("balance snapshot below behaviour 3 carries a FEED_STATE section (10)");
         }
         return new Decoded(lastAppliedTradeId, consumePosition, journalSeq, lastLogTime, accounts, holds,
                 sectionCount, pos - offset);
@@ -750,7 +850,7 @@ public final class BalanceSnapshotCodec {
         int pos = start;
         final int count = src.getInt(pos);
         pos += 4;
-        if (count < 0 || limit - pos < count * 6) {
+        if (count < 0 || limit - pos < count * 10) {
             throw new IllegalStateException("balance snapshot GATES section declares " + count + " gates");
         }
         engine.gate().reset();
@@ -761,11 +861,13 @@ public final class BalanceSnapshotCodec {
             pos += 1;
             final GateReason reason = GateReason.fromCode(src.getByte(pos) & 0xFF);
             pos += 1;
+            final int reasons = src.getInt(pos);
+            pos += 4;
             if (!OrderEntryGate.validMarket(marketId) || state == null || reason == null) {
                 throw new IllegalStateException("balance snapshot GATES section: market " + marketId
                         + " state/reason bytes this build does not know");
             }
-            engine.gate().set(marketId, state, reason);
+            engine.gate().restore(marketId, state, reason, reasons); // validated after section 8 (verifyRestoredInvariants)
         }
         return pos;
     }

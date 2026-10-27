@@ -70,6 +70,26 @@ public final class SessionRegistry {
         return new Registration(changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, CoreRejectReason.NONE, changed);
     }
 
+    /**
+     * RC2 S7 D8b, at the bind: every registered FORWARDER or BRIDGE session whose {@code sourceEpoch} is not in
+     * {0, {@code boundEpoch}} is revoked, in ascending session id; {@code revoked} receives each id (the demuxer closes
+     * it through the transport hook). Returns how many were revoked.
+     */
+    public int revokeForeignEpoch(final long boundEpoch, final java.util.function.LongConsumer revoked) {
+        final List<SessionAuthority> hit = new ArrayList<>();
+        forEachBySessionId(a -> {
+            if (a.isRegistered() && (a.sessionClass() == SessionClass.FORWARDER || a.sessionClass() == SessionClass.BRIDGE)
+                    && a.sourceEpoch() != 0 && a.sourceEpoch() != boundEpoch) {
+                hit.add(a);
+            }
+        });
+        for (final SessionAuthority a : hit) {
+            a.revoke();
+            revoked.accept(a.sessionId());
+        }
+        return hit.size();
+    }
+
     /** Restore one row (snapshot section 9). */
     public void restore(final long sessionId, final byte[] encodedPrincipal, final boolean registered,
                         final int channelMask, final boolean resumable, final int readerKind,
