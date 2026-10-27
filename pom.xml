@@ -38,7 +38,7 @@
              independently of match. -->
         <cluster-kit.version>0.1.7</cluster-kit.version>
         <agrona.version>2.6.1</agrona.version>
-        <aeron.version>1.53.1</aeron.version>
+        <aeron.version>1.53.3</aeron.version>
         <sbe.version>1.40.2</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
         <!-- Postgres + pool for the money projector (versions match the OMS repo). -->
