@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.infrastructure.persistence;
 
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
 import com.openexchange.assets.infrastructure.persistence.ApplierParityRig.ApplierArm;
 import com.openexchange.assets.infrastructure.persistence.SessionedLog.Kind;
@@ -44,7 +45,7 @@ public class TailCloseInsideWindowTest {
         final List<LogStep> t = new ArrayList<>(base.subList(0, OPEN_AT));
         final long tsOpen = t.get(t.size() - 1).timestamp();
         t.add(SessionedLog.open(SESSION, tsOpen,
-                CorePrincipal.forUsers(SessionClass.GATEWAY, 77, 1, 2, 3, 4, 5, 6).encode()));      // step 100
+                ClusterPrincipal.forUsers(AssetsSessionClasses.toKit(SessionClass.GATEWAY), 77, 1, 2, 3, 4, 5, 6).encode()));      // step 100
         t.add(SessionedLog.message(SESSION, tsOpen, enc.register(7_770_001L, SessionClass.GATEWAY))); // step 101
         int next = OPEN_AT;
         while (t.size() < CLOSE_AT) {                                                               // steps 102..249

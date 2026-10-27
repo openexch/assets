@@ -2,7 +2,8 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.order.CoreOrder;
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
 
 import java.math.BigInteger;
@@ -118,7 +119,7 @@ final class CoreFrameStory {
         steps.add(s);
     }
 
-    private void open(final long session, final CorePrincipal principal) {
+    private void open(final long session, final ClusterPrincipal principal) {
         position += 64;
         final Step s = new Step(Kind.OPEN_SESSION, principal.encode(), now, session, position);
         model.apply(s);
@@ -192,9 +193,9 @@ final class CoreFrameStory {
             frame(enc.riskConfig(corr++, 1, m, 200, 40, 2_000));
         }
         frame(enc.riskConfig(corr++, 1, 9, 200, 40, 2_000)); // unknown market: REJECTED
-        open(GATEWAY_SESSION, CorePrincipal.forUsers(SessionClass.GATEWAY, 7, 1, 2, 3, 4, 5, 6));
-        open(FORWARDER_SESSION, CorePrincipal.anyUser(SessionClass.FORWARDER, 8));
-        open(UNREGISTERED_BRIDGE, CorePrincipal.anyUser(SessionClass.BRIDGE, 9));
+        open(GATEWAY_SESSION, ClusterPrincipal.forUsers(AssetsSessionClasses.toKit(SessionClass.GATEWAY), 7, 1, 2, 3, 4, 5, 6));
+        open(FORWARDER_SESSION, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.FORWARDER), 8));
+        open(UNREGISTERED_BRIDGE, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.BRIDGE), 9));
         frame(enc.register(corr++, SessionClass.GATEWAY), GATEWAY_SESSION);
         frame(enc.register(corr++, SessionClass.FORWARDER), FORWARDER_SESSION);
         for (int u = 1; u <= USERS; u++) {

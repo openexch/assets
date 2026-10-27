@@ -2,6 +2,8 @@
 package com.openexchange.assets.auth;
 
 import com.openexchange.assets.infrastructure.generated.SessionClass;
+import com.openexchange.cluster.auth.ClusterPrincipal;
+import com.openexchange.cluster.auth.ClusterSessionClass;
 import org.junit.Test;
 
 import java.util.Arrays;
@@ -13,14 +15,25 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC1 S3 (K6): the principal every replica reads from the SessionOpen event. */
+/**
+ * RC1 S3 (K6): the principal every replica reads from SessionOpen. RC2 S6: the class is the kit principal, the
+ * engine enum comes from {@link AssetsSessionClasses}; these cases pin the AE's use of it.
+ */
 public class CorePrincipalTest {
+
+    private static ClusterPrincipal any(final SessionClass c, final int identity) {
+        return ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(c), identity);
+    }
+
+    private static ClusterPrincipal scoped(final SessionClass c, final int identity, final long... users) {
+        return ClusterPrincipal.forUsers(AssetsSessionClasses.toKit(c), identity, users);
+    }
 
     @Test
     public void anyUserRoundTripsAndAllowsEveryone() {
-        final CorePrincipal p = CorePrincipal.anyUser(SessionClass.GATEWAY, 42);
-        final CorePrincipal d = CorePrincipal.decode(p.encode());
-        assertEquals(SessionClass.GATEWAY, d.sessionClass());
+        final ClusterPrincipal p = any(SessionClass.GATEWAY, 42);
+        final ClusterPrincipal d = ClusterPrincipal.decode(p.encode());
+        assertEquals(SessionClass.GATEWAY, AssetsSessionClasses.of(d.classCode()));
         assertEquals(42, d.identity());
         assertTrue(d.anyUser());
         assertTrue(d.allowsUser(1) && d.allowsUser(Long.MAX_VALUE));
@@ -29,46 +42,42 @@ public class CorePrincipalTest {
 
     @Test
     public void scopedPrincipalSortsDedupesAndBinarySearches() {
-        final CorePrincipal p = CorePrincipal.forUsers(SessionClass.TREASURY, 7, 30, 10, 20);
-        final CorePrincipal d = CorePrincipal.decode(p.encode());
+        final ClusterPrincipal d = ClusterPrincipal.decode(scoped(SessionClass.TREASURY, 7, 30, 10, 20).encode());
         assertArrayEquals(new long[] {10, 20, 30}, d.userIds());
         assertTrue(d.allowsUser(20));
         assertFalse(d.allowsUser(25));
         assertFalse(d.anyUser());
-        assertThrows(IllegalArgumentException.class, () -> CorePrincipal.forUsers(SessionClass.TREASURY, 7, 1, 1));
-        assertThrows(IllegalArgumentException.class, () -> CorePrincipal.forUsers(SessionClass.TREASURY, 7));
-        final long[] tooMany = new long[CorePrincipal.MAX_USERS + 1];
-        for (int i = 0; i < tooMany.length; i++) {
-            tooMany[i] = i;
-        }
-        assertThrows(IllegalArgumentException.class, () -> CorePrincipal.forUsers(SessionClass.TREASURY, 7, tooMany));
+        assertThrows(IllegalArgumentException.class, () -> scoped(SessionClass.TREASURY, 7, 1, 1));
+        assertThrows(IllegalArgumentException.class, () -> scoped(SessionClass.TREASURY, 7));
+        assertThrows(IllegalArgumentException.class,
+                () -> scoped(SessionClass.TREASURY, 7, new long[ClusterPrincipal.MAX_USERS + 1]));
     }
 
     @Test
     public void foreignBytesDecodeToNoneWhichAuthorisesNothing() {
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(null));
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(new byte[0]));
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(new byte[] {9, 1, 1, 0, 0, 0, 0, 0, 0, 0})); // version 9
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(new byte[] {1, 0, 1, 0, 0, 0, 0, 0, 0, 0})); // class UNSET
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(new byte[] {1, 1, 0, 0, 0, 0, 0, 0, 0, 0})); // no scope, not ANY
-        final byte[] truncated = Arrays.copyOf(CorePrincipal.forUsers(SessionClass.TOOL, 1, 5, 6).encode(), 20);
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(truncated));
-        final byte[] unsorted = CorePrincipal.forUsers(SessionClass.TOOL, 1, 5, 6).encode();
-        unsorted[10] = 9; // first user 9 > second user 6
-        assertSame(CorePrincipal.NONE, CorePrincipal.decode(unsorted));
-        assertFalse(CorePrincipal.NONE.allowsUser(1));
-        assertEquals(SessionClass.UNSET, CorePrincipal.NONE.sessionClass());
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(null));
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(new byte[0]));
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(new byte[] {9, 1, 1, 0, 0, 0, 0, 0, 0, 0}));
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(new byte[] {1, 0, 1, 0, 0, 0, 0, 0, 0, 0}));
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(new byte[] {1, 1, 0, 0, 0, 0, 0, 0, 0, 0}));
+        final byte[] truncated = Arrays.copyOf(scoped(SessionClass.TOOL, 1, 5, 6).encode(), 20);
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(truncated));
+        final byte[] unsorted = scoped(SessionClass.TOOL, 1, 5, 6).encode();
+        unsorted[10] = 9;
+        assertSame(ClusterPrincipal.NONE, ClusterPrincipal.decode(unsorted));
+        assertFalse(ClusterPrincipal.NONE.allowsUser(1));
+        assertEquals(SessionClass.UNSET, AssetsSessionClasses.of(ClusterPrincipal.NONE.classCode()));
     }
 
     @Test
     public void classCodesFollowTheWireEnum() {
-        assertEquals(SessionClass.GATEWAY, CorePrincipal.classOf(1));
-        assertEquals(SessionClass.TREASURY, CorePrincipal.classOf(6));
-        // money-schema v7 (RC2 S1 4.1, W5): 7 is REPLICA; 8 and above stay UNSET
-        assertEquals(SessionClass.REPLICA, CorePrincipal.classOf(7));
-        assertEquals(SessionClass.UNSET, CorePrincipal.classOf(8));
-        assertEquals(SessionClass.UNSET, CorePrincipal.classOf(0));
-        final CorePrincipal replica = CorePrincipal.anyUser(SessionClass.REPLICA, 3);
-        assertEquals(SessionClass.REPLICA, CorePrincipal.decode(replica.encode()).sessionClass());
+        assertEquals(SessionClass.GATEWAY, AssetsSessionClasses.of(1));
+        assertEquals(SessionClass.TREASURY, AssetsSessionClasses.of(6));
+        assertEquals(SessionClass.REPLICA, AssetsSessionClasses.of(7));
+        assertEquals(SessionClass.UNSET, AssetsSessionClasses.of(8));
+        assertEquals(SessionClass.UNSET, AssetsSessionClasses.of(0));
+        assertEquals(ClusterSessionClass.UNSET, AssetsSessionClasses.toKit(SessionClass.NULL_VAL));
+        final ClusterPrincipal replica = any(SessionClass.REPLICA, 3);
+        assertEquals(SessionClass.REPLICA, AssetsSessionClasses.of(ClusterPrincipal.decode(replica.encode()).classCode()));
     }
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.infrastructure.persistence;
 
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.infrastructure.generated.AmendOrderDecoder;
 import com.openexchange.assets.infrastructure.generated.CancelOrderDecoder;
 import com.openexchange.assets.infrastructure.generated.CircuitBreakerDecoder;
@@ -40,7 +41,7 @@ import java.util.List;
  * the in-process {@code dispatchTrusted} can apply, and which the service would dispatch as an unknown session) are
  * re-homed to one production session per class: the first class allowed for the template, in the order ADMIN, BRIDGE,
  * FORWARDER, GATEWAY (the demuxer's class-mask table). Each such session has id {@code 900 + class code} and principal
- * {@code CorePrincipal.anyUser(class, 90 + class code)}; a prefix opens all four and registers the three classes that
+ * {@code ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(class), 90 + class code)}; a prefix opens all four and registers the three classes that
  * must register before sending. Every original step keeps its kind, time and bytes and is shifted by the prefix length;
  * a story SWEEP becomes a TimerEvent with the term-0 sweep id.
  */
@@ -69,7 +70,7 @@ final class SessionedLog {
     }
 
     static byte[] principalOf(final SessionClass c) {
-        return CorePrincipal.anyUser(c, 90 + c.value()).encode();
+        return ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(c), 90 + c.value()).encode();
     }
 
     /** The class a TRUSTED frame of this template is re-homed to (strict: an unmapped template throws). */

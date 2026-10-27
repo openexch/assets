@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.infrastructure.auth;
 
-import com.openexchange.assets.auth.AuthKeyTable;
+import com.openexchange.assets.auth.AssetsAuth;
+import com.openexchange.assets.auth.AssetsSessionClasses;
 import com.openexchange.assets.auth.CoreCredentials;
-import com.openexchange.assets.auth.CorePrincipal;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
+import com.openexchange.cluster.auth.AuthKeyTable;
+import com.openexchange.cluster.auth.ClusterAuthenticator;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import io.aeron.security.SessionProxy;
 import org.junit.Test;
 
@@ -13,7 +16,11 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-/** RC1 S3 (K6 v1): the consensus-module authenticator, driven the way SessionManager drives it. */
+/**
+ * RC1 S3 (K6 v1): the consensus-module authenticator, driven the way SessionManager drives it. RC2 S6: the AE now
+ * installs the kit's {@link ClusterAuthenticator} with the AE policy; these are the RC1 cases against it (the
+ * credentials are built with the CoreCredentials shim, as the AE's clients build them).
+ */
 public class CoreAuthenticatorTest {
 
     private static final String SECRET = "ab".repeat(32);
@@ -44,19 +51,20 @@ public class CoreAuthenticatorTest {
         public void reject() { rejected = true; }
     }
 
-    private static CoreAuthenticator authenticator() {
-        return new CoreAuthenticator(AuthKeyTable.fromSpec("1:ADMIN:" + SECRET + ";2:TREASURY:" + SECRET + ":9:users=7"));
+    private static ClusterAuthenticator authenticator() {
+        return new ClusterAuthenticator(AuthKeyTable.fromSpec("1:ADMIN:" + SECRET + "::users=*;2:TREASURY:" + SECRET
+                + ":9:users=7", AssetsAuth.POLICY));
     }
 
     @Test
     public void aKnownKeyMintsItsPrincipalIntoTheSession() {
-        final CoreAuthenticator a = authenticator();
+        final ClusterAuthenticator a = authenticator();
         final Proxy p = new Proxy(11);
         a.onConnectRequest(11, CoreCredentials.fromSpec("2:TREASURY:" + SECRET).encode(), 1_000);
         a.onConnectedSession(p, 1_001);
         assertFalse(p.rejected);
-        final CorePrincipal minted = CorePrincipal.decode(p.principal);
-        assertEquals(SessionClass.TREASURY, minted.sessionClass());
+        final ClusterPrincipal minted = ClusterPrincipal.decode(p.principal);
+        assertEquals(SessionClass.TREASURY, AssetsSessionClasses.of(minted.classCode()));
         assertEquals(9, minted.identity());
         assertTrue(minted.allowsUser(7));
         assertFalse(minted.allowsUser(8));
@@ -65,7 +73,7 @@ public class CoreAuthenticatorTest {
 
     @Test
     public void unknownKeyWrongSecretMissingCredentialsAndChallengesAreRejected() {
-        final CoreAuthenticator a = authenticator();
+        final ClusterAuthenticator a = authenticator();
         final Proxy unknown = new Proxy(1);
         a.onConnectRequest(1, CoreCredentials.fromSpec("5:ADMIN:" + SECRET).encode(), 0);
         a.onConnectedSession(unknown, 0);
@@ -88,7 +96,7 @@ public class CoreAuthenticatorTest {
 
     @Test
     public void anAuthenticateThatIsNotYetPossibleIsRetriedOnTheNextCycle() {
-        final CoreAuthenticator a = authenticator();
+        final ClusterAuthenticator a = authenticator();
         final Proxy p = new Proxy(5);
         p.refuseAuthenticateOnce = true;
         a.onConnectRequest(5, CoreCredentials.fromSpec("1:ADMIN:" + SECRET).encode(), 0);
@@ -96,13 +104,13 @@ public class CoreAuthenticatorTest {
         assertNull("not yet", p.principal);
         assertFalse(p.rejected);
         a.onConnectedSession(p, 1);
-        assertEquals(SessionClass.ADMIN, CorePrincipal.decode(p.principal).sessionClass());
+        assertEquals(SessionClass.ADMIN, AssetsSessionClasses.of(ClusterPrincipal.decode(p.principal).classCode()));
         assertEquals(1, a.acceptedCount());
     }
 
     @Test
     public void anEmptyTableRejectsEveryoneInsteadOfDegrading() {
-        final CoreAuthenticator a = new CoreAuthenticator(AuthKeyTable.empty());
+        final ClusterAuthenticator a = new ClusterAuthenticator(AuthKeyTable.empty(AssetsAuth.POLICY));
         final Proxy p = new Proxy(6);
         a.onConnectRequest(6, CoreCredentials.fromSpec("1:ADMIN:" + SECRET).encode(), 0);
         a.onConnectedSession(p, 0);

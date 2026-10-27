@@ -22,6 +22,14 @@
             <artifactId>agrona</artifactId>
         </dependency>
 
+        <!-- RC2 S6: the session authority (credential, principal, key table) is the shared kit copy;
+             assets-common keeps the CoreCredentials shim, the AE policy and the class mapping. The kit
+             brings no Aeron of its own (provided scope there). -->
+        <dependency>
+            <groupId>com.openexchange</groupId>
+            <artifactId>cluster-kit</artifactId>
+        </dependency>
+
         <!-- Aeron client for transport configuration (channel URIs) -->
         <dependency>
             <groupId>io.aeron</groupId>

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.application.engine.session;
 
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.domain.AdminResult;
 import com.openexchange.assets.domain.CoreRejectReason;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
@@ -28,7 +28,7 @@ public final class SessionRegistry {
 
     /** SessionOpen: parse the principal once. A malformed or missing principal becomes NONE (no authority). */
     public SessionAuthority open(final long sessionId, final byte[] encodedPrincipal) {
-        final SessionAuthority a = new SessionAuthority(sessionId, CorePrincipal.decode(encodedPrincipal));
+        final SessionAuthority a = new SessionAuthority(sessionId, ClusterPrincipal.decode(encodedPrincipal));
         byId.put(sessionId, a);
         return a;
     }

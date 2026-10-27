@@ -675,7 +675,7 @@ public final class BalanceSnapshotCodec {
             pos[0] += 8;
             dst.putLong(pos[0], a.sourceEpoch());
             pos[0] += 8;
-            final byte[] principal = a.principal().sessionClass() == com.openexchange.assets.infrastructure.generated.SessionClass.UNSET
+            final byte[] principal = a.principal().classCode() == 0 // UNSET
                     ? new byte[0] : a.principal().encode();
             dst.putShort(pos[0], (short) principal.length);
             pos[0] += 2;

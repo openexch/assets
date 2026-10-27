@@ -78,7 +78,8 @@ public class BridgeEndToEndTest {
     /** RC1 S3: the AE authenticates every session; the bridge presents the BRIDGE key, the test's own client the TOOL key. */
     private static final String TEST_TOOL_SECRET = "22".repeat(32);
     private static final String TEST_BRIDGE_SECRET = "33".repeat(32);
-    private static final String TEST_KEYS = "2:TOOL:" + TEST_TOOL_SECRET + ";3:BRIDGE:" + TEST_BRIDGE_SECRET;
+    // RC2 S6 (A16): any-user scope is the explicit users=*.
+    private static final String TEST_KEYS = "2:TOOL:" + TEST_TOOL_SECRET + "::users=*;3:BRIDGE:" + TEST_BRIDGE_SECRET + "::users=*";
 
     static {
         System.setProperty(com.openexchange.assets.auth.CoreCredentials.PROPERTY, "3:BRIDGE:" + TEST_BRIDGE_SECRET);
@@ -268,7 +269,7 @@ public class BridgeEndToEndTest {
         IoUtil.delete(tmp, true);
 
         // Real single-node AE cluster (embedded driver, backoff idle) — ClusterBootSmokeTest pattern.
-        System.setProperty(com.openexchange.assets.auth.AuthKeyTable.PROPERTY, TEST_KEYS);
+        System.setProperty(com.openexchange.assets.auth.AssetsAuth.POLICY.keysProperty(), TEST_KEYS);
         final ClusterConfig cfg = ClusterConfig.create(0, List.of("localhost"), AE_PORT_BASE,
                 new AssetsClusteredService());
         cfg.baseDir(new File(tmp, "node0"));

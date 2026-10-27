@@ -1069,7 +1069,7 @@ public final class AssetsSbeDemuxer {
             rejectDecode("RegisterSession class " + classRaw + " resumable " + resumableRaw);
             return;
         }
-        final SessionClass asserted = com.openexchange.assets.auth.CorePrincipal.classOf(classRaw);
+        final SessionClass asserted = com.openexchange.assets.auth.AssetsSessionClasses.of(classRaw);
         final EgressChannelsDecoder ch = registerSessionDecoder.channels();
         int mask = 0;
         if (ch.acks())        mask |= AssetsEventPublisher.CH_ACKS;

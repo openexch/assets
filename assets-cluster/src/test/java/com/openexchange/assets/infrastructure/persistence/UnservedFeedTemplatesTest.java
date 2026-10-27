@@ -3,7 +3,8 @@ package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.application.projection.SettlementProjector;
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.determinism.AssetsEngineEvent;
 import com.openexchange.assets.determinism.RecordingAssetsSink;
 import com.openexchange.assets.domain.AdminResult;
@@ -55,7 +56,7 @@ public class UnservedFeedTemplatesTest {
 
         /** Open a session with {@code cls}'s principal and register it with the same class (accepted). */
         long registered(final long sessionId, final SessionClass cls) {
-            engine.sessions().open(sessionId, CorePrincipal.anyUser(cls, (int) sessionId).encode());
+            engine.sessions().open(sessionId, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(cls), (int) sessionId).encode());
             final RegisterSessionEncoder e = new RegisterSessionEncoder().wrapAndApplyHeader(zeroed(), 0, header)
                     .correlationId(sessionId).sessionClass(cls).readerKind((short) 0).resumable(BoolFlag.TRUE)
                     .identity(0).sourceEpoch(0);
@@ -70,7 +71,7 @@ public class UnservedFeedTemplatesTest {
         }
 
         long unregistered(final long sessionId, final SessionClass cls) {
-            engine.sessions().open(sessionId, CorePrincipal.anyUser(cls, (int) sessionId).encode());
+            engine.sessions().open(sessionId, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(cls), (int) sessionId).encode());
             return sessionId;
         }
 
