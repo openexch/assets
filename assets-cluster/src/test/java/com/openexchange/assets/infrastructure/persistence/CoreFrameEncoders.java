@@ -31,6 +31,13 @@ import com.openexchange.assets.infrastructure.generated.SessionClass;
 import com.openexchange.assets.infrastructure.generated.Side;
 import com.openexchange.assets.infrastructure.generated.TimeInForce;
 import com.openexchange.assets.infrastructure.generated.WithdrawEncoder;
+import com.openexchange.assets.infrastructure.generated.FeedHaltEncoder;
+import com.openexchange.assets.infrastructure.generated.FeedHaltReason;
+import com.openexchange.assets.infrastructure.generated.FeedLatchClearEncoder;
+import com.openexchange.assets.infrastructure.generated.MeCommandReleaseEncoder;
+import com.openexchange.assets.infrastructure.generated.MeEngineConfigEncoder;
+import com.openexchange.assets.infrastructure.generated.ReleaseResult;
+import com.openexchange.assets.infrastructure.generated.ReleaseScope;
 import org.agrona.concurrent.UnsafeBuffer;
 
 import java.util.List;
@@ -46,7 +53,18 @@ final class CoreFrameEncoders {
 
     /** A trade as the bridge journals it; the fields of MeJournalTrade (61) and of one MeJournalTradeBatch entry. */
     record Trade(long egressSeq, long tradeId, int marketId, long takerLeg, long takerUser, long makerLeg, long makerUser,
-                 long price, long quantity, boolean takerIsBuy, long meTimestamp, long takerOms, long makerOms) { }
+                 long price, long quantity, boolean takerIsBuy, long meTimestamp, long takerOms, long makerOms, long journalSeq) {
+        Trade(long egressSeq, long tradeId, int marketId, long takerLeg, long takerUser, long makerLeg, long makerUser,
+              long price, long quantity, boolean takerIsBuy, long meTimestamp, long takerOms, long makerOms) {
+            this(egressSeq, tradeId, marketId, takerLeg, takerUser, makerLeg, makerUser, price, quantity, takerIsBuy, meTimestamp,
+                    takerOms, makerOms, 0L);
+        }
+    }
+
+    /** RC2 S7: the producer epoch every ME-sourced frame carries (1 in the v1/v2 story; the bound genesisId at v3). */
+    long meEpoch = 1L;
+    /** RC2 S7: the genesisId every CoreConfig frame carries (0 in the v1/v2 story). */
+    long genesisId = 0L;
 
     private final UnsafeBuffer buf = new UnsafeBuffer(new byte[4096]);
     private final MessageHeaderEncoder header = new MessageHeaderEncoder();
@@ -111,7 +129,7 @@ final class CoreFrameEncoders {
     byte[] tick(int market, long version, long bid, long ask, long last, long lastTradeId) {
         zero();
         return out(new MarketTickEncoder().wrapAndApplyHeader(buf, 0, header).marketId(market).bookVersion(version).bestBid(bid)
-                .bestAsk(ask).lastTradePrice(last).lastTradeId(lastTradeId).meEpoch(1).encodedLength());
+                .bestAsk(ask).lastTradePrice(last).lastTradeId(lastTradeId).meEpoch(meEpoch).encodedLength());
     }
 
     byte[] trade(final Trade t) {
@@ -120,7 +138,8 @@ final class CoreFrameEncoders {
                 .marketId(t.marketId()).takerOrderId(t.takerLeg()).takerUserId(t.takerUser()).makerOrderId(t.makerLeg())
                 .makerUserId(t.makerUser()).price(t.price()).quantity(t.quantity())
                 .takerIsBuy(t.takerIsBuy() ? BoolFlag.TRUE : BoolFlag.FALSE).meTimestamp(t.meTimestamp())
-                .takerOmsOrderId(t.takerOms()).makerOmsOrderId(t.makerOms()).meEpoch(1).encodedLength());
+                .takerOmsOrderId(t.takerOms()).makerOmsOrderId(t.makerOms()).meEpoch(meEpoch).journalSeq(t.journalSeq())
+                .encodedLength());
     }
 
     byte[] tradeBatch(final List<Trade> trades) {
@@ -131,33 +150,45 @@ final class CoreFrameEncoders {
             g.next().egressSeq(t.egressSeq()).tradeId(t.tradeId()).marketId(t.marketId()).takerOrderId(t.takerLeg())
                     .takerUserId(t.takerUser()).makerOrderId(t.makerLeg()).makerUserId(t.makerUser()).price(t.price())
                     .quantity(t.quantity()).takerIsBuy(t.takerIsBuy() ? BoolFlag.TRUE : BoolFlag.FALSE)
-                    .meTimestamp(t.meTimestamp()).takerOmsOrderId(t.takerOms()).makerOmsOrderId(t.makerOms()).meEpoch(1);
+                    .meTimestamp(t.meTimestamp()).takerOmsOrderId(t.takerOms()).makerOmsOrderId(t.makerOms()).meEpoch(meEpoch)
+                    .journalSeq(t.journalSeq());
         }
         return out(e.encodedLength());
     }
 
     byte[] terminal(long egress, long leg, long user, int market, int status, long meTs, long oms) {
+        return terminal(egress, leg, user, market, status, meTs, oms, 0L);
+    }
+
+    byte[] terminal(long egress, long leg, long user, int market, int status, long meTs, long oms, long journalSeq) {
         zero();
         return out(new MeJournalTerminalEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress).orderId(leg).userId(user)
-                .marketId(market).status(OrderStatus.get((short) status)).meTimestamp(meTs).omsOrderId(oms).meEpoch(1)
+                .marketId(market).status(OrderStatus.get((short) status)).meTimestamp(meTs).omsOrderId(oms).meEpoch(meEpoch)
+                .journalSeq(journalSeq)
                 .encodedLength());
     }
 
     byte[] outcome(long egress, long cmdHigh, long cmdLow, long user, long oms, long old, long price, long qty, long budget,
                    int market, int kind, int type, int side, long meTs, long leg, int reason, int result) {
+        return outcome(egress, cmdHigh, cmdLow, user, oms, old, price, qty, budget, market, kind, type, side, meTs, leg, reason,
+                result, 0L);
+    }
+
+    byte[] outcome(long egress, long cmdHigh, long cmdLow, long user, long oms, long old, long price, long qty, long budget,
+                   int market, int kind, int type, int side, long meTs, long leg, int reason, int result, long journalSeq) {
         zero();
         return out(new MeCommandOutcomeEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress).commandIdHigh(cmdHigh)
                 .commandIdLow(cmdLow).userId(user).omsOrderId(oms).oldOrderId(old).price(price).quantity(qty).budget(budget)
                 .marketId(market).commandKind((short) kind).orderType((short) type).orderSide((short) side)
                 .appliedPosition(egress).meTimestamp(meTs).orderId(leg).status(0).reason(reason).oldCancelled((short) 0)
-                .result(result).meEpoch(1).encodedLength());
+                .result(result).meEpoch(meEpoch).journalSeq(journalSeq).encodedLength());
     }
 
     /** The compiled Market.ALL / Asset tables as a CoreConfig frame (the only config the S7 cross-check accepts). */
     byte[] coreConfig(long corr, long version, long behavior, long tick, long min, long max, long lot) {
         zero();
         final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(buf, 0, header).correlationId(corr)
-                .configVersion(version).behaviorVersion(behavior);
+                .configVersion(version).behaviorVersion(behavior).genesisId(genesisId);
         final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(Market.ALL.length);
         for (final Market d : Market.ALL) {
             m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id()).quoteAssetId(d.quoteAsset().id())
@@ -202,5 +233,37 @@ final class CoreFrameEncoders {
                 .sessionClass(cls).readerKind((short) 0).resumable(BoolFlag.TRUE).identity(0).sourceEpoch(0);
         e.channels().clear().acks(true).orders(true).dispatch(true).control(true);
         return out(e.encodedLength());
+    }
+
+    // ---- RC2 S7 (16.4 fuzz corpus rows): the v7 feed templates 66, 67, 68 and 76 ----
+
+    byte[] feedHalt(long corr, int reason, long meEpochSeen, long expected, long seen) {
+        zero();
+        return out(new FeedHaltEncoder().wrapAndApplyHeader(buf, 0, header).correlationId(corr)
+                .reason(FeedHaltReason.get((short) reason)).meEpochSeen(meEpochSeen).expectedJournalSeq(expected)
+                .seenJournalSeq(seen).bridgeIdentity(0x77).encodedLength());
+    }
+
+    /** One release entry (the corpus row S1 review FIX-1 asked for: groupCount(67) = 1). */
+    byte[] meCommandRelease(long egress, long journalSeq, long meEpoch, long commandIdHigh) {
+        zero();
+        final MeCommandReleaseEncoder e = new MeCommandReleaseEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress)
+                .journalSeq(journalSeq).meEpoch(meEpoch).releaseSeq(1).ledgerSize(0).ledgerCapacity(4096).tombstoneRanges(0);
+        e.releasesCount(1).next().commandIdHigh(commandIdHigh).idLowFloor(0).scope(ReleaseScope.UP_TO).result(ReleaseResult.APPLIED)
+                .removed(1);
+        return out(e.encodedLength());
+    }
+
+    byte[] meEngineConfig(long egress, long journalSeq, long meEpoch, long configVersion, int decision) {
+        zero();
+        return out(new MeEngineConfigEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress).journalSeq(journalSeq)
+                .meEpoch(meEpoch).configVersion(configVersion).behaviorVersion(2).ledgerCapacity(4096).maxWireVersion(12)
+                .decision(com.openexchange.assets.infrastructure.generated.ConfigDecision.get((short) decision)).encodedLength());
+    }
+
+    byte[] feedLatchClear(long corr, int haltReason, long journalSeq) {
+        zero();
+        return out(new FeedLatchClearEncoder().wrapAndApplyHeader(buf, 0, header).correlationId(corr)
+                .haltReason(FeedHaltReason.get((short) haltReason)).journalSeq(journalSeq).encodedLength());
     }
 }

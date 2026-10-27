@@ -273,13 +273,23 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     @Override
     public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId,
                                      boolean journalEnabled) {
+        // the S1 tail: what every v1/v2 core reports (RC2 S1 4.4)
+        onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled, 0L, 0L, false,
+                com.openexchange.assets.domain.FeedHaltReason.NONE);
+    }
+
+    @Override
+    public void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId, boolean journalEnabled,
+                                     long meEpoch, long lastAppliedJournalSeq, boolean feedHalted,
+                                     com.openexchange.assets.domain.FeedHaltReason haltReason) {
         feedPositionReportEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(correlationId).consumePosition(consumePosition)
                 .lastAppliedTradeId(lastAppliedTradeId)
                 .journalEnabled(journalEnabled ? BoolFlag.TRUE : BoolFlag.FALSE)
-                // v7 tail, S1 values (RC2 S1 4.4); RC2 S7 fills them from FeedState
-                .meEpoch(0L).lastAppliedJournalSeq(0L).feedHalted(BoolFlag.FALSE)
-                .haltReason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.NONE);
+                // v7 tail (RC2 S7 3.6): the FeedState, all zero under v1/v2
+                .meEpoch(meEpoch).lastAppliedJournalSeq(lastAppliedJournalSeq)
+                .feedHalted(feedHalted ? BoolFlag.TRUE : BoolFlag.FALSE)
+                .haltReason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.get((short) haltReason.code()));
         flush(feedPositionReportEncoder.encodedLength(), CH_ACKS, Routing.ORIGIN);
     }
 
@@ -340,16 +350,32 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     @Override
     public void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
                                  long atMs, long logPosition, boolean toOrigin) {
+        // S1's single-reason form: OPEN -> 0, SUSPENDED -> 1 << gateReason
+        onAdmissionState(marketId, gateState, gateReason, circuitBreaker, atMs, logPosition, toOrigin,
+                gateReasonsOf(gateState, gateReason));
+    }
+
+    @Override
+    public void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                                 long atMs, long logPosition, boolean toOrigin, int gateReasons) {
         admissionStateEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .marketId(marketId)
                 .gateState(com.openexchange.assets.infrastructure.generated.GateState.get((short) gateState.code()))
                 .gateReason(com.openexchange.assets.infrastructure.generated.GateReason.get((short) gateReason.code()))
                 .circuitBreaker(circuitBreaker ? BoolFlag.TRUE : BoolFlag.FALSE)
                 .atMs(atMs).logPosition(logPosition);
-        // v7 (RC2 S1 4.4): the D4 bitmask's wire form. S1 holds one reason: OPEN -> 0, SUSPENDED -> 1 << gateReason.
-        buffer.putInt(admissionStateEncoder.offset() + AdmissionStateEncoder.gateReasonsEncodingOffset(),
-                gateReasonsOf(gateState, gateReason), java.nio.ByteOrder.LITTLE_ENDIAN);
+        // v7: the D4 bitmask through the generated set encoder (RC2 S7 6.2; NOTE-2 of S1/review-assets.md)
+        admissionStateEncoder.gateReasons().clear()
+                .admin(bit(gateReasons, GateReason.ADMIN)).retentionBudget(bit(gateReasons, GateReason.RETENTION_BUDGET))
+                .bridgeHalt(bit(gateReasons, GateReason.BRIDGE_HALT)).recovery(bit(gateReasons, GateReason.RECOVERY))
+                .meCapacity(bit(gateReasons, GateReason.ME_CAPACITY)).genesis(bit(gateReasons, GateReason.GENESIS))
+                .applyFault(bit(gateReasons, GateReason.APPLY_FAULT)).meLegLive(bit(gateReasons, GateReason.ME_LEG_LIVE))
+                .meBehavior(bit(gateReasons, GateReason.ME_BEHAVIOR));
         flush(admissionStateEncoder.encodedLength(), CH_CONTROL, toOrigin ? Routing.ORIGIN : Routing.BROADCAST);
+    }
+
+    private static boolean bit(final int reasons, final GateReason r) {
+        return (reasons & (1 << r.code())) != 0;
     }
 
     /** {@code AdmissionState.gateReasons} for the single-reason gate of S1: 0 when OPEN, else the reason's bit. */
@@ -372,6 +398,13 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     @Override
     public void onOrderEvent(long eventSeq, long logPosition, CoreOrderView o, EventKind kind, CoreRejectReason reason,
                              long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs) {
+        onOrderEvent(eventSeq, logPosition, o, kind, reason, lastPrice, lastQty, tradeId, holdRemaining, updatedAtMs,
+                NOT_ME_SOURCED);
+    }
+
+    @Override
+    public void onOrderEvent(long eventSeq, long logPosition, CoreOrderView o, EventKind kind, CoreRejectReason reason,
+                             long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs, int meReason) {
         orderEventEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .eventSeq(eventSeq).logPosition(logPosition).orderId(o.orderId()).userId(o.userId()).marketId(o.marketId())
                 .eventKind(com.openexchange.assets.infrastructure.generated.EventKind.get((short) kind.code()))
@@ -385,7 +418,7 @@ public final class AssetsEventPublisher implements AssetsEventSink {
                 .meOrderId(o.meOrderId()).holdAssetId(o.holdAssetId()).holdAmount(o.holdAmount()).holdRemaining(holdRemaining)
                 .clientOrderIdHigh(o.clientOrderIdHigh()).clientOrderIdLow(o.clientOrderIdLow())
                 .createdAtMs(o.createdAtMs()).updatedAtMs(updatedAtMs)
-                .meReason(NOT_ME_SOURCED); // v7: S1 always writes 255 (RC2 S1 4.4); S7 writes the ME code
+                .meReason((short) meReason); // v7 (RC2 S7 D9b): the ME code on ME-caused events, else 255
         flush(orderEventEncoder.encodedLength(), CH_ORDERS, Routing.BROADCAST);
     }
 

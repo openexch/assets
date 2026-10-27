@@ -139,4 +139,34 @@ public interface AssetsEventSink {
     default void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
                                    long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
                                    long quantity, long budget, int timeInForceCode) { }
+
+    // ---- RC2 S7 (contract section 15). Defaults delegate to the RC1 methods, so every existing sink compiles unchanged;
+    //      the engine calls these, the publisher overrides them and writes the v7 fields. ----
+
+    /** {@link #onFeedPositionReport(long, long, long, boolean)} with the v7 tail (3.6): all zero under v1/v2. */
+    default void onFeedPositionReport(long correlationId, long consumePosition, long lastAppliedTradeId, boolean journalEnabled,
+                                      long meEpoch, long lastAppliedJournalSeq, boolean feedHalted, FeedHaltReason haltReason) {
+        onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled);
+    }
+
+    /** {@link #onAdmissionState} with the D4 bitmask (6.2); equal to S1's derived value under v1/v2. */
+    default void onAdmissionState(int marketId, GateState gateState, GateReason gateReason, boolean circuitBreaker,
+                                  long atMs, long logPosition, boolean toOrigin, int gateReasons) {
+        onAdmissionState(marketId, gateState, gateReason, circuitBreaker, atMs, logPosition, toOrigin);
+    }
+
+    /** {@link #onOrderEvent} with the ME reason code (D9b); 255 = not ME-sourced, always 255 under v1/v2. */
+    default void onOrderEvent(long eventSeq, long logPosition, CoreOrderView order, EventKind kind, CoreRejectReason reason,
+                              long lastPrice, long lastQty, long tradeId, long holdRemaining, long updatedAtMs, int meReason) {
+        onOrderEvent(eventSeq, logPosition, order, kind, reason, lastPrice, lastQty, tradeId, holdRemaining, updatedAtMs);
+    }
+
+    /**
+     * Node-local observability (review 2 FIX-F): a feed latch was raised or replaced (5.2). Never wire bytes (production
+     * alerting reads the OrderFault{FEED_HALT}); {@code rawTradeId} is the refused frame's own tradeId, diagnostic only.
+     */
+    default void onFeedLatch(FeedHaltReason reason, long expected, long seen, long skip, long rawTradeId) { }
+
+    /** Node-local observability: a latch was cleared by the reach-clear ({@code auto}) or by FeedLatchClear 76. */
+    default void onFeedLatchCleared(FeedHaltReason reason, long journalSeq, boolean auto) { }
 }

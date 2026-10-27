@@ -64,7 +64,7 @@ public class CoreSnapshotSizingTest {
     private static final int USER_RISK_BYTES = 80;
     private static final int MARKET_STATE_BYTES = 117;
     private static final int MARKET_SLOTS = 6;
-    private static final int GATE_ROW_BYTES = 4 + 1 + 1;
+    private static final int GATE_ROW_BYTES = 4 + 1 + 1 + 4;            // RC2 S7 6.3: + reasons u32 (layout v2)
     private static final int REQUEST_ROW_BYTES = 58;
     private static final int CONFIG_MARKET_BYTES = 4 + 16 + 4 + 4 + 4 * 8;
     private static final int CONFIG_ASSET_BYTES = 4 + 8 + 1;
@@ -95,6 +95,24 @@ public class CoreSnapshotSizingTest {
     }
 
     /** The pinned literals must equal the code's constants, or the arithmetic below checks a layout nobody writes. */
+    /** RC2 S7 16.5: under behaviour 3 the image gains section 10 FEED_STATE (92 bytes): 9 sections. */
+    @Test
+    public void aV3ImageCarriesTheFeedStateSection() {
+        final com.openexchange.assets.application.engine.feed.V3Rig r = com.openexchange.assets.application.engine.feed.V3Rig.bound();
+        final ExpandableArrayBuffer out = new ExpandableArrayBuffer();
+        final int length = BalanceSnapshotCodec.serialize(r.engine, out, 0);
+        final long v2Shape = expectedImageBytes(0, 0, 0, 0, Market.ALL.length, Asset.count());
+        // section 10 layout v2 (3.8): 92-byte head + freshDigest 8 + digestCount 4 + one digest per entry (cursor 1)
+        assertEquals("v3 = the v1/v2 layout + one section header + 92 + 12 + 8 bytes", v2Shape + SECTION_HEADER_BYTES + 92 + 12 + 8,
+                length);
+        final AssetsEngine restored = new AssetsEngine();
+        restored.coreConfig().setSupportedBehaviorVersions(1, 2, 3);
+        restored.setEventSink(new QuietSink());
+        final BalanceSnapshotCodec.Decoded decoded = BalanceSnapshotCodec.deserialize(new UnsafeBuffer(out.byteArray(), 0, length),
+                0, length, restored);
+        assertEquals("sections (1..6, 8 CORE_CONFIG, 9 SESSIONS, 10 FEED_STATE)", 9, decoded.sectionCount);
+    }
+
     @Test
     public void declaredRecordSizesMatchTheCodeConstants() {
         assertEquals("order record (S5 contract 1: 33 longs, 4 ints, 1 short, 6 bytes)", ORDER_BYTES, CoreOrder.SNAPSHOT_BYTES);
@@ -217,7 +235,8 @@ public class CoreSnapshotSizingTest {
         final long marketState = 4 + (long) MARKET_SLOTS * MARKET_STATE_BYTES;
         final long gates = 4 + (long) MARKET_SLOTS * GATE_ROW_BYTES;
         final long requests = 8 + 4 + (long) requestRows * REQUEST_ROW_BYTES;
-        final long config = 8 + 8 + 4 + (long) configMarkets * CONFIG_MARKET_BYTES + 4 + (long) configAssets * CONFIG_ASSET_BYTES;
+        // RC2 S7 7.3: section 8 layout v2, genesisId after behaviorVersion
+        final long config = 8 + 8 + 8 + 4 + (long) configMarkets * CONFIG_MARKET_BYTES + 4 + (long) configAssets * CONFIG_ASSET_BYTES;
         final long sessions = 4; // in-process: no session authorities
         return HEADER_BYTES + (long) sections * SECTION_HEADER_BYTES
                 + accounts + orderSection + userRisk + marketState + gates + requests + config + sessions;

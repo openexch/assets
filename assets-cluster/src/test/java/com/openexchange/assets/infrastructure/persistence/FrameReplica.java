@@ -36,6 +36,8 @@ final class FrameReplica {
 
     private FrameReplica(final AssetsEngine engine) {
         this.engine = engine;
+        // RC2 S7: the v3 story runs behaviour 3, which the S7 jar supports only through this test seam (node-local)
+        engine.coreConfig().setSupportedBehaviorVersions(1, 2, 3);
         engine.setEventSink(sink);
         engine.setConfigFailFast(() -> failFastCalls++);
         demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
@@ -46,6 +48,7 @@ final class FrameReplica {
         final UnsafeBuffer buffer = new UnsafeBuffer(image);
         final int payloadLength = new SnapshotEnvelope().open(buffer, image.length);
         final AssetsEngine fresh = new AssetsEngine();
+        fresh.coreConfig().setSupportedBehaviorVersions(1, 2, 3); // before the codec's cross-check of section 8
         final int[] failFast = new int[1];
         fresh.setConfigFailFast(() -> failFast[0]++);
         final BalanceSnapshotCodec.Decoded decoded =

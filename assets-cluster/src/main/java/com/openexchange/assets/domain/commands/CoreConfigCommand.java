@@ -17,9 +17,9 @@ public final class CoreConfigCommand {
     public long configVersion;
     public long behaviorVersion;
     /**
-     * money-schema v7 (RC2 S1 4.4): the genesis nonce, decoded from the wire only. It is NOT part of the DUPLICATE
-     * equality and NOT recorded ({@code CoreConfigStateMachine.install} does not copy it, the snapshot does not carry
-     * it); RC2 S7 records it (section 8 layout v2) and puts the recorded value into the equality.
+     * money-schema v7 (RC2 S1 4.4): the genesis nonce. RC2 S7 (contract 7.1): recorded at ADOPT as sent
+     * ({@code CoreConfigStateMachine.install} copies it, section 8 layout v2 carries it); every later config must carry
+     * the recorded value (row 2b), and the switch to behaviour 3 needs it non-zero (row 7).
      */
     public long genesisId;
     public MarketDef[] markets = new MarketDef[0];

@@ -418,6 +418,15 @@ public final class AssetsSbeDemuxer {
             return;
         }
 
+        // 4b. RC2 S7 7.2 row 3 (D-1): under behaviour v3 the v5 money templates are refused for EVERY authority, the trusted
+        //     path included, before the trusted bypass of step 5. There is no manual money hatch on a v3 core; repair goes
+        //     through FeedLatchClear 76 or a dual genesis. CLASS_MASK stays a static table (review 2 FIX-A).
+        if ((templateId == SettleDecoder.TEMPLATE_ID || templateId == TerminalReleaseDecoder.TEMPLATE_ID
+                || templateId == SettleBatchDecoder.TEMPLATE_ID) && engine.behaviorV3()) {
+            engine.refuseV5Money(templateId, correlationIdOf(templateId), userIdOf(templateId), authority.sessionClass().value());
+            return;
+        }
+
         // 5. Session authority (K6): class mask, registration-first, user scope. RegisterSession itself is
         //    judged by the registry (so a session with no usable principal gets a REJECTED ack, not silence).
         if (!authority.isTrusted() && templateId != RegisterSessionDecoder.TEMPLATE_ID) {
@@ -477,10 +486,11 @@ public final class AssetsSbeDemuxer {
                 case RegisterSessionDecoder.TEMPLATE_ID:     handleRegisterSession(authority, timestamp); break;
                 case OrderEntryGateDecoder.TEMPLATE_ID:      handleOrderEntryGate(timestamp); break;
                 // v7 (RC2 S1): raw ranges validated, then counted unserved (no mutation, no egress) until S7/S8.
-                case FeedHaltDecoder.TEMPLATE_ID:            handleFeedHalt(); break;
-                case MeCommandReleaseDecoder.TEMPLATE_ID:    handleMeCommandRelease(); break;
-                case MeEngineConfigDecoder.TEMPLATE_ID:      handleMeEngineConfig(); break;
-                case FeedLatchClearDecoder.TEMPLATE_ID:      handleFeedLatchClear(); break;
+                // RC2 S7: served under behaviour v3 (section 7.2 row 1); below v3 counted unserved exactly as S1.
+                case FeedHaltDecoder.TEMPLATE_ID:            handleFeedHalt(authority, timestamp); break;
+                case MeCommandReleaseDecoder.TEMPLATE_ID:    handleMeCommandRelease(timestamp); break;
+                case MeEngineConfigDecoder.TEMPLATE_ID:      handleMeEngineConfig(timestamp); break;
+                case FeedLatchClearDecoder.TEMPLATE_ID:      handleFeedLatchClear(timestamp); break;
                 case SubscribeDecoder.TEMPLATE_ID:
                     // Transport-level; consumed at the service boundary before dispatch. Reaching
                     // here means the service peek declined it (bad length/version): drop, count.
@@ -687,23 +697,38 @@ public final class AssetsSbeDemuxer {
                 requestOrderSnapshotDecoder.fromOrderId(), allUsers);
     }
 
-    /** 61 (and 62 per entry). v7 {@code journalSeq} is accepted with any value and not passed to the engine until RC2 S7. */
+    /**
+     * 61. Under v1/v2 {@code journalSeq} is decoded and not used (the RC1 apply); under v3 it is the cursor key (RC2 S7 D1)
+     * and a range failure is decode poison reported to the engine with the raw journalSeq, meEpoch and tradeId (5.4).
+     */
     private void handleMeJournalTrade(long timestamp) {
         meJournalTradeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int buy = meJournalTradeDecoder.takerIsBuyRaw();
         if (!validBool(buy)) {
             rejectDecode("MeJournalTrade takerIsBuy " + buy);
+            if (engine.behaviorV3()) {
+                applying = true;
+                engine.onFeedPoison(MeJournalTradeDecoder.TEMPLATE_ID,
+                        frame.getLong(HEADER + MeJournalTradeDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        frame.getLong(HEADER + MeJournalTradeDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        frame.getLong(HEADER + MeJournalTradeDecoder.tradeIdEncodingOffset(), ByteOrder.LITTLE_ENDIAN), timestamp);
+            }
             return;
         }
         applying = true;
-        engine.orders().applyTrade(meJournalTradeDecoder.egressSeq(), meJournalTradeDecoder.tradeId(), meJournalTradeDecoder.marketId(),
-                meJournalTradeDecoder.takerOrderId(), meJournalTradeDecoder.takerUserId(), meJournalTradeDecoder.makerOrderId(),
-                meJournalTradeDecoder.makerUserId(), meJournalTradeDecoder.price(), meJournalTradeDecoder.quantity(),
-                buy == BoolFlag.TRUE.value(), meJournalTradeDecoder.meTimestamp(), meJournalTradeDecoder.takerOmsOrderId(),
-                meJournalTradeDecoder.makerOmsOrderId(), meJournalTradeDecoder.meEpoch(), timestamp);
+        engine.onMeTrade(meJournalTradeDecoder.egressSeq(), meJournalTradeDecoder.journalSeq(), meJournalTradeDecoder.tradeId(),
+                meJournalTradeDecoder.marketId(), meJournalTradeDecoder.takerOrderId(), meJournalTradeDecoder.takerUserId(),
+                meJournalTradeDecoder.makerOrderId(), meJournalTradeDecoder.makerUserId(), meJournalTradeDecoder.price(),
+                meJournalTradeDecoder.quantity(), buy == BoolFlag.TRUE.value(), meJournalTradeDecoder.meTimestamp(),
+                meJournalTradeDecoder.takerOmsOrderId(), meJournalTradeDecoder.makerOmsOrderId(), meJournalTradeDecoder.meEpoch(),
+                timestamp);
     }
 
     private void handleMeJournalTradeBatch(long timestamp) {
+        if (engine.behaviorV3()) {
+            handleMeJournalTradeBatchV3(timestamp);
+            return;
+        }
         meJournalTradeBatchDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         // Raw enum bytes are validated for the WHOLE group before the first entry is applied (K5: no partial batch).
         // The frame's OWN dimensions (root block, group entry block) locate the bytes, exactly as the generated decoder
@@ -729,6 +754,41 @@ public final class AssetsSbeDemuxer {
     }
 
     /**
+     * RC2 S7 3.5: 62 under v3, entry by entry in group order, each through D1 with its own raw {@code takerIsBuy} check
+     * right before it. DUPLICATE entries are passed over, APPLY entries applied and committed one by one; the first REFUSED
+     * entry, or a poisoned one that latched (5.4 rows 1 and 2), stops the batch. A poison that is only counted (a corrupt
+     * duplicate or gap entry) is passed over (review 2 NOTE-D). Partial application is exact under the dense cursor.
+     */
+    private void handleMeJournalTradeBatchV3(long timestamp) {
+        final int groupOffset = HEADER + headerDecoder.blockLength();
+        final int blockLength = Short.toUnsignedInt(frame.getShort(groupOffset, ByteOrder.LITTLE_ENDIAN));
+        final int groupStart = groupOffset + GROUP_HEADER;
+        meJournalTradeBatchDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        applying = true;
+        int i = 0;
+        for (final MeJournalTradeBatchDecoder.TradesDecoder t : meJournalTradeBatchDecoder.trades()) {
+            final int at = groupStart + i++ * blockLength;
+            final int raw = frame.getByte(at + MeJournalTradeBatchDecoder.TradesDecoder.takerIsBuyEncodingOffset()) & 0xFF;
+            if (!validBool(raw)) {
+                rejectDecode("MeJournalTradeBatch takerIsBuy " + raw + " at " + (i - 1));
+                if (engine.onFeedPoison(MeJournalTradeBatchDecoder.TEMPLATE_ID,
+                        frame.getLong(at + MeJournalTradeBatchDecoder.TradesDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        frame.getLong(at + MeJournalTradeBatchDecoder.TradesDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        frame.getLong(at + MeJournalTradeBatchDecoder.TradesDecoder.tradeIdEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        timestamp)) {
+                    return;
+                }
+                continue;
+            }
+            if (!engine.onMeTradeEntry(MeJournalTradeBatchDecoder.TEMPLATE_ID, t.egressSeq(), t.journalSeq(), t.tradeId(),
+                    t.marketId(), t.takerOrderId(), t.takerUserId(), t.makerOrderId(), t.makerUserId(), t.price(), t.quantity(),
+                    raw == BoolFlag.TRUE.value(), t.meTimestamp(), t.takerOmsOrderId(), t.makerOmsOrderId(), t.meEpoch(), timestamp)) {
+                return;
+            }
+        }
+    }
+
+    /**
      * 63. v7 {@code rejectReason} is the ME code verbatim ({@code 0 = NONE}); 255 is never written by the bridge and is
      * decode poison. It and {@code journalSeq} are not passed to the engine until RC2 S7.
      */
@@ -736,14 +796,22 @@ public final class AssetsSbeDemuxer {
         meJournalTerminalDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int status = meJournalTerminalDecoder.statusRaw();
         final int meReject = meJournalTerminalDecoder.rejectReason();
-        if (status < 2 || status > 5 || meReject < 0 || meReject > 254) {
+        final boolean v3 = engine.behaviorV3();
+        // v3 (RC2 S7 5.4, FIX-8): status 2..4 (5 EXPIRED never comes from the ME); v1/v2 keep 2..5
+        if (status < 2 || status > (v3 ? 4 : 5) || meReject < 0 || meReject > 254) {
             rejectDecode("MeJournalTerminal status " + status + " rejectReason " + meReject);
+            if (v3) {
+                applying = true;
+                engine.onFeedPoison(MeJournalTerminalDecoder.TEMPLATE_ID,
+                        frame.getLong(HEADER + MeJournalTerminalDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        frame.getLong(HEADER + MeJournalTerminalDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), 0L, timestamp);
+            }
             return;
         }
         applying = true;
-        engine.orders().applyTerminal(meJournalTerminalDecoder.egressSeq(), meJournalTerminalDecoder.orderId(), meJournalTerminalDecoder.userId(),
-                meJournalTerminalDecoder.marketId(), status, meJournalTerminalDecoder.meTimestamp(), meJournalTerminalDecoder.omsOrderId(),
-                meJournalTerminalDecoder.meEpoch(), timestamp);
+        engine.onMeTerminal(meJournalTerminalDecoder.egressSeq(), meJournalTerminalDecoder.journalSeq(), meJournalTerminalDecoder.orderId(),
+                meJournalTerminalDecoder.userId(), meJournalTerminalDecoder.marketId(), status, meReject,
+                meJournalTerminalDecoder.meTimestamp(), meJournalTerminalDecoder.omsOrderId(), meJournalTerminalDecoder.meEpoch(), timestamp);
     }
 
     /**
@@ -756,16 +824,27 @@ public final class AssetsSbeDemuxer {
         final int kind = meCommandOutcomeDecoder.commandKind();
         final int result = meCommandOutcomeDecoder.result();
         final int tif = meCommandOutcomeDecoder.timeInForce();
-        if (kind < 0 || kind > 2 || result < 0 || result > 8 || tif < 0 || tif > 2) {
-            rejectDecode("MeCommandOutcome kind " + kind + " result " + result + " timeInForce " + tif);
+        final int oldCancelled = meCommandOutcomeDecoder.oldCancelled();
+        final boolean v3 = engine.behaviorV3();
+        // v3 (RC2 S7 5.4): oldCancelled 0..1, and result >= 2 carries oldCancelled 0
+        if (kind < 0 || kind > 2 || result < 0 || result > 8 || tif < 0 || tif > 2
+                || (v3 && (oldCancelled > 1 || (result >= 2 && oldCancelled != 0)))) {
+            rejectDecode("MeCommandOutcome kind " + kind + " result " + result + " timeInForce " + tif + " oldCancelled " + oldCancelled);
+            if (v3) {
+                applying = true;
+                engine.onFeedPoison(MeCommandOutcomeDecoder.TEMPLATE_ID,
+                        frame.getLong(HEADER + MeCommandOutcomeDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                        frame.getLong(HEADER + MeCommandOutcomeDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), 0L, timestamp);
+            }
             return;
         }
         applying = true;
-        engine.orders().applyOutcome(meCommandOutcomeDecoder.egressSeq(), meCommandOutcomeDecoder.commandIdHigh(),
+        engine.onMeOutcome(meCommandOutcomeDecoder.egressSeq(), meCommandOutcomeDecoder.journalSeq(), meCommandOutcomeDecoder.commandIdHigh(),
                 meCommandOutcomeDecoder.commandIdLow(), meCommandOutcomeDecoder.userId(), meCommandOutcomeDecoder.omsOrderId(),
                 meCommandOutcomeDecoder.oldOrderId(), meCommandOutcomeDecoder.price(), meCommandOutcomeDecoder.quantity(),
                 meCommandOutcomeDecoder.budget(), meCommandOutcomeDecoder.marketId(), kind, result, meCommandOutcomeDecoder.orderId(),
-                meCommandOutcomeDecoder.reason(), meCommandOutcomeDecoder.meTimestamp(), meCommandOutcomeDecoder.meEpoch(), timestamp);
+                meCommandOutcomeDecoder.reason(), oldCancelled == 1, meCommandOutcomeDecoder.meTimestamp(),
+                meCommandOutcomeDecoder.meEpoch(), timestamp);
     }
 
     private void handleRequestPendingDispatch() {
@@ -1029,22 +1108,30 @@ public final class AssetsSbeDemuxer {
 
     // ---- v7 (RC2 S1 4.3 / 4.3a): defined, bounds- and range-checked, not served (S7 / S8) ----
 
-    /** FeedHalt (66, BRIDGE): {@code reason 1..5}; NONE (0) is not a halt. Served by RC2 S7. */
-    private void handleFeedHalt() {
+    /** FeedHalt (66, BRIDGE): {@code reason 1..5}; NONE (0) is not a halt. Served under v3 (RC2 S7 D3a). */
+    private void handleFeedHalt(final SessionAuthority authority, final long timestamp) {
         feedHaltDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int reason = feedHaltDecoder.reasonRaw();
         if (reason < 1 || reason > 5) {
             rejectDecode("FeedHalt reason " + reason);
             return;
         }
-        unhandled(FeedHaltDecoder.TEMPLATE_ID);
+        if (!engine.behaviorV3()) {
+            unhandled(FeedHaltDecoder.TEMPLATE_ID);
+            return;
+        }
+        applying = true;
+        engine.applyFeedHalt(authority.sessionId(), feedHaltDecoder.correlationId(),
+                com.openexchange.assets.domain.FeedHaltReason.fromCode(reason), feedHaltDecoder.meEpochSeen(),
+                feedHaltDecoder.expectedJournalSeq(), feedHaltDecoder.seenJournalSeq(), feedHaltDecoder.bridgeIdentity(), timestamp);
     }
 
     /**
      * MeCommandRelease (67, BRIDGE): every entry's {@code scope 0..1} and {@code result 0..2}, located by the frame's
      * own dimensions as for 62. Served by RC2 S8.
      */
-    private void handleMeCommandRelease() {
+    private void handleMeCommandRelease(final long timestamp) {
+        final boolean v3 = engine.behaviorV3();
         final int groupOffset = HEADER + headerDecoder.blockLength();
         final int entryBlock = Short.toUnsignedInt(frame.getShort(groupOffset, ByteOrder.LITTLE_ENDIAN));
         final int count = Short.toUnsignedInt(frame.getShort(groupOffset + 2, ByteOrder.LITTLE_ENDIAN));
@@ -1055,32 +1142,68 @@ public final class AssetsSbeDemuxer {
             final int result = frame.getByte(at + MeCommandReleaseDecoder.ReleasesDecoder.resultEncodingOffset()) & 0xFF;
             if (scope > 1 || result > 2) {
                 rejectDecode("MeCommandRelease scope " + scope + " result " + result + " at " + i);
+                if (v3) {
+                    applying = true;
+                    engine.onFeedPoison(MeCommandReleaseDecoder.TEMPLATE_ID,
+                            frame.getLong(HEADER + MeCommandReleaseDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                            frame.getLong(HEADER + MeCommandReleaseDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), 0L,
+                            timestamp);
+                }
                 return;
             }
         }
-        unhandled(MeCommandReleaseDecoder.TEMPLATE_ID);
-    }
-
-    /** MeEngineConfig (68, BRIDGE): {@code decision 0..3}. Served by RC2 S7. */
-    private void handleMeEngineConfig() {
-        meEngineConfigDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
-        final int decision = meEngineConfigDecoder.decisionRaw();
-        if (decision > 3) {
-            rejectDecode("MeEngineConfig decision " + decision);
+        if (!v3) {
+            unhandled(MeCommandReleaseDecoder.TEMPLATE_ID);
             return;
         }
-        unhandled(MeEngineConfigDecoder.TEMPLATE_ID);
+        // RC2 S7: the cursor is consumed, the content is S8's (counted unservedReleaseCount)
+        final long egressSeq = frame.getLong(HEADER + MeCommandReleaseDecoder.egressSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        applying = true;
+        engine.onMeRelease(egressSeq,
+                frame.getLong(HEADER + MeCommandReleaseDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
+                frame.getLong(HEADER + MeCommandReleaseDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), timestamp);
     }
 
-    /** FeedLatchClear (76, ADMIN): {@code haltReason 1..5}. Served by RC2 S7. */
-    private void handleFeedLatchClear() {
+    /** MeEngineConfig (68, BRIDGE): {@code decision 0..3}. Served under v3 (RC2 S7 D2 row 1, 4.2, D8b). */
+    private void handleMeEngineConfig(final long timestamp) {
+        meEngineConfigDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
+        final int decision = meEngineConfigDecoder.decisionRaw();
+        final boolean v3 = engine.behaviorV3();
+        if (decision > 3) {
+            rejectDecode("MeEngineConfig decision " + decision);
+            if (v3) {
+                applying = true;
+                engine.onFeedPoison(MeEngineConfigDecoder.TEMPLATE_ID, meEngineConfigDecoder.journalSeq(),
+                        meEngineConfigDecoder.meEpoch(), 0L, timestamp);
+            }
+            return;
+        }
+        if (!v3) {
+            unhandled(MeEngineConfigDecoder.TEMPLATE_ID);
+            return;
+        }
+        applying = true;
+        engine.onMeEngineConfig(meEngineConfigDecoder.egressSeq(), meEngineConfigDecoder.journalSeq(), meEngineConfigDecoder.meEpoch(),
+                meEngineConfigDecoder.configVersion(), meEngineConfigDecoder.behaviorVersion(), meEngineConfigDecoder.ledgerCapacity(),
+                meEngineConfigDecoder.maxWireVersion(), com.openexchange.assets.domain.ConfigDecision.fromCode(decision), timestamp,
+                hooks::onSessionRejected);
+    }
+
+    /** FeedLatchClear (76, ADMIN): {@code haltReason 1..5}. Served under v3 (RC2 S7 D3b). */
+    private void handleFeedLatchClear(final long timestamp) {
         feedLatchClearDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int reason = feedLatchClearDecoder.haltReasonRaw();
         if (reason < 1 || reason > 5) {
             rejectDecode("FeedLatchClear haltReason " + reason);
             return;
         }
-        unhandled(FeedLatchClearDecoder.TEMPLATE_ID);
+        if (!engine.behaviorV3()) {
+            unhandled(FeedLatchClearDecoder.TEMPLATE_ID);
+            return;
+        }
+        applying = true;
+        engine.applyFeedLatchClear(feedLatchClearDecoder.correlationId(), com.openexchange.assets.domain.FeedHaltReason.fromCode(reason),
+                feedLatchClearDecoder.journalSeq(), timestamp);
     }
 
     /** The frame's correlationId when its template starts with one, else 0. Frame already bounds-checked. */

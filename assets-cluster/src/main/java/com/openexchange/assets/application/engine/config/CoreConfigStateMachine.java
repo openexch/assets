@@ -62,13 +62,21 @@ public final class CoreConfigStateMachine {
         return supported.clone();
     }
 
-    /** Section 3: the decision for {@code c}, without mutating anything. */
-    public Decision decide(final CoreConfigCommand c) {
+    /**
+     * Section 3 (RC1 S7) with the RC2 S7 rows (contract 7.1): the decision for {@code c}, without mutating anything.
+     * {@code globalOpen} and {@code feedVirgin} are replicated inputs the engine passes in (review 2 NOTE-E: this method
+     * never reaches into the engine); they matter only to row 7, the switch to behaviour 3.
+     */
+    public Decision decide(final CoreConfigCommand c, final boolean globalOpen, final boolean feedVirgin) {
         if (invalidReason(c) != null) {
             return Decision.INVALID;
         }
         if (recorded == null) {
             return c.behaviorVersion == 1 ? Decision.ADOPT : Decision.INVALID;
+        }
+        // row 2b: a genesisId other than the recorded one is a re-genesis attempt
+        if (c.genesisId != recorded.genesisId) {
+            return Decision.INVALID;
         }
         if (c.configVersion == recorded.configVersion && c.behaviorVersion == recorded.behaviorVersion && tablesEqual(c, recorded)) {
             return Decision.DUPLICATE;
@@ -81,6 +89,11 @@ public final class CoreConfigStateMachine {
         }
         if (c.behaviorVersion == recorded.behaviorVersion) {
             return Decision.ACCEPT;
+        }
+        // row 7: the switch to 3 needs a recorded genesisId, a feed-virgin core and GLOBAL SUSPENDED (no order can be admitted
+        // between the switch and the bind)
+        if (c.behaviorVersion == 3 && recorded.behaviorVersion == 2 && (recorded.genesisId == 0 || !feedVirgin || globalOpen)) {
+            return Decision.INVALID;
         }
         return c.behaviorVersion == recorded.behaviorVersion + 1 ? Decision.SWITCH : Decision.INVALID;
     }
@@ -208,6 +221,7 @@ public final class CoreConfigStateMachine {
         copy.correlationId = 0L;
         copy.configVersion = c.configVersion;
         copy.behaviorVersion = c.behaviorVersion;
+        copy.genesisId = c.genesisId; // RC2 S7 7.1 row 2: recorded as sent (section 8 layout v2)
         copy.markets = sortedMarkets(c.markets);
         copy.assets = sortedAssets(c.assets);
         recorded = copy;

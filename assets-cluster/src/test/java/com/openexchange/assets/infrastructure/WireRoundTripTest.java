@@ -751,9 +751,13 @@ public class WireRoundTripTest {
         }
     }
 
-    /** 4.4 row 70: genesisId is decoded, excluded from the DUPLICATE equality and not recorded in S1. */
+    /**
+     * 4.4 row 70 as served by RC2 S7 (contract 7.1 rows 2 and 2b; the S1 form of this test pinned "decoded, neither
+     * compared nor recorded" and said S7 turns the other-nonce resend into a re-genesis REJECT): genesisId is recorded at
+     * ADOPT as sent, carried by section 8 layout v2, and any later config with another nonce is REJECTED INVALID.
+     */
     @Test
-    public void coreConfigGenesisIdIsNeitherComparedNorRecorded() {
+    public void coreConfigGenesisIdIsRecordedAndComparedFromS7() {
         final UnsafeBuffer b = new UnsafeBuffer(new byte[2048]);
         final MessageHeaderEncoder he = new MessageHeaderEncoder();
         final MessageHeaderDecoder hd = new MessageHeaderDecoder();
@@ -768,23 +772,26 @@ public class WireRoundTripTest {
         final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
         demuxer.dispatchTrusted(b, 0, len, 1_000L);
         assertEquals(1, engine.coreConfig().adoptedCount());
-        assertEquals("not recorded in S1", 0L, engine.coreConfig().recorded().genesisId);
+        assertEquals("recorded as sent (S7 7.1 row 2)", 0x1234_5678_9ABCL, engine.coreConfig().recorded().genesisId);
         final org.agrona.ExpandableArrayBuffer img = new org.agrona.ExpandableArrayBuffer();
         final int imgLen = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, img);
 
-        // the same config under another nonce is a DUPLICATE in S1 (S7 makes it a re-genesis REJECT)
+        // the same config under another nonce is a re-genesis attempt: REJECTED INVALID (row 2b), nothing recorded
         demuxer.dispatchTrusted(b, 0, coreConfig(b, he, 42L), 1_000L);
-        assertEquals(1, engine.coreConfig().duplicateCount());
+        assertEquals(0, engine.coreConfig().duplicateCount());
+        assertEquals(1, engine.coreConfig().rejectCount());
         assertEquals(0, demuxer.decodeRejectCount());
         final var ack = (com.openexchange.assets.determinism.AssetsEngineEvent.AdminAck) sink.events().get(sink.events().size() - 1);
-        assertEquals(com.openexchange.assets.domain.AdminResult.DUPLICATE, ack.result());
+        assertEquals(com.openexchange.assets.domain.AdminResult.REJECTED, ack.result());
+        assertEquals(com.openexchange.assets.domain.CoreRejectReason.INVALID.code(), ack.reason());
+        assertEquals(0x1234_5678_9ABCL, engine.coreConfig().recorded().genesisId);
         final org.agrona.ExpandableArrayBuffer img2 = new org.agrona.ExpandableArrayBuffer();
         final int imgLen2 = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, img2);
         final byte[] a = new byte[imgLen];
         final byte[] c = new byte[imgLen2];
         img.getBytes(0, a);
         img2.getBytes(0, c);
-        org.junit.Assert.assertArrayEquals("the nonce leaves no trace in the image", a, c);
+        org.junit.Assert.assertArrayEquals("the refused re-genesis leaves no trace in the image", a, c);
     }
 
     /** The compiled market and asset tables as a behaviour-1 CoreConfig (what the cross-check accepts). */

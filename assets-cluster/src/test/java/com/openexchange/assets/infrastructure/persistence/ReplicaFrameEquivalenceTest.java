@@ -21,9 +21,12 @@ import com.openexchange.assets.infrastructure.generated.RequestOrderSnapshotDeco
 import com.openexchange.assets.infrastructure.generated.RequestPendingDispatchDecoder;
 import com.openexchange.assets.infrastructure.generated.RiskConfigSetDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawDecoder;
-import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
+import java.util.Collection;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -44,24 +47,37 @@ import static org.junit.Assert.assertTrue;
  * and to replica 1's events after the cut. This covers what the typed DSL runner skips: the frame gate, the decoders,
  * the session-class checks and the per-session authority that rides the snapshot.
  */
+@RunWith(Parameterized.class)
 public class ReplicaFrameEquivalenceTest {
 
     private static final long SEED = 42L;
     private static final int FRAMES = 300;
     private static final int CHECK_EVERY = 25;
 
-    private static List<CoreFrameStory.Step> story;
+    /** RC2 S7 (review F-2): the same three checks on the behaviour-3 story (journalSeq cursor, latches, 76, 67/68). */
+    @Parameters(name = "v3 {0}")
+    public static Collection<Object[]> modes() {
+        return List.of(new Object[] {false}, new Object[] {true});
+    }
 
-    @BeforeClass
-    public static void buildStory() {
+    private final boolean v3;
+    private final List<CoreFrameStory.Step> story;
+
+    public ReplicaFrameEquivalenceTest(final boolean v3) {
+        this.v3 = v3;
         final long t0 = System.nanoTime();
-        story = CoreFrameStory.build(SEED, FRAMES);
-        System.out.println("[FRAME-EQ] story seed=" + SEED + " steps=" + story.size() + " frames="
+        this.story = CoreFrameStory.build(SEED, FRAMES, v3);
+        System.out.println("[FRAME-EQ] story seed=" + SEED + " v3=" + v3 + " steps=" + story.size() + " frames="
                 + story.stream().filter(s -> s.kind() == CoreFrameStory.Kind.FRAME).count()
                 + " buildMs=" + (System.nanoTime() - t0) / 1_000_000);
     }
 
-    private static String where(final int i) {
+    /** The story's deliberate ingress drops: none at v1/v2, the poisoned 67 of the v3 beat. */
+    private long expectedDrops() {
+        return v3 ? CoreFrameStory.V3_DELIBERATE_DROPS : 0;
+    }
+
+    private String where(final int i) {
         final CoreFrameStory.Step s = story.get(i);
         return "step " + i + " (" + s.kind() + " template=" + s.templateId() + " ts=" + s.timestamp() + ")";
     }
@@ -90,7 +106,8 @@ public class ReplicaFrameEquivalenceTest {
         }
         for (final FrameReplica r : new FrameReplica[] {a, b}) {
             assertEquals("no apply fault on a well-formed story", 0, r.demuxer.applyErrorCount());
-            assertEquals("no ingress drop on a well-formed story", 0, r.dropTotal());
+            assertEquals("no ingress drop on a well-formed story", expectedDrops(), r.dropTotal());
+            assertEquals("verbatim resends never trip the 3.8 belt (belt review F-2)", 0L, r.engine.feed().duplicateMismatchCount());
             assertEquals("the compiled tables match the declared config", 0, r.failFastCalls);
         }
         assertEquals(a.engine.getUnauthorisedCount(), b.engine.getUnauthorisedCount());
@@ -124,6 +141,7 @@ public class ReplicaFrameEquivalenceTest {
             }
             assertEquals("cross-check after restore at cut " + cut, 0, restored.failFastCalls);
             assertEquals("apply faults after restore at cut " + cut, 0, restored.demuxer.applyErrorCount());
+            assertEquals("no belt mismatch after restore at cut " + cut, 0L, restored.engine.feed().duplicateMismatchCount());
             assertEquals("events after cut " + cut + " (" + (cut < story.size() ? where(cut) : "end") + ")",
                     reference.rendered(eventsAt[cut]), restored.rendered(0));
             assertArrayEquals("final bytes after restore at cut " + cut, finalImage, restored.image());
@@ -183,11 +201,28 @@ public class ReplicaFrameEquivalenceTest {
                 EventKind.SLICE_SUBMITTED, EventKind.QUARANTINED}) {
             assertTrue("lifecycle path " + k + " reached: " + kinds, kinds.getOrDefault(k, 0) > 0);
         }
-        assertTrue("CoreConfig adopt, duplicate, stale and the v2 switch", cfg.adoptedCount() == 1 && cfg.duplicateCount() >= 1
-                && cfg.staleCount() >= 1 && cfg.switchCount() == 1);
+        assertTrue("CoreConfig adopt, duplicate, stale and the v2 switch (and the v3 switch)", cfg.adoptedCount() == 1
+                && cfg.duplicateCount() >= 1 && cfg.staleCount() >= 1 && cfg.switchCount() == (v3 ? 2 : 1));
         assertTrue("unauthorised traffic is refused by class/scope/registration", r.engine.getUnauthorisedCount() >= 1);
         assertTrue("stale ticks and stale terminals appear", o.staleTicks() > 0 && o.staleTerminalCount() > 0);
-        assertEquals(0, r.dropTotal());
+        assertEquals(expectedDrops(), r.dropTotal());
         assertEquals(0, r.demuxer.applyErrorCount());
+        final var f = r.engine.feed();
+        System.out.println("[FRAME-EQ] feed v3=" + v3 + " bound=" + f.boundMeEpoch() + " cursor=" + f.lastAppliedJournalSeq()
+                + " latch=" + f.latchReason() + " gaps=" + f.gapCount() + " autoClears=" + f.latchAutoClearCount() + " clears="
+                + f.latchClearCount() + " unservedReleases=" + f.unservedReleaseCount() + " dups61=" + f.duplicateCount(61)
+                + " dups62=" + f.duplicateCount(62) + " dups64=" + f.duplicateCount(64) + " legRegressions=" + o.legRegressionCount());
+        if (v3) {
+            assertEquals("behaviour 3", 3L, cfg.behaviorVersion());
+            assertEquals("bound on the FRESH record", CoreFrameStory.GENESIS, f.boundMeEpoch());
+            assertEquals("no latch left at the end of the story", com.openexchange.assets.domain.FeedHaltReason.NONE, f.latchReason());
+            assertTrue("the lost 67 latched GAP and its redelivery reach-cleared it", f.gapCount() >= 1 && f.latchAutoClearCount() >= 1);
+            assertEquals("the poisoned 67 was skipped by one 76", 1L, f.latchClearCount());
+            assertTrue("re-delivered 62 entries and outcomes are cursor DUPLICATEs", f.duplicateCount(62) + f.duplicateCount(64) > 0);
+            assertTrue("the cursor carried the whole story", f.lastAppliedJournalSeq() > 100);
+            assertEquals("the story's re-deliveries are verbatim: no belt mismatch", 0L, f.duplicateMismatchCount());
+        } else {
+            assertEquals("v1/v2: the feed state stays empty", 0L, f.lastAppliedJournalSeq());
+        }
     }
 }

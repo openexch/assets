@@ -118,6 +118,15 @@ public final class OrderEngine {
     private long rejectedCount;
     private long cancelledCount;
     private long staleTicks;
+    // RC2 S7 (node-local)
+    private long legRegressionCount;
+    private long oldCancelledIgnoredCount;
+    /**
+     * RC2 S7 D9b: the ME reason code of the feed entry being applied (255 = none). Set by the 63/64 v3 entry, consumed once
+     * by {@link #terminalize} or {@link #abortReplace} in that apply, reset in a finally. Transient, never replicated.
+     */
+    private int pendingMeReason = NOT_ME_SOURCED;
+    private static final int NOT_ME_SOURCED = 255;
 
     public OrderEngine(final AssetsEngine ledger) {
         this.ledger = ledger;
@@ -546,11 +555,33 @@ public final class OrderEngine {
     /** One OrderEvent per transition with a fresh eventSeq (projector idempotency key). */
     private void emitEvent(final CoreOrder o, final EventKind kind, final CoreRejectReason reason, final long lastPrice,
                            final long lastQty, final long tradeId, final long now) {
+        emitEvent(o, kind, reason, lastPrice, lastQty, tradeId, now, NOT_ME_SOURCED);
+    }
+
+    private void emitEvent(final CoreOrder o, final EventKind kind, final CoreRejectReason reason, final long lastPrice,
+                           final long lastQty, final long tradeId, final long now, final int meReason) {
         final long eventSeq = ledger.getEventSeq() + 1;
         ledger.setEventSeq(eventSeq);
         o.eventSeq = eventSeq;
         ledger.eventSink().onOrderEvent(eventSeq, ledger.getLogPosition(), o, kind, reason, lastPrice, lastQty, tradeId,
-                holdRemaining(o), now);
+                holdRemaining(o), now, meReason);
+    }
+
+    /** D9b: the pending ME reason, once. */
+    private int takeMeReason() {
+        final int r = pendingMeReason;
+        pendingMeReason = NOT_ME_SOURCED;
+        return r;
+    }
+
+    /** RC2 S7: the v3 rules read the recorded behaviour, one field read per apply. */
+    private boolean v3() {
+        return ledger.coreConfig().behaviorVersion() >= 3;
+    }
+
+    /** 12.2: under v3 a leg may be installed only when it is newer than every leg the order has had. */
+    private boolean beltRefuses(final CoreOrder o, final long legId) {
+        return v3() && legId <= Math.max(o.currentLegId, o.oldLegId);
     }
 
     private void fault(final OrderFaultKind kind, final CoreOrder o, final long tradeId, final long amount) {
@@ -580,7 +611,7 @@ public final class OrderEngine {
         o.rejectReason = (byte) reason.code();
         o.updatedAtMs = now;
         ledger.releaseOrderHold(o.userId, o.orderId, -1L);
-        emitEvent(o, kind, reason, lastPrice, lastQty, tradeId, now);
+        emitEvent(o, kind, reason, lastPrice, lastQty, tradeId, now, takeMeReason());
         if (statusCode == ST_CANCELLED || statusCode == ST_EXPIRED) {
             cancelledCount++;
         }
@@ -607,7 +638,7 @@ public final class OrderEngine {
             ledger.releaseOrderHold(o.userId, o.orderId, o.pendingHoldDelta);
         }
         closeReplaceWindow(o, now);
-        emitEvent(o, EventKind.REPLACED, reason, 0L, 0L, 0L, now);
+        emitEvent(o, EventKind.REPLACED, reason, 0L, 0L, 0L, now, takeMeReason());
     }
 
     private void closeReplaceWindow(final CoreOrder o, final long now) {
@@ -780,13 +811,25 @@ public final class OrderEngine {
         m.breakerTripped = trip;
         sink.onAdminAck(correlationId, T_BREAKER, AdminResult.ACCEPTED, 0, 0L);
         sink.onAdmissionState(marketId, ledger.gate().state(marketId), ledger.gate().reason(marketId), trip,
-                ledger.getLastLogTime(), ledger.getLogPosition(), false);
+                ledger.getLastLogTime(), ledger.getLogPosition(), false, ledger.gate().reasons(marketId));
     }
 
     /** A forwarder top-of-book tick: state only; a bookVersion at or below the stored one is stale (K4). */
     public void applyMarketTick(final int marketId, final long bookVersion, final long bestBid, final long bestAsk,
                                 final long lastTradePrice, final long lastTradeId, final long meEpoch, final long timestamp) {
         ledger.observeLogTime(timestamp);
+        if (v3()) {
+            // RC2 S7 D6 (W17): a tick counts only from the bound ME epoch; nothing is live before the bind
+            final long bound = ledger.feed().boundMeEpoch();
+            if (bound == 0) {
+                ledger.feed().countTickUnbound();
+                return;
+            }
+            if (meEpoch != bound) {
+                ledger.feed().countTickEpochDrop();
+                return;
+            }
+        }
         if (marketId < 1 || marketId > MARKETS) {
             invalidTickCount++; // S6 3.1 #1: an unknown market is part of the validation, counted like the rest
             return;
@@ -927,7 +970,6 @@ public final class OrderEngine {
                            final long quantity, final boolean takerIsBuy, final long meTimestamp, final long takerOmsOrderId,
                            final long makerOmsOrderId, final long meEpoch, final long timestamp) {
         ledger.observeLogTime(timestamp);
-        final long now = ledger.getLastLogTime();
         final long last = ledger.getLastAppliedTradeId();
         if (tradeId <= last) {
             return; // already applied: byte-level no-op (R-C5b)
@@ -937,10 +979,40 @@ public final class OrderEngine {
             ledger.eventSink().onSettleRejected(tradeId, marketId, egressSeq, SettleRejectReason.TRADE_GAP, last + 1);
             return;
         }
+        tradeBody(egressSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price, quantity, takerIsBuy,
+                takerOmsOrderId, makerOmsOrderId, timestamp);
+    }
+
+    /**
+     * RC2 S7 3.4: one exactly-next 61 or 62 entry under behaviour v3. The tradeId must be {@code lastAppliedTradeId + 1}
+     * (an exactly-next entry can never have been applied already, so {@code tradeId <= last} is refused loudly too), and
+     * every SettleRejected carries {@code journalPosition = journalSeq}. Returns false on a refusal (nothing mutated).
+     */
+    public boolean applyTradeV3(final long journalSeq, final long egressSeq, final long tradeId, final int marketId,
+                                final long takerLegId, final long takerUserId, final long makerLegId, final long makerUserId,
+                                final long price, final long quantity, final boolean takerIsBuy, final long meTimestamp,
+                                final long takerOmsOrderId, final long makerOmsOrderId, final long meEpoch, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        final long last = ledger.getLastAppliedTradeId();
+        if (tradeId != last + 1) {
+            tradeGapCount++;
+            ledger.eventSink().onSettleRejected(tradeId, marketId, journalSeq, SettleRejectReason.TRADE_GAP, last + 1);
+            return false;
+        }
+        return tradeBody(journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price, quantity,
+                takerIsBuy, takerOmsOrderId, makerOmsOrderId, timestamp);
+    }
+
+    /** The S5 3.1 apply of a dense trade; {@code journalPosition} is what a settle refusal echoes. */
+    private boolean tradeBody(final long journalPosition, final long tradeId, final int marketId, final long takerLegId,
+                              final long takerUserId, final long makerLegId, final long makerUserId, final long price,
+                              final long quantity, final boolean takerIsBuy, final long takerOmsOrderId, final long makerOmsOrderId,
+                              final long timestamp) {
+        final long now = ledger.getLastLogTime();
         // 1. money, for the full trade quantity, through the ledger's settle (hold-scoped, faults never silent)
         final SettleCommand sc = settleCommand;
         sc.reset();
-        sc.setJournalPosition(egressSeq);
+        sc.setJournalPosition(journalPosition);
         sc.setTradeId(tradeId);
         sc.setMarketId(marketId);
         sc.setTakerOrderId(takerOmsOrderId);
@@ -951,7 +1023,7 @@ public final class OrderEngine {
         sc.setQuantity(quantity);
         sc.setTakerIsBuy(takerIsBuy);
         if (!ledger.settle(sc, timestamp)) {
-            return; // refused before any mutation (SettleRejected emitted); the order accounting stays untouched too
+            return false; // refused before any mutation (SettleRejected emitted); the order accounting stays untouched too
         }
         if (marketId >= 1 && marketId <= MARKETS && tradeId > markets[marketId].lastTradeId) {
             markets[marketId].lastTradeId = tradeId; // S6 3.5: the collar reference follows settled trades
@@ -960,6 +1032,7 @@ public final class OrderEngine {
         // 2. the two core orders (either may be a legacy hold the core does not own)
         applyFill(takerOmsOrderId, takerLegId, takerUserId, price, quantity, tradeId, now);
         applyFill(makerOmsOrderId, makerLegId, makerUserId, price, quantity, tradeId, now);
+        return true;
     }
 
     private void applyFill(final long omsOrderId, final long legId, final long userId, final long price, final long quantity,
@@ -975,6 +1048,12 @@ public final class OrderEngine {
         boolean implicitAck = false;
         boolean windowClosedByTrade = false;
         if (legId != 0 && o.currentLegId == 0 && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE) {
+            if (beltRefuses(o, legId)) {
+                // RC2 S7 12.2 site 1: e.g. a late trade on the just-exhausted slice; the money stands, no leg is learned
+                legRegressionCount++;
+                fault(OrderFaultKind.SETTLE, o, tradeId, quantity);
+                return;
+            }
             // implicit ack: the leg exists at the ME (contract 3.1); the post-ack rules run after the fill below
             o.currentLegId = legId;
             clearPending(o);
@@ -985,6 +1064,11 @@ public final class OrderEngine {
             emitEvent(o, EventKind.ACK_NEW, CoreRejectReason.NONE, 0L, 0L, 0L, now);
         } else if (legId != 0 && legId != o.currentLegId) {
             if (o.has(CoreOrder.F_REPLACE_PENDING) && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_AMEND) {
+                if (beltRefuses(o, legId)) {
+                    legRegressionCount++; // RC2 S7 12.2 site 2: an older leg cannot be the replace's new leg
+                    fault(OrderFaultKind.SETTLE, o, tradeId, quantity);
+                    return;
+                }
                 // a trade on the NEW leg before the amend outcome: resolve first (B7), then fill; the window is closed
                 // by this trade, so the post-window rules (3.8 #9/#13: a cancel flagged meanwhile) run after the fill
                 clearPending(o);
@@ -1106,6 +1190,42 @@ public final class OrderEngine {
         }
     }
 
+    /**
+     * RC2 S7 2.4: MeJournalTerminal (63) with the ME reject code. Under v3 the code reaches the terminal event this entry
+     * makes (D9b); under v1/v2 it is ignored (the RC1 signature below is this with no code).
+     */
+    public void applyTerminal(final long egressSeq, final long legId, final long userId, final int marketId, final int statusCode,
+                              final long meTimestamp, final long omsOrderId, final long meEpoch, final long timestamp,
+                              final int meReason) {
+        pendingMeReason = v3() ? meReason : NOT_ME_SOURCED;
+        try {
+            applyTerminal(egressSeq, legId, userId, marketId, statusCode, meTimestamp, omsOrderId, meEpoch, timestamp);
+        } finally {
+            pendingMeReason = NOT_ME_SOURCED;
+        }
+    }
+
+    /**
+     * RC2 S7 2.4: MeCommandOutcome (64) with {@code oldCancelled} (D9a) and, on result 1, the ME reason code (D9b). Both
+     * are v3 only; under v1/v2 this is the RC1 apply.
+     */
+    public void applyOutcome(final long egressSeq, final long commandIdHigh, final long commandIdLow, final long userId,
+                             final long omsOrderId, final long oldOrderId, final long price, final long quantity, final long budget,
+                             final int marketId, final int commandKind, final int result, final long legId, final int reason,
+                             final long meTimestamp, final long meEpoch, final long timestamp, final boolean oldCancelled) {
+        final boolean v3 = v3();
+        pendingMeReason = v3 && result == RESULT_REJECTED && reason >= 0 && reason <= 254 ? reason : NOT_ME_SOURCED;
+        try {
+            outcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget, marketId,
+                    commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, v3 && oldCancelled);
+        } finally {
+            pendingMeReason = NOT_ME_SOURCED;
+        }
+    }
+
+    public long legRegressionCount() { return legRegressionCount; }
+    public long oldCancelledIgnoredCount() { return oldCancelledIgnoredCount; }
+
     /** MeJournalTerminal (63). Contract S5 §3.2. */
     public void applyTerminal(final long egressSeq, final long legId, final long userId, final int marketId, final int statusCode,
                               final long meTimestamp, final long omsOrderId, final long meEpoch, final long timestamp) {
@@ -1117,12 +1237,22 @@ public final class OrderEngine {
             return;
         }
         if (o.has(CoreOrder.F_REPLACE_PENDING) && legId != 0 && legId != o.currentLegId) {
+            if (beltRefuses(o, legId)) {
+                legRegressionCount++; // RC2 S7 12.2 site 3: an older leg never resolves the replace
+                staleTerminalCount++;
+                return;
+            }
             // the NEW leg speaks before the amend outcome: resolve first, then apply (B7)
             clearPending(o);
             resolveReplace(o, legId, now);
         }
         if (!o.has(CoreOrder.F_REPLACE_PENDING) && legId != 0 && o.currentLegId == 0 && legId != o.oldLegId
                 && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE) {
+            if (beltRefuses(o, legId)) {
+                legRegressionCount++; // RC2 S7 12.2 site 4 (G9, H1): no leg learned, no slice minted
+                staleTerminalCount++;
+                return;
+            }
             // G9 (S6 3.6): the ME journals a terminal for a create it refused or ended before its outcome reached us.
             // Learn the leg and apply the terminal; the later CREATE outcome is redundant. A refused leg never rested,
             // so no ACK_NEW is announced for it.
@@ -1191,6 +1321,14 @@ public final class OrderEngine {
                              final long omsOrderId, final long oldOrderId, final long price, final long quantity, final long budget,
                              final int marketId, final int commandKind, final int result, final long legId, final int reason,
                              final long meTimestamp, final long meEpoch, final long timestamp) {
+        outcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget, marketId,
+                commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, false);
+    }
+
+    private void outcome(final long egressSeq, final long commandIdHigh, final long commandIdLow, final long userId,
+                         final long omsOrderId, final long oldOrderId, final long price, final long quantity, final long budget,
+                         final int marketId, final int commandKind, final int result, final long legId, final int reason,
+                         final long meTimestamp, final long meEpoch, final long timestamp, final boolean oldCancelled) {
         ledger.observeLogTime(timestamp);
         final long now = ledger.getLastLogTime();
         final CoreOrder o = orders.get(commandIdHigh);
@@ -1204,6 +1342,15 @@ public final class OrderEngine {
             return;
         }
         final int pending = o.pendingKind;
+        if (oldCancelled && pending != CoreOrder.PK_AMEND) {
+            oldCancelledIgnoredCount++; // D9a: only an AMEND can cancel an old leg
+        }
+        if (result == RESULT_APPLIED && pending != CoreOrder.PK_CANCEL && beltRefuses(o, legId)) {
+            // RC2 S7 12.2 sites 5 (CREATE APPLIED) and 6 (AMEND APPLIED): the pending command is left as it is
+            legRegressionCount++;
+            staleOutcomeCount++;
+            return;
+        }
         switch (result) {
             case RESULT_APPLIED:
                 if (pending == CoreOrder.PK_CREATE) {
@@ -1238,6 +1385,11 @@ public final class OrderEngine {
                 if (pending == CoreOrder.PK_CREATE) {
                     clearPending(o);
                     terminalize(o, ST_REJECTED, EventKind.REJECTED, why, 0L, 0L, 0L, now);
+                } else if (pending == CoreOrder.PK_AMEND && result == RESULT_REJECTED && oldCancelled) {
+                    // RC2 S7 D9a row 1 (H3/X14): the ME cancelled the old leg and placed nothing. The order ends REJECTED
+                    // with its true filledQty; terminalize releases the whole residual (top-up, hidden remainder included)
+                    clearPending(o);
+                    terminalize(o, ST_REJECTED, EventKind.REJECTED, CoreRejectReason.ME_REJECTED, 0L, 0L, 0L, now);
                 } else if (pending == CoreOrder.PK_CANCEL) {
                     clearPending(o); // the leg is gone or refused: the journal terminal settles it; the flag stays
                     cancelRefusedCount++;
