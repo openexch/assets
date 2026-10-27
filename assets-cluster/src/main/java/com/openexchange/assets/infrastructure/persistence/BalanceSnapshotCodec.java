@@ -80,10 +80,14 @@ public final class BalanceSnapshotCodec {
      */
     public static final short SECTION_FEED_STATE = 10;
     /**
-     * RESERVED (RC2 S1 4.9): the ME link (release backlog, meBehaviorVersion, meLedgerSize, meLedgerCapacity), content
-     * owned by RC2 S8. Neither written nor read by this build: refused as an unknown section until S8 lands.
+     * RC2 S8 5.2: the ME link (head 16 B: meLedgerSize, backlogCount, capacityHigh, reserved; then 56 B per release
+     * backlog entry, ascending orderId). Written iff the recorded behaviour is 3 or more and mandatory then, refused below
+     * 3; presence tracked as for section 10. meLedgerCapacity and meBehaviorVersion stay in section 10.
      */
     public static final short SECTION_ME_LINK = 11;
+    /** Section 11 head and entry sizes (S8 5.2). */
+    public static final int ME_LINK_HEAD_BYTES = 16;
+    public static final int ME_LINK_ENTRY_BYTES = 56;
 
     private static final int FLAG_JOURNAL_ENABLED = 1;
     private static final int KNOWN_FLAGS = FLAG_JOURNAL_ENABLED;
@@ -154,7 +158,7 @@ public final class BalanceSnapshotCodec {
         // 9 SESSIONS on this build (RC1 S4); 7 and 8 land with their slices.
         final boolean withConfig = engine.coreConfig().recorded() != null;
         final boolean withFeed = engine.behaviorV3(); // RC2 S7 3.7: section 10 iff behaviour >= 3
-        dst.putInt(pos[0], (withConfig ? 8 : 7) + (withFeed ? 1 : 0));
+        dst.putInt(pos[0], (withConfig ? 8 : 7) + (withFeed ? 2 : 0)); // RC2 S8: section 11 with section 10
         pos[0] += 4;
         pos[0] = writeAccountsSection(engine, dst, pos[0]);
         pos[0] = writeOrdersSection(engine, dst, pos[0]);
@@ -168,6 +172,7 @@ public final class BalanceSnapshotCodec {
         pos[0] = writeSessionsSection(engine, dst, pos[0]);
         if (withFeed) {
             pos[0] = writeFeedStateSection(engine, dst, pos[0]);
+            pos[0] = writeMeLinkSection(engine, dst, pos[0]);
         }
 
         return pos[0] - offset;
@@ -233,7 +238,8 @@ public final class BalanceSnapshotCodec {
                 o.price, o.quantity, o.budget, o.stopPrice, o.trailingDelta, o.trailingArmPrice, o.displayQty, o.hiddenQty,
                 o.sliceRemainingQty, o.expiresAtMs, o.filledQty, o.remainingQty, o.cumQuoteQty, o.lastPrice, o.lastQty,
                 o.holdAmount, o.createdAtMs, o.updatedAtMs, o.eventSeq, o.currentLegId, o.pendingPrice, o.pendingQuantity,
-                o.pendingHoldDelta, o.pendingHoldTarget, o.oldLegId, o.pendingDispatchSeq, o.replaceDeadlineMs};
+                o.pendingHoldDelta, o.pendingHoldTarget, o.oldLegId, o.pendingDispatchSeq, o.replaceDeadlineMs,
+                o.pendingLegQty, o.pendingExpectedOldRemaining}; // RC2 S8 5.1: the last two after replaceDeadlineMs
         for (final long v : longs) {
             dst.putLong(p, v);
             p += 8;
@@ -253,7 +259,7 @@ public final class BalanceSnapshotCodec {
     }
 
     private static int readOrder(DirectBuffer src, int p, CoreOrder o) {
-        final long[] longs = new long[33];
+        final long[] longs = new long[35];
         for (int i = 0; i < longs.length; i++) {
             longs[i] = src.getLong(p);
             p += 8;
@@ -266,6 +272,7 @@ public final class BalanceSnapshotCodec {
         o.holdAmount = longs[21]; o.createdAtMs = longs[22]; o.updatedAtMs = longs[23]; o.eventSeq = longs[24];
         o.currentLegId = longs[25]; o.pendingPrice = longs[26]; o.pendingQuantity = longs[27]; o.pendingHoldDelta = longs[28];
         o.pendingHoldTarget = longs[29]; o.oldLegId = longs[30]; o.pendingDispatchSeq = longs[31]; o.replaceDeadlineMs = longs[32];
+        o.pendingLegQty = longs[33]; o.pendingExpectedOldRemaining = longs[34];
         o.marketId = src.getInt(p); p += 4;
         o.flags = src.getInt(p); p += 4;
         o.holdAssetId = src.getInt(p); p += 4;
@@ -373,6 +380,12 @@ public final class BalanceSnapshotCodec {
         for (int i = 0; i < count; i++) {
             final CoreOrder o = oe.orders().acquire();
             pos = readOrder(src, pos, o);
+            if (o.marketId < 1 || o.marketId > OrderEngine.MARKETS) {
+                // review Q4: restoreOrder indexes the trigger book by marketId before the restore invariants run; an
+                // out-of-range market is refused here (admission keeps it in range on every behaviour)
+                throw new IllegalStateException("balance snapshot ORDERS section: order " + o.orderId + " market " + o.marketId
+                        + " outside [1, " + OrderEngine.MARKETS + "]");
+            }
             oe.restoreOrder(o);
         }
         return pos;
@@ -547,6 +560,89 @@ public final class BalanceSnapshotCodec {
             window[i] = src.getLong(start + FeedState.DIGEST_HEAD_BYTES + 8 * i);
         }
         engine.feed().restoreDigests(src.getLong(start + 92), window);
+    }
+
+    /** Section 11 ME_LINK (S8 5.2), native byte order; reserved bytes 0. */
+    private static int writeMeLinkSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final OrderEngine oe = engine.orders();
+        final int count = oe.backlog().size();
+        int p = start;
+        dst.putShort(p, SECTION_ME_LINK); p += 2;
+        dst.putInt(p, ME_LINK_HEAD_BYTES + ME_LINK_ENTRY_BYTES * count); p += 4;
+        dst.putLong(p, oe.meLedgerSize());
+        dst.putInt(p + 8, count);
+        dst.putByte(p + 12, (byte) (oe.capacityHigh() ? 1 : 0));
+        dst.putByte(p + 13, (byte) 0);
+        dst.putShort(p + 14, (short) 0);
+        final int[] q = {p + ME_LINK_HEAD_BYTES};
+        oe.backlog().forEachByOrderId(e -> {
+            final int b = q[0];
+            dst.putLong(b, e.orderId);
+            dst.putLong(b + 8, e.floor);
+            dst.putLong(b + 16, e.dispatchSeq);
+            dst.putLong(b + 24, e.userId);
+            dst.putLong(b + 32, e.legId);
+            dst.putInt(b + 40, e.marketId);
+            dst.putInt(b + 44, e.attempt);
+            dst.putByte(b + 48, (byte) e.scope);
+            dst.putByte(b + 49, (byte) e.stage);
+            dst.putByte(b + 50, (byte) e.side);
+            dst.putByte(b + 51, (byte) e.meOrderType);
+            dst.putByte(b + 52, (byte) e.orphanTries);
+            dst.putByte(b + 53, (byte) 0);
+            dst.putShort(b + 54, (short) 0);
+            q[0] = b + ME_LINK_ENTRY_BYTES;
+        });
+        return q[0];
+    }
+
+    /**
+     * Section 11 read (S8 5.2): the length rule and the byte-level ranges (reserved 0, capacityHigh 0..1, scope, stage and
+     * orphanTries codes); the state invariants of rules 1-7 run in {@code verifyRestoredInvariants} after sections 2, 8,
+     * 10, each with its live rule (5.0).
+     */
+    private static void readMeLinkSection(DirectBuffer src, int start, int length, AssetsEngine engine) {
+        if (length < ME_LINK_HEAD_BYTES) {
+            throw new IllegalStateException("balance snapshot ME_LINK section is " + length + " bytes, below its 16-byte head");
+        }
+        final long count = src.getInt(start + 8) & 0xFFFFFFFFL;
+        if (length != ME_LINK_HEAD_BYTES + ME_LINK_ENTRY_BYTES * count) {
+            throw new IllegalStateException("balance snapshot ME_LINK section: " + count + " entries in " + length + " bytes");
+        }
+        final int high = src.getByte(start + 12) & 0xFF;
+        if (high > 1 || src.getByte(start + 13) != 0 || src.getShort(start + 14) != 0) {
+            throw new IllegalStateException("balance snapshot ME_LINK section: capacityHigh " + high + " or a reserved byte");
+        }
+        final OrderEngine oe = engine.orders();
+        oe.restoreMeLink(src.getLong(start), high == 1);
+        final com.openexchange.assets.application.engine.order.ReleaseBacklog.Entry e =
+                new com.openexchange.assets.application.engine.order.ReleaseBacklog.Entry();
+        long previous = 0L;
+        for (int i = 0; i < count; i++) {
+            final int b = start + ME_LINK_HEAD_BYTES + i * ME_LINK_ENTRY_BYTES;
+            e.orderId = src.getLong(b);
+            if (e.orderId <= previous) {
+                throw new IllegalStateException("balance snapshot ME_LINK entry " + e.orderId + " after " + previous
+                        + ": orderIds must be strictly ascending (5.2 rule 2)");
+            }
+            previous = e.orderId;
+            e.floor = src.getLong(b + 8);
+            e.dispatchSeq = src.getLong(b + 16);
+            e.userId = src.getLong(b + 24);
+            e.legId = src.getLong(b + 32);
+            e.marketId = src.getInt(b + 40);
+            e.attempt = src.getInt(b + 44);
+            e.scope = src.getByte(b + 48) & 0xFF;
+            e.stage = src.getByte(b + 49) & 0xFF;
+            e.side = src.getByte(b + 50) & 0xFF;
+            e.meOrderType = src.getByte(b + 51) & 0xFF;
+            e.orphanTries = src.getByte(b + 52) & 0xFF;
+            if (e.scope > 1 || e.stage > 2 || e.orphanTries > 1 || src.getByte(b + 53) != 0 || src.getShort(b + 54) != 0) {
+                throw new IllegalStateException("balance snapshot ME_LINK entry " + e.orderId + ": scope " + e.scope + " stage "
+                        + e.stage + " orphanTries " + e.orphanTries + " or a reserved byte this build does not know");
+            }
+            oe.restoreBacklogEntry(e);
+        }
     }
 
     /**
@@ -742,6 +838,7 @@ public final class BalanceSnapshotCodec {
         int holds = 0;
         int previousId = 0;
         boolean feedSection = false;
+        boolean linkSection = false;
         for (int s = 0; s < sectionCount; s++) {
             if (end - pos < SECTION_HEADER) {
                 throw new IllegalStateException("balance snapshot section " + s + " header runs past the payload");
@@ -826,6 +923,10 @@ public final class BalanceSnapshotCodec {
                     readFeedStateSection(src, pos, sectionLength, engine);
                     feedSection = true;
                     break;
+                case SECTION_ME_LINK:
+                    readMeLinkSection(src, pos, sectionLength, engine);
+                    linkSection = true;
+                    break;
                 default:
                     throw new IllegalStateException("balance snapshot section id " + id
                             + " is not known to this build (layout page sections 2..8 land with their slices)");
@@ -842,6 +943,15 @@ public final class BalanceSnapshotCodec {
         if (!v3 && feedSection) {
             throw new IllegalStateException("balance snapshot below behaviour 3 carries a FEED_STATE section (10)");
         }
+        // RC2 S8 5.2: section 11 exactly as section 10
+        if (v3 && !linkSection) {
+            throw new IllegalStateException("balance snapshot of a behaviour-" + engine.coreConfig().behaviorVersion()
+                    + " core has no ME_LINK section (11)");
+        }
+        if (!v3 && linkSection) {
+            throw new IllegalStateException("balance snapshot below behaviour 3 carries an ME_LINK section (11)");
+        }
+        engine.orders().rebuildDerived(); // S8 1.5: the derived index and gauges, every behaviour
         return new Decoded(lastAppliedTradeId, consumePosition, journalSeq, lastLogTime, accounts, holds,
                 sectionCount, pos - offset);
     }

@@ -6,6 +6,7 @@ import com.openexchange.assets.domain.ConfigKind;
 import com.openexchange.assets.domain.OrderFaultKind;
 import com.openexchange.assets.domain.CoreOrderView;
 import com.openexchange.assets.domain.DispatchKind;
+import com.openexchange.assets.domain.ReleaseScope;
 import com.openexchange.assets.domain.EventKind;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.AssetsEventSink;
@@ -426,15 +427,35 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     public void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
                              long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
                              long quantity, long budget, int timeInForceCode) {
+        onMeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode, ReleaseScope.UP_TO, 0L);
+    }
+
+    @Override
+    public void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                             long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                             long quantity, long budget, int timeInForceCode, ReleaseScope releaseScope,
+                             long expectedOldRemaining) {
+        encodeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode, releaseScope, expectedOldRemaining);
+        flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.BROADCAST);
+    }
+
+    /** One 104 frame; v7 fields 15 and 16 (RC2 S8 section 4): {@code releaseScope} 0 unless RELEASE_ID. */
+    private void encodeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                long quantity, long budget, int timeInForceCode, ReleaseScope releaseScope,
+                                long expectedOldRemaining) {
         meDispatchEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .dispatchSeq(dispatchSeq).commandIdHigh(commandIdHigh).commandIdLow(commandIdLow)
                 .kind(com.openexchange.assets.infrastructure.generated.DispatchKind.get((short) kind.code()))
                 .userId(userId).omsOrderId(omsOrderId).oldOrderId(oldOrderId).marketId(marketId)
                 .orderType((short) orderTypeCode).side((short) sideCode).price(price).quantity(quantity).budget(budget)
                 .timeInForce((short) timeInForceCode)
-                // v7 (RC2 S1 4.4): 0, 0 in S1; S8 fills them (RELEASE_ID scope, AMEND old remaining)
-                .releaseScope(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO).expectedOldRemaining(0L);
-        flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.BROADCAST);
+                .releaseScope(kind == DispatchKind.RELEASE_ID && releaseScope == ReleaseScope.ORDER
+                        ? com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER
+                        : com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO)
+                .expectedOldRemaining(expectedOldRemaining);
     }
 
     @Override
@@ -506,13 +527,17 @@ public final class AssetsEventPublisher implements AssetsEventSink {
     public void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
                                   long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
                                   long quantity, long budget, int timeInForceCode) {
-        meDispatchEncoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
-                .dispatchSeq(dispatchSeq).commandIdHigh(commandIdHigh).commandIdLow(commandIdLow)
-                .kind(com.openexchange.assets.infrastructure.generated.DispatchKind.get((short) kind.code()))
-                .userId(userId).omsOrderId(omsOrderId).oldOrderId(oldOrderId).marketId(marketId)
-                .orderType((short) orderTypeCode).side((short) sideCode).price(price).quantity(quantity).budget(budget)
-                .timeInForce((short) timeInForceCode)
-                .releaseScope(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO).expectedOldRemaining(0L);
+        onMeDispatchReply(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode, ReleaseScope.UP_TO, 0L);
+    }
+
+    @Override
+    public void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                  long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                  long quantity, long budget, int timeInForceCode, ReleaseScope releaseScope,
+                                  long expectedOldRemaining) {
+        encodeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode, releaseScope, expectedOldRemaining);
         flush(meDispatchEncoder.encodedLength(), CH_DISPATCH, Routing.ORIGIN);
     }
 

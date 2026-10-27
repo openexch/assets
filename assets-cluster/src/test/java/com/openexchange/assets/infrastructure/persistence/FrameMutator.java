@@ -60,6 +60,8 @@ final class FrameMutator {
         TEMPLATE_KNOWN_SWAP(Judgement.OBSERVED),
         BITFLIP_HEADER(Judgement.OBSERVED),
         BITFLIP_BODY(Judgement.OBSERVED),
+        /** RC2 S8 3.9: a field the v3 decode ranges refuse (an id, price or quantity 0, a negative tail, core-only clauses). */
+        V3_RANGE(Judgement.MUST_DROP),
         WIDE_BLOCK_VALID(Judgement.EQUIVALENT),
         TRAILING_BYTES(Judgement.EQUIVALENT);
 
@@ -163,6 +165,51 @@ final class FrameMutator {
         return out;
     }
 
+    /** Can {@code c} be applied to frame {@code f} in a behaviour-{@code v3} run? {@link Category#V3_RANGE} is v3 only. */
+    static boolean applicable(final Category c, final byte[] f, final boolean v3) {
+        if (c == Category.V3_RANGE) {
+            return v3 && !v3RangeFields(templateOf(f)).isEmpty();
+        }
+        return applicable(c, f);
+    }
+
+    /** RC2 S8 3.9: {name, offset (root; -1 - offset for the first group entry), width 4/8, the refused value}. */
+    private static List<long[]> v3RangeFields(final int template) {
+        switch (template) {
+            case MeJournalTradeDecoder.TEMPLATE_ID:
+                return List.of(new long[] {MeJournalTradeDecoder.tradeIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.priceEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.quantityEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.marketIdEncodingOffset(), 4, 0},
+                        new long[] {MeJournalTradeDecoder.takerOrderIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.makerOrderIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.takerUserIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.makerUserIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.takerOmsOrderIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTradeDecoder.makerOmsOrderIdEncodingOffset(), 8, 0});
+            case MeJournalTerminalDecoder.TEMPLATE_ID:
+                return List.of(new long[] {MeJournalTerminalDecoder.orderIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTerminalDecoder.userIdEncodingOffset(), 8, 0},
+                        new long[] {MeJournalTerminalDecoder.marketIdEncodingOffset(), 4, 0},
+                        new long[] {MeJournalTerminalDecoder.omsOrderIdEncodingOffset(), 8, 0});
+            case MeCommandOutcomeDecoder.TEMPLATE_ID:
+                return List.of(new long[] {MeCommandOutcomeDecoder.userIdEncodingOffset(), 8, 0},
+                        new long[] {MeCommandOutcomeDecoder.omsOrderIdEncodingOffset(), 8, 0},
+                        new long[] {MeCommandOutcomeDecoder.marketIdEncodingOffset(), 4, 0},
+                        new long[] {MeCommandOutcomeDecoder.ledgerSizeEncodingOffset(), 4, -1},
+                        new long[] {MeCommandOutcomeDecoder.ledgerCapacityEncodingOffset(), 4, 0},
+                        new long[] {MeCommandOutcomeDecoder.behaviorVersionEncodingOffset(), 4, 0},
+                        new long[] {MeCommandOutcomeDecoder.appliedPositionEncodingOffset(), 8, -1});
+            case T_RELEASE:
+                return List.of(new long[] {MeCommandReleaseDecoder.releaseSeqEncodingOffset(), 8, -1},
+                        new long[] {MeCommandReleaseDecoder.ledgerCapacityEncodingOffset(), 4, 0},
+                        new long[] {-1 - MeCommandReleaseDecoder.ReleasesDecoder.commandIdHighEncodingOffset(), 8, 0},
+                        new long[] {-1 - MeCommandReleaseDecoder.ReleasesDecoder.idLowFloorEncodingOffset(), 8, -1});
+            default:
+                return List.of();
+        }
+    }
+
     /** Can {@code c} be applied to frame {@code f}? */
     static boolean applicable(final Category c, final byte[] f) {
         final int t = templateOf(f);
@@ -170,6 +217,7 @@ final class FrameMutator {
             case GROUP_COUNT_BEYOND_FRAME, GROUP_BLOCK_SHORT -> groupCount(t) > 0;
             case BLOCK_SHORT -> AssetsSbeDemuxer.minimumBlockLength(t) > 0;
             case INVALID_ENUM, INVALID_ENUM_WIDE_BLOCK -> !rootFields(t).isEmpty() || groupCount(t) > 0;
+            case V3_RANGE -> false; // v3 only: see applicable(c, f, v3)
             default -> true;
         };
     }
@@ -371,6 +419,27 @@ final class FrameMutator {
             }
             case INVALID_ENUM:
                 return mutant(c, m, f, poison(m));
+            case V3_RANGE: {
+                final List<long[]> fields = v3RangeFields(templateOf(m));
+                final long[] fd = fields.get(rnd.nextInt(fields.size()));
+                int at;
+                if (fd[0] >= 0) {
+                    at = HEADER + (int) fd[0];
+                } else {
+                    final List<int[]> gs = groups(m);
+                    if (gs.isEmpty() || gs.get(0)[2] == 0) {
+                        at = HEADER + MeCommandReleaseDecoder.ledgerCapacityEncodingOffset(); // no entry: the root clause
+                        fd[1] = 4;
+                        fd[2] = 0;
+                    } else {
+                        at = gs.get(0)[0] + GROUP_HEADER + (int) (-1 - fd[0]);
+                    }
+                }
+                for (int i = 0; i < fd[1]; i++) {
+                    m[at + i] = (byte) (fd[2] >>> (8 * i));
+                }
+                return mutant(c, m, f, "3.9 field @" + at + " (" + fd[1] + " B) -> " + fd[2]);
+            }
             case INVALID_ENUM_WIDE_BLOCK: {
                 final int[] wd = widths();
                 final byte[] w = widen(f, wd[0], wd[1]);

@@ -43,4 +43,44 @@ public class OrderConservationFuzzTest {
     public void seed5_lifecycleInvariantsHoldAfterEveryOp() {
         new OrderFuzzDriver(5).run(OPS);
     }
+
+    // ---------------------------------------------------------------- RC2 S8 7 G10: behaviour-3 seeds
+
+    /**
+     * Behaviour 3 against the reference ME of {@link V3CoreFuzzDriver}, with releases, confirmations, LEG_LIVE and orphan
+     * rounds, CAPACITY with resync re-offers, INVALID, RELEASED and leg-0 entries: the S8 invariant set (locked ==
+     * sum(holds), the 5.1/5.2 rules, no live order with remainingQty 0, the R1 counter) after every apply, a snapshot round
+     * trip at random steps, and once the backlog drains no ME ledger entry of a dead order that is not PARKED.
+     */
+    @Test
+    public void v3SeedsHoldTheS8InvariantsAndDrainTheMeLedger() {
+        long releases = 0, capacity = 0, invalid = 0, released = 0, legLive = 0, legZero = 0, roundTrips = 0, flagged = 0, leaks = 0;
+        long parked = 0, orphans = 0, confirmed = 0;
+        for (long seed = 101; seed <= 106; seed++) {
+            final V3CoreFuzzDriver d = new V3CoreFuzzDriver(seed, true);
+            d.run(400);
+            d.drainAndCheckLedger();
+            releases += d.releaseMints;
+            capacity += d.capacityInjected;
+            invalid += d.invalidInjected;
+            released += d.releasedInjected;
+            legLive += d.legLiveInjected;
+            legZero += d.legZeroInjected;
+            roundTrips += d.roundTrips;
+            flagged += d.diedFlagged.size();
+            leaks += d.flaggedLeaks();
+            parked += d.r.engine.orders().parkedCount();
+            orphans += d.r.engine.orders().orphanCancelCount();
+            confirmed += d.r.engine.orders().releaseConfirmedCount();
+        }
+        System.out.println("[S8-FUZZ] seeds 101-106 x 400 steps: releases=" + releases + " confirmed=" + confirmed + " orphans="
+                + orphans + " parked=" + parked + " capacity=" + capacity + " invalid=" + invalid + " released=" + released
+                + " legLive=" + legLive + " legZero=" + legZero + " roundTrips=" + roundTrips + " diedFlagged=" + flagged
+                + " flaggedLedgerLeaks=" + leaks);
+        org.junit.Assert.assertEquals("review Q1 option (d): no flagged order dies owning an ME ledger entry", 0L, leaks);
+        org.junit.Assert.assertTrue("the verbs were exercised: releases " + releases + " capacity " + capacity + " invalid "
+                + invalid + " released " + released + " legLive " + legLive + " legZero " + legZero + " roundTrips "
+                + roundTrips, releases > 100 && capacity > 0 && invalid > 0 && released > 0 && legLive > 0 && legZero > 0
+                && roundTrips > 0);
+    }
 }

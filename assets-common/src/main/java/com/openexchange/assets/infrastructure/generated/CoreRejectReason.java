@@ -106,9 +106,15 @@ public enum CoreRejectReason
 
 
     /**
-     * v7: terminal REJECTED after an INVALID 8 outcome on a pending command (RC2 S8)
+     * v7: terminal REJECTED after an INVALID 8 outcome on a pending command, or the REPLACED abort of an AMEND (RC2 S8)
      */
     ME_INVALID((short)42),
+
+
+    /**
+     * v7 (RC2 S8, appended D-S8-1): terminal REJECTED or the REPLACED abort after RELEASED 7 on a pending command
+     */
+    ME_RELEASED((short)43),
 
     /**
      * To be used to represent not present or null.
@@ -183,6 +189,7 @@ public enum CoreRejectReason
             case 40: return FEED_HALTED;
             case 41: return ME_LANE_INACTIVE;
             case 42: return ME_INVALID;
+            case 43: return ME_RELEASED;
             case 255: return NULL_VAL;
         }
 

@@ -145,7 +145,8 @@
             <!-- v7 (RC2 S1): additions only, sinceVersion 7. -->
             <validValue name="FEED_HALTED" description="v7: ADMIN OPEN refused while the feed is latched (RC2 S7)" sinceVersion="7">40</validValue>
             <validValue name="ME_LANE_INACTIVE" description="v7: ADMIN OPEN refused while meBehaviorVersion &lt; 2 under core behaviour v3 (RC2 S7/S8)" sinceVersion="7">41</validValue>
-            <validValue name="ME_INVALID" description="v7: terminal REJECTED after an INVALID 8 outcome on a pending command (RC2 S8)" sinceVersion="7">42</validValue>
+            <validValue name="ME_INVALID" description="v7: terminal REJECTED after an INVALID 8 outcome on a pending command, or the REPLACED abort of an AMEND (RC2 S8)" sinceVersion="7">42</validValue>
+            <validValue name="ME_RELEASED" description="v7 (RC2 S8, appended D-S8-1): terminal REJECTED or the REPLACED abort after RELEASED 7 on a pending command" sinceVersion="7">43</validValue>
         </enum>
         <!-- Session classes (K6; critic C5 + D10). The authoritative class comes from the authenticator's principal;
              RegisterSession.sessionClass is an assertion checked against it. -->
@@ -207,6 +208,8 @@
             <validValue name="ME_LEG_LIVE" description="v7" sinceVersion="7">4</validValue>
             <validValue name="ME_CAPACITY_WHILE_OPEN" description="v7: RC2 L 3.7" sinceVersion="7">5</validValue>
             <validValue name="FEED_HALT" description="v7: the control event FeedHaltApplied: orderId 0, tradeId = seenJournalSeq, amount = expectedJournalSeq; also the audit event of FeedLatchClear (tradeId = journalSeq, amount 0)" sinceVersion="7">6</validValue>
+            <validValue name="ME_INVALID" description="v7 (RC2 S8, appended D-S8-1): INVALID 8 on a pending command; amount = the command's idLow" sinceVersion="7">7</validValue>
+            <validValue name="ME_AMEND_MISMATCH" description="v7 (RC2 S8, appended D-S8-1): AMEND REJECTED reason 16; amount = the core's expectedOldRemaining at mint" sinceVersion="7">8</validValue>
         </enum>
         <!-- Why a feed Settle was refused before any mutation (hardening B2 / critic D13). The settle does NOT
              advance consumePosition; the bridge sees the reject on its own session. -->

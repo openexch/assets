@@ -15,9 +15,10 @@ import com.openexchange.assets.domain.EventKind;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.domain.GateReason;
 import com.openexchange.assets.domain.OrderFaultKind;
+import com.openexchange.assets.domain.ReleaseResult;
+import com.openexchange.assets.domain.ReleaseScope;
 import com.openexchange.assets.domain.SettleRejectReason;
 import com.openexchange.assets.domain.commands.SettleCommand;
-import org.agrona.collections.Long2LongHashMap;
 import com.openexchange.assets.domain.Market;
 import com.openexchange.assets.domain.OrderStatus;
 import com.openexchange.assets.domain.RejectReason;
@@ -65,6 +66,7 @@ public final class OrderEngine {
     private static final int T_AMEND = 52;
     private static final int T_ORDER_SNAPSHOT = 53;
     private static final int T_QUARANTINE = 74;
+    private static final int T_PENDING_DISPATCH = 65;
     /** Replace window observability deadline (lifecycle B5, D6): no state change when it fires. */
     public static final long REPLACE_DEADLINE_MS = 10_000L;
     /** RequestOrderSnapshot page cap (contract 3.6). */
@@ -86,6 +88,15 @@ public final class OrderEngine {
     private static final int RESULT_UNKNOWN_LEG = 4;
     private static final int RESULT_NOT_OWNER = 5;
     private static final int RESULT_UNKNOWN_MARKET = 6;
+    private static final int RESULT_RELEASED = 7;
+    private static final int RESULT_INVALID = 8;
+    private static final int RESULT_LEG_LIVE_RELEASE = 2; // ReleaseResult.LEG_LIVE
+    /** RC2 S8 3.1 rule 1: the deferred UP_TO list (capacity 8); a fifth entry in one apply is a bug (IllegalStateException). */
+    private static final int DEFERRED_CAPACITY = 8;
+    private static final int DEFERRED_LIMIT = 4;
+    /** {@link AssetsEventSink#onReleaseEffect} row codes (S8 3.2): C1..C6, E1..E4, abandonment. */
+    public static final int ROW_C1 = 1, ROW_C2 = 2, ROW_C3 = 3, ROW_C4 = 4, ROW_C5 = 5, ROW_C6 = 6;
+    public static final int ROW_E1 = 11, ROW_E2 = 12, ROW_E3 = 13, ROW_E4 = 14, ROW_ABANDON = 21;
 
     private static final int ST_PENDING_TRIGGER = 7;
 
@@ -128,6 +139,62 @@ public final class OrderEngine {
     private int pendingMeReason = NOT_ME_SOURCED;
     private static final int NOT_ME_SOURCED = 255;
 
+    // ---- RC2 S8: the ME link (replicated, section 11), the derived index and the deferred release list ----
+    /** S8 1.2: the release backlog (section 11). */
+    private final ReleaseBacklog backlog = new ReleaseBacklog();
+    /** S8 3.8: the pending-dispatch index (derived; rebuilt by {@link #rebuildDerived}). Behaviour-independent. */
+    private final PendingDispatchIndex index = new PendingDispatchIndex();
+    /** S8 1.3: the last applied {@code ledgerSize}, clamped to {@code [0, meLedgerCapacity]} at apply (section 11). */
+    private long meLedgerSize;
+    /** S8 3.5: the Schmitt-trigger state of the capacity gate (section 11). */
+    private boolean capacityHigh;
+    /** S8 3.1 rule 1: UP_TO releases recorded in this apply, flushed by {@link #endApply}. Transient. */
+    private final long[] deferredOrder = new long[DEFERRED_CAPACITY];
+    private final long[] deferredFloor = new long[DEFERRED_CAPACITY];
+    private int deferredCount;
+    private final MeOutcomeView defaultOutcome = new MeOutcomeView();
+    /**
+     * Review Q1 option (d), transient: the 64 being applied is the one that set or kept F_ME_RELEASED on a pending CREATE
+     * (Table A rows 7 and 8); only a terminal reached from it skips M11. Reset after every 64.
+     */
+    private boolean skipOrderRelease;
+    /**
+     * Review NOTE-5, node-local: orphan cancels whose last outcome was CAPACITY (E4); counted in {@link #capacityParked} so
+     * MeCapacityParked fires instead of DispatchStuck. Not snapshotted: after a restore it is empty until the orphan's next
+     * outcome (the forwarder's resync re-offers it either way).
+     */
+    private final org.agrona.collections.LongHashSet orphanCapacityWait = new org.agrona.collections.LongHashSet();
+
+    // S8 1.6 node-local counters
+    private long releaseMintedUpToCount;
+    private long releaseMintedOrderCount;
+    private long releaseConfirmedCount;
+    private long releaseConfirmStaleCount;
+    private long releaseAbandonedCount;
+    private long releaseSkippedCount;
+    private long legLiveCount;
+    private long legLiveDuplicateCount;
+    private long orphanCancelCount;
+    private long parkedCount;
+    private long releasedLateCount;
+    private long meInvalidCount;
+    private long meReleaseEarlyCount;
+    private long meAmendMismatchCount;
+    private long capacityWhileOpenCount;
+    private long capacityOutcomeCount;
+    private long meLinkMismatchCount;
+    private long meLedgerSizeClampedCount;
+    private long lateApplyOnDeadOrderCount;
+    private long legZeroRefusedCount;
+    private long terminalWithPendingCreateCount;
+    private long restoreCapacityBitWithoutHighCount;
+    private long pendingReplyVisited;
+    // S8 1.6 maintained gauges (plain longs written on the service thread at each transition)
+    private long capacityParked;
+    private long quarantinedLive;
+    private long pendingOldestSeq;
+    private long oldestReleaseSeq;
+
     public OrderEngine(final AssetsEngine ledger) {
         this.ledger = ledger;
         for (int m = 0; m < markets.length; m++) {
@@ -138,6 +205,11 @@ public final class OrderEngine {
     // ---------------------------------------------------------------- CreateOrder
 
     public void applyCreate(final CreateOrderCommand c, final long timestamp) {
+        createBody(c, timestamp);
+        endApply();
+    }
+
+    private void createBody(final CreateOrderCommand c, final long timestamp) {
         ledger.observeLogTime(timestamp);
         final long now = ledger.getLastLogTime();
         final AssetsEventSink sink = ledger.eventSink();
@@ -167,7 +239,8 @@ public final class OrderEngine {
             reject(sink, c, CoreRejectReason.INVALID, c.orderType, now, false);
             return;
         }
-        if (c.timeInForce == TIF_FOK || (c.orderType >= TYPE_STOP_LOSS && c.timeInForce == TIF_IOC)) {
+        if (v3() ? unsupportedTifV3(c.orderType, c.timeInForce)
+                : (c.timeInForce == TIF_FOK || (c.orderType >= TYPE_STOP_LOSS && c.timeInForce == TIF_IOC))) {
             reject(sink, c, CoreRejectReason.UNSUPPORTED_TIF, c.timeInForce, now, false);
             return;
         }
@@ -409,6 +482,9 @@ public final class OrderEngine {
         if (c.timeInForce == TIF_IOC) {
             o.set(CoreOrder.F_IOC);
         }
+        if (c.timeInForce == TIF_FOK) {
+            o.set(CoreOrder.F_FOK); // RC2 S8 3.6: native FOK, a plain LIMIT create only (admission above)
+        }
         final long eventSeq = ledger.getEventSeq() + 1;
         ledger.setEventSeq(eventSeq);
         o.eventSeq = eventSeq;
@@ -430,6 +506,20 @@ public final class OrderEngine {
                 armed ? OrderStatus.PENDING_TRIGGER : OrderStatus.PENDING_NEW, false, holdAsset, holdAmount, now, eventSeq);
         sink.onOrderEvent(eventSeq, ledger.getLogPosition(), o, EventKind.ACCEPTED, CoreRejectReason.NONE, 0L, 0L, 0L,
                 account.holdRemaining(orderId), now);
+    }
+
+    /**
+     * RC2 S8 3.6 admission table under v3: IOC native on LIMIT and MARKET, FOK native on LIMIT only, every other IOC/FOK
+     * cell UNSUPPORTED_TIF (LIMIT_MAKER IOC is new; stops, trailing and iceberg keep GTC/GTD only).
+     */
+    private static boolean unsupportedTifV3(final int orderType, final int tif) {
+        if (tif == TIF_FOK) {
+            return orderType != TYPE_LIMIT;
+        }
+        if (tif == TIF_IOC) {
+            return orderType != TYPE_LIMIT && orderType != TYPE_MARKET;
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- RC1 S7: behaviour v2 admission shape
@@ -514,13 +604,33 @@ public final class OrderEngine {
     /** Mint the next durable ME command for {@code o}: idHigh = orderId, idLow = attempt << 2 | kind. */
     private void dispatch(final AssetsEventSink sink, final CoreOrder o, final DispatchKind kind, final long oldLegId,
                           final long price, final long quantity, final long budget) {
+        if (o.pendingDispatchSeq != 0) {
+            index.remove(o.pendingDispatchSeq); // defensive: one pending command per order (never reached by the live paths)
+        }
         final long dispatchSeq = ledger.getDispatchSeq() + 1;
         ledger.setDispatchSeq(dispatchSeq);
         o.pendingDispatchSeq = dispatchSeq;
         o.set(CoreOrder.F_DISPATCH_PENDING);
+        index.add(dispatchSeq, o.orderId, PendingDispatchIndex.TAG_TRADING);
         final long idLow = ((long) o.attempt << 2) | kind.code();
+        final boolean v3 = v3();
         sink.onMeDispatch(dispatchSeq, o.orderId, idLow, kind, o.userId, o.orderId, oldLegId, o.marketId,
-                meOrderType(o), o.side, price, quantity, budget, o.timeInForce);
+                meOrderType(o), o.side, price, quantity, budget, wireTif(o, kind, v3), ReleaseScope.UP_TO,
+                kind == DispatchKind.AMEND && v3 ? o.pendingExpectedOldRemaining : 0L);
+    }
+
+    /**
+     * RC2 S8 3.6: the wire timeInForce, mint and reply alike. Under v3 a CREATE carries GTC 0, IOC 1, FOK 2 (GTD 0) and
+     * every other kind 0; under v1/v2 the record's code on every kind (the base bytes).
+     */
+    private static int wireTif(final CoreOrder o, final DispatchKind kind, final boolean v3) {
+        if (!v3) {
+            return o.timeInForce;
+        }
+        if (kind != DispatchKind.CREATE) {
+            return 0;
+        }
+        return o.timeInForce == TIF_IOC ? TIF_IOC : o.timeInForce == TIF_FOK ? TIF_FOK : TIF_GTC;
     }
 
     /** Mint the single cancel for a resting leg (attempt+1, kind CANCEL) and say so on the orders channel. */
@@ -533,6 +643,13 @@ public final class OrderEngine {
     }
 
     private void clearPending(final CoreOrder o) {
+        if (o.pendingDispatchSeq != 0) {
+            index.remove(o.pendingDispatchSeq);
+        }
+        if (o.has(CoreOrder.F_ME_CAPACITY_WAIT)) {
+            o.unset(CoreOrder.F_ME_CAPACITY_WAIT);
+            capacityParked--;
+        }
         o.unset(CoreOrder.F_DISPATCH_PENDING);
         o.pendingDispatchSeq = 0L;
         o.pendingKind = (byte) CoreOrder.PK_NONE;
@@ -585,8 +702,13 @@ public final class OrderEngine {
     }
 
     private void fault(final OrderFaultKind kind, final CoreOrder o, final long tradeId, final long amount) {
+        fault(kind, o.orderId, o.userId, o.marketId, tradeId, amount);
+    }
+
+    private void fault(final OrderFaultKind kind, final long orderId, final long userId, final int marketId, final long tradeId,
+                       final long amount) {
         orderFaultCount++;
-        ledger.eventSink().onOrderFault(kind, o.orderId, o.userId, o.marketId, tradeId, amount, ledger.getLogPosition());
+        ledger.eventSink().onOrderFault(kind, orderId, userId, marketId, tradeId, amount, ledger.getLogPosition());
     }
 
     /**
@@ -595,6 +717,13 @@ public final class OrderEngine {
      */
     private void terminalize(final CoreOrder o, final int statusCode, final EventKind kind, final CoreRejectReason reason,
                              final long lastPrice, final long lastQty, final long tradeId, final long now) {
+        final boolean v3 = v3();
+        if (v3 && o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE) {
+            terminalWithPendingCreateCount++; // S8 3.1 rule 5 (R1 as an assertion): must stay 0; M11 still runs
+        }
+        if (o.has(CoreOrder.F_QUARANTINED)) {
+            quarantinedLive--;
+        }
         if (o.status == ST_PENDING_TRIGGER) {
             triggers.remove(o); // an armed order ends without ever reaching the ME (S6 3.3)
         }
@@ -614,6 +743,19 @@ public final class OrderEngine {
         emitEvent(o, kind, reason, lastPrice, lastQty, tradeId, now, takeMeReason());
         if (statusCode == ST_CANCELLED || statusCode == ST_EXPIRED) {
             cancelledCount++;
+        }
+        if (v3) {
+            // S8 3.1 M11: after the terminal OrderEvent, before the record leaves; one ORDER release for every terminal (an
+            // armed cancel or expiry included, attempt 0), unless F_ME_RELEASED (rule 2: the floor of the order is unknown)
+            // Review Q1 option (d): M11 is skipped only when the dying apply is the 64 that set or kept the flag (Table A rows
+            // 7 and 8): the ME may hold a tombstone of h there, which would make the ORDER an unjournaled NOOP. Any other
+            // death of a flagged order follows a journal event naming its live leg (or ending its pending command): no
+            // tombstone can exist while a leg of h rests (S4 4.2 LEG_LIVE, B0), so the ORDER is APPLIED or LEG_LIVE.
+            if (o.has(CoreOrder.F_ME_RELEASED) && skipOrderRelease) {
+                releaseSkippedCount++;
+            } else {
+                mintRelease(o.orderId, ((long) o.attempt << 2) | 3, ReleaseBacklog.SCOPE_ORDER, o);
+            }
         }
         orders.remove(o);
     }
@@ -651,6 +793,8 @@ public final class OrderEngine {
         o.pendingHoldDelta = 0L;
         o.pendingHoldTarget = 0L;
         o.oldLegId = 0L;
+        o.pendingLegQty = 0L;
+        o.pendingExpectedOldRemaining = 0L;
         o.unset(CoreOrder.F_REPLACE_PENDING);
         o.status = (byte) (o.filledQty > 0 ? ST_PARTIALLY_FILLED : ST_NEW);
         o.updatedAtMs = now;
@@ -694,6 +838,11 @@ public final class OrderEngine {
     // ---------------------------------------------------------------- CancelOrder
 
     public void applyCancel(final CancelOrderCommand c, final long timestamp) {
+        cancelBody(c, timestamp);
+        endApply();
+    }
+
+    private void cancelBody(final CancelOrderCommand c, final long timestamp) {
         ledger.observeLogTime(timestamp);
         final long now = ledger.getLastLogTime();
         final AssetsEventSink sink = ledger.eventSink();
@@ -817,6 +966,12 @@ public final class OrderEngine {
     /** A forwarder top-of-book tick: state only; a bookVersion at or below the stored one is stale (K4). */
     public void applyMarketTick(final int marketId, final long bookVersion, final long bestBid, final long bestAsk,
                                 final long lastTradePrice, final long lastTradeId, final long meEpoch, final long timestamp) {
+        tickBody(marketId, bookVersion, bestBid, bestAsk, lastTradePrice, lastTradeId, meEpoch, timestamp);
+        endApply();
+    }
+
+    private void tickBody(final int marketId, final long bookVersion, final long bestBid, final long bestAsk,
+                          final long lastTradePrice, final long lastTradeId, final long meEpoch, final long timestamp) {
         ledger.observeLogTime(timestamp);
         if (v3()) {
             // RC2 S7 D6 (W17): a tick counts only from the bound ME epoch; nothing is live before the bind
@@ -923,6 +1078,11 @@ public final class OrderEngine {
 
     /** A deadline popped by the single sweep (one-shot): GTD expiry of an order, or a requestId TTL. */
     public void onDeadline(final long deadlineMs, final long id, final int kind, final long now) {
+        deadlineBody(deadlineMs, id, kind, now);
+        endApply();
+    }
+
+    private void deadlineBody(final long deadlineMs, final long id, final int kind, final long now) {
         switch (kind) {
             case DeadlineIndex.KIND_GTD: {
                 final CoreOrder o = orders.get(id);
@@ -981,6 +1141,7 @@ public final class OrderEngine {
         }
         tradeBody(egressSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price, quantity, takerIsBuy,
                 takerOmsOrderId, makerOmsOrderId, timestamp);
+        endApply();
     }
 
     /**
@@ -999,8 +1160,12 @@ public final class OrderEngine {
             ledger.eventSink().onSettleRejected(tradeId, marketId, journalSeq, SettleRejectReason.TRADE_GAP, last + 1);
             return false;
         }
-        return tradeBody(journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price, quantity,
-                takerIsBuy, takerOmsOrderId, makerOmsOrderId, timestamp);
+        final boolean applied = tradeBody(journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price,
+                quantity, takerIsBuy, takerOmsOrderId, makerOmsOrderId, timestamp);
+        if (applied) {
+            endApply();
+        }
+        return applied;
     }
 
     /** The S5 3.1 apply of a dense trade; {@code journalPosition} is what a settle refusal echoes. */
@@ -1041,6 +1206,12 @@ public final class OrderEngine {
         if (o == null) {
             return;
         }
+        if (legId <= 0 && v3()) {
+            // RC2 S8 3.4 (FIX-4): the leg-0 engine guard for every caller; the trade's money already stands (S5 3.1)
+            legZeroRefusedCount++;
+            fault(OrderFaultKind.SETTLE, o, tradeId, quantity);
+            return;
+        }
         if (o.userId != userId) {
             fault(OrderFaultKind.SETTLE, o, tradeId, quantity);
             return;
@@ -1055,6 +1226,8 @@ public final class OrderEngine {
                 return;
             }
             // implicit ack: the leg exists at the ME (contract 3.1); the post-ack rules run after the fill below
+            o.unset(CoreOrder.F_ME_RELEASED); // review Q3: the ME judged this id above its floor
+            deferUpTo(o, DispatchKind.CREATE.code()); // RC2 S8 M1
             o.currentLegId = legId;
             clearPending(o);
             o.status = (byte) ST_NEW;
@@ -1071,6 +1244,8 @@ public final class OrderEngine {
                 }
                 // a trade on the NEW leg before the amend outcome: resolve first (B7), then fill; the window is closed
                 // by this trade, so the post-window rules (3.8 #9/#13: a cancel flagged meanwhile) run after the fill
+                o.unset(CoreOrder.F_ME_RELEASED); // review Q3
+                deferUpTo(o, DispatchKind.AMEND.code()); // RC2 S8 M2
                 clearPending(o);
                 resolveReplace(o, legId, now);
                 windowClosedByTrade = true;
@@ -1171,6 +1346,9 @@ public final class OrderEngine {
         if (o.has(CoreOrder.F_QUARANTINED) || o.has(CoreOrder.F_DISPATCH_PENDING)) {
             return;
         }
+        if (v3() && (o.has(CoreOrder.F_IOC) || o.has(CoreOrder.F_FOK) || meOrderType(o) == TYPE_MARKET)) {
+            return; // RC2 S8 3.6 (D-S8-6): the ME ends such an order inside its create; a cancel would only meet UNKNOWN_LEG
+        }
         if (o.has(CoreOrder.F_CANCEL_PENDING)) {
             mintCancel(o, now);
         } else if (o.has(CoreOrder.F_IOC) && o.remainingQty > 0) {
@@ -1213,14 +1391,16 @@ public final class OrderEngine {
                              final long omsOrderId, final long oldOrderId, final long price, final long quantity, final long budget,
                              final int marketId, final int commandKind, final int result, final long legId, final int reason,
                              final long meTimestamp, final long meEpoch, final long timestamp, final boolean oldCancelled) {
-        final boolean v3 = v3();
-        pendingMeReason = v3 && result == RESULT_REJECTED && reason >= 0 && reason <= 254 ? reason : NOT_ME_SOURCED;
-        try {
-            outcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget, marketId,
-                    commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, v3 && oldCancelled);
-        } finally {
-            pendingMeReason = NOT_ME_SOURCED;
+        if (v3()) {
+            // RC2 S8 section 2: every caller under v3 reaches the S8 tables; the 64 tail takes the section 2 defaults
+            applyOutcomeV3(outcomeWithDefaults(defaultOutcome, egressSeq, 0L, commandIdHigh, commandIdLow, userId, omsOrderId,
+                    oldOrderId, price, quantity, budget, marketId, commandKind, result, legId, reason, oldCancelled, meTimestamp,
+                    meEpoch), timestamp);
+            return;
         }
+        outcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget, marketId,
+                commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, false);
+        endApply();
     }
 
     public long legRegressionCount() { return legRegressionCount; }
@@ -1229,10 +1409,22 @@ public final class OrderEngine {
     /** MeJournalTerminal (63). Contract S5 §3.2. */
     public void applyTerminal(final long egressSeq, final long legId, final long userId, final int marketId, final int statusCode,
                               final long meTimestamp, final long omsOrderId, final long meEpoch, final long timestamp) {
+        terminalBody(legId, statusCode, omsOrderId, timestamp);
+        endApply();
+    }
+
+    private void terminalBody(final long legId, final int statusCode, final long omsOrderId, final long timestamp) {
         ledger.observeLogTime(timestamp);
         final long now = ledger.getLastLogTime();
         final CoreOrder o = orders.get(omsOrderId);
         if (o == null) {
+            staleTerminalCount++;
+            return;
+        }
+        final boolean v3 = v3();
+        if (v3 && legId <= 0) {
+            // RC2 S8 3.4 (FIX-4): a terminal naming leg 0 changes nothing (the R1 hole: it would terminalize a pending CREATE)
+            legZeroRefusedCount++;
             staleTerminalCount++;
             return;
         }
@@ -1243,6 +1435,10 @@ public final class OrderEngine {
                 return;
             }
             // the NEW leg speaks before the amend outcome: resolve first, then apply (B7)
+            if (o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_AMEND) {
+                o.unset(CoreOrder.F_ME_RELEASED); // review Q3
+                deferUpTo(o, DispatchKind.AMEND.code()); // RC2 S8 M3
+            }
             clearPending(o);
             resolveReplace(o, legId, now);
         }
@@ -1256,10 +1452,13 @@ public final class OrderEngine {
             // G9 (S6 3.6): the ME journals a terminal for a create it refused or ended before its outcome reached us.
             // Learn the leg and apply the terminal; the later CREATE outcome is redundant. A refused leg never rested,
             // so no ACK_NEW is announced for it.
+            o.unset(CoreOrder.F_ME_RELEASED); // review Q3
+            deferUpTo(o, DispatchKind.CREATE.code()); // RC2 S8 M4
             o.currentLegId = legId;
             clearPending(o);
             implicitAckCount++;
-            if (statusCode != ST_REJECTED) {
+            // RC2 S8 3.4: an IOC/FOK leg the ME killed (CANCELLED) never rested: no ACK_NEW under v3
+            if (statusCode != ST_REJECTED && !(v3 && statusCode == ST_CANCELLED && iocOrFok(o))) {
                 if (o.status == ST_PENDING_NEW) {
                     o.status = (byte) ST_NEW;
                 }
@@ -1272,6 +1471,10 @@ public final class OrderEngine {
         }
         if (o.has(CoreOrder.F_REPLACE_PENDING)) {
             if (statusCode == ST_REJECTED) {
+                if (o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_AMEND) {
+                    o.unset(CoreOrder.F_ME_RELEASED); // review Q3
+                    deferUpTo(o, DispatchKind.AMEND.code()); // RC2 S8 M5
+                }
                 clearPending(o); // the ME named the OLD leg when it refused the amend (A6): abort, order stays live
                 abortReplace(o, CoreRejectReason.ME_REJECTED, now);
                 afterWindow(o, now);
@@ -1298,7 +1501,8 @@ public final class OrderEngine {
                 terminalize(o, ST_FILLED, EventKind.FILL, CoreRejectReason.NONE, o.lastPrice, 0L, 0L, now);
                 break;
             case ST_CANCELLED:
-                if (o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
+                if (o.has(CoreOrder.F_EXPIRY_REQUESTED) || (v3 && iocOrFok(o))) {
+                    // RC2 S8 3.4: an IOC/FOK leg the ME cancelled (reasons 12, 13, 14, 7 in meReason) ends EXPIRED
                     terminalize(o, ST_EXPIRED, EventKind.EXPIRED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
                 } else {
                     terminalize(o, ST_CANCELLED, EventKind.CANCELLED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
@@ -1321,7 +1525,7 @@ public final class OrderEngine {
                              final long omsOrderId, final long oldOrderId, final long price, final long quantity, final long budget,
                              final int marketId, final int commandKind, final int result, final long legId, final int reason,
                              final long meTimestamp, final long meEpoch, final long timestamp) {
-        outcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget, marketId,
+        applyOutcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget, marketId,
                 commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, false);
     }
 
@@ -1402,6 +1606,9 @@ public final class OrderEngine {
             }
             case RESULT_CONFLICT:
                 clearPending(o);
+                if (!o.has(CoreOrder.F_QUARANTINED)) {
+                    quarantinedLive++;
+                }
                 o.set(CoreOrder.F_QUARANTINED);
                 o.rejectReason = (byte) CoreRejectReason.ME_CONFLICT.code();
                 o.updatedAtMs = now;
@@ -1418,10 +1625,837 @@ public final class OrderEngine {
         }
     }
 
+    // ================================================================ RC2 S8: releases, Tables A-D, the 67, capacity
+
+    private static boolean iocOrFok(final CoreOrder o) {
+        return o.has(CoreOrder.F_IOC) || o.has(CoreOrder.F_FOK);
+    }
+
+    /** S8 3.1 rule 1: record the UP_TO of a resolution site (floor captured now, before clearPending); flushed by endApply. */
+    private void deferUpTo(final CoreOrder o, final int kindCode) {
+        if (!v3()) {
+            return;
+        }
+        if (deferredCount == DEFERRED_LIMIT) {
+            throw new IllegalStateException("S8 3.1 rule 1: a fifth deferred UP_TO in one apply (order " + o.orderId + ")");
+        }
+        deferredOrder[deferredCount] = o.orderId;
+        deferredFloor[deferredCount] = ((long) o.attempt << 2) | kindCode;
+        deferredCount++;
+    }
+
+    /**
+     * The end of every mutating public apply (S8 section 2): under v3 the deferred UP_TO releases (recording order; only for
+     * an order still live and without {@code F_ME_RELEASED}), then the capacity rule of 3.5; on every behaviour the
+     * maintained gauges of the index (1.6). A refused apply recorded nothing, so it flushes nothing.
+     */
+    private void endApply() {
+        if (deferredCount > 0) {
+            final int n = deferredCount;
+            deferredCount = 0;
+            for (int i = 0; i < n; i++) {
+                final CoreOrder o = orders.get(deferredOrder[i]);
+                if (o != null && !o.has(CoreOrder.F_ME_RELEASED)) {
+                    mintRelease(deferredOrder[i], deferredFloor[i], ReleaseBacklog.SCOPE_UP_TO, null);
+                }
+            }
+        }
+        if (v3()) {
+            capacityRule();
+        }
+        refreshGauges();
+    }
+
+    private void refreshGauges() {
+        final long trading = index.headSeq(PendingDispatchIndex.TAG_TRADING);
+        final long orphan = index.headSeq(PendingDispatchIndex.TAG_ORPHAN);
+        pendingOldestSeq = trading == 0 ? orphan : orphan == 0 ? trading : Math.min(trading, orphan);
+        oldestReleaseSeq = index.headSeq(PendingDispatchIndex.TAG_RELEASE);
+    }
+
+    /**
+     * S8 3.1: one release mint. It advances the replicated dispatchSeq, indexes the seq (tag RELEASE), writes the backlog
+     * entry (supersede: the old seq leaves the index; ORDER replaces UP_TO, an UP_TO never replaces ORDER) and emits the
+     * frozen S1 4.4 RELEASE_ID mapping. It touches no CoreOrder ({@code dying} is only read, for the M11 identity).
+     */
+    private long mintRelease(final long h, final long floor, final int scope, final CoreOrder dying) {
+        ReleaseBacklog.Entry b = backlog.get(h);
+        if (b != null) {
+            if (b.scope == ReleaseBacklog.SCOPE_ORDER && scope == ReleaseBacklog.SCOPE_UP_TO) {
+                releaseSkippedCount++; // unreachable (UP_TO flushes only for a live order, ORDER exists only for a dead one)
+                return 0L;
+            }
+            if (b.stage != ReleaseBacklog.STAGE_PARKED) {
+                index.remove(b.dispatchSeq);
+            }
+            if (b.stage != ReleaseBacklog.STAGE_RELEASE) {
+                backlog.setStage(b, ReleaseBacklog.STAGE_RELEASE);
+            }
+        } else {
+            b = backlog.insert(h);
+        }
+        final long seq = ledger.getDispatchSeq() + 1;
+        ledger.setDispatchSeq(seq);
+        index.add(seq, h, PendingDispatchIndex.TAG_RELEASE);
+        b.floor = floor;
+        b.dispatchSeq = seq;
+        b.scope = scope;
+        if (dying != null) {
+            b.userId = dying.userId;
+            b.marketId = dying.marketId;
+            b.side = dying.side;
+            b.meOrderType = meOrderType(dying);
+            b.legId = dying.currentLegId != 0 ? dying.currentLegId : dying.oldLegId;
+            b.attempt = dying.attempt;
+            b.orphanTries = 0;
+        }
+        if (scope == ReleaseBacklog.SCOPE_ORDER) {
+            releaseMintedOrderCount++;
+        } else {
+            releaseMintedUpToCount++;
+        }
+        ledger.eventSink().onMeDispatch(seq, h, floor, DispatchKind.RELEASE_ID, 0L, 0L, 0L, 0, 0, 0, 0L, 0L, 0L, 0, scopeOf(scope), 0L);
+        return seq;
+    }
+
+    /** S8 3.2 C4: the orphan cancel of {@code b.legId} for {@code b.attempt}; its seq replaces the release in the index. */
+    private long mintOrphanCancel(final ReleaseBacklog.Entry b) {
+        index.remove(b.dispatchSeq);
+        final long seq = ledger.getDispatchSeq() + 1;
+        ledger.setDispatchSeq(seq);
+        index.add(seq, b.orderId, PendingDispatchIndex.TAG_ORPHAN);
+        b.dispatchSeq = seq;
+        orphanCancelCount++;
+        ledger.eventSink().onMeDispatch(seq, b.orderId, ((long) b.attempt << 2) | DispatchKind.CANCEL.code(), DispatchKind.CANCEL,
+                b.userId, b.orderId, b.legId, b.marketId, b.meOrderType, b.side, 0L, 0L, 0L, 0, ReleaseScope.UP_TO, 0L);
+        return seq;
+    }
+
+    /** S8 3.1 rule 2 (BLOCKER-2): set F_ME_RELEASED and abandon the order's backlog entry in the same apply. */
+    private void markReleased(final CoreOrder o) {
+        o.set(CoreOrder.F_ME_RELEASED);
+        final ReleaseBacklog.Entry b = backlog.get(o.orderId);
+        if (b != null) {
+            if (b.stage != ReleaseBacklog.STAGE_PARKED) {
+                index.remove(b.dispatchSeq);
+            }
+            final long floor = b.floor;
+            final int scope = b.scope;
+            backlog.remove(o.orderId);
+            releaseAbandonedCount++;
+            ledger.eventSink().onReleaseEffect(o.orderId, floor, scopeOf(scope), null, ROW_ABANDON);
+        }
+    }
+
+    private void clearOrphanWait(final long h) {
+        if (orphanCapacityWait.remove(h)) {
+            capacityParked--;
+        }
+    }
+
+    /** Drop {@code b} (a dominating confirmation, C1/C2). */
+    private void dropEntry(final ReleaseBacklog.Entry b) {
+        clearOrphanWait(b.orderId);
+        if (b.stage != ReleaseBacklog.STAGE_PARKED) {
+            index.remove(b.dispatchSeq);
+        }
+        backlog.remove(b.orderId);
+    }
+
+    private void park(final ReleaseBacklog.Entry b) {
+        index.remove(b.dispatchSeq);
+        backlog.setStage(b, ReleaseBacklog.STAGE_PARKED);
+        parkedCount++;
+    }
+
+    private boolean globalHas(final GateReason r) {
+        return (ledger.gate().reasons(OrderEntryGate.GLOBAL) & (1 << r.code())) != 0;
+    }
+
+    /** S8 3.5: the pending command count {@code P} (index entries of the trading and orphan tags). */
+    public long pendingCommands() {
+        return index.live(PendingDispatchIndex.TAG_TRADING) + index.live(PendingDispatchIndex.TAG_ORPHAN);
+    }
+
+    /** S8 3.5 Schmitt trigger, integer only; unbound or {@code C == 0} never gates (W6). */
+    private void capacityRule() {
+        final long c = ledger.feed().meLedgerCapacity();
+        if (ledger.feed().boundMeEpoch() == 0 || c < 1) {
+            return;
+        }
+        final long e = meLedgerSize + pendingCommands();
+        if (!capacityHigh && 5 * e >= 4 * c) {
+            capacityHigh = true;
+            ledger.suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.ME_CAPACITY);
+        } else if (capacityHigh && 5 * e <= 3 * c) {
+            capacityHigh = false;
+            ledger.clearGateInternally(OrderEntryGate.GLOBAL, GateReason.ME_CAPACITY);
+        }
+    }
+
+    /** S8 3.5 CAPACITY outcome rule (Tables A-C row 3, E4); {@code L = C} was already set by step 0. */
+    private void capacityOutcome(final long orderId, final long userId, final int marketId) {
+        capacityOutcomeCount++;
+        if (!globalHas(GateReason.ME_CAPACITY)) {
+            capacityWhileOpenCount++;
+            fault(OrderFaultKind.ME_CAPACITY_WHILE_OPEN, orderId, userId, marketId, 0L, meLedgerSize + pendingCommands());
+        }
+        ledger.suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.ME_CAPACITY);
+        capacityHigh = true;
+    }
+
+    /** Step 0 of 3.3 and the root of 3.2 (BLOCKER-1, FIX-3): decided at apply, never left to the restore. */
+    private void linkCheck(final long ledgerSize, final long ledgerCapacity, final boolean behaviourMismatch,
+                           final boolean capacityResult) {
+        final long c = ledger.feed().meLedgerCapacity();
+        final boolean clamped = ledgerSize > c;
+        // ledgerSize < 0 cannot pass the 3.9 decode; an engine-API caller that sends one is clamped to 0 and named (P1)
+        final boolean mismatch = ledgerCapacity != c || behaviourMismatch || clamped || ledgerSize < 0
+                || (capacityResult && ledgerSize != ledgerCapacity);
+        meLedgerSize = capacityResult ? c : Math.max(0L, Math.min(ledgerSize, c));
+        if (mismatch) {
+            meLinkMismatchCount++;
+            if (clamped) {
+                meLedgerSizeClampedCount++;
+            }
+            ledger.suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.ME_BEHAVIOR);
+        }
+    }
+
+    private void gateMarket(final int marketId) {
+        ledger.suspendGateInternally(marketId, GateReason.ME_LEG_LIVE);
+    }
+
+    private void setCapacityWait(final CoreOrder o) {
+        if (!o.has(CoreOrder.F_ME_CAPACITY_WAIT)) {
+            o.set(CoreOrder.F_ME_CAPACITY_WAIT);
+            capacityParked++;
+        }
+    }
+
+    private void quarantine(final CoreOrder o, final long now) {
+        clearPending(o);
+        if (!o.has(CoreOrder.F_QUARANTINED)) {
+            quarantinedLive++;
+        }
+        o.set(CoreOrder.F_QUARANTINED);
+        o.rejectReason = (byte) CoreRejectReason.ME_CONFLICT.code();
+        o.updatedAtMs = now;
+        conflictCount++;
+        emitEvent(o, EventKind.QUARANTINED, CoreRejectReason.ME_CONFLICT, 0L, 0L, 0L, now);
+    }
+
+    /**
+     * MeCommandOutcome 64 under behaviour v3 (S8 3.3): step 0 (link check and clamp), the RC1 match, the S7 belt, then Tables
+     * A (pending CREATE), B (pending CANCEL), C (pending AMEND) or D (unmatched). The engine guard for every caller.
+     */
+    public void applyOutcomeV3(final MeOutcomeView v, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        // S7 11.2 for result 1, and the S8 3.3 rows 7 and 8 (RELEASED and INVALID carry the 64's reason, 0 on the wire)
+        pendingMeReason = (v.result == RESULT_REJECTED || v.result == RESULT_RELEASED || v.result == RESULT_INVALID)
+                && v.reason >= 0 && v.reason <= 254 ? v.reason : NOT_ME_SOURCED;
+        try {
+            outcomeV3(v, ledger.getLastLogTime());
+        } finally {
+            pendingMeReason = NOT_ME_SOURCED;
+            skipOrderRelease = false;
+        }
+        endApply();
+    }
+
+    private void outcomeV3(final MeOutcomeView v, final long now) {
+        linkCheck(v.ledgerSize, v.ledgerCapacity, v.behaviorVersion != ledger.feed().meBehaviorVersion(),
+                v.result == RESULT_CAPACITY);
+        final long h = v.commandIdHigh;
+        final CoreOrder o = orders.get(h);
+        if (o == null || !o.has(CoreOrder.F_DISPATCH_PENDING)
+                || v.commandIdLow != (((long) o.attempt << 2) | kindCodeOf(o.pendingKind))) {
+            unmatchedV3(v, o, now);
+            return;
+        }
+        final int pending = o.pendingKind;
+        final long legId = v.orderId;
+        if (v.oldCancelled && pending != CoreOrder.PK_AMEND) {
+            oldCancelledIgnoredCount++; // D9a: only an AMEND can cancel an old leg
+        }
+        if (v.result == RESULT_APPLIED && pending != CoreOrder.PK_CANCEL && beltRefuses(o, legId)) {
+            // RC2 S7 12.2 sites 5 and 6 (legId <= 0 included: max(cur, old) >= 0): the pending command is left as it is
+            legRegressionCount++;
+            staleOutcomeCount++;
+            return;
+        }
+        if (v.result <= RESULT_UNKNOWN_MARKET) {
+            o.unset(CoreOrder.F_ME_RELEASED); // 3.1 rule 2 (review 2 FIX-1): the ME judged this id above its coverage
+        }
+        switch (pending) {
+            case CoreOrder.PK_CREATE: outcomeCreate(o, v, legId, now); break;
+            case CoreOrder.PK_CANCEL: outcomeCancel(o, v, now); break;
+            default: outcomeAmend(o, v, legId, now); break;
+        }
+    }
+
+    /** Table A, pending CREATE. */
+    private void outcomeCreate(final CoreOrder o, final MeOutcomeView v, final long legId, final long now) {
+        switch (v.result) {
+            case RESULT_APPLIED:
+                deferUpTo(o, DispatchKind.CREATE.code()); // M6
+                o.currentLegId = legId;
+                clearPending(o);
+                if (o.status == ST_PENDING_NEW) {
+                    o.status = (byte) ST_NEW;
+                }
+                o.updatedAtMs = now;
+                emitEvent(o, EventKind.ACK_NEW, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                afterAck(o, now);
+                break;
+            case RESULT_REJECTED:
+            case RESULT_UNKNOWN_LEG:
+            case RESULT_NOT_OWNER:
+            case RESULT_UNKNOWN_MARKET:
+                clearPending(o);
+                terminalize(o, ST_REJECTED, EventKind.REJECTED, meWhy(v.result), 0L, 0L, 0L, now); // M11
+                break;
+            case RESULT_CONFLICT:
+                quarantine(o, now);
+                break;
+            case RESULT_CAPACITY:
+                setCapacityWait(o);
+                capacityOutcome(o.orderId, o.userId, o.marketId);
+                break;
+            case RESULT_RELEASED:
+                // D-S8-2: no leg exists (the dense cursor would have resolved an applied original first); no ORDER (rule 2)
+                meReleaseEarlyCount++;
+                fault(OrderFaultKind.ME_RELEASE_EARLY, o, 0L, v.commandIdLow);
+                markReleased(o);
+                clearPending(o);
+                skipOrderRelease = true; // Table A row 7: the 64 that set the flag kills the order
+                terminalize(o, ST_REJECTED, EventKind.REJECTED, CoreRejectReason.ME_RELEASED, 0L, 0L, 0L, now);
+                break;
+            default: // RESULT_INVALID (W8)
+                meInvalidCount++;
+                fault(OrderFaultKind.ME_INVALID, o, 0L, v.commandIdLow);
+                clearPending(o);
+                skipOrderRelease = o.has(CoreOrder.F_ME_RELEASED); // Table A row 8 on a flagged order: the 64 kept the flag
+                terminalize(o, ST_REJECTED, EventKind.REJECTED, CoreRejectReason.ME_INVALID, 0L, 0L, 0L, now); // M11
+                break;
+        }
+    }
+
+    /** Table B, pending CANCEL. */
+    private void outcomeCancel(final CoreOrder o, final MeOutcomeView v, final long now) {
+        switch (v.result) {
+            case RESULT_APPLIED:
+                clearPending(o);
+                if (o.has(CoreOrder.F_EXPIRY_REQUESTED)) {
+                    terminalize(o, ST_EXPIRED, EventKind.EXPIRED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                } else {
+                    terminalize(o, ST_CANCELLED, EventKind.CANCELLED, CoreRejectReason.NONE, 0L, 0L, 0L, now);
+                }
+                break;
+            case RESULT_REJECTED:
+            case RESULT_UNKNOWN_LEG:
+            case RESULT_NOT_OWNER:
+            case RESULT_UNKNOWN_MARKET:
+                deferUpTo(o, DispatchKind.CANCEL.code()); // M8
+                clearPending(o); // the flags stay (RC1)
+                cancelRefusedCount++;
+                break;
+            case RESULT_CONFLICT:
+                quarantine(o, now);
+                break;
+            case RESULT_CAPACITY:
+                setCapacityWait(o);
+                capacityOutcome(o.orderId, o.userId, o.marketId);
+                break;
+            case RESULT_RELEASED:
+                meReleaseEarlyCount++;
+                fault(OrderFaultKind.ME_RELEASE_EARLY, o, 0L, v.commandIdLow);
+                markReleased(o);
+                clearPending(o); // flags stay, the order stays live on its resting leg; no automatic re-mint
+                gateMarket(o.marketId);
+                break;
+            default: // RESULT_INVALID
+                meInvalidCount++;
+                fault(OrderFaultKind.ME_INVALID, o, 0L, v.commandIdLow);
+                deferUpTo(o, DispatchKind.CANCEL.code()); // M10
+                clearPending(o);
+                gateMarket(o.marketId);
+                break;
+        }
+    }
+
+    /** Table C, pending AMEND. */
+    private void outcomeAmend(final CoreOrder o, final MeOutcomeView v, final long legId, final long now) {
+        switch (v.result) {
+            case RESULT_APPLIED:
+                deferUpTo(o, DispatchKind.AMEND.code()); // M7 (M11 instead if afterWindow terminalizes)
+                clearPending(o);
+                resolveReplace(o, legId, now);
+                afterWindow(o, now);
+                break;
+            case RESULT_REJECTED:
+                if (v.oldCancelled) {
+                    // S7 D9a row 1: the ME cancelled the old leg and placed nothing; terminalize releases the whole residual
+                    clearPending(o);
+                    terminalize(o, ST_REJECTED, EventKind.REJECTED, CoreRejectReason.ME_REJECTED, 0L, 0L, 0L, now); // M11
+                    break;
+                }
+                if (v.reason == 16) {
+                    // N-4: the fault first, it reads the reference closeReplaceWindow zeroes
+                    meAmendMismatchCount++;
+                    fault(OrderFaultKind.ME_AMEND_MISMATCH, o, 0L, o.pendingExpectedOldRemaining);
+                }
+                deferUpTo(o, DispatchKind.AMEND.code()); // M9
+                clearPending(o);
+                abortReplace(o, CoreRejectReason.ME_REJECTED, now);
+                afterWindow(o, now);
+                break;
+            case RESULT_UNKNOWN_LEG:
+            case RESULT_NOT_OWNER:
+            case RESULT_UNKNOWN_MARKET:
+                deferUpTo(o, DispatchKind.AMEND.code()); // M9
+                clearPending(o);
+                abortReplace(o, meWhy(v.result), now);
+                afterWindow(o, now);
+                break;
+            case RESULT_CONFLICT:
+                quarantine(o, now); // RC1: the window stays open (finding F-3)
+                break;
+            case RESULT_CAPACITY:
+                setCapacityWait(o);
+                capacityOutcome(o.orderId, o.userId, o.marketId);
+                break;
+            case RESULT_RELEASED:
+                meReleaseEarlyCount++;
+                fault(OrderFaultKind.ME_RELEASE_EARLY, o, 0L, v.commandIdLow);
+                markReleased(o);
+                clearPending(o);
+                gateMarket(o.marketId);
+                abortReplace(o, CoreRejectReason.ME_RELEASED, now); // live on the old leg with its old hold
+                afterWindow(o, now);
+                break;
+            default: // RESULT_INVALID
+                meInvalidCount++;
+                fault(OrderFaultKind.ME_INVALID, o, 0L, v.commandIdLow);
+                gateMarket(o.marketId);
+                deferUpTo(o, DispatchKind.AMEND.code()); // M10
+                clearPending(o);
+                abortReplace(o, CoreRejectReason.ME_INVALID, now);
+                afterWindow(o, now);
+                break;
+        }
+    }
+
+    private static CoreRejectReason meWhy(final int result) {
+        return result == RESULT_REJECTED ? CoreRejectReason.ME_REJECTED
+                : result == RESULT_UNKNOWN_LEG ? CoreRejectReason.ME_UNKNOWN_LEG
+                : result == RESULT_NOT_OWNER ? CoreRejectReason.NOT_OWNER : CoreRejectReason.UNKNOWN_MARKET;
+    }
+
+    /** Table D, an unmatched outcome (first matching row). */
+    private void unmatchedV3(final MeOutcomeView v, final CoreOrder o, final long now) {
+        final long h = v.commandIdHigh;
+        final boolean dead = o == null && h >= 1 && h < ledger.getNextOrderId();
+        final ReleaseBacklog.Entry b = dead ? backlog.get(h) : null;
+        final long legId = v.orderId;
+        final boolean lateApply = v.result == RESULT_APPLIED
+                && (v.commandKind == DispatchKind.CREATE.code() || v.commandKind == DispatchKind.AMEND.code());
+        if (b != null && b.stage == ReleaseBacklog.STAGE_ORPHAN_CANCEL
+                && v.commandIdLow == (((long) b.attempt << 2) | DispatchKind.CANCEL.code())) {
+            orphanOutcome(b, v); // U0, first (FIX-1)
+            return;
+        }
+        if (v.result == RESULT_RELEASED) {
+            releasedLateCount++; // U1
+            return;
+        }
+        if (o != null) {
+            if (v.result == RESULT_APPLIED && legId != 0 && legId == o.currentLegId) {
+                redundantOutcomeCount++; // U2
+            } else {
+                staleOutcomeCount++; // U3
+            }
+            return;
+        }
+        if (dead && b != null && b.scope == ReleaseBacklog.SCOPE_ORDER && lateApply && legId > b.legId) {
+            // U5 (S2 handoff): a late copy applied after the core ended the order; never a second release
+            lateApplyOnDeadOrderCount++;
+            fault(OrderFaultKind.ME_LEG_LIVE, h, b.userId, b.marketId, 0L, legId);
+            gateMarket(b.marketId);
+            if (b.stage == ReleaseBacklog.STAGE_RELEASE) {
+                b.legId = legId; // the coming LEG_LIVE (C4) cancels this leg; the minted orphan frame stays frozen (FIX-2)
+            }
+            return;
+        }
+        if (dead && b == null && lateApply && legId > 0) {
+            // U5b (review 2 FIX-2): no backlog entry (abandoned or confirmed); cannot come from a correct ME
+            lateApplyOnDeadOrderCount++;
+            fault(OrderFaultKind.ME_LEG_LIVE, h, v.userId, v.marketId, 0L, legId);
+            if (v.marketId >= 1 && v.marketId <= MARKETS) {
+                gateMarket(v.marketId);
+            } else {
+                ledger.suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.ME_BEHAVIOR);
+            }
+            return;
+        }
+        if (dead && b != null && v.result == RESULT_APPLIED && b.scope == ReleaseBacklog.SCOPE_ORDER && legId <= b.legId) {
+            redundantOutcomeCount++; // U6: the outcome after the ME's own terminal (IOC and G9 shapes)
+            return;
+        }
+        staleOutcomeCount++; // U7
+    }
+
+    /** Table D row U0: the outcome of an orphan cancel (rows E1-E4). */
+    private void orphanOutcome(final ReleaseBacklog.Entry b, final MeOutcomeView v) {
+        if (v.result != RESULT_CAPACITY) {
+            clearOrphanWait(b.orderId);
+        }
+        switch (v.result) {
+            case RESULT_APPLIED:
+            case RESULT_REJECTED:
+            case RESULT_UNKNOWN_LEG:
+            case RESULT_NOT_OWNER:
+            case RESULT_UNKNOWN_MARKET: {
+                // E1 / E2: the leg was cancelled (its CANCELLED terminal preceded, stale) or is not live: M12 ORDER
+                final int row = v.result == RESULT_APPLIED ? ROW_E1 : ROW_E2;
+                mintRelease(b.orderId, ((long) b.attempt << 2) | 3, ReleaseBacklog.SCOPE_ORDER, null);
+                b.orphanTries = 1;
+                ledger.eventSink().onReleaseEffect(b.orderId, b.floor, ReleaseScope.ORDER, null, row);
+                break;
+            }
+            case RESULT_CAPACITY:
+                capacityOutcome(b.orderId, b.userId, b.marketId); // E4: stays, the resync re-offers it
+                if (orphanCapacityWait.add(b.orderId)) {
+                    capacityParked++; // review NOTE-5
+                }
+                ledger.eventSink().onReleaseEffect(b.orderId, b.floor, ReleaseScope.ORDER, null, ROW_E4);
+                break;
+            default:
+                // E3 (CONFLICT, RELEASED, INVALID): parked, alarmed; the market stays gated until ADMIN OPEN (D-S8-3)
+                park(b);
+                fault(OrderFaultKind.ME_LEG_LIVE, b.orderId, b.userId, b.marketId, 0L, b.legId);
+                ledger.eventSink().onReleaseEffect(b.orderId, b.floor, ReleaseScope.ORDER, null, ROW_E3);
+                break;
+        }
+    }
+
+    /**
+     * MeCommandRelease 67 content under behaviour v3 (S8 3.2): the root link check and clamp, then each group entry in
+     * order against the backlog, first matching row of C1-C6. Releases nothing from any hold.
+     */
+    public void applyReleaseV3(final MeReleaseView v, final long timestamp) {
+        ledger.observeLogTime(timestamp);
+        linkCheck(v.ledgerSize, v.ledgerCapacity, false, false);
+        for (int i = 0; i < v.count; i++) {
+            releaseEntry(v.commandIdHigh[i], v.idLowFloor[i], v.scope[i], v.result[i]);
+        }
+        endApply();
+    }
+
+    private void releaseEntry(final long h, final long f, final int sc, final int r) {
+        final ReleaseBacklog.Entry b = backlog.get(h);
+        final ReleaseScope scope = scopeOf(sc);
+        final ReleaseResult result = ReleaseResult.fromCode(r);
+        int row;
+        if (r != RESULT_LEG_LIVE_RELEASE) {
+            if (sc == ReleaseBacklog.SCOPE_ORDER && b != null) {
+                dropEntry(b); // C1: ORDER APPLIED proves no leg rests, NOOP that h was tombstoned
+                releaseConfirmedCount++;
+                row = ROW_C1;
+            } else if (sc == ReleaseBacklog.SCOPE_UP_TO && b != null && b.scope == ReleaseBacklog.SCOPE_UP_TO && f >= b.floor) {
+                dropEntry(b); // C2: S4 NOTE-9 dominance
+                releaseConfirmedCount++;
+                row = ROW_C2;
+            } else {
+                releaseConfirmStaleCount++; // C3
+                row = ROW_C3;
+            }
+        } else if (b != null && b.scope == ReleaseBacklog.SCOPE_ORDER && b.stage == ReleaseBacklog.STAGE_RELEASE && f == b.floor) {
+            // W4: a leg of h still rests at the ME
+            legLiveCount++;
+            fault(OrderFaultKind.ME_LEG_LIVE, h, b.userId, b.marketId, 0L, b.legId);
+            gateMarket(b.marketId);
+            if (b.orphanTries == 0) {
+                if (b.legId == 0) {
+                    park(b); // C4 with no known leg
+                } else {
+                    b.attempt++;
+                    backlog.setStage(b, ReleaseBacklog.STAGE_ORPHAN_CANCEL);
+                    mintOrphanCancel(b); // C4; from here the frame's fields are frozen (FIX-2)
+                }
+                row = ROW_C4;
+            } else {
+                park(b); // C5: the second LEG_LIVE after an orphan round
+                row = ROW_C5;
+            }
+        } else {
+            legLiveDuplicateCount++; // C6: dedupe per order across forwarder copies
+            row = ROW_C6;
+        }
+        ledger.eventSink().onReleaseEffect(h, f, scope, result, row);
+    }
+
+    /**
+     * Section 2 defaults (FIX-7) for the S7 signatures and every RC1-shaped caller under v3: orderType and side from the
+     * matched record (0 when none), appliedPosition = egressSeq, status 0 / 4 / -1 by result, timeInForce and
+     * expectedOldRemaining as the matched pending dispatch was minted (0 when none), ledgerSize = meLedgerSize (the bound
+     * meLedgerCapacity for a CAPACITY result, S4 3.3), ledgerCapacity = meLedgerCapacity, behaviorVersion =
+     * meBehaviorVersion.
+     */
+    public MeOutcomeView outcomeWithDefaults(final MeOutcomeView v, final long egressSeq, final long journalSeq,
+                                             final long commandIdHigh, final long commandIdLow, final long userId,
+                                             final long omsOrderId, final long oldOrderId, final long price, final long quantity,
+                                             final long budget, final int marketId, final int commandKind, final int result,
+                                             final long legId, final int reason, final boolean oldCancelled,
+                                             final long meTimestamp, final long meEpoch) {
+        v.reset();
+        v.egressSeq = egressSeq;
+        v.journalSeq = journalSeq;
+        v.meEpoch = meEpoch;
+        v.commandIdHigh = commandIdHigh;
+        v.commandIdLow = commandIdLow;
+        v.userId = userId;
+        v.omsOrderId = omsOrderId;
+        v.oldOrderId = oldOrderId;
+        v.price = price;
+        v.quantity = quantity;
+        v.budget = budget;
+        v.marketId = marketId;
+        v.commandKind = commandKind;
+        v.result = result;
+        v.orderId = legId;
+        v.reason = reason;
+        v.oldCancelled = oldCancelled;
+        v.meTimestamp = meTimestamp;
+        v.appliedPosition = egressSeq;
+        v.status = result == RESULT_APPLIED ? 0 : result == RESULT_REJECTED ? ST_REJECTED : -1;
+        final CoreOrder o = orders.get(commandIdHigh);
+        if (o != null) {
+            v.orderType = meOrderType(o);
+            v.orderSide = o.side;
+            if (o.has(CoreOrder.F_DISPATCH_PENDING) && commandIdLow == (((long) o.attempt << 2) | kindCodeOf(o.pendingKind))) {
+                final DispatchKind kind = o.pendingKind == CoreOrder.PK_CANCEL ? DispatchKind.CANCEL
+                        : o.pendingKind == CoreOrder.PK_AMEND ? DispatchKind.AMEND : DispatchKind.CREATE;
+                v.timeInForce = wireTif(o, kind, v3());
+                v.expectedOldRemaining = kind == DispatchKind.AMEND && v3() ? o.pendingExpectedOldRemaining : 0L;
+            }
+        }
+        v.ledgerCapacity = ledger.feed().meLedgerCapacity();
+        v.ledgerSize = result == RESULT_CAPACITY ? v.ledgerCapacity : meLedgerSize;
+        v.behaviorVersion = ledger.feed().meBehaviorVersion();
+        return v;
+    }
+
+    // ---------------------------------------------------------------- RC2 S8: restore (sections 2 and 11) and derived state
+
+    /** Section 11 restore: one backlog entry exactly as read (checked by {@link #meLinkRestoreBreach}). */
+    public void restoreBacklogEntry(final ReleaseBacklog.Entry e) {
+        backlog.restore(e);
+    }
+
+    /** Section 11 restore: the ME link head. */
+    public void restoreMeLink(final long ledgerSize, final boolean high) {
+        this.meLedgerSize = ledgerSize;
+        this.capacityHigh = high;
+    }
+
+    /**
+     * Rebuild the derived state of S8 1.5/1.6 after sections 2 and 11: the index (live {@code F_DISPATCH_PENDING} records
+     * and the backlog's RELEASE and ORPHAN_CANCEL entries, sorted by seq), and the maintained gauges.
+     */
+    public void rebuildDerived() {
+        final int n = orders.size() + backlog.size();
+        final long[] seqs = new long[n];
+        final long[] refs = new long[n];
+        final int[] tags = new int[n];
+        final int[] k = {0};
+        final long[] parked = {0L};
+        final long[] quarantined = {0L};
+        orders.forEachByOrderId(o -> {
+            if (o.has(CoreOrder.F_DISPATCH_PENDING)) {
+                seqs[k[0]] = o.pendingDispatchSeq;
+                refs[k[0]] = o.orderId;
+                tags[k[0]] = PendingDispatchIndex.TAG_TRADING;
+                k[0]++;
+            }
+            if (o.has(CoreOrder.F_ME_CAPACITY_WAIT)) {
+                parked[0]++;
+            }
+            if (o.has(CoreOrder.F_QUARANTINED)) {
+                quarantined[0]++;
+            }
+        });
+        backlog.forEachByOrderId(b -> {
+            if (b.stage != ReleaseBacklog.STAGE_PARKED) {
+                seqs[k[0]] = b.dispatchSeq;
+                refs[k[0]] = b.orderId;
+                tags[k[0]] = b.stage == ReleaseBacklog.STAGE_RELEASE ? PendingDispatchIndex.TAG_RELEASE : PendingDispatchIndex.TAG_ORPHAN;
+                k[0]++;
+            }
+        });
+        index.rebuild(seqs, refs, tags, k[0]);
+        orphanCapacityWait.clear(); // NOTE-5: node-local, not snapshotted
+        capacityParked = parked[0];
+        quarantinedLive = quarantined[0];
+        deferredCount = 0;
+        refreshGauges();
+    }
+
+    /**
+     * S8 5.1 a-d on every restored record (5.0: each with its live rule); null when they hold, else the first breach.
+     */
+    public String orderRestoreBreach(final boolean v3) {
+        final String[] breach = new String[1];
+        orders.forEachByOrderId(o -> {
+            if (breach[0] != null) {
+                return;
+            }
+            if (v3 && (o.userId < 1 || o.marketId < 1 || o.marketId > MARKETS || o.side < 0 || o.side > 1 || o.orderType < 0
+                    || o.orderType > 6 || o.timeInForce < 0 || o.timeInForce > 3 || o.attempt < 0 || o.currentLegId < 0
+                    || o.oldLegId < 0 || o.orderId < 1)) {
+                // review Q4: the identity M11 copies into an ORDER entry, range-checked as admission (applyCreate) checks it,
+                // the live rule of the 5.0 FIX-4 row; refused here instead of at the snapshot after M11 copies it
+                breach[0] = "order " + o.orderId + " has an identity outside the admission ranges (user " + o.userId + ", market "
+                        + o.marketId + ", side " + o.side + ", type " + o.orderType + ", tif " + o.timeInForce + ", attempt "
+                        + o.attempt + ", legs " + o.currentLegId + "/" + o.oldLegId + ")";
+            } else if ((o.stateFlags & ~CoreOrder.KNOWN_STATE_FLAGS) != 0) {
+                breach[0] = "order " + o.orderId + " carries state flag bits 0x" + Integer.toHexString(o.stateFlags);
+            } else if (o.has(CoreOrder.F_ME_CAPACITY_WAIT) && !o.has(CoreOrder.F_DISPATCH_PENDING)) {
+                breach[0] = "order " + o.orderId + " is ME_CAPACITY_WAIT without a pending dispatch";
+            } else if ((o.pendingLegQty != 0 || o.pendingExpectedOldRemaining != 0) && !o.has(CoreOrder.F_REPLACE_PENDING)) {
+                breach[0] = "order " + o.orderId + " carries an amend reference outside a replace window";
+            } else if (v3 && o.has(CoreOrder.F_REPLACE_PENDING) && (o.pendingLegQty < 1 || o.pendingExpectedOldRemaining < 1
+                    || o.pendingExpectedOldRemaining != o.quantity - o.pendingQuantity + o.pendingLegQty)) {
+                breach[0] = "order " + o.orderId + " has an amend reference that breaks 3.7 (leg " + o.pendingLegQty + ", eor "
+                        + o.pendingExpectedOldRemaining + ", qty " + o.quantity + ", pendingQty " + o.pendingQuantity + ")";
+            }
+        });
+        return breach[0];
+    }
+
+    /** S8 5.2 rules 1-7 against the restored sections 2, 8, 10 and 11; null when they hold, else the first breach. */
+    public String meLinkRestoreBreach() {
+        final long cap = ledger.feed().meLedgerCapacity();
+        if (meLedgerSize < 0 || meLedgerSize > cap) {
+            return "meLedgerSize " + meLedgerSize + " outside [0, " + cap + "]";
+        }
+        final long next = ledger.getNextOrderId();
+        final long head = ledger.getDispatchSeq();
+        final String[] breach = new String[1];
+        final long[] previous = {0L};
+        final org.agrona.collections.LongHashSet seqs = new org.agrona.collections.LongHashSet();
+        orders.forEachByOrderId(o -> {
+            if (o.has(CoreOrder.F_DISPATCH_PENDING)) {
+                seqs.add(o.pendingDispatchSeq);
+            }
+        });
+        backlog.forEachByOrderId(b -> {
+            if (breach[0] != null) {
+                return;
+            }
+            final String what = "backlog entry " + b.orderId + " " + b;
+            if (b.orderId <= previous[0] || b.orderId < 1 || b.orderId >= next) {
+                breach[0] = what + ": orderId outside [1, " + next + ") or not ascending";
+                return;
+            }
+            previous[0] = b.orderId;
+            if (b.scope < 0 || b.scope > 1 || b.stage < 0 || b.stage > 2 || b.orphanTries < 0 || b.orphanTries > 1) {
+                breach[0] = what + ": scope, stage or orphanTries out of range";
+                return;
+            }
+            final CoreOrder o = orders.get(b.orderId);
+            if (b.scope == ReleaseBacklog.SCOPE_UP_TO) {
+                if (o == null || o.has(CoreOrder.F_ME_RELEASED) || b.stage != ReleaseBacklog.STAGE_RELEASE || b.orphanTries != 0
+                        || b.userId != 0 || b.legId != 0 || b.marketId != 0 || b.attempt != 0 || b.side != 0 || b.meOrderType != 0
+                        || b.floor < 0 || b.floor >= ((((long) o.attempt) << 2) | 3)) {
+                    breach[0] = what + ": an UP_TO entry breaks rule 3";
+                    return;
+                }
+            } else {
+                final boolean identity = b.userId >= 1 && b.marketId >= 1 && b.marketId <= MARKETS && b.side >= 0 && b.side <= 1
+                        && b.meOrderType >= 0 && b.meOrderType <= 2 && b.legId >= 0 && b.attempt >= 0 && b.floor >= 3;
+                final long first = (((long) b.attempt) << 2) | 3;
+                final long second = ((((long) b.attempt) - 1) << 2) | 3;
+                final boolean stageOk;
+                switch (b.stage) {
+                    case ReleaseBacklog.STAGE_RELEASE: stageOk = b.floor == first; break;
+                    case ReleaseBacklog.STAGE_ORPHAN_CANCEL:
+                        stageOk = b.attempt >= 1 && b.floor == second && b.legId >= 1 && b.orphanTries == 0;
+                        break;
+                    default: stageOk = b.floor == first || (b.attempt >= 1 && b.floor == second); break;
+                }
+                if (o != null || !identity || !stageOk
+                        || (b.orphanTries == 1 && b.stage == ReleaseBacklog.STAGE_ORPHAN_CANCEL)) {
+                    breach[0] = what + ": an ORDER entry breaks rule 4 or 6";
+                    return;
+                }
+                final com.openexchange.assets.domain.Account acct = ledger.account(b.userId);
+                if (acct != null && acct.holdAssetId(b.orderId) >= 0) {
+                    breach[0] = what + ": the account of user " + b.userId + " still holds under the ORDER entry (rule 7)";
+                    return;
+                }
+            }
+            if (b.dispatchSeq < 1 || b.dispatchSeq > head || !seqs.add(b.dispatchSeq)) {
+                breach[0] = what + ": dispatchSeq outside [1, " + head + "] or not unique (rule 5)";
+            }
+        });
+        return breach[0];
+    }
+
+    /** S8 5.2 diagnostic D1 (counted, never a refusal): ME_CAPACITY on GLOBAL without capacityHigh. */
+    public void countRestoreDiagnostics() {
+        if (globalHas(GateReason.ME_CAPACITY) && !capacityHigh) {
+            restoreCapacityBitWithoutHighCount++;
+        }
+    }
+
+    // ---------------------------------------------------------------- RC2 S8: reads (metrics, tests)
+
+    public ReleaseBacklog backlog() { return backlog; }
+    public PendingDispatchIndex dispatchIndex() { return index; }
+    public long meLedgerSize() { return meLedgerSize; }
+    public boolean capacityHigh() { return capacityHigh; }
+    public long releaseMintedUpToCount() { return releaseMintedUpToCount; }
+    public long releaseMintedOrderCount() { return releaseMintedOrderCount; }
+    public long releaseConfirmedCount() { return releaseConfirmedCount; }
+    public long releaseConfirmStaleCount() { return releaseConfirmStaleCount; }
+    public long releaseAbandonedCount() { return releaseAbandonedCount; }
+    public long releaseSkippedCount() { return releaseSkippedCount; }
+    public long legLiveCount() { return legLiveCount; }
+    public long legLiveDuplicateCount() { return legLiveDuplicateCount; }
+    public long orphanCancelCount() { return orphanCancelCount; }
+    public long parkedCount() { return parkedCount; }
+    public long releasedLateCount() { return releasedLateCount; }
+    public long meInvalidCount() { return meInvalidCount; }
+    public long meReleaseEarlyCount() { return meReleaseEarlyCount; }
+    public long meAmendMismatchCount() { return meAmendMismatchCount; }
+    public long capacityWhileOpenCount() { return capacityWhileOpenCount; }
+    public long capacityOutcomeCount() { return capacityOutcomeCount; }
+    public long meLinkMismatchCount() { return meLinkMismatchCount; }
+    public long meLedgerSizeClampedCount() { return meLedgerSizeClampedCount; }
+    public long lateApplyOnDeadOrderCount() { return lateApplyOnDeadOrderCount; }
+    public long legZeroRefusedCount() { return legZeroRefusedCount; }
+    public long terminalWithPendingCreateCount() { return terminalWithPendingCreateCount; }
+    public long restoreCapacityBitWithoutHighCount() { return restoreCapacityBitWithoutHighCount; }
+    /** Index slots the last RequestPendingDispatch reply visited (test hook, G7). */
+    public long pendingReplyVisited() { return pendingReplyVisited; }
+    public long capacityParked() { return capacityParked; }
+    public long quarantinedLive() { return quarantinedLive; }
+    public long pendingOldestSeq() { return pendingOldestSeq; }
+    public long oldestReleaseSeq() { return oldestReleaseSeq; }
+    public long backlogRelease() { return backlog.count(ReleaseBacklog.STAGE_RELEASE); }
+    public long backlogOrphan() { return backlog.count(ReleaseBacklog.STAGE_ORPHAN_CANCEL); }
+    public long backlogParked() { return backlog.count(ReleaseBacklog.STAGE_PARKED); }
+
     // ---------------------------------------------------------------- RC1 S5: AmendOrder, QuarantineOrder, queries
 
     /** AmendOrder (52). Contract S5 §3.4 (lifecycle B7). */
     public void applyAmend(final AmendOrderCommand c, final long timestamp) {
+        amendBody(c, timestamp);
+        endApply();
+    }
+
+    private void amendBody(final AmendOrderCommand c, final long timestamp) {
         ledger.observeLogTime(timestamp);
         final long now = ledger.getLastLogTime();
         final AssetsEventSink sink = ledger.eventSink();
@@ -1460,7 +2494,11 @@ public final class OrderEngine {
         }
         if (o.isTerminal() || o.has(CoreOrder.F_QUARANTINED) || o.has(CoreOrder.F_CANCEL_PENDING)
                 || (o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingKind == CoreOrder.PK_CREATE)
-                || (o.orderType != TYPE_LIMIT && o.orderType != TYPE_LIMIT_MAKER)) {
+                || (o.orderType != TYPE_LIMIT && o.orderType != TYPE_LIMIT_MAKER)
+                || (o.remainingQty == 0 && v3())    // RC2 S8 3.7: defensive NOT_OPEN (structurally unreachable, FIX-5)
+                || (v3() && (o.has(CoreOrder.F_IOC) || o.has(CoreOrder.F_FOK)))) {
+            // review BLOCKER-1 (coordinator 2026-10-27): the native ME never rests an IOC/FOK, so an amend of one has no
+            // meaning; admitting it let the ME's kill terminal be taken for the replace's old-leg cancel and strand the hold
             rejectAmend(sink, c, CoreRejectReason.NOT_OPEN, c.orderId, now, false);
             return;
         }
@@ -1553,6 +2591,8 @@ public final class OrderEngine {
         o.pendingQuantity = newQty;
         o.pendingHoldDelta = holdDelta;
         o.pendingHoldTarget = holdTarget;
+        o.pendingLegQty = legQty; // RC2 S8 3.7, every behaviour: the reply replays the minted bytes
+        o.pendingExpectedOldRemaining = o.remainingQty;
         o.oldLegId = o.currentLegId;
         o.set(CoreOrder.F_REPLACE_PENDING);
         o.status = (byte) ST_PENDING_REPLACE;
@@ -1591,6 +2631,7 @@ public final class OrderEngine {
             sink.onAdminAck(correlationId, T_QUARANTINE, AdminResult.DUPLICATE, 0, 0L);
             return;
         }
+        quarantinedLive++;
         o.set(CoreOrder.F_QUARANTINED);
         o.updatedAtMs = now;
         if (o.status == ST_PENDING_TRIGGER) {
@@ -1630,50 +2671,94 @@ public final class OrderEngine {
         Arrays.fill(snapshotPage, 0, n[0], null);
     }
 
-    /** RequestPendingDispatch (65), ORIGIN-only reply. Contract S5 §3.6. */
+    /**
+     * RequestPendingDispatch (65), ORIGIN-only reply (RC2 S8 3.8, every behaviour). {@code maxEntries < 0}: OrderReject
+     * INVALID naming 65; {@code 0}: the head probe ({@code PendingDispatchEnd{0, dispatchSeq}}, no index visit); {@code 1..4096}
+     * a page (above 4096 clamped). The page walks the index from the first seq above {@code fromDispatchSeq}: O(log n + k +
+     * dead-in-range), zero allocation. Every reply entry equals its minted MeDispatch field for field. Read-only: no
+     * endApply, no mint, no BROADCAST.
+     */
     public void applyRequestPendingDispatch(final long correlationId, final long fromDispatchSeq, final int maxEntries) {
         final AssetsEventSink sink = ledger.eventSink();
-        final int max = maxEntries <= 0 ? PENDING_DISPATCH_DEFAULT : Math.min(maxEntries, PENDING_DISPATCH_CAP);
-        // a resync is rare and leader-only in effect: an allocation per call is acceptable (not a hot path)
-        final Long2LongHashMap seqToOrder = new Long2LongHashMap(-1L);
-        orders.forEachByOrderId(o -> {
-            if (o.has(CoreOrder.F_DISPATCH_PENDING) && o.pendingDispatchSeq > fromDispatchSeq) {
-                seqToOrder.put(o.pendingDispatchSeq, o.orderId);
-            }
-        });
-        final long[] seqs = new long[seqToOrder.size()];
-        int i = 0;
-        for (final long seq : seqToOrder.keySet()) {
-            seqs[i++] = seq;
+        pendingReplyVisited = 0;
+        if (maxEntries < 0) {
+            sink.onOrderReject(correlationId, 0L, 0L, 0L, 0L, 0, T_PENDING_DISPATCH, CoreRejectReason.INVALID, 255, maxEntries,
+                    ledger.getLastLogTime());
+            return;
         }
-        Arrays.sort(seqs);
-        final int count = Math.min(max, seqs.length);
-        for (int k = 0; k < count; k++) {
-            final CoreOrder o = orders.get(seqToOrder.get(seqs[k]));
-            final DispatchKind kind;
-            long oldLeg = 0L, price = 0L, qty = 0L, budget = 0L;
-            switch (o.pendingKind) {
-                case CoreOrder.PK_CANCEL:
-                    kind = DispatchKind.CANCEL;
-                    oldLeg = o.currentLegId;
-                    break;
-                case CoreOrder.PK_AMEND:
-                    kind = DispatchKind.AMEND;
-                    oldLeg = o.oldLegId;
-                    price = o.pendingPrice;
-                    qty = o.pendingQuantity - o.filledQty;
-                    break;
-                default:
-                    kind = DispatchKind.CREATE;
-                    price = meOrderType(o) == TYPE_MARKET ? 0L : o.price;
-                    qty = createQuantity(o);
-                    budget = o.budget;
-                    break;
-            }
-            sink.onMeDispatchReply(o.pendingDispatchSeq, o.orderId, ((long) o.attempt << 2) | kind.code(), kind, o.userId, o.orderId,
-                    oldLeg, o.marketId, meOrderType(o), o.side, price, qty, budget, o.timeInForce);
+        if (maxEntries == 0) {
+            sink.onPendingDispatchEnd(correlationId, 0, ledger.getDispatchSeq());
+            return;
         }
+        final int max = Math.min(maxEntries, PENDING_DISPATCH_CAP);
+        final boolean v3 = v3();
+        int count = 0;
+        long visited = 0;
+        for (int slot = index.firstSlotAfter(fromDispatchSeq); slot < index.end() && count < max; slot = index.nextSlot(slot)) {
+            visited++;
+            if (index.isDead(slot)) {
+                continue;
+            }
+            final long seq = index.seqAt(slot);
+            final long h = index.refAt(slot);
+            switch (index.tagAt(slot)) {
+                case PendingDispatchIndex.TAG_TRADING: {
+                    final CoreOrder o = orders.get(h);
+                    if (o == null || o.pendingDispatchSeq != seq) {
+                        throw new IllegalStateException("pending-dispatch index names seq " + seq + " for order " + h
+                                + " but the record says " + (o == null ? "dead" : String.valueOf(o.pendingDispatchSeq)));
+                    }
+                    replyTrading(sink, o, v3);
+                    break;
+                }
+                case PendingDispatchIndex.TAG_RELEASE: {
+                    final ReleaseBacklog.Entry b = backlog.get(h);
+                    sink.onMeDispatchReply(seq, h, b.floor, DispatchKind.RELEASE_ID, 0L, 0L, 0L, 0, 0, 0, 0L, 0L, 0L, 0,
+                            scopeOf(b.scope), 0L);
+                    break;
+                }
+                default: {
+                    final ReleaseBacklog.Entry b = backlog.get(h);
+                    sink.onMeDispatchReply(seq, h, ((long) b.attempt << 2) | DispatchKind.CANCEL.code(), DispatchKind.CANCEL, b.userId,
+                            h, b.legId, b.marketId, b.meOrderType, b.side, 0L, 0L, 0L, 0, ReleaseScope.UP_TO, 0L);
+                    break;
+                }
+            }
+            count++;
+        }
+        pendingReplyVisited = visited;
         sink.onPendingDispatchEnd(correlationId, count, ledger.getDispatchSeq());
+    }
+
+    /** The reply of one trading dispatch, computed from the record exactly as it was minted (3.6, 3.7, 3.8). */
+    private void replyTrading(final AssetsEventSink sink, final CoreOrder o, final boolean v3) {
+        final DispatchKind kind;
+        long oldLeg = 0L, price = 0L, qty = 0L, budget = 0L, eor = 0L;
+        switch (o.pendingKind) {
+            case CoreOrder.PK_CANCEL:
+                kind = DispatchKind.CANCEL;
+                oldLeg = o.currentLegId;
+                break;
+            case CoreOrder.PK_AMEND:
+                kind = DispatchKind.AMEND;
+                oldLeg = o.oldLegId;
+                price = o.pendingPrice;
+                qty = o.pendingLegQty; // S8 3.7: the minted quantity, never recomputed from fills inside the window
+                eor = v3 ? o.pendingExpectedOldRemaining : 0L;
+                break;
+            default:
+                kind = DispatchKind.CREATE;
+                price = meOrderType(o) == TYPE_MARKET ? 0L : o.price;
+                qty = createQuantity(o);
+                budget = o.budget;
+                break;
+        }
+        sink.onMeDispatchReply(o.pendingDispatchSeq, o.orderId, ((long) o.attempt << 2) | kind.code(), kind, o.userId, o.orderId,
+                oldLeg, o.marketId, meOrderType(o), o.side, price, qty, budget, wireTif(o, kind, v3), ReleaseScope.UP_TO, eor);
+    }
+
+    private static ReleaseScope scopeOf(final int scope) {
+        return scope == ReleaseBacklog.SCOPE_ORDER ? ReleaseScope.ORDER : ReleaseScope.UP_TO;
     }
 
     public long invalidTickCount() { return invalidTickCount; }

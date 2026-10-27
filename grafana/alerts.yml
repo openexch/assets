@@ -1,0 +1,90 @@
+# Prometheus alert rules for the Assets Engine (OMS + ledger core), RC2 S8 3.10 item 3 (D-S8-9).
+# Every expression names a series the node registers (AlertsFileTest checks this against OrderEngineMetrics).
+groups:
+  - name: assets-core
+    rules:
+      - alert: FeedDuplicateMismatch
+        expr: increase(assets_feed_duplicate_mismatch_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "A feed copy at an applied journalSeq differs from what was applied (in-epoch ME rewind or corrupt copy)"
+
+      - alert: FeedUnverifiedNoLaneBehind
+        # per instance, same labels on both sides; the 5m window on both sides keeps a lane that just caught up from paging
+        expr: increase(assets_feed_duplicate_unverified_total[5m]) > 0 and max_over_time(assets_feed_lanes_behind[5m]) == 0
+        labels: {severity: page}
+        annotations:
+          summary: "Feed duplicates older than the digest window while no bridge lane is catching up"
+
+      - alert: FeedUnverifiedLong
+        expr: increase(assets_feed_duplicate_unverified_total[5m]) > 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Unverifiable feed duplicates for 30m (a lane far behind, or a dead registered bridge lane, review 2 N-6)"
+
+      - alert: FeedLatched
+        expr: max(assets_feed_latch_reason) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "The ME feed is latched (FeedHaltReason code in the value); order entry is closed by BRIDGE_HALT"
+
+      - alert: GlobalGateClosed
+        # the registered GLOBAL reason bitmask; the existing assets_order_entry_gate gauge stays
+        expr: min(assets_order_entry_gate_reasons) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The global order-entry gate has carried a reason for 5m"
+
+      - alert: MeLinkFault
+        expr: >-
+          increase(assets_me_leg_live_total[5m]) > 0
+          or increase(assets_me_invalid_total[5m]) > 0
+          or increase(assets_me_release_early_total[5m]) > 0
+          or increase(assets_me_amend_mismatch_total[5m]) > 0
+          or increase(assets_me_link_mismatch_total[5m]) > 0
+          or increase(assets_late_apply_on_dead_order_total[5m]) > 0
+          or increase(assets_terminal_with_pending_create_total[5m]) > 0
+          or increase(assets_leg_zero_refused_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "The ME told the core something a correct ME never says (LEG_LIVE, INVALID, RELEASED early, amend mismatch, link mismatch, late apply, leg 0)"
+
+      - alert: MeCapacityWhileOpen
+        expr: increase(assets_me_capacity_while_open_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "A CAPACITY outcome while ME_CAPACITY was clear (expected once after an ADMIN override, D-S8-4)"
+
+      - alert: ReleaseBacklogParked
+        expr: max(assets_release_backlog_parked) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "A release backlog entry is PARKED: a leg may rest at the ME for an order the core ended (operator exit D-S8-3)"
+
+      - alert: DispatchStuck
+        # S12 A-3; replaces the forwarder spec's nonexistent core pending-age alarm (rc2-forwarder.md:600)
+        expr: changes(assets_pending_oldest_seq[2m]) == 0 and assets_pending_commands > 0 and assets_me_capacity_parked == 0
+        labels: {severity: page}
+        annotations:
+          summary: "The oldest pending ME command has not moved for 2m and nothing waits on capacity"
+
+      - alert: ReleasePathStuck
+        expr: changes(assets_release_backlog_oldest_seq[10m]) == 0 and (assets_release_backlog - assets_release_backlog_parked) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "The oldest unconfirmed release has not moved for 10m"
+
+      - alert: MeCapacityParked
+        expr: max(assets_me_capacity_parked) > 0
+        for: 60s
+        labels: {severity: warning}
+        annotations:
+          summary: "Commands wait after a CAPACITY outcome for 60s (the forwarder resync re-offers them at the reopen)"
+
+      - alert: CoreOrderMoneyRefused
+        expr: increase(assets_core_order_hold_refused_total[5m]) > 0 or increase(assets_core_order_release_refused_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "A TOOL/ADMIN Hold or Release named a core orderId under behaviour 3 and was refused (S8 3.12)"

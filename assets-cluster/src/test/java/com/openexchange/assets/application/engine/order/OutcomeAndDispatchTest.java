@@ -471,7 +471,7 @@ public class OutcomeAndDispatchTest {
         r.create(r.limit(1, 1, BUY, 100 * ONE, ONE));
         assertEquals(CoreRejectReason.GATE_CLOSED, r.reject().reason());
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xCA, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0xCA, 0L, 1024);
         assertEquals("the resync re-offers the pending create", 1, r.count(AssetsEngineEvent.MeDispatchReply.class));
         assertEquals(1, r.first(AssetsEngineEvent.MeDispatchReply.class).dispatchSeq());
     }

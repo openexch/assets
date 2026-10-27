@@ -411,11 +411,15 @@ public class FeedCursorTest {
     @Test
     public void release67ConsumesTheCursor() {
         final V3Rig r = book();
+        assertNotNull("precondition: the ack of order 1 minted its M6 UP_TO", r.engine.orders().backlog().get(1));
         r.mark();
-        assertTrue("67 applies (content unserved until S8)", r.release());
+        // RC2 S8 3.2: the content is applied, the cursor consumed as in S7
+        assertTrue("67 applies", r.releaseEntry(1, 0L, 0, 0));
         assertEquals(4L, r.cursor());
-        assertEquals(1L, r.feed().unservedReleaseCount());
-        assertEquals("67 emits nothing in S7", 0, r.events().size());
+        assertEquals("S8 serves the content", 0L, r.feed().unservedReleaseCount());
+        assertNull("C2: the dominating UP_TO confirmation drops the entry", r.engine.orders().backlog().get(1));
+        assertEquals(1L, r.engine.orders().releaseConfirmedCount());
+        assertEquals("one node-local release effect, no wire event", 1, r.events().size());
         assertTrue("the next entry is exactly next, not a gap", r.terminal(1, 101, 1, V3Rig.ME_CANCELLED, 0));
         assertEquals(5L, r.cursor());
         r.assertNotLatched("67 then 63");

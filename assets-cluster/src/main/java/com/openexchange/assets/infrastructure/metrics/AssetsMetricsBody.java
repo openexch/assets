@@ -35,6 +35,12 @@ public final class AssetsMetricsBody {
         return this;
     }
 
+    /** RC2 S8 3.10 item 3: register a group of series (one appended chain call per registrar, critic 1.2 seam 1). */
+    public AssetsMetricsBody include(final java.util.function.Consumer<AssetsMetricsBody> registrar) {
+        registrar.accept(this);
+        return this;
+    }
+
     public String render() {
         metrics.acquire(); // volatile read: makes service-thread plain writes visible
         final StringBuilder sb = new StringBuilder(8192);

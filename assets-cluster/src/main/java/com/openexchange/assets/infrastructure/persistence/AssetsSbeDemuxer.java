@@ -327,6 +327,18 @@ public final class AssetsSbeDemuxer {
     private final OrderEntryGateDecoder orderEntryGateDecoder = new OrderEntryGateDecoder();
     /** A session this registry never saw (or whose principal was unreadable): authorises nothing. */
     private final SessionAuthority unknownSession = new SessionAuthority(-2L, null);
+    // RC2 S8: the reusable 64 and 67 views (zero allocation on the feed path)
+    private final com.openexchange.assets.application.engine.order.MeOutcomeView outcomeView =
+            new com.openexchange.assets.application.engine.order.MeOutcomeView();
+    private final com.openexchange.assets.application.engine.order.MeReleaseView releaseView =
+            new com.openexchange.assets.application.engine.order.MeReleaseView();
+    // RC2 S8 3.10 item 3: node-local BRIDGE lane table (at most LANES), the highest journalSeq each lane delivered
+    static final int LANES = 8;
+    private final long[] laneSession = new long[LANES];
+    private final long[] laneHighest = new long[LANES];
+    private int laneCount;
+    /** The highest journalSeq of the feed frame being handled (0 = none); set by the feed handlers under v3. */
+    private long frameJournalSeq;
 
     /**
      * Dispatch a frame from a cluster session: the frame gate, then the session's authority (class mask,
@@ -427,6 +439,17 @@ public final class AssetsSbeDemuxer {
             return;
         }
 
+        // 4c. RC2 S8 3.12 (D-S8-10): under v3 a Hold 3 or Release 4 from TOOL or ADMIN, the trusted path included, naming
+        //     orderId >= 1 (the core's whole id space: past, live and future orders) is refused before the trusted bypass.
+        if ((templateId == HoldDecoder.TEMPLATE_ID || templateId == ReleaseDecoder.TEMPLATE_ID) && engine.behaviorV3()
+                && (authority.isTrusted() || authority.sessionClass() == SessionClass.TOOL
+                        || authority.sessionClass() == SessionClass.ADMIN)
+                && orderIdOf(templateId) >= 1) {
+            engine.refuseCoreOrderMoney(templateId, correlationIdOf(templateId), userIdOf(templateId),
+                    authority.sessionClass().value());
+            return;
+        }
+
         // 5. Session authority (K6): class mask, registration-first, user scope. RegisterSession itself is
         //    judged by the registry (so a session with no usable principal gets a REJECTED ack, not silence).
         if (!authority.isTrusted() && templateId != RegisterSessionDecoder.TEMPLATE_ID) {
@@ -454,6 +477,7 @@ public final class AssetsSbeDemuxer {
 
         // 6. Body decode and apply. Decode poison (IAE/IOOBE before any application callback) is dropped
         //    deterministically; any failure after `applying = true` latches and escapes to the service.
+        frameJournalSeq = 0L;
         try {
             switch (templateId) {
                 case DepositDecoder.TEMPLATE_ID:                handleDeposit(authority, timestamp); break;
@@ -501,6 +525,9 @@ public final class AssetsSbeDemuxer {
                     // ahead of this build is visible, never silent. Every known template has a case above today.
                     unhandled(templateId);
                     break;
+            }
+            if (isFeedTemplate(templateId) && engine.behaviorV3()) {
+                noteLane(authority); // node-local, after the apply (the cursor it compares against has moved)
             }
         } catch (final RuntimeException | Error failure) {
             if (!applying && (failure instanceof IllegalArgumentException
@@ -704,8 +731,15 @@ public final class AssetsSbeDemuxer {
     private void handleMeJournalTrade(long timestamp) {
         meJournalTradeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
         final int buy = meJournalTradeDecoder.takerIsBuyRaw();
-        if (!validBool(buy)) {
-            rejectDecode("MeJournalTrade takerIsBuy " + buy);
+        final boolean v3 = engine.behaviorV3();
+        if (v3) {
+            frameJournalSeq = meJournalTradeDecoder.journalSeq();
+        }
+        if (!validBool(buy) || (v3 && !tradeRangesV3(meJournalTradeDecoder.tradeId(), meJournalTradeDecoder.price(),
+                meJournalTradeDecoder.quantity(), meJournalTradeDecoder.marketId(), meJournalTradeDecoder.takerOrderId(),
+                meJournalTradeDecoder.makerOrderId(), meJournalTradeDecoder.takerUserId(), meJournalTradeDecoder.makerUserId(),
+                meJournalTradeDecoder.takerOmsOrderId(), meJournalTradeDecoder.makerOmsOrderId()))) {
+            rejectDecode("MeJournalTrade takerIsBuy " + buy + " or a v3 range (S8 3.9)");
             if (engine.behaviorV3()) {
                 applying = true;
                 engine.onFeedPoison(MeJournalTradeDecoder.TEMPLATE_ID,
@@ -769,8 +803,14 @@ public final class AssetsSbeDemuxer {
         for (final MeJournalTradeBatchDecoder.TradesDecoder t : meJournalTradeBatchDecoder.trades()) {
             final int at = groupStart + i++ * blockLength;
             final int raw = frame.getByte(at + MeJournalTradeBatchDecoder.TradesDecoder.takerIsBuyEncodingOffset()) & 0xFF;
-            if (!validBool(raw)) {
-                rejectDecode("MeJournalTradeBatch takerIsBuy " + raw + " at " + (i - 1));
+            final long entrySeq = frame.getLong(at + MeJournalTradeBatchDecoder.TradesDecoder.journalSeqEncodingOffset(),
+                    ByteOrder.LITTLE_ENDIAN);
+            if (entrySeq > frameJournalSeq) {
+                frameJournalSeq = entrySeq;
+            }
+            if (!validBool(raw) || !tradeRangesV3(t.tradeId(), t.price(), t.quantity(), t.marketId(), t.takerOrderId(),
+                    t.makerOrderId(), t.takerUserId(), t.makerUserId(), t.takerOmsOrderId(), t.makerOmsOrderId())) {
+                rejectDecode("MeJournalTradeBatch takerIsBuy " + raw + " or a v3 range (S8 3.9) at " + (i - 1));
                 if (engine.onFeedPoison(MeJournalTradeBatchDecoder.TEMPLATE_ID,
                         frame.getLong(at + MeJournalTradeBatchDecoder.TradesDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
                         frame.getLong(at + MeJournalTradeBatchDecoder.TradesDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
@@ -797,8 +837,14 @@ public final class AssetsSbeDemuxer {
         final int status = meJournalTerminalDecoder.statusRaw();
         final int meReject = meJournalTerminalDecoder.rejectReason();
         final boolean v3 = engine.behaviorV3();
-        // v3 (RC2 S7 5.4, FIX-8): status 2..4 (5 EXPIRED never comes from the ME); v1/v2 keep 2..5
-        if (status < 2 || status > (v3 ? 4 : 5) || meReject < 0 || meReject > 254) {
+        if (v3) {
+            frameJournalSeq = meJournalTerminalDecoder.journalSeq();
+        }
+        // v3 (RC2 S7 5.4, FIX-8): status 2..4 (5 EXPIRED never comes from the ME); v1/v2 keep 2..5. RC2 S8 3.9 (PJ:74-76):
+        // leg, user, market and OMS ids > 0 under v3
+        if (status < 2 || status > (v3 ? 4 : 5) || meReject < 0 || meReject > 254
+                || (v3 && (meJournalTerminalDecoder.orderId() <= 0 || meJournalTerminalDecoder.userId() <= 0
+                        || meJournalTerminalDecoder.marketId() <= 0 || meJournalTerminalDecoder.omsOrderId() <= 0))) {
             rejectDecode("MeJournalTerminal status " + status + " rejectReason " + meReject);
             if (v3) {
                 applying = true;
@@ -815,9 +861,9 @@ public final class AssetsSbeDemuxer {
     }
 
     /**
-     * 64. v7 ranges: {@code commandKind 0..2}, {@code result 0..8} (7 RELEASED and 8 INVALID reach applyOutcome and land
-     * in its default branch, counted stale with no mutation, until RC2 S8), {@code timeInForce 0..2}. The v7 tail
-     * (journalSeq, timeInForce, expectedOldRemaining, ledgerSize, ledgerCapacity, behaviorVersion) is not passed (S8).
+     * 64. v1/v2 ranges (S1/S7): {@code commandKind 0..2}, {@code result 0..8}, {@code timeInForce 0..2}. Under v3 the S8 3.9
+     * superset of the projector's rules ({@code PJ:92-101} verbatim, plus core-only (a) {@code ledgerCapacity >= 1}), and
+     * every field reaches the engine through the reusable view (zero allocation).
      */
     private void handleMeCommandOutcome(long timestamp) {
         meCommandOutcomeDecoder.wrapAndApplyHeader(frame, 0, headerDecoder);
@@ -826,25 +872,139 @@ public final class AssetsSbeDemuxer {
         final int tif = meCommandOutcomeDecoder.timeInForce();
         final int oldCancelled = meCommandOutcomeDecoder.oldCancelled();
         final boolean v3 = engine.behaviorV3();
-        // v3 (RC2 S7 5.4): oldCancelled 0..1, and result >= 2 carries oldCancelled 0
-        if (kind < 0 || kind > 2 || result < 0 || result > 8 || tif < 0 || tif > 2
-                || (v3 && (oldCancelled > 1 || (result >= 2 && oldCancelled != 0)))) {
-            rejectDecode("MeCommandOutcome kind " + kind + " result " + result + " timeInForce " + tif + " oldCancelled " + oldCancelled);
+        final com.openexchange.assets.application.engine.order.MeOutcomeView v = outcomeView.reset();
+        v.egressSeq = meCommandOutcomeDecoder.egressSeq();
+        v.journalSeq = meCommandOutcomeDecoder.journalSeq();
+        v.meEpoch = meCommandOutcomeDecoder.meEpoch();
+        v.commandIdHigh = meCommandOutcomeDecoder.commandIdHigh();
+        v.commandIdLow = meCommandOutcomeDecoder.commandIdLow();
+        v.userId = meCommandOutcomeDecoder.userId();
+        v.omsOrderId = meCommandOutcomeDecoder.omsOrderId();
+        v.oldOrderId = meCommandOutcomeDecoder.oldOrderId();
+        v.price = meCommandOutcomeDecoder.price();
+        v.quantity = meCommandOutcomeDecoder.quantity();
+        v.budget = meCommandOutcomeDecoder.budget();
+        v.marketId = meCommandOutcomeDecoder.marketId();
+        v.commandKind = kind;
+        v.orderType = meCommandOutcomeDecoder.orderType();
+        v.orderSide = meCommandOutcomeDecoder.orderSide();
+        v.appliedPosition = meCommandOutcomeDecoder.appliedPosition();
+        v.meTimestamp = meCommandOutcomeDecoder.meTimestamp();
+        v.orderId = meCommandOutcomeDecoder.orderId();
+        v.status = meCommandOutcomeDecoder.status();
+        v.reason = meCommandOutcomeDecoder.reason();
+        v.oldCancelled = oldCancelled == 1;
+        v.result = result;
+        v.timeInForce = tif;
+        v.expectedOldRemaining = meCommandOutcomeDecoder.expectedOldRemaining();
+        v.ledgerSize = meCommandOutcomeDecoder.ledgerSize();
+        v.ledgerCapacity = meCommandOutcomeDecoder.ledgerCapacity();
+        v.behaviorVersion = meCommandOutcomeDecoder.behaviorVersion();
+        if (v3) {
+            frameJournalSeq = v.journalSeq;
+        }
+        final boolean base = kind >= 0 && kind <= 2 && result >= 0 && result <= 8 && tif >= 0 && tif <= 2;
+        // v3: RC2 S7 5.4 (oldCancelled 0..1, result >= 2 carries 0) and the S8 3.9 superset of the projector's rules
+        if (!base || (v3 && (oldCancelled > 1 || (result >= 2 && oldCancelled != 0) || !outcomeRangesV3(v, oldCancelled)))) {
+            rejectDecode("MeCommandOutcome kind " + kind + " result " + result + " timeInForce " + tif + " oldCancelled "
+                    + oldCancelled + (v3 ? " or a v3 range (S8 3.9)" : ""));
             if (v3) {
                 applying = true;
-                engine.onFeedPoison(MeCommandOutcomeDecoder.TEMPLATE_ID,
-                        frame.getLong(HEADER + MeCommandOutcomeDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
-                        frame.getLong(HEADER + MeCommandOutcomeDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), 0L, timestamp);
+                engine.onFeedPoison(MeCommandOutcomeDecoder.TEMPLATE_ID, v.journalSeq, v.meEpoch, 0L, timestamp);
             }
             return;
         }
         applying = true;
-        engine.onMeOutcome(meCommandOutcomeDecoder.egressSeq(), meCommandOutcomeDecoder.journalSeq(), meCommandOutcomeDecoder.commandIdHigh(),
-                meCommandOutcomeDecoder.commandIdLow(), meCommandOutcomeDecoder.userId(), meCommandOutcomeDecoder.omsOrderId(),
-                meCommandOutcomeDecoder.oldOrderId(), meCommandOutcomeDecoder.price(), meCommandOutcomeDecoder.quantity(),
-                meCommandOutcomeDecoder.budget(), meCommandOutcomeDecoder.marketId(), kind, result, meCommandOutcomeDecoder.orderId(),
-                meCommandOutcomeDecoder.reason(), oldCancelled == 1, meCommandOutcomeDecoder.meTimestamp(),
-                meCommandOutcomeDecoder.meEpoch(), timestamp);
+        engine.onMeOutcome(v, timestamp);
+    }
+
+    /** S8 3.9: {@code PJ:92-101} verbatim, then core-only (a). */
+    private static boolean outcomeRangesV3(final com.openexchange.assets.application.engine.order.MeOutcomeView v,
+                                           final int oldCancelledRaw) {
+        final int kind = v.commandKind;
+        final int result = v.result;
+        return !(v.commandIdHigh == 0 && v.commandIdLow == 0)
+                && v.userId > 0 && v.omsOrderId > 0 && v.marketId > 0
+                && v.appliedPosition >= 0 && v.appliedPosition <= v.egressSeq
+                && v.orderId >= 0
+                && kind >= 0 && kind <= 2 && v.orderType >= 0 && v.orderType <= 2 && v.orderSide >= 0 && v.orderSide <= 1
+                && v.status >= -1 && v.status <= 4 && v.reason >= 0 && oldCancelledRaw <= 1 && result >= 0 && result <= 8
+                && (kind == 0 ? v.oldOrderId == 0 : v.oldOrderId > 0)
+                && (result <= 1 ? (v.orderId > 0 && v.status >= 0) : (v.orderId == 0 && v.status == -1))
+                && (oldCancelledRaw == 0 || kind == 2)
+                && v.timeInForce >= 0 && v.timeInForce <= 2
+                && v.expectedOldRemaining >= 0 && (kind == 2 || v.expectedOldRemaining == 0)
+                && v.ledgerSize >= 0 && v.behaviorVersion >= 1
+                && v.ledgerCapacity >= 1; // core-only (a)
+    }
+
+    /** S8 3.9 for 61 and each 62 entry ({@code PJ:61-63}); takerIsBuy is checked by the caller. */
+    private static boolean tradeRangesV3(final long tradeId, final long price, final long quantity, final int marketId,
+                                         final long takerLeg, final long makerLeg, final long takerUser, final long makerUser,
+                                         final long takerOms, final long makerOms) {
+        return tradeId > 0 && price > 0 && quantity > 0 && marketId > 0 && takerLeg > 0 && makerLeg > 0 && takerUser > 0
+                && makerUser > 0 && takerOms > 0 && makerOms > 0;
+    }
+
+    private static boolean isFeedTemplate(final int templateId) {
+        switch (templateId) {
+            case MeJournalTradeDecoder.TEMPLATE_ID:
+            case MeJournalTradeBatchDecoder.TEMPLATE_ID:
+            case MeJournalTerminalDecoder.TEMPLATE_ID:
+            case MeCommandOutcomeDecoder.TEMPLATE_ID:
+            case MeCommandReleaseDecoder.TEMPLATE_ID:
+            case MeEngineConfigDecoder.TEMPLATE_ID:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * RC2 S8 3.10 item 3: the node-local BRIDGE lane table. A registered BRIDGE session's highest delivered journalSeq is
+     * kept (at most {@link #LANES} lanes, more counted); a lane is dropped once its session is gone or not registered.
+     * {@code lanesBehind} = lanes below the cursor, recomputed per feed frame (O(lanes)). Never replicated.
+     */
+    private void noteLane(final SessionAuthority authority) {
+        if (!authority.isTrusted() && authority.sessionClass() == SessionClass.BRIDGE && frameJournalSeq > 0) {
+            final long id = authority.sessionId();
+            int at = -1;
+            for (int i = 0; i < laneCount; i++) {
+                if (laneSession[i] == id) {
+                    at = i;
+                    break;
+                }
+            }
+            if (at < 0) {
+                if (laneCount == LANES) {
+                    engine.feed().countFeedLaneOverflow();
+                } else {
+                    at = laneCount++;
+                    laneSession[at] = id;
+                    laneHighest[at] = 0L;
+                }
+            }
+            if (at >= 0 && frameJournalSeq > laneHighest[at]) {
+                laneHighest[at] = frameJournalSeq;
+            }
+        }
+        final long cursor = engine.feed().lastAppliedJournalSeq();
+        long behind = 0;
+        int w = 0;
+        for (int i = 0; i < laneCount; i++) {
+            final SessionAuthority a = engine.sessions().get(laneSession[i]);
+            if (a == null || !a.isRegistered()) {
+                continue; // dropped
+            }
+            laneSession[w] = laneSession[i];
+            laneHighest[w] = laneHighest[i];
+            w++;
+            if (laneHighest[i] < cursor) {
+                behind++;
+            }
+        }
+        laneCount = w;
+        engine.feed().setLanesBehind(behind);
     }
 
     private void handleRequestPendingDispatch() {
@@ -1127,8 +1287,9 @@ public final class AssetsSbeDemuxer {
     }
 
     /**
-     * MeCommandRelease (67, BRIDGE): every entry's {@code scope 0..1} and {@code result 0..2}, located by the frame's
-     * own dimensions as for 62. Served by RC2 S8.
+     * MeCommandRelease (67, BRIDGE): every entry's {@code scope 0..1} and {@code result 0..2}, located by the frame's own
+     * dimensions as for 62; under v3 also the S8 3.9 ranges ({@code PJ:118-125} and core-only (c)), then the content goes to
+     * the engine through the reusable view.
      */
     private void handleMeCommandRelease(final long timestamp) {
         final boolean v3 = engine.behaviorV3();
@@ -1136,32 +1297,57 @@ public final class AssetsSbeDemuxer {
         final int entryBlock = Short.toUnsignedInt(frame.getShort(groupOffset, ByteOrder.LITTLE_ENDIAN));
         final int count = Short.toUnsignedInt(frame.getShort(groupOffset + 2, ByteOrder.LITTLE_ENDIAN));
         final int groupStart = groupOffset + GROUP_HEADER;
+        final long journalSeq = frame.getLong(HEADER + MeCommandReleaseDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        final long meEpoch = frame.getLong(HEADER + MeCommandReleaseDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        if (v3) {
+            frameJournalSeq = journalSeq;
+        }
+        final com.openexchange.assets.application.engine.order.MeReleaseView v = releaseView.reset();
+        v.egressSeq = frame.getLong(HEADER + MeCommandReleaseDecoder.egressSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        v.journalSeq = journalSeq;
+        v.meEpoch = meEpoch;
+        v.releaseSeq = frame.getLong(HEADER + MeCommandReleaseDecoder.releaseSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        v.ledgerSize = frame.getInt(HEADER + MeCommandReleaseDecoder.ledgerSizeEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        v.ledgerCapacity = frame.getInt(HEADER + MeCommandReleaseDecoder.ledgerCapacityEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        v.tombstoneRanges = frame.getInt(HEADER + MeCommandReleaseDecoder.tombstoneRangesEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
+        boolean poison = v3 && (v.releaseSeq < 0 || v.ledgerSize < 0 || v.ledgerCapacity < 1 || v.tombstoneRanges < 0);
         for (int i = 0; i < count; i++) {
             final int at = groupStart + i * entryBlock;
             final int scope = frame.getByte(at + MeCommandReleaseDecoder.ReleasesDecoder.scopeEncodingOffset()) & 0xFF;
             final int result = frame.getByte(at + MeCommandReleaseDecoder.ReleasesDecoder.resultEncodingOffset()) & 0xFF;
-            if (scope > 1 || result > 2) {
-                rejectDecode("MeCommandRelease scope " + scope + " result " + result + " at " + i);
-                if (v3) {
-                    applying = true;
-                    engine.onFeedPoison(MeCommandReleaseDecoder.TEMPLATE_ID,
-                            frame.getLong(HEADER + MeCommandReleaseDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
-                            frame.getLong(HEADER + MeCommandReleaseDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), 0L,
-                            timestamp);
-                }
-                return;
+            final long high = frame.getLong(at + MeCommandReleaseDecoder.ReleasesDecoder.commandIdHighEncodingOffset(),
+                    ByteOrder.LITTLE_ENDIAN);
+            final long floor = frame.getLong(at + MeCommandReleaseDecoder.ReleasesDecoder.idLowFloorEncodingOffset(),
+                    ByteOrder.LITTLE_ENDIAN);
+            final int removed = frame.getInt(at + MeCommandReleaseDecoder.ReleasesDecoder.removedEncodingOffset(),
+                    ByteOrder.LITTLE_ENDIAN);
+            if (scope > 1 || result > 2 || (v3 && (removed < 0 || high < 1 || floor < 0 || (result == 2 && scope != 1)))) {
+                poison = true;
             }
+            if (!poison && v3) {
+                v.add(high, floor, scope, result, removed);
+            }
+            if (poison) {
+                rejectDecode("MeCommandRelease entry " + i + ": scope " + scope + " result " + result + " or a v3 range (S8 3.9)");
+                break;
+            }
+        }
+        if (poison) {
+            if (count == 0) {
+                rejectDecode("MeCommandRelease root: a v3 range (S8 3.9)");
+            }
+            if (v3) {
+                applying = true;
+                engine.onFeedPoison(MeCommandReleaseDecoder.TEMPLATE_ID, journalSeq, meEpoch, 0L, timestamp);
+            }
+            return;
         }
         if (!v3) {
             unhandled(MeCommandReleaseDecoder.TEMPLATE_ID);
             return;
         }
-        // RC2 S7: the cursor is consumed, the content is S8's (counted unservedReleaseCount)
-        final long egressSeq = frame.getLong(HEADER + MeCommandReleaseDecoder.egressSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN);
         applying = true;
-        engine.onMeRelease(egressSeq,
-                frame.getLong(HEADER + MeCommandReleaseDecoder.journalSeqEncodingOffset(), ByteOrder.LITTLE_ENDIAN),
-                frame.getLong(HEADER + MeCommandReleaseDecoder.meEpochEncodingOffset(), ByteOrder.LITTLE_ENDIAN), timestamp);
+        engine.onMeRelease(v, timestamp); // RC2 S8 3.2: the content is served
     }
 
     /** MeEngineConfig (68, BRIDGE): {@code decision 0..3}. Served under v3 (RC2 S7 D2 row 1, 4.2, D8b). */
@@ -1182,6 +1368,7 @@ public final class AssetsSbeDemuxer {
             unhandled(MeEngineConfigDecoder.TEMPLATE_ID);
             return;
         }
+        frameJournalSeq = meEngineConfigDecoder.journalSeq();
         applying = true;
         engine.onMeEngineConfig(meEngineConfigDecoder.egressSeq(), meEngineConfigDecoder.journalSeq(), meEngineConfigDecoder.meEpoch(),
                 meEngineConfigDecoder.configVersion(), meEngineConfigDecoder.behaviorVersion(), meEngineConfigDecoder.ledgerCapacity(),
@@ -1209,6 +1396,12 @@ public final class AssetsSbeDemuxer {
     /** The frame's correlationId when its template starts with one, else 0. Frame already bounds-checked. */
     private long correlationIdOf(final int templateId) {
         return HAS_CORRELATION[templateId] ? frame.getLong(HEADER) : 0L;
+    }
+
+    /** The decoded orderId of a Hold 3 or Release 4 frame (S8 3.12). Frame already bounds-checked. */
+    private long orderIdOf(final int templateId) {
+        return templateId == HoldDecoder.TEMPLATE_ID ? frame.getLong(HEADER + HoldDecoder.orderIdEncodingOffset())
+                : frame.getLong(HEADER + ReleaseDecoder.orderIdEncodingOffset());
     }
 
     /** The frame's userId for a user-scoped template, else 0. Offsets come from the generated codecs. */

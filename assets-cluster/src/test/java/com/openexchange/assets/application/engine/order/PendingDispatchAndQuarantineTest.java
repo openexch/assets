@@ -100,7 +100,7 @@ public class PendingDispatchAndQuarantineTest {
         // contract 3.6 RequestPendingDispatch (65): ordered by pendingDispatchSeq, original payload, then PENDINGEND
         final OrderRig r = threeCreatesAndACancel();
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xC0, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0xC0, 0L, 1024);
         assertEquals("4 DISPATCHREPLY frames + PENDINGEND, got " + r.events(), 5, r.events().size());
         final List<AssetsEngineEvent.MeDispatchReply> p = replies(r);
         assertEquals("ordered by dispatchSeq", List.of(2L, 3L, 4L, 5L), seqs(r));
@@ -147,7 +147,7 @@ public class PendingDispatchAndQuarantineTest {
         // contract 3.6: pending = DISPATCH_PENDING and pendingDispatchSeq > fromDispatchSeq
         final OrderRig r = fourCreates();
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xC1, 2L, 0);
+        r.orders.applyRequestPendingDispatch(0xC1, 2L, 1024);
         assertEquals("seqs 3 and 4 + PENDINGEND, got " + r.events(), 3, r.events().size());
         assertEquals(List.of(3L, 4L), seqs(r));
         final AssetsEngineEvent.PendingDispatchEnd end = r.first(AssetsEngineEvent.PendingDispatchEnd.class);
@@ -156,7 +156,7 @@ public class PendingDispatchAndQuarantineTest {
         assertEquals(0xC1, end.correlationId());
         // a cursor at the head: an empty page, still an end frame
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xC2, 4L, 0);
+        r.orders.applyRequestPendingDispatch(0xC2, 4L, 1024);
         final AssetsEngineEvent.PendingDispatchEnd empty = r.only(AssetsEngineEvent.PendingDispatchEnd.class);
         assertEquals(0, empty.count());
         assertEquals(4, empty.headDispatchSeq());
@@ -177,7 +177,7 @@ public class PendingDispatchAndQuarantineTest {
         r.orders.applyRequestPendingDispatch(0xC4, 2L, 2);
         assertEquals("the next page continues from the last seq seen", List.of(3L, 4L), seqs(r));
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xC5, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0xC5, 0L, 1024);
         assertEquals("maxEntries 0 is the default page (1024), not an empty page", List.of(1L, 2L, 3L, 4L), seqs(r));
         assertEquals(4, r.first(AssetsEngineEvent.PendingDispatchEnd.class).count());
     }
@@ -191,7 +191,7 @@ public class PendingDispatchAndQuarantineTest {
         outcome(r, 3, 0, KIND_CREATE, REJECTED, 0L, 0L);
         assertNull("precondition: a refused create left the store (3.3)", r.orders.orders().get(3));
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xC6, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0xC6, 0L, 1024);
         assertEquals("only the unresolved creates 1 and 4 are replayed", List.of(1L, 4L), seqs(r));
         final AssetsEngineEvent.PendingDispatchEnd end = r.first(AssetsEngineEvent.PendingDispatchEnd.class);
         assertEquals(2, end.count());

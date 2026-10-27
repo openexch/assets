@@ -177,6 +177,8 @@ public final class AssetsClusteredService implements ClusteredService {
     private boolean drainTimerArmed;
     private volatile long drainTimerFires;
     private volatile long resumableSessionsClosed;
+    /** Review FIX-2: every RC2 S8 3.13 discard close on this node (written on the service thread only). */
+    private volatile long discardClosesTotal;
 
     // Live egress instrumentation, published as Aeron counters so AeronStat (and therefore every bench
     // run) can read them without touching this process. Updated only from the drain timer, never from
@@ -377,7 +379,8 @@ public final class AssetsClusteredService implements ClusteredService {
                 .gauge("assets_deadline_index_size", "Entries in the derived deadline index (GTD, replace, requestId TTL)",
                         () -> engine.deadlines().size())
                 .gauge("assets_last_log_time_ms", "Monotone log time last applied by this ledger (cluster epoch ms)",
-                        engine::getLastLogTime);
+                        engine::getLastLogTime)
+                .include(com.openexchange.assets.infrastructure.metrics.OrderEngineMetrics.of(engine.metricsView(), this::egressDiscardCloses));
     }
 
     /**
@@ -1251,7 +1254,7 @@ public final class AssetsClusteredService implements ClusteredService {
         for (final ClientSession session : sessions) {
             SessionEgressQueue queue = egressBySessionId.get(session.id());
             if (queue == null || queue.session() != session) {
-                queue = new SessionEgressQueue(session);
+                queue = new SessionEgressQueue(session, this::countDiscardClose);
                 egressBySessionId.put(session.id(), queue);
             }
             rebuilt[i++] = queue;
@@ -1311,6 +1314,19 @@ public final class AssetsClusteredService implements ClusteredService {
             idleStrategy.idle();
         }
         drainTimerArmed = true;
+    }
+
+    /**
+     * RC2 S8 3.13 with review FIX-2: a monotone service-level total. Each queue reports its discard close here at the
+     * moment it closes the session, so the count survives the queue's retirement at onSessionClose (a sum over the live
+     * queues fell back to 0 within a duty cycle) and never decreases.
+     */
+    private long egressDiscardCloses() {
+        return discardClosesTotal;
+    }
+
+    private void countDiscardClose() {
+        discardClosesTotal++;
     }
 
     /** Sum over live session queues (a closed session's drops leave with its queue). */

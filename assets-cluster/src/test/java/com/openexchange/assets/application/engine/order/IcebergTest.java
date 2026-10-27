@@ -351,7 +351,7 @@ public class IcebergTest {
         k.sellerTakes(a, S1, PX, ONE);
         final AssetsEngineEvent.MeDispatch d = k.onlyIceDispatch("refill");
         r.markNow();
-        r.orders.applyRequestPendingDispatch(4_242L, 0L, 0);
+        r.orders.applyRequestPendingDispatch(4_242L, 0L, 1024);
         AssetsEngineEvent.MeDispatchReply reply = null;
         for (final AssetsEngineEvent e : r.events()) {
             if (e instanceof AssetsEngineEvent.MeDispatchReply x && x.omsOrderId() == ICE) {

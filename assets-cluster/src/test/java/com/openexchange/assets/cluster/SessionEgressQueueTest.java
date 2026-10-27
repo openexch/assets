@@ -85,8 +85,11 @@ public class SessionEgressQueueTest {
             return new byte[0];
         }
 
+        int closes;
+
         @Override
         public void close() {
+            closes++;
         }
 
         @Override
@@ -513,5 +516,67 @@ public class SessionEgressQueueTest {
         assertEquals("the ack staged behind it follows, in order",
                 HoldAckBatchDecoder.TEMPLATE_ID, templateIdOf(session.deliveredFrames.get(1)));
         assertTrue(queue.isEmpty());
+    }
+
+    /**
+     * RC2 S8 3.13 (S12 A-2): on a resumable session that has had a positive offer, NOT_CONNECTED or MAX_POSITION_EXCEEDED
+     * resets the queue and closes the session exactly as the ceiling path does; nothing later is delivered on it. Before
+     * the first delivery, or on a non-resumable session, today's discard stands.
+     */
+    @Test
+    public void notConnectedAfterFirstDeliveryClosesResumableSession() {
+        for (final long result : new long[] {Publication.NOT_CONNECTED, Publication.MAX_POSITION_EXCEEDED}) {
+            final ScriptedSession session = new ScriptedSession(7);
+            final SessionEgressQueue queue = new SessionEgressQueue(session);
+            queue.markResumable();
+            append(queue, 1);
+            queue.drainAll();
+            assertArrayEquals("the first frame delivered", new int[] {1}, session.delivered());
+            session.result(result);
+            append(queue, 2);
+            append(queue, 3);
+            queue.drainAll();
+            assertTrue("closed on the discard (" + result + ")", queue.isDiscardClosed());
+            assertEquals("the session close went out", 1, session.closes);
+            assertEquals(1L, queue.discardCloseCount());
+            assertTrue("the queue was reset", queue.isEmpty());
+            session.result(1); // even if the transport came back, nothing later is delivered on this session
+            append(queue, 4);
+            queue.drainAll();
+            assertArrayEquals("nothing after the close", new int[] {1}, session.delivered());
+            assertEquals("counted once", 1L, queue.discardCloseCount());
+        }
+        // no positive offer yet: today's discard (aDeadSessionDiscardsRatherThanBlocking), no close
+        final ScriptedSession fresh = new ScriptedSession(8);
+        final SessionEgressQueue never = new SessionEgressQueue(fresh);
+        never.markResumable();
+        fresh.result(Publication.NOT_CONNECTED);
+        append(never, 1);
+        never.drainAll();
+        assertEquals(0, fresh.closes);
+        assertEquals(0L, never.discardCloseCount());
+        // not resumable: today's discard
+        final ScriptedSession plain = new ScriptedSession(9);
+        final SessionEgressQueue q = new SessionEgressQueue(plain);
+        append(q, 1);
+        q.drainAll();
+        plain.result(Publication.NOT_CONNECTED);
+        append(q, 2);
+        q.drainAll();
+        assertEquals(0, plain.closes);
+        plain.result(1);
+        append(q, 3);
+        q.drainAll();
+        assertArrayEquals("a non-resumable session keeps today's behaviour", new int[] {1, 3}, plain.delivered());
+        // CLOSED keeps today's discard too
+        final ScriptedSession gone = new ScriptedSession(10);
+        final SessionEgressQueue g = new SessionEgressQueue(gone);
+        g.markResumable();
+        append(g, 1);
+        g.drainAll();
+        gone.result(Publication.CLOSED);
+        append(g, 2);
+        g.drainAll();
+        assertEquals("CLOSED: no second close", 0, gone.closes);
     }
 }

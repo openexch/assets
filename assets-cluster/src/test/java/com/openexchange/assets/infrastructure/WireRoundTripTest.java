@@ -739,6 +739,52 @@ public class WireRoundTripTest {
         assertEquals(0L, md.expectedOldRemaining());
     }
 
+    /**
+     * RC2 S8 section 4 (W7, D-S8-1): the three appended enum values on the wire (OrderFault kinds 7 and 8, CoreRejectReason
+     * 43 on an OrderReject) and the publisher's MeDispatch fields 15 and 16 (releaseScope on RELEASE_ID, the AMEND
+     * reference), BROADCAST and ORIGIN alike.
+     */
+    @Test
+    public void s8EnumAppendsAndDispatchFieldsRoundTrip() {
+        final RawEgress egress = new RawEgress();
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> false);
+        for (final com.openexchange.assets.domain.OrderFaultKind k : new com.openexchange.assets.domain.OrderFaultKind[] {
+                com.openexchange.assets.domain.OrderFaultKind.ME_INVALID, com.openexchange.assets.domain.OrderFaultKind.ME_AMEND_MISMATCH}) {
+            p.onOrderFault(k, 11L, 12L, 1, 0L, 13L, 14L);
+            final UnsafeBuffer f = egress.last();
+            final var d = new com.openexchange.assets.infrastructure.generated.OrderFaultDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+            assertEquals(k.code(), d.kindRaw());
+            assertEquals(k.name(), d.kind().name());
+            assertEquals(13L, d.amount());
+        }
+        assertEquals(7, com.openexchange.assets.domain.OrderFaultKind.ME_INVALID.code());
+        assertEquals(8, com.openexchange.assets.domain.OrderFaultKind.ME_AMEND_MISMATCH.code());
+        assertEquals(43, com.openexchange.assets.domain.CoreRejectReason.ME_RELEASED.code());
+        p.onOrderReject(5L, 0L, 0L, 1L, 2L, 1, 50, com.openexchange.assets.domain.CoreRejectReason.ME_RELEASED, 255, 0L, 9L);
+        UnsafeBuffer f = egress.last();
+        final var rej = new com.openexchange.assets.infrastructure.generated.OrderRejectDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.CoreRejectReason.ME_RELEASED, rej.reason());
+        // 104 fields 15 and 16
+        p.onMeDispatch(1L, 2L, 7L, com.openexchange.assets.domain.DispatchKind.RELEASE_ID, 0L, 0L, 0L, 0, 0, 0, 0L, 0L, 0L, 0,
+                com.openexchange.assets.domain.ReleaseScope.ORDER, 0L);
+        f = egress.last();
+        var md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER, md.releaseScope());
+        assertEquals(7L, md.commandIdLow());
+        p.onMeDispatchReply(1L, 2L, 6L, com.openexchange.assets.domain.DispatchKind.AMEND, 3L, 2L, 101L, 1, 0, 0, 100L, 50L, 0L, 0,
+                com.openexchange.assets.domain.ReleaseScope.UP_TO, 75L);
+        f = egress.last();
+        md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(75L, md.expectedOldRemaining());
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+        // releaseScope is written 0 on every other kind, whatever the caller passes (S1 4.4)
+        p.onMeDispatch(1L, 2L, 6L, com.openexchange.assets.domain.DispatchKind.CANCEL, 3L, 2L, 101L, 1, 0, 0, 0L, 0L, 0L, 0,
+                com.openexchange.assets.domain.ReleaseScope.ORDER, 0L);
+        f = egress.last();
+        md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+    }
+
     private static final class OrderEventDecoderView {
         private final com.openexchange.assets.infrastructure.generated.OrderEventDecoder d;
 

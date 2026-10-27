@@ -199,4 +199,62 @@ public class FeedDuplicateBeltTest {
         assertFalse(w.releaseAt(oldest, EPOCH, oldest * 10 + 1));
         assertEquals(1L, w.feed().duplicateMismatchCount());
     }
+
+    // RC2 S8 7 G8 (3.10 item 2): the widened digests: a copy at an applied journalSeq that differs only in the 64 tail
+    // (ledgerSize, status) or in one 67 entry is a mismatch, latched SOURCE_SCHEMA, no longer a silent DUPLICATE
+    @Test
+    public void widenedDigestRefusesTailAndGroupCopies() {
+        for (final String field : new String[] {"ledgerSize", "status", "tif", "eor", "behavior"}) {
+            final V3Rig r = V3Rig.open();
+            r.deposit(1, USD, 1_000_000 * ONE);
+            final long h = r.create(r.limit(1, 0, 100 * ONE, ONE));
+            final com.openexchange.assets.application.engine.order.MeOutcomeView v = r.outcomeView(h, 0, V3Rig.KIND_CREATE, 0, 101, 0);
+            assertTrue(r.apply(v));
+            final long applied = v.journalSeq;
+            final com.openexchange.assets.application.engine.order.MeOutcomeView copy = r.outcomeView(h, 0, V3Rig.KIND_CREATE, 0, 101, 0);
+            copy.journalSeq = applied;
+            copy.egressSeq = v.egressSeq;
+            copy.appliedPosition = v.appliedPosition;
+            copy.orderType = v.orderType;
+            copy.orderSide = v.orderSide;
+            copy.timeInForce = v.timeInForce;
+            copy.expectedOldRemaining = v.expectedOldRemaining;
+            copy.ledgerSize = v.ledgerSize;
+            copy.status = v.status;
+            copy.behaviorVersion = v.behaviorVersion;
+            switch (field) {
+                case "ledgerSize": copy.ledgerSize = v.ledgerSize + 1; break;
+                case "status": copy.status = 3; break;
+                case "tif": copy.timeInForce = 1; break;
+                case "eor": copy.expectedOldRemaining = 1; break;
+                default: copy.behaviorVersion = 3; break;
+            }
+            assertFalse(field + ": refused", r.apply(copy));
+            assertEquals(field + ": a mismatch", 1L, r.feed().duplicateMismatchCount());
+            assertEquals(field + ": latched", FeedHaltReason.SOURCE_SCHEMA, r.feed().latchReason());
+            // the byte-equal copy stays a DUPLICATE
+            final V3Rig q = V3Rig.open();
+            q.deposit(1, USD, 1_000_000 * ONE);
+            final long g = q.create(q.limit(1, 0, 100 * ONE, ONE));
+            final com.openexchange.assets.application.engine.order.MeOutcomeView w = q.outcomeView(g, 0, V3Rig.KIND_CREATE, 0, 101, 0);
+            assertTrue(q.apply(w));
+            assertTrue(field + ": an equal copy is a DUPLICATE", q.apply(w));
+            assertEquals(0L, q.feed().duplicateMismatchCount());
+        }
+        // a 67 copy differing in one group entry
+        final V3Rig r = V3Rig.open();
+        final com.openexchange.assets.application.engine.order.MeReleaseView v = r.releaseView(new long[] {5, 0, 0, 0}, new long[] {6, 0, 0, 1});
+        assertTrue(r.apply(v));
+        final com.openexchange.assets.application.engine.order.MeReleaseView copy = new com.openexchange.assets.application.engine.order.MeReleaseView();
+        copy.egressSeq = v.egressSeq;
+        copy.journalSeq = v.journalSeq;
+        copy.meEpoch = v.meEpoch;
+        copy.releaseSeq = v.releaseSeq;
+        copy.ledgerSize = v.ledgerSize;
+        copy.ledgerCapacity = v.ledgerCapacity;
+        copy.add(5, 0, 0, 0, 1).add(6, 0, 0, 1, 2); // the second entry's removed differs
+        assertFalse(r.apply(copy));
+        assertEquals(1L, r.feed().duplicateMismatchCount());
+        assertEquals(FeedHaltReason.SOURCE_SCHEMA, r.feed().latchReason());
+    }
 }

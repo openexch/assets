@@ -415,7 +415,8 @@ final class CoreFrameStory {
                     frame(b); // re-delivery: a counted no-op
                 }
             } else if (p < 95) {
-                frame(outcome(o, cmdLow, kind, 0L, 0L, 3, 1)); // REJECTED by the ME
+                // REJECTED by the ME; under v3 the ME names the refused leg (RC2 S8 3.9: result <= 1 carries orderId > 0)
+                frame(outcome(o, cmdLow, kind, 0L, v3 ? ++legSeq : 0L, 3, 1));
             } else {
                 frame(enc.terminal(++egress, ++legSeq, o.userId, o.marketId, 4, now, o.orderId, js())); // terminal first (G9)
             }
@@ -428,7 +429,9 @@ final class CoreFrameStory {
                 frame(outcome(o, cmdLow, kind, o.currentLegId, o.currentLegId, 2, 1)); // refused: flag kept
             }
         } else {
-            frame(p < 80 ? outcome(o, cmdLow, kind, o.oldLegId, ++legSeq, 0, 0) : outcome(o, cmdLow, kind, o.oldLegId, 0L, 2, 1));
+            // an amend REJECTED names the old leg under v3 (RC2 S8 3.9: result <= 1 carries orderId > 0; S7 A6)
+            frame(p < 80 ? outcome(o, cmdLow, kind, o.oldLegId, ++legSeq, 0, 0)
+                    : outcome(o, cmdLow, kind, o.oldLegId, v3 ? o.oldLegId : 0L, 2, 1));
         }
     }
 

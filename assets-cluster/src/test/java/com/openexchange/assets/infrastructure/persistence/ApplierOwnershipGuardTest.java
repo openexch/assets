@@ -45,7 +45,7 @@ public class ApplierOwnershipGuardTest {
             "accountCount", "getLastAppliedTradeId", "getConsumePosition", "getJournalSeq", "isMoneyJournalEnabled",
             "getSettleFaultCount", "getSuppressedFeedReleaseCount", "getExhaustedHoldsReaped", "getSettleRejectCount",
             "getLastLogTime", "sessions().size", "gate().state", "deadlines().size", "deadlines().isEmpty",
-            "forEachAccountByUserId", "orders().orders");
+            "forEachAccountByUserId", "orders().orders", "metricsView"); // RC2 S8 3.10 item 3: the read-only metrics view
     /** Engine members that are sub-component accessors: the access is judged one call deeper. */
     static final Set<String> ENGINE_COMPONENTS = Set.of("sessions", "gate", "deadlines", "orders");
     static final Set<String> DEMUXER_ALLOWED = Set.of(

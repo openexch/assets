@@ -125,7 +125,7 @@ public class OutcomeEdgeCasesTest {
         assertEquals("the top-up stays locked", 200 * ONE, s.acct(1).locked(USD));
         assertEquals(0, r2.orders.staleOutcomeCount());
         r2.markNow();
-        r2.orders.applyRequestPendingDispatch(0xCB, 0L, 0);
+        r2.orders.applyRequestPendingDispatch(0xCB, 0L, 1024);
         final AssetsEngineEvent.MeDispatchReply d = r2.first(AssetsEngineEvent.MeDispatchReply.class);
         assertEquals("the resync re-offers the AMEND", DispatchKind.AMEND, d.kind());
         assertEquals(2, d.dispatchSeq());

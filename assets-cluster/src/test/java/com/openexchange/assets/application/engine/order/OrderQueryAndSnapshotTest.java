@@ -39,7 +39,7 @@ public class OrderQueryAndSnapshotTest {
     private static final int T_REQUEST_ORDER_SNAPSHOT = 53;
     private static final int PAGE = 512;
     /** Contract section 1 (amended 2026-10-26): 33 longs (pendingDispatchSeq, replaceDeadlineMs), 4 ints, 1 short, 6 bytes. */
-    private static final int SECTION2_RECORD_BYTES = 33 * 8 + 4 * 4 + 2 + 6;
+    private static final int SECTION2_RECORD_BYTES = 35 * 8 + 4 * 4 + 2 + 6; // RC2 S8 5.1: 288 -> 304
 
     private static byte[] bytes(final AssetsEngine e) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
@@ -195,11 +195,12 @@ public class OrderQueryAndSnapshotTest {
     }
 
     @Test
-    public void section2RecordIs288BytesPerLiveOrder() {
-        // contract 1 (2026-10-26): CoreOrder gains pendingDispatchSeq and replaceDeadlineMs; the section 2 record is 288 B
+    public void section2RecordIs304BytesPerLiveOrder() {
+        // contract 1 (2026-10-26): CoreOrder gains pendingDispatchSeq and replaceDeadlineMs (288 B); RC2 S8 5.1 adds
+        // pendingLegQty and pendingExpectedOldRemaining after replaceDeadlineMs: 304 B, every behaviour
         final OrderRig r = threeUsersFiveOrders();
-        assertEquals("CoreOrder.SNAPSHOT_BYTES must be 33 longs + 4 ints + 1 short + 6 bytes (contract 1: pendingDispatchSeq and "
-                + "replaceDeadlineMs ride the record)", SECTION2_RECORD_BYTES, CoreOrder.SNAPSHOT_BYTES);
+        assertEquals("CoreOrder.SNAPSHOT_BYTES must be 35 longs + 4 ints + 1 short + 6 bytes (S5 contract 1 and RC2 S8 5.1)",
+                SECTION2_RECORD_BYTES, CoreOrder.SNAPSHOT_BYTES);
         final byte[] image = bytes(r.engine);
         final int[] section2 = ordersSection(image);
         assertEquals("section 2 declares the five live records", 5, section2[0]);
@@ -254,7 +255,7 @@ public class OrderQueryAndSnapshotTest {
         assertArrayEquals("bytes are a function of state", image, bytes(b));
 
         r.markNow();
-        r.orders.applyRequestPendingDispatch(601L, 0L, 0);
+        r.orders.applyRequestPendingDispatch(601L, 0L, 1024);
         final List<String> original = renders(r.events());
         final String cancelReply = new AssetsEngineEvent.MeDispatchReply(4, 2, (1L << 2) | 1, DispatchKind.CANCEL, 2, 2, 102, 1, 0, 1,
                 0, 0, 0, 0).render();
@@ -268,12 +269,12 @@ public class OrderQueryAndSnapshotTest {
 
         final RecordingAssetsSink sinkB = (RecordingAssetsSink) b.eventSink();
         final int before = sinkB.events().size();
-        b.orders().applyRequestPendingDispatch(601L, 0L, 0);
+        b.orders().applyRequestPendingDispatch(601L, 0L, 1024);
         assertEquals("the restored engine answers RequestPendingDispatch identically", original,
                 renders(sinkB.events().subList(before, sinkB.events().size())));
 
         final int beforeCursor = sinkB.events().size();
-        b.orders().applyRequestPendingDispatch(602L, 3L, 0);
+        b.orders().applyRequestPendingDispatch(602L, 3L, 1024);
         assertEquals("the forwarder cursor (fromDispatchSeq 3) survives restore: only dispatch 4 is re-offered",
                 List.of(cancelReply, new AssetsEngineEvent.PendingDispatchEnd(602L, 1, 4L).render()),
                 renders(sinkB.events().subList(beforeCursor, sinkB.events().size())));

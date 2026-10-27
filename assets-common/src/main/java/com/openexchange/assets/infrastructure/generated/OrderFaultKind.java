@@ -34,6 +34,18 @@ public enum OrderFaultKind
      */
     FEED_HALT((short)6),
 
+
+    /**
+     * v7 (RC2 S8, appended D-S8-1): INVALID 8 on a pending command; amount = the command's idLow
+     */
+    ME_INVALID((short)7),
+
+
+    /**
+     * v7 (RC2 S8, appended D-S8-1): AMEND REJECTED reason 16; amount = the core's expectedOldRemaining at mint
+     */
+    ME_AMEND_MISMATCH((short)8),
+
     /**
      * To be used to represent not present or null.
      */
@@ -73,6 +85,8 @@ public enum OrderFaultKind
             case 4: return ME_LEG_LIVE;
             case 5: return ME_CAPACITY_WHILE_OPEN;
             case 6: return FEED_HALT;
+            case 7: return ME_INVALID;
+            case 8: return ME_AMEND_MISMATCH;
             case 255: return NULL_VAL;
         }
 

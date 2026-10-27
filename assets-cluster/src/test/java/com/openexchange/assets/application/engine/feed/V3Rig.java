@@ -94,6 +94,18 @@ public final class V3Rig implements AssetsSbeDemuxer.TransportHooks {
         return r;
     }
 
+    /** RC2 S8: behaviour 3 bound by a FRESH record with ME ledger capacity {@code capacity}, GLOBAL opened. */
+    public static V3Rig openWithCapacity(final long capacity) {
+        final V3Rig r = unbound();
+        r.jseq = 1;
+        if (!r.engine.onMeEngineConfig(++r.egress, 1L, V3Genesis.GENESIS_ID, V3Genesis.ME_CONFIG_VERSION, V3Genesis.ME_BEHAVIOR,
+                capacity, V3Genesis.ME_MAX_WIRE, ConfigDecision.FRESH, r.now, id -> { })) {
+            throw new AssertionError("FRESH with capacity " + capacity + " did not bind");
+        }
+        r.engine.applyOrderEntryGate(1L, OrderEntryGate.GLOBAL, GateState.OPEN, GateReason.ADMIN, r.now);
+        return r;
+    }
+
     /** Behaviour 2 recorded (the RC1 rules), for the v1/v2 contrast rows. */
     public static V3Rig v2() {
         final V3Rig r = new V3Rig();
@@ -101,6 +113,24 @@ public final class V3Rig implements AssetsSbeDemuxer.TransportHooks {
         r.engine.applyCoreConfig(V3Genesis.config(1, 1), r.now);
         r.engine.applyCoreConfig(V3Genesis.config(2, 2), r.now);
         return r;
+    }
+
+    /**
+     * RC2 S8 (ReleaseSpliceTest): a new rig whose engine is restored from this rig's snapshot image (supported set widened,
+     * the restore invariants run), carrying the feed and request counters, so the same next operations apply to both.
+     */
+    public V3Rig fork() {
+        final org.agrona.ExpandableArrayBuffer buf = new org.agrona.ExpandableArrayBuffer();
+        final int len = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, buf, 0);
+        final V3Rig f = new V3Rig();
+        f.engine.coreConfig().setSupportedBehaviorVersions(1, 2, 3);
+        com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.deserialize(buf, 0, len, f.engine);
+        f.engine.verifyRestoredInvariants();
+        f.now = now;
+        f.jseq = jseq;
+        f.egress = egress;
+        f.nextRequest = nextRequest;
+        return f;
     }
 
     public boolean bindFresh() {
@@ -321,6 +351,52 @@ public final class V3Rig implements AssetsSbeDemuxer.TransportHooks {
         final var o = engine.orders().orders().get(orderId);
         return engine.onMeOutcome(g, js, orderId, ((long) attempt << 2) | kind, o == null ? 0L : o.userId, orderId, 0L, 0L, 0L,
                 0L, MKT, kind, result, leg, reason, oldCancelled, now, epoch, now);
+    }
+
+    /**
+     * RC2 S8 (section 8 defaults, FIX-7): the 64 a correct ME journals for {@code attempt} of {@code kind} on {@code orderId}
+     * at the next journalSeq, as a mutable view: status by result (0, 4, -1), appliedPosition = egressSeq, orderType and side
+     * from the record, tif and expectedOldRemaining as minted, ledgerSize = meLedgerSize (the capacity on CAPACITY),
+     * ledgerCapacity = meLedgerCapacity, behaviorVersion = meBehaviorVersion. A test overrides fields, then {@link #apply}.
+     */
+    public com.openexchange.assets.application.engine.order.MeOutcomeView outcomeView(final long orderId, final int attempt,
+                                                                                      final int kind, final int result,
+                                                                                      final long leg, final int reason) {
+        final var o = engine.orders().orders().get(orderId);
+        final var v = engine.orders().outcomeWithDefaults(new com.openexchange.assets.application.engine.order.MeOutcomeView(),
+                ++egress, nextJseq(), orderId, ((long) attempt << 2) | kind, o == null ? 1L : o.userId, orderId,
+                kind == KIND_CREATE ? 0L : (o == null ? 1L : Math.max(1L, o.currentLegId != 0 ? o.currentLegId : o.oldLegId)),
+                0L, 0L, 0L, o == null ? MKT : o.marketId, kind, result, result <= 1 ? leg : 0L, reason, false, now, EPOCH);
+        return v;
+    }
+
+    /** Apply a 64 view through the engine's view form (D1 admission, widened digest, the S8 tables). */
+    public boolean apply(final com.openexchange.assets.application.engine.order.MeOutcomeView v) {
+        return engine.onMeOutcome(v, now);
+    }
+
+    /** A 67 at the next journalSeq with the bound link (ledgerSize = meLedgerSize), entries {h, floor, scope, result}. */
+    public com.openexchange.assets.application.engine.order.MeReleaseView releaseView(final long[]... entries) {
+        final var v = new com.openexchange.assets.application.engine.order.MeReleaseView();
+        v.egressSeq = ++egress;
+        v.journalSeq = nextJseq();
+        v.meEpoch = EPOCH;
+        v.releaseSeq = 1;
+        v.ledgerSize = engine.orders().meLedgerSize();
+        v.ledgerCapacity = engine.feed().meLedgerCapacity();
+        for (final long[] e : entries) {
+            v.add(e[0], e[1], (int) e[2], (int) e[3], e.length > 4 ? (int) e[4] : 1);
+        }
+        return v;
+    }
+
+    public boolean apply(final com.openexchange.assets.application.engine.order.MeReleaseView v) {
+        return engine.onMeRelease(v, now);
+    }
+
+    /** One-entry 67 at the next journalSeq. */
+    public boolean releaseEntry(final long h, final long floor, final int scope, final int result) {
+        return apply(releaseView(new long[] {h, floor, scope, result}));
     }
 
     /** CREATE APPLIED for attempt {@code attempt}: the core learns {@code leg}. */

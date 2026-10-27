@@ -48,8 +48,10 @@ public enum CoreRejectReason {
     FEED_HALTED(40),
     /** v7 (RC2 S1, served by S7/S8): ADMIN OPEN refused while meBehaviorVersion &lt; 2 under core behaviour v3. */
     ME_LANE_INACTIVE(41),
-    /** v7 (RC2 S1, served by S8): terminal REJECTED after an INVALID 8 outcome on a pending command. */
-    ME_INVALID(42);
+    /** v7 (RC2 S1, served by S8): terminal REJECTED after an INVALID 8 outcome on a pending command, or the REPLACED abort of an AMEND. */
+    ME_INVALID(42),
+    /** v7 (RC2 S8, appended D-S8-1): terminal REJECTED or the REPLACED abort after RELEASED 7 on a pending command. */
+    ME_RELEASED(43);
 
     private final int code;
 
