@@ -177,6 +177,13 @@ public class FeedHarnessClusterTest {
         o = t1(env, "t1-core", "oracle", dir.toString());
         assertEquals("oracle: " + o.text(), 0, o.code());
         assertTrue(o.text(), o.text().startsWith("PASS "));
+        assertLatch(o, "L false 0");
+    }
+
+    /** The latch is outside the money hash, so every oracle comparison asserts it explicitly (halted, reason). */
+    static void assertLatch(final Out o, final String expected) {
+        assertTrue("the oracle reports the live latch line '" + expected + "': " + o.text(),
+                o.text().contains("latch " + expected + "\n") || o.text().trim().endsWith("latch " + expected));
     }
 
     @Test
@@ -201,6 +208,7 @@ public class FeedHarnessClusterTest {
         o = t1(env, "t1-core", "oracle", dir.toString());
         assertEquals("an extra deposit not in --extra: FAIL", 1, o.code());
         assertTrue("the FAIL names the user: " + o.text(), o.text().contains("FAIL") && o.text().contains("B 2 0 "));
+        assertLatch(o, "L false 0");
         // the same deposit named in --extra: PASS again
         final Path extra = dir.resolve("extra.flog");
         Files.write(extra, FeedFiles.encodeFlog(List.of(new FeedFiles.LogEntry(FeedFiles.LogEntry.FRAME,
@@ -208,17 +216,21 @@ public class FeedHarnessClusterTest {
                 new CoreFrames().deposit(0xE1L, 2, 0, 777, 0xE1L, 1)))));
         o = t1(env, "t1-core", "oracle", dir.toString(), "--extra", extra.toString());
         assertEquals(o.text(), 0, o.code());
+        assertLatch(o, "L false 0");
         // a prefix the live core is past: FAIL; the operator verbs answer
         final long n = FeedStory.read(dir).length();
-        assertEquals("--upto N-1 against a core at N", 1, t1(env, "t1-core", "oracle", dir.toString(), "--upto",
-                Long.toString(n - 1)).code());
+        o = t1(env, "t1-core", "oracle", dir.toString(), "--upto", Long.toString(n - 1));
+        assertEquals("--upto N-1 against a core at N", 1, o.code());
+        assertLatch(o, "L false 0");
         o = t1(env, "t1-core", "latch-clear", "1", "0");
         assertTrue("no latch: DUPLICATE " + o.text(), o.code() == 0 && o.text().contains("ref=76 result=DUPLICATE"));
         o = t1(env, "t1-core", "withdraw", "2", "0", "777");
         assertTrue(o.text(), o.code() == 0 && o.text().contains("WITHDRAW template 16"));
         o = t1(env, "t1-core", "gate");
         assertTrue(o.text(), o.code() == 0 && o.text().contains("\"market\":0"));
-        assertEquals("deposit then withdraw: PASS without --extra", 0, t1(env, "t1-core", "oracle", dir.toString()).code());
+        o = t1(env, "t1-core", "oracle", dir.toString());
+        assertEquals("deposit then withdraw: PASS without --extra", 0, o.code());
+        assertLatch(o, "L false 0");
     }
 
     @Test
@@ -230,6 +242,7 @@ public class FeedHarnessClusterTest {
         assertTrue("the pump cannot connect or register without its key: " + run.text(), run.code() != 0);
         final Out oracle = t1(env, "t1-core", "oracle", dir.toString());
         assertEquals("oracle FAIL: " + oracle.text(), 1, oracle.code());
+        assertLatch(oracle, "L false 0"); // never bound: not halted
     }
 
     @Test
@@ -314,6 +327,7 @@ public class FeedHarnessClusterTest {
                 assertEquals(step + ": " + out, 0, p.exitValue());
                 if (step.get(1).equals("oracle")) {
                     assertTrue(out, out.contains("PASS "));
+                    assertTrue("the live latch, explicitly: " + out, out.contains("latch L false 0"));
                 }
             }
             // H5: an env key variable removed

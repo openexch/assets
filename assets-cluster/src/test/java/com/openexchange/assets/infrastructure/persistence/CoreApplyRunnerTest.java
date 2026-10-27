@@ -570,6 +570,15 @@ public class CoreApplyRunnerTest {
                 ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0).array())), out));
     }
 
+    /** The {@code L halted reason} line of a DUMP reply (the latch is reported outside the money hash, asserted here). */
+    static String latchLine(final CoreServe.Reply d) {
+        final String text = new String(d.payload(), 132, d.payload().length - 132, StandardCharsets.UTF_8);
+        final String[] lines = text.split("\n");
+        final String last = lines[lines.length - 1];
+        assertTrue("the dump ends with the latch line: " + last, last.startsWith("L "));
+        return last;
+    }
+
     @Test
     public void anApplyFaultIsH4NotAMalformedRequest() throws Exception {
         h4(storyDir(2));
@@ -610,6 +619,8 @@ public class CoreApplyRunnerTest {
                 final String live = new String(d.payload(), 0, 64, StandardCharsets.US_ASCII);
                 final String model = new String(d.payload(), 64, 64, StandardCharsets.US_ASCII);
                 assertEquals("the money state equals the clean prefix up to e - 1", model, live);
+                assertEquals("the latch is checked explicitly, never silently outside the hash: halted, GAP (1)",
+                        "L true 1", latchLine(d));
                 for (int i = 1; i < f.size(); i++) {
                     c.frame(CoreApplyRunner.BRIDGE_SESSION, f.get(i)); // the fill
                 }
@@ -627,6 +638,7 @@ public class CoreApplyRunnerTest {
                         .putLong(st.length()).array());
                 assertEquals("and the clean run's dump", new String(d.payload(), 64, 64, StandardCharsets.US_ASCII),
                         new String(d.payload(), 0, 64, StandardCharsets.US_ASCII));
+                assertEquals("and the latch, explicitly: not halted", "L false 0", latchLine(d));
             } else {
                 assertNotEquals("without ADMIN OPEN the BRIDGE_HALT bit stays in the hash", st.expectedSha256(), sha(json));
             }

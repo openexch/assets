@@ -83,7 +83,7 @@ public class E1CorpusTest {
     public void thePinHolds() throws Exception {
         final Map<String, byte[]> f = files(corpus());
         assertEquals("15 scenarios x (3 members + MANIFEST)", 60, f.size());
-        assertEquals("421226c", FeedHarnessMain.e1Pin().get("match_commit"));
+        assertEquals("the match commit holding the corpus", "ed984774007ccb7bac49218048749452ee7001dc", FeedHarnessMain.e1Pin().get("match_commit"));
     }
 
     @Test
