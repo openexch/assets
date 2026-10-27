@@ -1,0 +1,4 @@
+# RC2 S9h section 8: the E1 corpus pin (match test resources mejournal-e1/, captured from J-ME3 by MeJournalCorpusCapture).
+# match_commit names the match base the capture tool ran on; the tool and the corpus are uncommitted there (S9h, no commit).
+match_commit=421226c
+sums_sha256=a77d4e9fd31f753f58841e127000c2510c6cafc2164c7666c239a716b281370d

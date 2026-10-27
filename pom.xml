@@ -50,6 +50,9 @@
              The trailing g<sha> names the exact match commit these wire bytes came from.
              Bumped by match CI's consumer-bump PR (or by hand: pick any published version). -->
         <match.version>1.0-runtime.20260927.r00.g7ea66bf</match.version>
+        <!-- RC2 S9h (D-S9h-1): the ME journal schema 4 codecs (match 421226c) for the TEST-scope feed harness of
+             assets-cluster only. Separate from match.version on purpose: the frozen assets-bridge keeps schema 3. -->
+        <match.journal.version>1.0-runtime.20260929.r02h</match.journal.version>
         <!-- Benchmark loadgen histograms (assets-loadgen only; not in any engine hot path). -->
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
         <!-- Default so surefire's ${argLine} resolves even before jacoco's prepare-agent sets it. -->

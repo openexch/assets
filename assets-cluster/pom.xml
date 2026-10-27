@@ -53,6 +53,24 @@
             <artifactId>junit</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- RC2 S9h (D-S9h-1, contract 2.2): match-common at the schema 4 build, TEST scope only, for the feed harness
+             (reference translator, CoreApplyRunner, T1 tools). The version is explicit (not the root pin, which stays the
+             frozen bridge's schema 3 match.version), and nothing transitive comes with it: the generated codecs need
+             only agrona, which this module already pins. The version string alone is not trusted: the harness and its
+             tests check the schema XML sha256 inside the jar (rule H1). -->
+        <dependency>
+            <groupId>com.match</groupId>
+            <artifactId>match-common</artifactId>
+            <version>${match.journal.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
     </dependencies>
 
     <build>
@@ -105,4 +123,46 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- RC2 S9h 2.3: the feed harness jar (test scope, never a runtime artifact). `mvn -pl assets-cluster -am
+             -Pfeed-harness -DskipTests package` builds target/assets-feed-harness.jar: main + test classes, the test
+             classpath, Main-Class FeedHarnessMain and META-INF/feed-harness.properties. The jar is written by the
+             test-scope FeedHarnessJarBuilder (sorted entries, the commit time on every entry, no build-time values),
+             so its sha256 is a function of the tree it was built from. -->
+        <profile>
+            <id>feed-harness</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>feed-harness-jar</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>java</executable>
+                                    <classpathScope>test</classpathScope>
+                                    <arguments>
+                                        <argument>-classpath</argument>
+                                        <classpath/>
+                                        <argument>com.openexchange.assets.feedharness.FeedHarnessJarBuilder</argument>
+                                        <argument>${project.build.directory}/assets-feed-harness.jar</argument>
+                                        <argument>${project.basedir}/..</argument>
+                                        <argument>${match.journal.version}</argument>
+                                        <argument>${aeron.version}</argument>
+                                        <argument>${sbe.version}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
