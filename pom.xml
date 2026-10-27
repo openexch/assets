@@ -42,7 +42,7 @@
         <sbe.version>1.40.2</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
         <!-- Postgres + pool for the money projector (versions match the OMS repo). -->
-        <postgresql.version>42.7.13</postgresql.version>
+        <postgresql.version>42.7.14</postgresql.version>
         <hikari.version>7.1.0</hikari.version>
         <slf4j.version>2.0.19</slf4j.version>
         <!-- match repo (settlement-journal codecs consumed by assets-bridge): an IMMUTABLE
