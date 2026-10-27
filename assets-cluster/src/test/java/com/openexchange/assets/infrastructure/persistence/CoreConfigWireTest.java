@@ -3,7 +3,8 @@ package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.application.projection.SettlementProjector;
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.determinism.AssetsEngineEvent;
 import com.openexchange.assets.determinism.AssetsScenarioRunner;
 import com.openexchange.assets.determinism.RecordingAssetsSink;
@@ -83,7 +84,7 @@ public class CoreConfigWireTest {
             return HEADER + e.encodedLength();
         }
 
-        long open(final long sessionId, final CorePrincipal principal) {
+        long open(final long sessionId, final ClusterPrincipal principal) {
             engine.sessions().open(sessionId, principal.encode());
             return sessionId;
         }
@@ -152,7 +153,7 @@ public class CoreConfigWireTest {
     @Test
     public void adminClassSessionCoreConfigReachesApplyAndAdopts() {
         final Rig r = new Rig();
-        final long admin = r.open(61, CorePrincipal.anyUser(SessionClass.ADMIN, 2));
+        final long admin = r.open(61, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.ADMIN), 2));
         final CoreConfigCommand sent = v1(42);
         r.markNow();
         r.dispatch(admin, r.coreConfig(sent));
@@ -163,7 +164,7 @@ public class CoreConfigWireTest {
     @Test
     public void gatewayClassSessionCoreConfigIsRefusedUnauthorizedClassAndNothingIsRecorded() {
         final Rig r = new Rig();
-        final long gateway = r.open(10, CorePrincipal.anyUser(SessionClass.GATEWAY, 1));
+        final long gateway = r.open(10, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.GATEWAY), 1));
         r.markNow();
         r.dispatch(gateway, r.register(1, SessionClass.GATEWAY));
         assertEquals("the gateway is registered, so the refusal is the class mask",
@@ -180,7 +181,7 @@ public class CoreConfigWireTest {
         assertNull(r.engine.coreConfig().recorded());
         assertEquals("never a fence event", 0, r.demuxer.applyErrorCount());
         // the refusal consumed nothing: the same frame from an ADMIN session is the first ADOPT
-        final long admin = r.open(61, CorePrincipal.anyUser(SessionClass.ADMIN, 2));
+        final long admin = r.open(61, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.ADMIN), 2));
         r.markNow();
         r.dispatch(admin, r.coreConfig(sent));
         assertAdoptedFromTheWire(r, sent);

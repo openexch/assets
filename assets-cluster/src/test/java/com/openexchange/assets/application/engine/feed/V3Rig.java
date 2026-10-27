@@ -4,7 +4,8 @@ package com.openexchange.assets.application.engine.feed;
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
 import com.openexchange.assets.application.projection.SettlementProjector;
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.determinism.AssetsEngineEvent;
 import com.openexchange.assets.determinism.RecordingAssetsSink;
 import com.openexchange.assets.determinism.V3Genesis;
@@ -413,7 +414,7 @@ public final class V3Rig implements AssetsSbeDemuxer.TransportHooks {
     }
 
     public long openSession(final long sessionId, final SessionClass cls) {
-        engine.sessions().open(sessionId, CorePrincipal.anyUser(cls, (int) sessionId).encode());
+        engine.sessions().open(sessionId, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(cls), (int) sessionId).encode());
         return sessionId;
     }
 

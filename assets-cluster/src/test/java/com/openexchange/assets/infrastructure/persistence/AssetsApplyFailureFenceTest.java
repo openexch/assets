@@ -81,8 +81,7 @@ public class AssetsApplyFailureFenceTest {
         service.engine().setEventSink(failingSink(failure));
         // The in-process dispatch has no ClientSession (id -1): give that id a TOOL authority so the
         // command reaches the engine and the fence, not the session-authority reject (RC1 S3).
-        service.engine().sessions().open(-1L, com.openexchange.assets.auth.CorePrincipal.anyUser(
-                com.openexchange.assets.infrastructure.generated.SessionClass.TOOL, 0).encode());
+        service.engine().sessions().open(-1L, com.openexchange.cluster.auth.ClusterPrincipal.anyUser(com.openexchange.assets.auth.AssetsSessionClasses.toKit(com.openexchange.assets.infrastructure.generated.SessionClass.TOOL), 0).encode());
         return service;
     }
 

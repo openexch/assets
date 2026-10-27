@@ -4,7 +4,8 @@ package com.openexchange.assets.infrastructure.persistence;
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
 import com.openexchange.assets.application.projection.SettlementProjector;
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.determinism.AssetsEngineEvent;
 import com.openexchange.assets.determinism.RecordingAssetsSink;
 import com.openexchange.assets.domain.AdminResult;
@@ -65,7 +66,7 @@ public class SessionAuthorityDemuxerTest {
             rejectedSessions.add(sessionId);
         }
 
-        long open(long sessionId, CorePrincipal principal) {
+        long open(long sessionId, ClusterPrincipal principal) {
             engine.sessions().open(sessionId, principal.encode());
             return sessionId;
         }
@@ -136,7 +137,7 @@ public class SessionAuthorityDemuxerTest {
     @Test
     public void redF17_aTemplateOutsideTheSessionClassIsRejectedNotApplied() {
         final Rig r = new Rig();
-        final long bridge = r.open(10, CorePrincipal.anyUser(SessionClass.BRIDGE, 1));
+        final long bridge = r.open(10, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.BRIDGE), 1));
         r.dispatch(bridge, r.register(1, SessionClass.BRIDGE, true));
         r.markNow();
         r.dispatch(bridge, r.deposit(7, 1, 1_000)); // BRIDGE may not deposit
@@ -149,7 +150,7 @@ public class SessionAuthorityDemuxerTest {
         assertEquals("never a fence event", 0, r.demuxer.applyErrorCount());
 
         r.markNow();
-        final long treasury = r.open(11, CorePrincipal.anyUser(SessionClass.TREASURY, 2));
+        final long treasury = r.open(11, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.TREASURY), 2));
         r.dispatch(treasury, r.settle(1)); // TREASURY may not settle
         assertEquals(CoreRejectReason.UNAUTHORIZED_CLASS, r.onlyReject().reason());
         r.markNow();
@@ -165,7 +166,7 @@ public class SessionAuthorityDemuxerTest {
     @Test
     public void redF18_aUserOutsideTheSessionScopeIsRejected() {
         final Rig r = new Rig();
-        final long scoped = r.open(20, CorePrincipal.forUsers(SessionClass.TREASURY, 4, 7));
+        final long scoped = r.open(20, ClusterPrincipal.forUsers(AssetsSessionClasses.toKit(SessionClass.TREASURY), 4, 7));
         r.markNow();
         r.dispatch(scoped, r.deposit(1, 8, 1_000));
         final AssetsEngineEvent.OrderReject rej = r.onlyReject();
@@ -182,7 +183,7 @@ public class SessionAuthorityDemuxerTest {
     @Test
     public void redF19_productionClassesMustRegisterBeforeAnythingButAQuery() {
         final Rig r = new Rig();
-        final long bridge = r.open(30, CorePrincipal.anyUser(SessionClass.BRIDGE, 1));
+        final long bridge = r.open(30, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.BRIDGE), 1));
         r.markNow();
         r.dispatch(bridge, r.settle(1));
         assertEquals(CoreRejectReason.UNREGISTERED_SESSION, r.onlyReject().reason());
@@ -204,7 +205,7 @@ public class SessionAuthorityDemuxerTest {
         assertEquals(30, r.registered.get(0)[0]);
         assertEquals(1, r.registered.get(0)[2]);
         // ADMIN and TOOL are exempt from registration-first (operators and the in-process harness).
-        final long tool = r.open(31, CorePrincipal.anyUser(SessionClass.TOOL, 2));
+        final long tool = r.open(31, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.TOOL), 2));
         r.markNow();
         r.dispatch(tool, r.deposit(9, 1, 50));
         assertTrue(r.events().get(0) instanceof AssetsEngineEvent.DepositAck);
@@ -213,7 +214,7 @@ public class SessionAuthorityDemuxerTest {
     @Test
     public void redF20_aClassMismatchOrANonResumableRegistrationIsRejectedAndTheSessionClosed() {
         final Rig r = new Rig();
-        final long bridge = r.open(40, CorePrincipal.anyUser(SessionClass.BRIDGE, 1));
+        final long bridge = r.open(40, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.BRIDGE), 1));
         r.markNow();
         r.dispatch(bridge, r.register(1, SessionClass.GATEWAY, true));
         AssetsEngineEvent.AdminAck ack = (AssetsEngineEvent.AdminAck) r.events().get(0);
@@ -254,8 +255,8 @@ public class SessionAuthorityDemuxerTest {
     @Test
     public void theGateIsAdminOnlyAndItsStateIsBroadcast() {
         final Rig r = new Rig();
-        final long tool = r.open(60, CorePrincipal.anyUser(SessionClass.TOOL, 1));
-        final long admin = r.open(61, CorePrincipal.anyUser(SessionClass.ADMIN, 2));
+        final long tool = r.open(60, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.TOOL), 1));
+        final long admin = r.open(61, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.ADMIN), 2));
         assertFalse("genesis: suspended", r.engine.gate().admits(1));
         r.markNow();
         r.dispatch(tool, r.gate(1, OrderEntryGate.GLOBAL, com.openexchange.assets.infrastructure.generated.GateState.OPEN,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.cluster;
 
-import com.openexchange.assets.auth.AuthKeyTable;
+import com.openexchange.assets.auth.AssetsAuth;
 import com.openexchange.assets.auth.CoreCredentials;
 import com.openexchange.assets.infrastructure.generated.EgressChannelsEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
@@ -31,22 +31,22 @@ public final class TestAuth {
     private static final String SECRET_FORWARDER = "66".repeat(32);
     private static final String SECRET_TREASURY_ANY = "77".repeat(32);
 
-    /** keyId:class:secret[:identity[:users=...]] */
+    /** keyId:class:secret:identity:users=... (RC2 S6, A16: any-user scope is the explicit users=*) */
     public static final String KEYS = String.join(";",
-            "1:ADMIN:" + SECRET_ADMIN,
-            "2:TOOL:" + SECRET_TOOL,
-            "3:BRIDGE:" + SECRET_BRIDGE,
+            "1:ADMIN:" + SECRET_ADMIN + "::users=*",
+            "2:TOOL:" + SECRET_TOOL + "::users=*",
+            "3:BRIDGE:" + SECRET_BRIDGE + "::users=*",
             "4:TREASURY:" + SECRET_TREASURY_7 + ":4:users=7",
-            "5:GATEWAY:" + SECRET_GATEWAY,
-            "6:FORWARDER:" + SECRET_FORWARDER,
-            "7:TREASURY:" + SECRET_TREASURY_ANY);
+            "5:GATEWAY:" + SECRET_GATEWAY + "::users=*",
+            "6:FORWARDER:" + SECRET_FORWARDER + "::users=*",
+            "7:TREASURY:" + SECRET_TREASURY_ANY + "::users=*");
 
     private TestAuth() {
     }
 
     /** Publish the test key table where ClusterConfig reads it. Idempotent. */
     public static void install() {
-        System.setProperty(AuthKeyTable.PROPERTY, KEYS);
+        System.setProperty(AssetsAuth.POLICY.keysProperty(), KEYS);
     }
 
     public static CredentialsSupplier credentials(final SessionClass sessionClass) {

@@ -176,12 +176,17 @@ public final class ClusterConfig {
                 .logFragmentLimit(64)
                 .wheelTickResolutionNs(1_000_000)
                 .ticksPerWheel(1024)
-                .maxConcurrentSessions(50)
-                // RC1 S3 (K6): every session authenticates against the node-local key table
-                // (-Dassets.auth.keys / ASSETS_AUTH_KEYS); the minted principal rides the SessionOpen log
-                // event to every member. An unset table rejects every session, loudly, by design.
-                .authenticatorSupplier(() -> new com.openexchange.assets.infrastructure.auth.CoreAuthenticator(
-                        com.openexchange.assets.auth.AuthKeyTable.fromEnvironment()));
+                .maxConcurrentSessions(50);
+        // RC1 S3 (K6): every session authenticates against the node-local key table (-Dassets.auth.keys /
+        // ASSETS_AUTH_KEYS); the minted principal rides the SessionOpen log event to every member. An unset table
+        // rejects every session, loudly, by design. RC2 S6: the one kit copy of the authenticator with the AE
+        // policy (classes 1..7, users=* or an id list; a malformed table fails the boot), and a fail-closed window
+        // for Aeron's shared backup session id (-1) that outlives the session timeout (review DEFECT-1).
+        consensusModuleContext.authenticatorSupplier(() -> new com.openexchange.cluster.auth.ClusterAuthenticator(
+                com.openexchange.cluster.auth.AuthKeyTable.fromEnvironment(com.openexchange.assets.auth.AssetsAuth.POLICY),
+                com.openexchange.cluster.auth.ClusterAuthenticator.DEFAULT_MAX_PENDING,
+                () -> com.openexchange.cluster.auth.ClusterAuthenticator.backupWindowMsFor(
+                        consensusModuleContext.sessionTimeoutNs())));
 
         if (clusteredService instanceof AssetsClusteredService engineService) {
             engineService.readinessConsensus(consensusModuleContext);

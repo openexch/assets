@@ -4,7 +4,8 @@ package com.openexchange.assets.determinism;
 import com.openexchange.assets.application.engine.AssetsEngine;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
 import com.openexchange.assets.application.engine.session.SessionAuthority;
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
 import com.openexchange.assets.domain.GateReason;
 import com.openexchange.assets.domain.GateState;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
@@ -63,8 +64,8 @@ public class GateAndSessionSnapshotTest {
     public void sessionAuthoritiesSurviveRestoreInSessionIdOrder() {
         final AssetsEngine a = new AssetsEngine();
         a.setEventSink(new RecordingAssetsSink());
-        a.sessions().open(30, CorePrincipal.anyUser(SessionClass.BRIDGE, 3).encode());
-        a.sessions().open(10, CorePrincipal.forUsers(SessionClass.TREASURY, 4, 7, 9).encode());
+        a.sessions().open(30, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.BRIDGE), 3).encode());
+        a.sessions().open(10, ClusterPrincipal.forUsers(AssetsSessionClasses.toKit(SessionClass.TREASURY), 4, 7, 9).encode());
         a.sessions().open(20, new byte[0]); // a session whose principal was unreadable
         a.sessions().register(30, SessionClass.BRIDGE, 0b101, true, 2, 77, 5);
         final byte[] image = bytes(a);

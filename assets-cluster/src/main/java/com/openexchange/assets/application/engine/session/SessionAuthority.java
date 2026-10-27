@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.application.engine.session;
 
-import com.openexchange.assets.auth.CorePrincipal;
+import com.openexchange.assets.auth.AssetsSessionClasses;
+import com.openexchange.cluster.auth.ClusterPrincipal;
+import com.openexchange.cluster.auth.ClusterSessionClass;
 import com.openexchange.assets.infrastructure.generated.SessionClass;
 
 /**
@@ -14,7 +16,8 @@ import com.openexchange.assets.infrastructure.generated.SessionClass;
 public final class SessionAuthority {
 
     /** The in-process authority tests and tools dispatch under: every class bit, every user. */
-    public static final SessionAuthority TRUSTED = new SessionAuthority(-1L, CorePrincipal.anyUser(SessionClass.ADMIN, 0));
+    public static final SessionAuthority TRUSTED = new SessionAuthority(-1L,
+            ClusterPrincipal.anyUser(ClusterSessionClass.ADMIN, 0));
 
     static {
         TRUSTED.registered = true;
@@ -23,7 +26,9 @@ public final class SessionAuthority {
     }
 
     private final long sessionId;
-    private CorePrincipal principal;
+    private final ClusterPrincipal principal;
+    // RC2 S6: the kit principal carries a class code; the engine enum is mapped once (AssetsSessionClasses).
+    private final SessionClass sessionClass;
     private boolean registered;
     private boolean resumable;
     private int channelMask;
@@ -32,26 +37,27 @@ public final class SessionAuthority {
     private long sourceEpoch;
     private boolean trusted;
 
-    public SessionAuthority(final long sessionId, final CorePrincipal principal) {
+    public SessionAuthority(final long sessionId, final ClusterPrincipal principal) {
         this.sessionId = sessionId;
-        this.principal = principal == null ? CorePrincipal.NONE : principal;
+        this.principal = principal == null ? ClusterPrincipal.NONE : principal;
+        this.sessionClass = AssetsSessionClasses.of(this.principal.classCode());
     }
 
     public long sessionId() {
         return sessionId;
     }
 
-    public CorePrincipal principal() {
+    public ClusterPrincipal principal() {
         return principal;
     }
 
     public SessionClass sessionClass() {
-        return principal.sessionClass();
+        return sessionClass;
     }
 
     /** Bit for the class-mask table: {@code 1 << class code}; UNSET has no bit. */
     public int classBit() {
-        final int code = principal.sessionClass().value();
+        final int code = principal.classCode();
         return code <= 0 || code > 6 ? 0 : 1 << code;
     }
 
