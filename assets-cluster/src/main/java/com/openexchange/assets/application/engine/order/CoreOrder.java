@@ -8,12 +8,13 @@ import com.openexchange.assets.domain.CoreOrderView;
  * indexed by the dense {@code orderId}. Every field is replicated state except nothing: diagnostics live on
  * the engine. Codes are wire codes (money-schema v6 enums) so the record serializes without a mapping table.
  *
- * <p>Serialized size is fixed at {@link #SNAPSHOT_BYTES}: 33 longs, 4 ints, 1 short, 6 bytes (S5 added
- * {@code pendingDispatchSeq} and {@code replaceDeadlineMs}).</p>
+ * <p>Serialized size is fixed at {@link #SNAPSHOT_BYTES}: 35 longs, 4 ints, 1 short, 6 bytes (S5 added
+ * {@code pendingDispatchSeq} and {@code replaceDeadlineMs}; RC2 S8 5.1 added {@code pendingLegQty} and
+ * {@code pendingExpectedOldRemaining}, 288 -> 304 B, every behaviour).</p>
  */
 public final class CoreOrder implements CoreOrderView {
 
-    public static final int SNAPSHOT_BYTES = 33 * 8 + 4 * 4 + 2 + 6;
+    public static final int SNAPSHOT_BYTES = 35 * 8 + 4 * 4 + 2 + 6;
 
     // state flags (u16)
     public static final int F_CANCEL_PENDING = 1;
@@ -23,6 +24,15 @@ public final class CoreOrder implements CoreOrderView {
     public static final int F_IOC = 1 << 4;
     public static final int F_FOK = 1 << 5;
     public static final int F_QUARANTINED = 1 << 6;
+    /** RC2 S8 1.1: the pending command got CAPACITY and was not resolved since; decides nothing, feeds a metric. */
+    public static final int F_ME_CAPACITY_WAIT = 1 << 7;
+    /**
+     * RC2 S8 1.1: a pending command of this order came back RELEASED 7, so the ME floor or tombstone of the order is unknown
+     * to the core: its backlog entry was abandoned and no release is minted for it while set (3.1 rule 2).
+     */
+    public static final int F_ME_RELEASED = 1 << 8;
+    /** Every state flag this build defines (S8 5.1 a: a restored record carries no other bit). */
+    public static final int KNOWN_STATE_FLAGS = (1 << 9) - 1;
 
     // pending command kinds (byte)
     public static final int PK_NONE = 0;
@@ -65,6 +75,10 @@ public final class CoreOrder implements CoreOrderView {
     public long pendingDispatchSeq;
     /** Log-time deadline of the open replace window (0 = none); its deadline-index entry is derived from it (S5). */
     public long replaceDeadlineMs;
+    /** RC2 S8 3.7: the AMEND quantity minted ({@code newQty - filledQty} at mint); 0 outside a replace window. */
+    public long pendingLegQty;
+    /** RC2 S8 3.7: {@code remainingQty} at the amend mint (S1 4.4 row 104); 0 outside a replace window. */
+    public long pendingExpectedOldRemaining;
     public int marketId;
     public int flags;
     public int holdAssetId;
@@ -83,6 +97,7 @@ public final class CoreOrder implements CoreOrderView {
         hiddenQty = 0; sliceRemainingQty = 0; expiresAtMs = 0; filledQty = 0; remainingQty = 0; cumQuoteQty = 0;
         lastPrice = 0; lastQty = 0; holdAmount = 0; createdAtMs = 0; updatedAtMs = 0; eventSeq = 0; currentLegId = 0;
         pendingPrice = 0; pendingQuantity = 0; pendingHoldDelta = 0; pendingHoldTarget = 0; oldLegId = 0; pendingDispatchSeq = 0; replaceDeadlineMs = 0;
+        pendingLegQty = 0; pendingExpectedOldRemaining = 0;
         marketId = 0; flags = 0; holdAssetId = 0; attempt = 0; stateFlags = 0;
         side = 0; orderType = 0; timeInForce = 0; status = 0; rejectReason = 0; pendingKind = 0;
     }

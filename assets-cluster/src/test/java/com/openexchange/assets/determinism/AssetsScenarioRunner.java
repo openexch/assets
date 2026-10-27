@@ -272,12 +272,32 @@ public final class AssetsScenarioRunner {
                 final int kind = reqInt(kv, "kind");
                 final int attempt = reqInt(kv, "attempt");
                 final com.openexchange.assets.application.engine.order.CoreOrder o = engine.orders().orders().get(order);
-                engine.onMeOutcome(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, optLong(kv, "jseq", 0L), order,
-                        ((long) attempt << 2) | kind,
-                        o == null ? 0L : o.userId, order, kv.containsKey("old") ? reqLong(kv, "old") : 0L, 0L, 0L, 0L,
-                        o == null ? 0 : o.marketId, kind, reqInt(kv, "result"), kv.containsKey("leg") ? reqLong(kv, "leg") : 0L,
+                final long seq = kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition;
+                if (!s8OutcomeKeys(kv)) {
+                    engine.onMeOutcome(seq, optLong(kv, "jseq", 0L), order, ((long) attempt << 2) | kind,
+                            o == null ? 0L : o.userId, order, kv.containsKey("old") ? reqLong(kv, "old") : 0L, 0L, 0L, 0L,
+                            o == null ? 0 : o.marketId, kind, reqInt(kv, "result"), kv.containsKey("leg") ? reqLong(kv, "leg") : 0L,
+                            kv.containsKey("reason") ? reqInt(kv, "reason") : 0, optLong(kv, "oldCancelled", 0L) != 0, clock.now(),
+                            optLong(kv, "epoch", 0L), clock.now());
+                    break;
+                }
+                // RC2 S8 section 6: the 64 tail, each key defaulting as section 2 (the view form)
+                final com.openexchange.assets.application.engine.order.MeOutcomeView v = engine.orders().outcomeWithDefaults(
+                        new com.openexchange.assets.application.engine.order.MeOutcomeView(), seq, optLong(kv, "jseq", 0L), order,
+                        ((long) attempt << 2) | kind, o == null ? 0L : o.userId, order, kv.containsKey("old") ? reqLong(kv, "old") : 0L,
+                        0L, 0L, 0L, o == null ? 0 : o.marketId, kind, reqInt(kv, "result"), kv.containsKey("leg") ? reqLong(kv, "leg") : 0L,
                         kv.containsKey("reason") ? reqInt(kv, "reason") : 0, optLong(kv, "oldCancelled", 0L) != 0, clock.now(),
-                        optLong(kv, "epoch", 0L), clock.now());
+                        optLong(kv, "epoch", 0L));
+                v.status = (int) optLong(kv, "status", v.status);
+                v.orderType = (int) optLong(kv, "type", v.orderType);
+                v.orderSide = (int) optLong(kv, "side", v.orderSide);
+                v.appliedPosition = optLong(kv, "applied", v.appliedPosition);
+                v.timeInForce = (int) optLong(kv, "tif", v.timeInForce);
+                v.expectedOldRemaining = optLong(kv, "eor", v.expectedOldRemaining);
+                v.ledgerSize = optLong(kv, "ledger", v.ledgerSize);
+                v.ledgerCapacity = optLong(kv, "cap", v.ledgerCapacity);
+                v.behaviorVersion = optLong(kv, "behavior", v.behaviorVersion);
+                engine.onMeOutcome(v, clock.now());
                 break;
             }
             case "AMEND": {
@@ -307,10 +327,29 @@ public final class AssetsScenarioRunner {
                         reqInt(kv, "maxWire"), com.openexchange.assets.domain.ConfigDecision.valueOf(req(kv, "decision")),
                         clock.now(), id -> { });
                 break;
-            case "MERELEASE":
-                engine.onMeRelease(kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition, reqLong(kv, "jseq"),
-                        reqLong(kv, "epoch"), clock.now());
+            case "MERELEASE": {
+                // RC2 S8 section 6: MERELEASE jseq= epoch= [rseq=] [ledger=] [cap=] [ranges=] [rel=h:f:scope:result:removed,...]
+                final com.openexchange.assets.application.engine.order.MeReleaseView v =
+                        new com.openexchange.assets.application.engine.order.MeReleaseView();
+                v.egressSeq = kv.containsKey("seq") ? reqLong(kv, "seq") : ++feedPosition;
+                v.journalSeq = reqLong(kv, "jseq");
+                v.meEpoch = reqLong(kv, "epoch");
+                v.releaseSeq = optLong(kv, "rseq", 0L);
+                v.ledgerSize = optLong(kv, "ledger", engine.orders().meLedgerSize());
+                v.ledgerCapacity = optLong(kv, "cap", engine.feed().meLedgerCapacity());
+                v.tombstoneRanges = optLong(kv, "ranges", 0L);
+                if (kv.containsKey("rel")) {
+                    for (final String e : req(kv, "rel").split(",")) {
+                        final String[] f = e.split(":");
+                        v.add(Long.parseLong(f[0]), Long.parseLong(f[1]),
+                                f[2].equals("ORDER") ? 1 : f[2].equals("UP_TO") ? 0 : Integer.parseInt(f[2]),
+                                f[3].equals("APPLIED") ? 0 : f[3].equals("NOOP") ? 1 : f[3].equals("LEG_LIVE") ? 2 : Integer.parseInt(f[3]),
+                                f.length > 4 ? Integer.parseInt(f[4]) : 1);
+                    }
+                }
+                engine.onMeRelease(v, clock.now());
                 break;
+            }
             case "FEEDHALT":
                 engine.applyFeedHalt(optLong(kv, "session", 0L), optLong(kv, "corr", 0L),
                         com.openexchange.assets.domain.FeedHaltReason.valueOf(req(kv, "reason")), optLong(kv, "epoch", 0L),
@@ -333,7 +372,8 @@ public final class AssetsScenarioRunner {
                 break;
             case "PENDINGDISPATCH":
                 engine.orders().applyRequestPendingDispatch(kv.containsKey("corr") ? reqLong(kv, "corr") : 0L,
-                        kv.containsKey("from") ? reqLong(kv, "from") : 0L, kv.containsKey("max") ? reqInt(kv, "max") : 0);
+                        kv.containsKey("from") ? reqLong(kv, "from") : 0L, kv.containsKey("max") ? reqInt(kv, "max") : 1024);
+                // RC2 S8 section 6: absent max= sends 1024 (the goldens' page), max=0 is the head probe
                 break;
             // ---- RC1 S4: order lifecycle verbs (admission, cancel, risk config, breaker, tick, gate) ----
             case "GATE": {
@@ -507,6 +547,16 @@ public final class AssetsScenarioRunner {
 
     private static long reqLong(Map<String, String> kv, String key) {
         return ScenarioText.reqLong(kv, key);
+    }
+
+    /** RC2 S8 section 6: any of the 64-tail keys selects the view form of MEOUTCOME. */
+    private static boolean s8OutcomeKeys(final java.util.Map<String, String> kv) {
+        for (final String k : new String[] {"status", "type", "side", "applied", "tif", "eor", "ledger", "cap", "behavior"}) {
+            if (kv.containsKey(k)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static long optLong(Map<String, String> kv, String key, long fallback) {

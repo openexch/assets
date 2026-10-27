@@ -75,7 +75,7 @@ public class TriggerLifecycleTest {
         t.assertChild("replay LIMIT child", sent.get(1), stopLimit, 1, BUY, TriggerRig.WIRE_LIMIT, 97 * ONE, 2 * ONE, 0L);
 
         t.r.markNow();
-        t.r.orders.applyRequestPendingDispatch(0xD1, 0L, 0);
+        t.r.orders.applyRequestPendingDispatch(0xD1, 0L, 1024);
         final List<AssetsEngineEvent.MeDispatchReply> replay = t.replies();
         assertEquals("3.2: both children are pending and replayed, got " + t.r.events(), 2, replay.size());
         for (int i = 0; i < 2; i++) {

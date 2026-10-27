@@ -31,7 +31,7 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.MeDispatch, AssetsEngineEvent.DepositReject, AssetsEngineEvent.ConfigApplied,
         AssetsEngineEvent.OrderFault, AssetsEngineEvent.OrderSnapshotEntry, AssetsEngineEvent.OrderSnapshotEnd,
         AssetsEngineEvent.PendingDispatchEnd, AssetsEngineEvent.MeDispatchReply,
-        AssetsEngineEvent.FeedLatch, AssetsEngineEvent.FeedLatchCleared {
+        AssetsEngineEvent.FeedLatch, AssetsEngineEvent.FeedLatchCleared, AssetsEngineEvent.ReleaseEffect {
 
     String render();
 
@@ -230,13 +230,43 @@ public sealed interface AssetsEngineEvent
     }
 
     record MeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId, long omsOrderId,
-                      long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget, int timeInForce)
+                      long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget, int timeInForce,
+                      com.openexchange.assets.domain.ReleaseScope releaseScope, long expectedOldRemaining)
             implements AssetsEngineEvent {
+        /** The RC1 shape (S8 fields UP_TO, 0). */
+        public MeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId, long omsOrderId,
+                          long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget, int timeInForce) {
+            this(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderType, side, price,
+                    quantity, budget, timeInForce, com.openexchange.assets.domain.ReleaseScope.UP_TO, 0L);
+        }
+
         @Override
         public String render() {
             return String.format("MEDISPATCH seq=%d id=%d/%d kind=%s u=%d order=%d old=%d market=%d type=%d side=%d px=%d qty=%d budget=%d tif=%d",
                     dispatchSeq, commandIdHigh, commandIdLow, kind.name(), userId, omsOrderId, oldOrderId, marketId, orderType, side,
-                    price, quantity, budget, timeInForce);
+                    price, quantity, budget, timeInForce) + s8Tail(kind, releaseScope, expectedOldRemaining);
+        }
+    }
+
+    /** RC2 S8 section 6: {@code scope=} on RELEASE_ID and {@code eor=} when non-zero; neither appears under v1/v2. */
+    static String s8Tail(final DispatchKind kind, final com.openexchange.assets.domain.ReleaseScope scope, final long eor) {
+        final StringBuilder sb = new StringBuilder();
+        if (kind == DispatchKind.RELEASE_ID) {
+            sb.append(" scope=").append(scope == null ? "UP_TO" : scope.name());
+        }
+        if (eor != 0) {
+            sb.append(" eor=").append(eor);
+        }
+        return sb.toString();
+    }
+
+    /** RC2 S8 section 6: one release-backlog effect (node-local {@code onReleaseEffect}). */
+    record ReleaseEffect(long orderId, long floor, com.openexchange.assets.domain.ReleaseScope scope,
+                         com.openexchange.assets.domain.ReleaseResult result, int row) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("RELEASEFX order=%d floor=%d scope=%s result=%s row=%d", orderId, floor,
+                    scope == null ? "-" : scope.name(), result == null ? "-" : result.name(), row);
         }
     }
 
@@ -289,13 +319,22 @@ public sealed interface AssetsEngineEvent
     }
 
     record MeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId, long omsOrderId,
-                           long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget, int timeInForce)
+                           long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget, int timeInForce,
+                           com.openexchange.assets.domain.ReleaseScope releaseScope, long expectedOldRemaining)
             implements AssetsEngineEvent {
+        /** The RC1 shape (S8 fields UP_TO, 0). */
+        public MeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId, long omsOrderId,
+                               long oldOrderId, int marketId, int orderType, int side, long price, long quantity, long budget,
+                               int timeInForce) {
+            this(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderType, side, price,
+                    quantity, budget, timeInForce, com.openexchange.assets.domain.ReleaseScope.UP_TO, 0L);
+        }
+
         @Override
         public String render() {
             return String.format("DISPATCHREPLY seq=%d id=%d/%d kind=%s u=%d order=%d old=%d market=%d type=%d side=%d px=%d qty=%d budget=%d tif=%d",
                     dispatchSeq, commandIdHigh, commandIdLow, kind.name(), userId, omsOrderId, oldOrderId, marketId, orderType, side, price,
-                    quantity, budget, timeInForce);
+                    quantity, budget, timeInForce) + s8Tail(kind, releaseScope, expectedOldRemaining);
         }
     }
 

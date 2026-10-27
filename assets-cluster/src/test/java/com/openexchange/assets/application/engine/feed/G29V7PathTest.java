@@ -210,8 +210,18 @@ public class G29V7PathTest {
         final V3Rig r = V3Rig.open();
         r.deposit(900_001L, USD, NOTIONAL * TRADES + 1_000 * ONE);
         r.deposit(900_002L, BTC, QTY * TRADES + ONE);
+        // RC2 S8 3.12 (D-S8-10): the drill's own holds name orderIds 5011/5022, inside the core's id space: refused on a v3
+        // core like the v5 money frames below (TRUSTED included), nothing locked
+        r.mark();
         r.dispatchTrusted(hold(r, 900_001L, 5_011L, USD, NOTIONAL * TRADES));
         r.dispatchTrusted(hold(r, 900_002L, 5_022L, BTC, QTY * TRADES));
+        assertEquals("both drill holds refused (S8 3.12)", 2, r.all(AssetsEngineEvent.OrderReject.class).size());
+        assertEquals(3, r.first(AssetsEngineEvent.OrderReject.class).refTemplateId());
+        assertEquals(CoreRejectReason.UNAUTHORIZED_CLASS, r.first(AssetsEngineEvent.OrderReject.class).reason());
+        assertEquals(0L, r.locked(900_001L, USD));
+        // the precondition holds are placed outside the core's id space (orderId <= 0 keeps today's handling)
+        r.dispatchTrusted(hold(r, 900_001L, -5_011L, USD, NOTIONAL * TRADES));
+        r.dispatchTrusted(hold(r, 900_002L, -5_022L, BTC, QTY * TRADES));
         final long buyerUsd = r.total(900_001L, USD);
         final long buyerLocked = r.locked(900_001L, USD);
         assertEquals("precondition: the drill's buyer hold is placed", NOTIONAL * TRADES, buyerLocked);
@@ -222,8 +232,8 @@ public class G29V7PathTest {
         r.mark();
         r.dispatchTrusted(settleBatch(r, 1));
         r.dispatchTrusted(settleBatch(r, 3));
-        r.dispatchTrusted(terminalRelease(r, 900_001L, 5_011L));
-        r.dispatchTrusted(terminalRelease(r, 900_002L, 5_022L));
+        r.dispatchTrusted(terminalRelease(r, 900_001L, -5_011L));
+        r.dispatchTrusted(terminalRelease(r, 900_002L, -5_022L));
         r.dispatchTrusted(settleBatch(r, 2));
 
         final List<AssetsEngineEvent.OrderReject> refused = r.all(AssetsEngineEvent.OrderReject.class);

@@ -177,11 +177,19 @@ final class CoreFrameEncoders {
     byte[] outcome(long egress, long cmdHigh, long cmdLow, long user, long oms, long old, long price, long qty, long budget,
                    int market, int kind, int type, int side, long meTs, long leg, int reason, int result, long journalSeq) {
         zero();
+        // RC2 S8 section 8 (FIX-7): the shape a correct ME journals: status 0 / 4 / -1 by result and leg 0 above result 1
+        // (3.9), the ME type of the command (0..2), ledgerCapacity and behaviorVersion as the bound FRESH, ledgerSize equal to
+        // the capacity on CAPACITY (S4 3.3) and 0 otherwise
+        final int status = result == 0 ? 0 : result == 1 ? 4 : -1;
+        final int meType = type == 3 || type == 5 ? 1 : type == 4 || type == 6 ? 0 : type;
+        final int capacity = (int) com.openexchange.assets.determinism.V3Genesis.ME_CAPACITY;
         return out(new MeCommandOutcomeEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress).commandIdHigh(cmdHigh)
                 .commandIdLow(cmdLow).userId(user).omsOrderId(oms).oldOrderId(old).price(price).quantity(qty).budget(budget)
-                .marketId(market).commandKind((short) kind).orderType((short) type).orderSide((short) side)
-                .appliedPosition(egress).meTimestamp(meTs).orderId(leg).status(0).reason(reason).oldCancelled((short) 0)
-                .result(result).meEpoch(meEpoch).journalSeq(journalSeq).encodedLength());
+                .marketId(market).commandKind((short) kind).orderType((short) meType).orderSide((short) side)
+                .appliedPosition(egress).meTimestamp(meTs).orderId(result <= 1 ? leg : 0L).status(status).reason(reason)
+                .oldCancelled((short) 0).result(result).meEpoch(meEpoch).journalSeq(journalSeq).timeInForce((short) 0)
+                .expectedOldRemaining(0L).ledgerSize(result == 3 ? capacity : 0).ledgerCapacity(capacity)
+                .behaviorVersion(com.openexchange.assets.determinism.V3Genesis.ME_BEHAVIOR).encodedLength());
     }
 
     /** The compiled Market.ALL / Asset tables as a CoreConfig frame (the only config the S7 cross-check accepts). */
@@ -248,9 +256,21 @@ final class CoreFrameEncoders {
     byte[] meCommandRelease(long egress, long journalSeq, long meEpoch, long commandIdHigh) {
         zero();
         final MeCommandReleaseEncoder e = new MeCommandReleaseEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress)
-                .journalSeq(journalSeq).meEpoch(meEpoch).releaseSeq(1).ledgerSize(0).ledgerCapacity(4096).tombstoneRanges(0);
+                .journalSeq(journalSeq).meEpoch(meEpoch).releaseSeq(1).ledgerSize(0)
+                .ledgerCapacity((int) com.openexchange.assets.determinism.V3Genesis.ME_CAPACITY).tombstoneRanges(0);
         e.releasesCount(1).next().commandIdHigh(commandIdHigh).idLowFloor(0).scope(ReleaseScope.UP_TO).result(ReleaseResult.APPLIED)
                 .removed(1);
+        return out(e.encodedLength());
+    }
+
+    /** RC2 S8: one 67 entry of any scope and result (ledgerSize as given, the bound capacity). */
+    byte[] release(long egress, long journalSeq, long meEpoch, long commandIdHigh, long floor, int scope, int result, int ledgerSize) {
+        zero();
+        final MeCommandReleaseEncoder e = new MeCommandReleaseEncoder().wrapAndApplyHeader(buf, 0, header).egressSeq(egress)
+                .journalSeq(journalSeq).meEpoch(meEpoch).releaseSeq(journalSeq).ledgerSize(ledgerSize)
+                .ledgerCapacity((int) com.openexchange.assets.determinism.V3Genesis.ME_CAPACITY).tombstoneRanges(0);
+        e.releasesCount(1).next().commandIdHigh(commandIdHigh).idLowFloor(floor).scope(ReleaseScope.get((short) scope))
+                .result(ReleaseResult.get((short) result)).removed(result == 0 ? 1 : 0);
         return out(e.encodedLength());
     }
 

@@ -166,17 +166,18 @@ public class BehaviorV3Test {
         assertEquals("deposits do not break feed-virginity", AdminResult.ADOPTED, new Box(true).config(1, 1, G).result());
     }
 
+    // RC2 S8 3.10 item 5 (G8): behaviour 3 joins the production set; replaces S7's productionSupportedSetStaysOneTwo
     @Test
-    public void productionSupportedSetStaysOneTwo() {
-        assertArrayEquals("the S7 jar ships behaviour {1, 2} only; S8 adds 3", new int[] {1, 2},
+    public void productionSupportedSetIncludesThree() {
+        assertArrayEquals("the S8 jar ships behaviour {1, 2, 3}", new int[] {1, 2, 3},
                 CoreConfigStateMachine.SUPPORTED_BEHAVIOR_VERSIONS);
         final Box b = new Box(false);
-        assertArrayEquals(new int[] {1, 2}, b.engine.coreConfig().supportedBehaviorVersions());
+        assertArrayEquals(new int[] {1, 2, 3}, b.engine.coreConfig().supportedBehaviorVersions());
         b.config(1, 1, G);
         b.config(2, 2, G);
-        assertEquals("no fail-fast through behaviour 2", 0, b.failFast);
-        b.config(3, 3, G);
-        assertEquals("a production S7 jar takes the fail-fast path at CoreConfig 3", 1, b.failFast);
+        assertEquals(AdminResult.ACCEPTED, b.config(3, 3, G).result());
+        assertEquals("no fail-fast at CoreConfig 3 on a production S8 jar (no test seam)", 0, b.failFast);
+        assertEquals(3, b.engine.coreConfig().behaviorVersion());
     }
 
     // ---------------------------------------------------------------- 7.2 row 3 (D-1): v5 money refused for every class
@@ -205,7 +206,7 @@ public class BehaviorV3Test {
 
     private static int terminalRelease(final V3Rig r) {
         final TerminalReleaseEncoder e = new TerminalReleaseEncoder().wrapAndApplyHeader(r.buffer(), 0, r.header())
-                .journalPosition(7_779).orderId(5_011).userId(9).timestamp(r.now);
+                .journalPosition(7_779).orderId(-5_011).userId(9).timestamp(r.now);
         return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
     }
 
@@ -216,7 +217,7 @@ public class BehaviorV3Test {
         r.deposit(10, V3Rig.BTC, 10 * ONE);
         final var hold = new com.openexchange.assets.domain.commands.HoldCommand();
         hold.reset();
-        hold.setOrderId(5_011);
+        hold.setOrderId(-5_011); // RC2 S8 3.12: outside the core's id space (a Hold naming orderId >= 1 is refused under v3)
         hold.setUserId(9);
         hold.setAssetId(V3Rig.USD);
         hold.setAmount(500 * ONE);
@@ -278,5 +279,151 @@ public class BehaviorV3Test {
             final String golden = Files.readString(dir.resolve(name + ".golden"), StandardCharsets.UTF_8);
             assertEquals("v1/v2 replay of " + name + " is byte-identical to its golden", golden, AssetsScenarioRunner.run(p));
         }
+    }
+
+    // ---------------------------------------------------------------- RC2 S8 3.12 (D-S8-10)
+
+    private static int holdFrame(final V3Rig r, final long user, final long order, final int asset, final long amount) {
+        final com.openexchange.assets.infrastructure.generated.HoldEncoder e = new com.openexchange.assets.infrastructure.generated.HoldEncoder()
+                .wrapAndApplyHeader(r.buffer(), 0, r.header()).correlationId(3_300 + order).orderId(order).userId(user).assetId(asset)
+                .amount(amount).omsManagedRelease(BoolFlag.FALSE);
+        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
+    }
+
+    private static int releaseFrame(final V3Rig r, final long user, final long order) {
+        final com.openexchange.assets.infrastructure.generated.ReleaseEncoder e = new com.openexchange.assets.infrastructure.generated.ReleaseEncoder()
+                .wrapAndApplyHeader(r.buffer(), 0, r.header()).orderId(order).userId(user).amount(-1L);
+        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
+    }
+
+    private static com.openexchange.assets.domain.commands.HoldCommand hold(final long user, final long order, final long amount) {
+        final var h = new com.openexchange.assets.domain.commands.HoldCommand();
+        h.reset();
+        h.setOrderId(order);
+        h.setUserId(user);
+        h.setAssetId(V3Rig.USD);
+        h.setAmount(amount);
+        return h;
+    }
+
+    @Test
+    public void switchRefusedWithForeignHoldInCoreRange() {
+        // 3.12 switch precondition: a v2 TOOL hold under nextOrderId + 5, and one under a live core order's id in ANOTHER account
+        for (final int variant : new int[] {0, 1}) {
+            final Box b = new Box(true);
+            b.config(1, 1, G);
+            b.config(2, 2, G);
+            final var d = new com.openexchange.assets.domain.commands.DepositCommand();
+            d.reset();
+            d.setUserId(9);
+            d.setAssetId(V3Rig.USD);
+            d.setAmount(1_000 * ONE);
+            b.engine.applyCommand(AssetsEngine.CMD_DEPOSIT, d, b.now);
+            final long foreignId;
+            if (variant == 0) {
+                foreignId = Math.max(1, b.engine.getNextOrderId()) + 5;
+            } else {
+                // a live core order of user 10 (order 1, an armed STOP_LIMIT: no dispatch, so the core stays feed-virgin), and
+                // user 9's TOOL hold under id 1
+                final var d10 = new com.openexchange.assets.domain.commands.DepositCommand();
+                d10.reset();
+                d10.setUserId(10);
+                d10.setAssetId(V3Rig.USD);
+                d10.setAmount(1_000 * ONE);
+                b.engine.applyCommand(AssetsEngine.CMD_DEPOSIT, d10, b.now);
+                b.engine.gate().set(OrderEntryGate.GLOBAL, GateState.OPEN, GateReason.ADMIN);
+                final var c = new com.openexchange.assets.domain.commands.CreateOrderCommand();
+                c.reset();
+                c.userId = 10; c.marketId = 1; c.side = 0; c.orderType = 4; c.timeInForce = 0; c.price = 110 * ONE; c.quantity = ONE;
+                c.stopPrice = 105 * ONE;
+                c.requestIdHigh = 1; c.requestIdLow = 1;
+                b.engine.orders().applyCreate(c, b.now);
+                foreignId = 1;
+                assertEquals("precondition: the armed order is live", 10L, b.engine.orders().orders().get(1).userId);
+                assertEquals("precondition: feed-virgin", 0L, b.engine.getDispatchSeq());
+                b.engine.gate().set(OrderEntryGate.GLOBAL, GateState.SUSPENDED, GateReason.GENESIS);
+            }
+            b.engine.applyCommand(AssetsEngine.CMD_HOLD, hold(9, foreignId, 10 * ONE), b.now);
+            assertEquals("precondition: the v2 TOOL hold stands", 10 * ONE, b.engine.account(9).locked(V3Rig.USD));
+            b.assertInvalid(b.config(3, 3, G), "variant " + variant + ": a foreign hold with orderId >= 1");
+            assertEquals(2L, b.engine.coreConfig().behaviorVersion());
+            // migration: Release 4 at v2 (served there), then CoreConfig 3 is accepted
+            final var rel = new com.openexchange.assets.domain.commands.ReleaseCommand();
+            rel.reset();
+            rel.setOrderId(foreignId);
+            rel.setUserId(9);
+            rel.setAmount(-1);
+            b.engine.applyCommand(AssetsEngine.CMD_RELEASE, rel, b.now);
+            assertEquals(0L, b.engine.account(9).locked(V3Rig.USD));
+            assertEquals(AdminResult.ACCEPTED, b.config(3, 3, G).result());
+            assertEquals(3L, b.engine.coreConfig().behaviorVersion());
+        }
+    }
+
+    @Test
+    public void toolOrAdminHoldOrReleaseNamingACoreOrderIdIsRefused() {
+        final V3Rig r = V3Rig.open();
+        r.deposit(1, V3Rig.USD, 10_000 * ONE);
+        final long live = r.create(r.limit(1, 0, 100 * ONE, ONE));
+        final long dead = r.create(r.limit(1, 0, 100 * ONE, ONE));
+        r.outcome(dead, 0, V3Rig.KIND_CREATE, 1, 102, 0, false); // REJECTED: dead, its hold gone
+        final long next = r.engine.getNextOrderId();
+        final long tool = r.openSession(41, SessionClass.TOOL);
+        final long admin = r.openSession(42, SessionClass.ADMIN);
+        final long available = r.engine.account(1).available(V3Rig.USD);
+        final long locked = r.locked(1, V3Rig.USD);
+        long refused = 0;
+        for (final long id : new long[] {dead, live, next, next + 5}) {
+            for (final long who : new long[] {tool, admin, -1}) {
+                r.mark();
+                final int len = holdFrame(r, 1, id, V3Rig.USD, 50 * ONE);
+                if (who < 0) {
+                    r.dispatchTrusted(len);
+                } else {
+                    r.dispatch(who, len);
+                }
+                final AssetsEngineEvent.OrderReject rej = r.first(AssetsEngineEvent.OrderReject.class);
+                assertEquals("Hold " + id + " from " + who, CoreRejectReason.UNAUTHORIZED_CLASS, rej.reason());
+                assertEquals(3, rej.refTemplateId());
+                assertEquals("no HoldAck", 0, r.count(AssetsEngineEvent.HoldAck.class));
+                assertEquals(++refused, r.engine.coreOrderHoldRefusedCount());
+            }
+        }
+        assertEquals("balances unchanged", available, r.engine.account(1).available(V3Rig.USD));
+        assertEquals(locked, r.locked(1, V3Rig.USD));
+        // Release 4 naming a live core order: refused loudly (supersedes S7 7.2 row 4's counted no-op)
+        for (final long who : new long[] {tool, admin, -1}) {
+            r.mark();
+            if (who < 0) {
+                r.dispatchTrusted(releaseFrame(r, 1, live));
+            } else {
+                r.dispatch(who, releaseFrame(r, 1, live));
+            }
+            assertEquals(CoreRejectReason.UNAUTHORIZED_CLASS, r.first(AssetsEngineEvent.OrderReject.class).reason());
+            assertEquals(4, r.first(AssetsEngineEvent.OrderReject.class).refTemplateId());
+        }
+        assertEquals(3L, r.engine.coreOrderReleaseRefusedCount());
+        assertEquals("the live order's hold untouched", locked, r.locked(1, V3Rig.USD));
+        // a create at nextOrderId gets a fresh hold of exactly its notional (nothing was topped up under its id)
+        final long fresh = r.create(r.limit(1, 0, 100 * ONE, ONE));
+        assertEquals(next, fresh);
+        assertEquals(100 * ONE, r.engine.account(1).holdRemaining(fresh));
+        // the engine API refuses with no reply
+        r.mark();
+        r.engine.applyCommand(AssetsEngine.CMD_HOLD, hold(1, next + 9, 5 * ONE), r.now);
+        assertEquals("no reply", 0, r.events().size());
+        assertEquals(refused + 1, r.engine.coreOrderHoldRefusedCount());
+        final var rel = new com.openexchange.assets.domain.commands.ReleaseCommand();
+        rel.reset();
+        rel.setOrderId(live);
+        rel.setUserId(1);
+        rel.setAmount(-1);
+        r.engine.applyCommand(AssetsEngine.CMD_RELEASE, rel, r.now);
+        assertEquals(0, r.events().size());
+        assertEquals(4L, r.engine.coreOrderReleaseRefusedCount());
+        // orderId 0 keeps today's handling
+        r.mark();
+        r.dispatchTrusted(holdFrame(r, 1, 0, V3Rig.USD, 5 * ONE));
+        assertEquals("orderId 0: today's hold path", 1, r.count(AssetsEngineEvent.HoldAck.class));
     }
 }

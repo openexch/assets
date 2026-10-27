@@ -387,7 +387,7 @@ public class AmendEdgeCasesTest {
         final AssetsEngineEvent.MeDispatch minted = r.first(AssetsEngineEvent.MeDispatch.class);
         assertEquals("precondition: the AMEND is dispatch 3", 3, minted.dispatchSeq());
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xD7, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0xD7, 0L, 1024);
         assertEquals("one DISPATCHREPLY + PENDINGEND, got " + r.events(), 2, r.events().size());
         final AssetsEngineEvent.MeDispatchReply d = r.first(AssetsEngineEvent.MeDispatchReply.class);
         assertEquals("original dispatchSeq", 3, d.dispatchSeq());
@@ -411,9 +411,10 @@ public class AmendEdgeCasesTest {
         assertEquals(3, end.headDispatchSeq());
     }
 
-    // contract 3.6 "amend: pendingPrice/legQty": a fill INSIDE the window moves filledQty, and the replayed leg follows it
+    // RC2 S8 3.7 (G6, every behaviour; inverts the RC1 S5 3.6 recompute): a fill INSIDE the window moves filledQty, but the
+    // replay carries the minted bytes, quantity = pendingLegQty
     @Test
-    public void pendingDispatchReplayOfAnAmendRecomputesTheLegFromFillsInsideTheWindow() {
+    public void pendingDispatchReplayOfAnAmendEqualsTheMintedFrameAfterAFillInsideTheWindow() {
         final AmendSupport s = AmendSupport.base();
         final OrderRig r = s.r;
         s.sellSide();
@@ -425,18 +426,20 @@ public class AmendEdgeCasesTest {
         assertEquals("precondition (3.8 #7): filled moves inside the window", 50_000_000L, s.order(1).filledQty);
         assertTrue(s.order(1).has(CoreOrder.F_REPLACE_PENDING));
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xD8, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0xD8, 0L, 1024);
         final AssetsEngineEvent.MeDispatchReply d = r.first(AssetsEngineEvent.MeDispatchReply.class);
         assertEquals(3, d.dispatchSeq());
         assertEquals((1L << 2) | 2, d.commandIdLow());
         assertEquals(110 * ONE, d.price());
-        assertEquals("legQty = pendingQuantity - filledQty at replay time (2 - 0.5), not the 2.0 minted", 150_000_000L, d.quantity());
+        assertEquals("S8 3.7: the minted legQty 2.0, never recomputed from the in-window fill (2 - 0.5)", 2 * ONE, d.quantity());
+        assertEquals("the reply is the minted frame, field for field", minted.render().replace("MEDISPATCH", "DISPATCHREPLY"),
+                d.render());
         assertEquals(1, r.first(AssetsEngineEvent.PendingDispatchEnd.class).count());
     }
 
-    // contract 3.6 "maxEntries 0 -> 1024, cap 4096": pages, the cap, and continuation from the 1024th seq
+    // RC2 S8 3.8 (S1 4.4 froze maxEntries for v7): 1024 asked, cap 4096, continuation from the 1024th seq; 0 is the head probe
     @Test
-    public void pendingDispatchPagesAt1024ByDefaultCapsAt4096AndContinuesFromTheCursor() {
+    public void pendingDispatchPagesAt1024WhenAskedCapsAt4096AndContinuesFromTheCursor() {
         final OrderRig r = OrderRig.open();
         final RiskConfigSetCommand cfg = r.riskConfig(1, 1);
         cfg.maxOrdersPerSec = 1_000;
@@ -456,14 +459,14 @@ public class AmendEdgeCasesTest {
         assertEquals(total, r.orders.orders().size());
         final Map<Long, String> minted = mintedFrames(r);
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xE0, 0L, 0);
-        assertPage(r, minted, 1, 1_024, 0xE0); // maxEntries 0 = the default page
+        r.orders.applyRequestPendingDispatch(0xE0, 0L, 1024);
+        assertPage(r, minted, 1, 1_024, 0xE0); // maxEntries 1024 asked
         r.markNow();
         r.orders.applyRequestPendingDispatch(0xE1, 0L, 5_000);
         assertPage(r, minted, 1, 4_096, 0xE1); // min(4096, pending) = the cap
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0xE2, 1_024L, 0);
-        assertPage(r, minted, 1_025, 2_048, 0xE2); // continuation, default page
+        r.orders.applyRequestPendingDispatch(0xE2, 1_024L, 1024);
+        assertPage(r, minted, 1_025, 2_048, 0xE2); // continuation, 1024 asked
         r.markNow();
         r.orders.applyRequestPendingDispatch(0xE3, 1_024L, 5_000);
         assertPage(r, minted, 1_025, total, 0xE3); // the rest: min(4096, 3226) = 3226
@@ -472,6 +475,12 @@ public class AmendEdgeCasesTest {
         assertEquals("a cursor at the head: an empty page, still an end frame", 0, replies(r).size());
         assertEquals(0, r.first(AssetsEngineEvent.PendingDispatchEnd.class).count());
         assertEquals(total, r.first(AssetsEngineEvent.PendingDispatchEnd.class).headDispatchSeq());
+        r.markNow();
+        r.orders.applyRequestPendingDispatch(0xE5, 0L, 0);
+        assertEquals("maxEntries 0 is the head probe (S8 3.8): no entry", 0, replies(r).size());
+        assertEquals(0, r.first(AssetsEngineEvent.PendingDispatchEnd.class).count());
+        assertEquals("head = dispatchSeq", total, r.first(AssetsEngineEvent.PendingDispatchEnd.class).headDispatchSeq());
+        assertEquals("the probe visits no index slot", 0, r.orders.pendingReplyVisited());
         assertEquals("a query mutates nothing", total, r.engine.getDispatchSeq());
         assertEquals(total, r.orders.orders().size());
     }

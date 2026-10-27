@@ -166,7 +166,8 @@ public class BalanceSnapshotCodecTest {
     @Test
     public void theReservedFeedStateAndMeLinkSectionsAreRefusedAndNeverWritten() {
         // RC2 S1 (contract 4.9): ids 10 and 11 are reserved constants. RC2 S7 (16.5): section 10 is now known, written
-        // iff v3 and refused when present below v3 (the v3 rows live in FeedStateSnapshotTest); 11 stays unknown (S8).
+        // iff v3 and refused when present below v3 (the v3 rows live in FeedStateSnapshotTest). RC2 S8 5.2: section 11 the
+        // same (written iff v3, refused below v3; the v3 rows live in MeLinkSnapshotTest).
         assertEquals(10, BalanceSnapshotCodec.SECTION_FEED_STATE);
         assertEquals(11, BalanceSnapshotCodec.SECTION_ME_LINK);
         for (final short reserved : new short[] {BalanceSnapshotCodec.SECTION_FEED_STATE, BalanceSnapshotCodec.SECTION_ME_LINK}) {
@@ -183,7 +184,7 @@ public class BalanceSnapshotCodecTest {
             assertEquals("the walk covers the whole image", len, pos);
             // an image carrying the reserved section (ascending, well-formed length) is refused
             buf.putInt(sectionCountOffset(), count + 1);
-            final int body = reserved == BalanceSnapshotCodec.SECTION_FEED_STATE ? 92 : 8; // a well-formed 10 is 92 bytes
+            final int body = reserved == BalanceSnapshotCodec.SECTION_FEED_STATE ? 92 : 16; // well-formed heads: 92 and 16 bytes
             buf.putShort(len, reserved);
             buf.putInt(len + 2, body);
             buf.setMemory(len + 6, body, (byte) 0);
@@ -191,7 +192,8 @@ public class BalanceSnapshotCodecTest {
             final IllegalStateException e = assertThrows(IllegalStateException.class,
                     () -> BalanceSnapshotCodec.deserialize(buf, 0, total, new AssetsEngine()));
             assertTrue(e.getMessage(), e.getMessage().contains("section id " + reserved)
-                    || (reserved == BalanceSnapshotCodec.SECTION_FEED_STATE && e.getMessage().contains("FEED_STATE")));
+                    || (reserved == BalanceSnapshotCodec.SECTION_FEED_STATE && e.getMessage().contains("FEED_STATE"))
+                    || (reserved == BalanceSnapshotCodec.SECTION_ME_LINK && e.getMessage().contains("ME_LINK section (11)")));
         }
     }
 

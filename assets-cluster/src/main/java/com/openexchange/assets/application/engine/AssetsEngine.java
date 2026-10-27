@@ -3,6 +3,9 @@ package com.openexchange.assets.application.engine;
 
 import com.openexchange.assets.application.engine.feed.FeedState;
 import com.openexchange.assets.application.engine.gate.OrderEntryGate;
+import com.openexchange.assets.application.engine.order.CoreMetricsView;
+import com.openexchange.assets.application.engine.order.MeOutcomeView;
+import com.openexchange.assets.application.engine.order.MeReleaseView;
 import com.openexchange.assets.application.engine.order.OrderEngine;
 import com.openexchange.assets.application.engine.session.SessionAuthority;
 import com.openexchange.assets.application.engine.session.SessionRegistry;
@@ -292,6 +295,11 @@ public final class AssetsEngine {
         if (!validAsset(c.getAssetId())) {
             return; // never a throw, never an account
         }
+        if (behaviorV3() && c.getOrderId() >= 1) {
+            // RC2 S8 3.12 (D-S8-10): under v3 the core owns every orderId >= 1; the engine guard for every caller (no reply)
+            coreOrderHoldRefusedCount++;
+            return;
+        }
         Account a = accounts.get(c.getUserId());
         if (a == null) {
             sink.onHoldReject(c.getCorrelationId(), c.getOrderId(), c.getUserId(), c.getAssetId(), c.getAmount(),
@@ -312,15 +320,15 @@ public final class AssetsEngine {
         if (a == null) {
             return; // unknown user: nothing held
         }
+        if (behaviorV3() && c.getOrderId() >= 1) {
+            // RC2 S8 3.12 (supersedes S7 7.2 row 4): a core order's hold has ONE release owner, terminalize (S5 3.2), live or
+            // dead; the engine guard for every caller (no reply, nothing moves)
+            coreOrderReleaseRefusedCount++;
+            return;
+        }
         int assetId = a.holdAssetId(c.getOrderId());
         if (assetId < 0) {
             return; // no such hold: idempotent no-op (already released / never held)
-        }
-        if (behaviorV3() && orders.orders().get(c.getOrderId()) != null) {
-            // RC2 S7 7.2 row 4: a live core order's hold has ONE release owner, terminalize (S5 3.2); a v5 Release naming
-            // it is a counted no-op
-            coreOwnedReleaseRefusedCount++;
-            return;
         }
         if (c.isFromFeed() && a.isOmsManagedRelease(c.getOrderId())) {
             // Iceberg/stop PARENT hold: slices share the parent's omsOrderId, so a slice FILLED on
@@ -834,6 +842,19 @@ public final class AssetsEngine {
         if (feed.latchReason() == FeedHaltReason.EPOCH_MISMATCH && feed.boundMeEpoch() == 0) {
             throw new IllegalStateException("restored EPOCH_MISMATCH latch on an unbound feed");
         }
+        // RC2 S8 5.1 a-d (every behaviour; d under v3) and 5.2 rules 1-7 (v3), each with its live rule (5.0)
+        final String o = orders.orderRestoreBreach(v3);
+        if (o != null) {
+            throw new IllegalStateException("restored orders fail their invariants: " + o);
+        }
+        if (v3) {
+            final String l = orders.meLinkRestoreBreach();
+            if (l != null) {
+                throw new IllegalStateException("restored ME link (section 11) fails its invariants: " + l);
+            }
+            orders.countRestoreDiagnostics();
+        }
+        orders.rebuildDerived();
     }
 
     // ---- RC1 S3: session authority and the order-entry gate ----
@@ -868,7 +889,10 @@ public final class AssetsEngine {
     /** CoreConfig (70), ADMIN class: contract S7 section 3, then the node-local cross-check (section 4). */
     public void applyCoreConfig(com.openexchange.assets.domain.commands.CoreConfigCommand c, long timestamp) {
         observeLogTime(timestamp);
-        final var decision = coreConfig.decide(c, gate.state(OrderEntryGate.GLOBAL) == GateState.OPEN, feedVirgin());
+        // RC2 S8 3.12: one O(holds) walk inside the switching apply only (review 2 NOTE-E kept: one boolean into decide)
+        final boolean foreignCoreHold = c.behaviorVersion == 3 && coreConfig.behaviorVersion() == 2 && foreignHoldInCoreRange();
+        final var decision = coreConfig.decide(c, gate.state(OrderEntryGate.GLOBAL) == GateState.OPEN, feedVirgin(),
+                foreignCoreHold);
         final long version = coreConfig.apply(decision, c);
         if (decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.SWITCH
                 && c.behaviorVersion == 3) {
@@ -890,6 +914,28 @@ public final class AssetsEngine {
             sink.onConfigApplied(com.openexchange.assets.domain.ConfigKind.CORE, 0, version, logPosition);
             crossCheckConfigOrFail(decision.name());
         }
+    }
+
+    /**
+     * RC2 S8 3.12 switch precondition: some account holds a hold with {@code orderId >= 1} that is not the hold of a live
+     * core order of that same account (a TOOL/ADMIN hold written under v1/v2 in what becomes the core's id space).
+     */
+    private boolean foreignHoldInCoreRange() {
+        final boolean[] found = {false};
+        forEachAccount(acc -> {
+            if (found[0]) {
+                return;
+            }
+            acc.forEachHold((orderId, assetId, remaining, oms) -> {
+                if (orderId >= 1) {
+                    final var o = orders.orders().get(orderId);
+                    if (o == null || o.userId != acc.userId()) {
+                        found[0] = true;
+                    }
+                }
+            });
+        });
+        return found[0];
     }
 
     /** Section 4: a node whose compiled truth differs from the declared config must not serve (never a reject). */
@@ -990,8 +1036,9 @@ public final class AssetsEngine {
     private final FeedState feed = new FeedState();
     /** v5 money templates refused under v3 (7.2 row 3). Node-local. */
     private long v5MoneyRefusedCount;
-    /** Release 4 naming a live core order under v3 (7.2 row 4). Node-local. */
-    private long coreOwnedReleaseRefusedCount;
+    /** RC2 S8 3.12: Hold 3 / Release 4 naming {@code orderId >= 1} under v3, refused (demuxer step or engine guard). */
+    private long coreOrderHoldRefusedCount;
+    private long coreOrderReleaseRefusedCount;
 
     private static final int V_APPLY = 0;
     private static final int V_DUPLICATE = 1;
@@ -1008,6 +1055,13 @@ public final class AssetsEngine {
         return feed;
     }
 
+    private final CoreMetricsView metricsView = new CoreMetricsView(this);
+
+    /** RC2 S8 3.10 item 3: read-only plain longs (feed + order) for the {@code OrderEngineMetrics} registrar. */
+    public CoreMetricsView metricsView() {
+        return metricsView;
+    }
+
     /** {@code coreConfig().behaviorVersion() >= 3}: every S7 rule is active only then (section 0). */
     public boolean behaviorV3() {
         return coreConfig.behaviorVersion() >= 3;
@@ -1017,13 +1071,31 @@ public final class AssetsEngine {
         return v5MoneyRefusedCount;
     }
 
-    public long coreOwnedReleaseRefusedCount() {
-        return coreOwnedReleaseRefusedCount;
+    public long coreOrderHoldRefusedCount() {
+        return coreOrderHoldRefusedCount;
+    }
+
+    public long coreOrderReleaseRefusedCount() {
+        return coreOrderReleaseRefusedCount;
     }
 
     /** The demuxer's 7.2 row 3 step: a v5 money template refused under v3, for every authority. */
     public void refuseV5Money(final int templateId, final long correlationId, final long userId, final int classCode) {
         v5MoneyRefusedCount++;
+        rejectUnauthorised(templateId, correlationId, userId, CoreRejectReason.UNAUTHORIZED_CLASS, classCode);
+    }
+
+    /**
+     * RC2 S8 3.12: the demuxer's step for Hold 3 / Release 4 from TOOL or ADMIN (the trusted path included) naming
+     * {@code orderId >= 1} under v3: counted and refused with the ORIGIN {@code OrderReject{UNAUTHORIZED_CLASS}}; nothing
+     * applies.
+     */
+    public void refuseCoreOrderMoney(final int templateId, final long correlationId, final long userId, final int classCode) {
+        if (templateId == 3) {
+            coreOrderHoldRefusedCount++;
+        } else {
+            coreOrderReleaseRefusedCount++;
+        }
         rejectUnauthorised(templateId, correlationId, userId, CoreRejectReason.UNAUTHORIZED_CLASS, classCode);
     }
 
@@ -1084,7 +1156,13 @@ public final class AssetsEngine {
         return true;
     }
 
-    /** MeCommandOutcome 64. Under v1/v2 the RC1 apply ({@code oldCancelled} unused). */
+    private final MeOutcomeView s7Outcome = new MeOutcomeView();
+    private final MeReleaseView s7Release = new MeReleaseView();
+
+    /**
+     * MeCommandOutcome 64, the S7 signature (kept, FIX-7): under v1/v2 the RC1 apply ({@code oldCancelled} unused); under v3
+     * the view form with the section 2 defaults for the 64 tail.
+     */
     public boolean onMeOutcome(long egressSeq, long journalSeq, long commandIdHigh, long commandIdLow, long userId,
                                long omsOrderId, long oldOrderId, long price, long quantity, long budget, int marketId,
                                int commandKind, int result, long legId, int reason, boolean oldCancelled, long meTimestamp,
@@ -1094,32 +1172,60 @@ public final class AssetsEngine {
                     marketId, commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp);
             return true;
         }
+        return onMeOutcome(orders.outcomeWithDefaults(s7Outcome, egressSeq, journalSeq, commandIdHigh, commandIdLow, userId,
+                omsOrderId, oldOrderId, price, quantity, budget, marketId, commandKind, result, legId, reason, oldCancelled,
+                meTimestamp, meEpoch), timestamp);
+    }
+
+    /**
+     * MeCommandOutcome 64 with every field (RC2 S8 section 2): under v3 D1 admission with the widened digest (3.10 item 2),
+     * then the S8 tables; under v1/v2 the RC1 apply of the fields it knows.
+     */
+    public boolean onMeOutcome(final MeOutcomeView v, final long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyOutcome(v.egressSeq, v.commandIdHigh, v.commandIdLow, v.userId, v.omsOrderId, v.oldOrderId, v.price,
+                    v.quantity, v.budget, v.marketId, v.commandKind, v.result, v.orderId, v.reason, v.meTimestamp, v.meEpoch,
+                    timestamp);
+            return true;
+        }
         observeLogTime(timestamp);
-        final long digest = outcomeDigest(egressSeq, journalSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price,
-                quantity, budget, marketId, commandKind, result, legId, reason, oldCancelled, meTimestamp, meEpoch);
-        final int verdict = admit(64, journalSeq, meEpoch, egressSeq, 0L, marketId, digest, false);
+        final long digest = outcomeDigest(v);
+        final int verdict = admit(64, v.journalSeq, v.meEpoch, v.egressSeq, 0L, v.marketId, digest, false);
         if (verdict != V_APPLY) {
             return verdict == V_DUPLICATE;
         }
-        orders.applyOutcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget,
-                marketId, commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp, oldCancelled);
-        commit(journalSeq, egressSeq, digest);
+        orders.applyOutcomeV3(v, timestamp);
+        commit(v.journalSeq, v.egressSeq, digest);
         return true;
     }
 
-    /** MeCommandRelease 67, v3 only: S7 consumes the cursor and counts the content unserved (S8 serves it). */
+    /**
+     * MeCommandRelease 67, the S7 signature (kept, FIX-7): {@code releaseSeq 0}, {@code ledgerSize = meLedgerSize},
+     * {@code ledgerCapacity = meLedgerCapacity}, {@code tombstoneRanges 0}, no entries.
+     */
     public boolean onMeRelease(long egressSeq, long journalSeq, long meEpoch, long timestamp) {
+        final MeReleaseView v = s7Release.reset();
+        v.egressSeq = egressSeq;
+        v.journalSeq = journalSeq;
+        v.meEpoch = meEpoch;
+        v.ledgerSize = orders.meLedgerSize();
+        v.ledgerCapacity = feed.meLedgerCapacity();
+        return onMeRelease(v, timestamp);
+    }
+
+    /** MeCommandRelease 67, v3 only (RC2 S8 3.2): D1 with the widened digest, then the content against the backlog. */
+    public boolean onMeRelease(final MeReleaseView v, final long timestamp) {
         if (!behaviorV3()) {
             return false; // not served below v3 (the demuxer counts it unhandled)
         }
         observeLogTime(timestamp);
-        final long digest = releaseDigest(egressSeq, journalSeq, meEpoch);
-        final int verdict = admit(67, journalSeq, meEpoch, egressSeq, 0L, 0, digest, false);
+        final long digest = releaseDigest(v);
+        final int verdict = admit(67, v.journalSeq, v.meEpoch, v.egressSeq, 0L, 0, digest, false);
         if (verdict != V_APPLY) {
             return verdict == V_DUPLICATE;
         }
-        feed.countUnservedRelease();
-        commit(journalSeq, egressSeq, digest);
+        orders.applyReleaseV3(v, timestamp);
+        commit(v.journalSeq, v.egressSeq, digest);
         return true;
     }
 
@@ -1459,8 +1565,9 @@ public final class AssetsEngine {
     private static final long K_RELEASE = 0x67L;
     private static final long K_CONFIG = 0x68L;
 
-    // The digest definition is part of behaviour 3 (contract 3.8): pinned by DigestVectorTest; once 3 is in the production
-    // set it may change only under a new behaviour version.
+    // The digest definition is part of behaviour 3 (contract 3.8): pinned by DigestVectorTest. Behaviour 3 is in the
+    // production set from RC2 S8; the digest and every v3 rule freeze at the first v3 log outside a test rig (S8 D-S8-3,
+    // 3.10 item 5) and may change only under a new behaviour version from then on.
 
     /** 3.8 digest of a 61 or of one 62 entry. */
     public static long tradeDigest(long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId, long takerUserId,
@@ -1478,20 +1585,62 @@ public final class AssetsEngine {
                 journalSeq), legId), userId), marketId), statusCode), meRejectReason), meTimestamp), omsOrderId), meEpoch), 0);
     }
 
-    /** 3.8 digest of a 64 (the fields the S7 core applies; S8 widens it, contract 21). */
-    public static long outcomeDigest(long egressSeq, long journalSeq, long commandIdHigh, long commandIdLow, long userId,
-                                     long omsOrderId, long oldOrderId, long price, long quantity, long budget, int marketId,
-                                     int commandKind, int result, long legId, int reason, boolean oldCancelled, long meTimestamp,
-                                     long meEpoch) {
-        return digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(
-                digest(digest(digest(digest(K_OUTCOME, egressSeq), journalSeq), commandIdHigh), commandIdLow), userId), omsOrderId),
-                oldOrderId), price), quantity), budget), marketId), commandKind), result), legId), reason), oldCancelled ? 1 : 0),
-                meTimestamp), meEpoch);
+    /**
+     * 3.8 digest of a 64, widened by RC2 S8 3.10 item 2: the S7 fields, then orderType, orderSide, appliedPosition, status,
+     * timeInForce, expectedOldRemaining, ledgerSize, ledgerCapacity, behaviorVersion.
+     */
+    public static long outcomeDigest(final MeOutcomeView v) {
+        long h = digest(K_OUTCOME, v.egressSeq);
+        h = digest(h, v.journalSeq);
+        h = digest(h, v.commandIdHigh);
+        h = digest(h, v.commandIdLow);
+        h = digest(h, v.userId);
+        h = digest(h, v.omsOrderId);
+        h = digest(h, v.oldOrderId);
+        h = digest(h, v.price);
+        h = digest(h, v.quantity);
+        h = digest(h, v.budget);
+        h = digest(h, v.marketId);
+        h = digest(h, v.commandKind);
+        h = digest(h, v.result);
+        h = digest(h, v.orderId);
+        h = digest(h, v.reason);
+        h = digest(h, v.oldCancelled ? 1 : 0);
+        h = digest(h, v.meTimestamp);
+        h = digest(h, v.meEpoch);
+        h = digest(h, v.orderType);
+        h = digest(h, v.orderSide);
+        h = digest(h, v.appliedPosition);
+        h = digest(h, v.status);
+        h = digest(h, v.timeInForce);
+        h = digest(h, v.expectedOldRemaining);
+        h = digest(h, v.ledgerSize);
+        h = digest(h, v.ledgerCapacity);
+        return digest(h, v.behaviorVersion);
     }
 
-    /** 3.8 digest of a 67 (the cursor fields only in S7; S8 widens it to the content it serves, contract 21). */
-    public static long releaseDigest(long egressSeq, long journalSeq, long meEpoch) {
-        return digest(digest(digest(digest(K_RELEASE, egressSeq), journalSeq), meEpoch), 0);
+    /**
+     * 3.8 digest of a 67, widened by RC2 S8 3.10 item 2: egressSeq, journalSeq, meEpoch, releaseSeq, ledgerSize,
+     * ledgerCapacity, tombstoneRanges, the entry count, then every entry (commandIdHigh, idLowFloor, scope, result, removed)
+     * in group order.
+     */
+    public static long releaseDigest(final MeReleaseView v) {
+        long h = digest(K_RELEASE, v.egressSeq);
+        h = digest(h, v.journalSeq);
+        h = digest(h, v.meEpoch);
+        h = digest(h, v.releaseSeq);
+        h = digest(h, v.ledgerSize);
+        h = digest(h, v.ledgerCapacity);
+        h = digest(h, v.tombstoneRanges);
+        h = digest(h, v.count);
+        for (int i = 0; i < v.count; i++) {
+            h = digest(h, v.commandIdHigh[i]);
+            h = digest(h, v.idLowFloor[i]);
+            h = digest(h, v.scope[i]);
+            h = digest(h, v.result[i]);
+            h = digest(h, v.removed[i]);
+        }
+        return h;
     }
 
     /** 3.8 digest of a 68. */

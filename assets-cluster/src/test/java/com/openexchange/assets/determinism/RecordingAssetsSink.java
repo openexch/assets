@@ -185,8 +185,24 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     public void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
                              long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
                              long quantity, long budget, int timeInForceCode) {
+        onMeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode, com.openexchange.assets.domain.ReleaseScope.UP_TO, 0L);
+    }
+
+    @Override
+    public void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                             long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                             long quantity, long budget, int timeInForceCode, com.openexchange.assets.domain.ReleaseScope releaseScope,
+                             long expectedOldRemaining) {
         events.add(new AssetsEngineEvent.MeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId,
-                oldOrderId, marketId, orderTypeCode, sideCode, price, quantity, budget, timeInForceCode));
+                oldOrderId, marketId, orderTypeCode, sideCode, price, quantity, budget, timeInForceCode, releaseScope,
+                expectedOldRemaining));
+    }
+
+    @Override
+    public void onReleaseEffect(long orderId, long floor, com.openexchange.assets.domain.ReleaseScope scope,
+                                com.openexchange.assets.domain.ReleaseResult result, int row) {
+        events.add(new AssetsEngineEvent.ReleaseEffect(orderId, floor, scope, result, row));
     }
 
     @Override
@@ -231,7 +247,17 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     public void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
                                   long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
                                   long quantity, long budget, int timeInForceCode) {
+        onMeDispatchReply(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode, com.openexchange.assets.domain.ReleaseScope.UP_TO, 0L);
+    }
+
+    @Override
+    public void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                  long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                  long quantity, long budget, int timeInForceCode,
+                                  com.openexchange.assets.domain.ReleaseScope releaseScope, long expectedOldRemaining) {
         events.add(new AssetsEngineEvent.MeDispatchReply(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId,
-                oldOrderId, marketId, orderTypeCode, sideCode, price, quantity, budget, timeInForceCode));
+                oldOrderId, marketId, orderTypeCode, sideCode, price, quantity, budget, timeInForceCode, releaseScope,
+                expectedOldRemaining));
     }
 }

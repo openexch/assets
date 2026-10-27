@@ -525,7 +525,7 @@ final class SyntheticFuzzDriver extends SyntheticFuzzHarness {
     private boolean opReplay() {
         opText = "PENDINGDISPATCH";
         final int pending = live(o -> o.has(CoreOrder.F_DISPATCH_PENDING)).size();
-        r.orders.applyRequestPendingDispatch(corr++, 0L, 0);
+        r.orders.applyRequestPendingDispatch(corr++, 0L, 1024);
         final List<AssetsEngineEvent.MeDispatchReply> replies = all(AssetsEngineEvent.MeDispatchReply.class);
         if (replies.size() != Math.min(pending, OrderEngine.PENDING_DISPATCH_DEFAULT)) {
             throw fail("one reply per pending dispatch: " + pending + ", got " + replies.size());

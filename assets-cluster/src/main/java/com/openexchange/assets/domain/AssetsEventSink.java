@@ -169,4 +169,35 @@ public interface AssetsEventSink {
 
     /** Node-local observability: a latch was cleared by the reach-clear ({@code auto}) or by FeedLatchClear 76. */
     default void onFeedLatchCleared(FeedHaltReason reason, long journalSeq, boolean auto) { }
+
+    // ---- RC2 S8 (contract section 4). Defaults delegate to the RC1 forms, so every existing sink compiles unchanged; the
+    //      engine calls these, the publisher overrides them and writes MeDispatch fields 15 and 16. ----
+
+    /**
+     * {@link #onMeDispatch} with the v7 fields: {@code releaseScope} (read only on RELEASE_ID, UP_TO otherwise) and
+     * {@code expectedOldRemaining} (the old leg's remainingQty at an AMEND mint under behaviour v3, else 0).
+     */
+    default void onMeDispatch(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                              long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                              long quantity, long budget, int timeInForceCode, ReleaseScope releaseScope,
+                              long expectedOldRemaining) {
+        onMeDispatch(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode);
+    }
+
+    /** {@link #onMeDispatchReply} with the v7 fields, equal to the minted frame field for field (S8 3.8). */
+    default void onMeDispatchReply(long dispatchSeq, long commandIdHigh, long commandIdLow, DispatchKind kind, long userId,
+                                   long omsOrderId, long oldOrderId, int marketId, int orderTypeCode, int sideCode, long price,
+                                   long quantity, long budget, int timeInForceCode, ReleaseScope releaseScope,
+                                   long expectedOldRemaining) {
+        onMeDispatchReply(dispatchSeq, commandIdHigh, commandIdLow, kind, userId, omsOrderId, oldOrderId, marketId, orderTypeCode,
+                sideCode, price, quantity, budget, timeInForceCode);
+    }
+
+    /**
+     * Node-local observability (no wire bytes, like {@link #onFeedLatch}): one release-backlog effect of S8 3.2, its row
+     * code ({@code 1..6} = C1..C6, {@code 11..14} = E1..E4, {@code 21} = abandonment). {@code result} is null for the
+     * orphan rows and the abandonment, which are not release results.
+     */
+    default void onReleaseEffect(long orderId, long floor, ReleaseScope scope, ReleaseResult result, int row) { }
 }

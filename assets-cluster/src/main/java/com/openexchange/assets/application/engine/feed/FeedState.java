@@ -190,6 +190,17 @@ public final class FeedState {
     public long tickUnboundCount() { return tickUnboundCount; }
     public long epochRevokedCount() { return epochRevokedCount; }
 
+    // ---- RC2 S8 3.10 item 3: the demuxer's bridge lane table, node-local (never replicated, never snapshotted) ----
+    long lanesBehind;
+    long feedLaneOverflowCount;
+
+    /** BRIDGE lanes whose highest delivered journalSeq is below the cursor (written by the demuxer per feed frame). */
+    public long lanesBehind() { return lanesBehind; }
+    public void setLanesBehind(final long n) { lanesBehind = n; }
+    /** BRIDGE sessions beyond the lane table's capacity (8). */
+    public long feedLaneOverflowCount() { return feedLaneOverflowCount; }
+    public void countFeedLaneOverflow() { feedLaneOverflowCount++; }
+
     // ---- mutators (the engine's feed apply is the only caller; every one runs inside one replicated apply) ----
 
     /** D2 row 1: trust on first use of the FRESH record's epoch. */

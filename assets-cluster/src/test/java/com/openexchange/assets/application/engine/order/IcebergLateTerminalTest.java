@@ -225,7 +225,8 @@ public class IcebergLateTerminalTest {
             assertEquals(CoreRejectReason.UNAUTHORIZED_CLASS, r.first(AssetsEngineEvent.OrderReject.class).reason());
             assertEquals(locked, r.locked(2, BTC));
         }
-        // Release 4 from TOOL, ADMIN and the trusted path naming the live core order: a counted no-op (7.2 row 4)
+        // Release 4 from TOOL, ADMIN and the trusted path naming the live core order: refused loudly (RC2 S8 3.12 supersedes
+        // S7 7.2 row 4's counted no-op): OrderReject{UNAUTHORIZED_CLASS}, the hold untouched as before
         long refused = 0;
         for (final long session : new long[] {tool, admin, -1L}) {
             r.mark();
@@ -234,9 +235,11 @@ public class IcebergLateTerminalTest {
             } else {
                 r.dispatch(session, release(r, 1, 2));
             }
+            assertEquals(CoreRejectReason.UNAUTHORIZED_CLASS, r.first(AssetsEngineEvent.OrderReject.class).reason());
+            assertEquals(4, r.first(AssetsEngineEvent.OrderReject.class).refTemplateId());
             assertEquals("no balance moved", 0, r.count(AssetsEngineEvent.Balance.class));
             assertEquals(locked, r.locked(2, BTC));
-            assertEquals(++refused, r.engine.coreOwnedReleaseRefusedCount());
+            assertEquals(++refused, r.engine.coreOrderReleaseRefusedCount());
         }
         assertNotNull(r.order(1));
     }

@@ -360,7 +360,9 @@ public class AdversarialFrameFuzzTest {
             sources.stream().filter(b -> FrameMutator.templateOf(b) == template).findFirst().ifPresent(b ->
                     truncateBefore.computeIfAbsent(rnd.nextInt(story.size()), k -> new ArrayList<>()).add(b));
         }
-        final Category[] drawn = Arrays.stream(Category.values()).filter(c -> c != Category.TRUNCATE).toArray(Category[]::new);
+        // RC2 S8: V3_RANGE (the 3.9 mutants) is drawn only in the v3 run, so the v1/v2 random stream is the RC1 one
+        final Category[] drawn = Arrays.stream(Category.values()).filter(c -> c != Category.TRUNCATE && (v3 || c != Category.V3_RANGE))
+                .toArray(Category[]::new);
         FrameReplica f = new FrameReplica();
         final FrameReplica reference = new FrameReplica();
         for (stepIndex = 0; stepIndex < story.size(); stepIndex++) {
@@ -377,7 +379,7 @@ public class AdversarialFrameFuzzTest {
                     // so a rare template (the trade batch, CoreConfig) is mutated as often as CreateOrder
                     final List<Integer> eligible = new ArrayList<>();
                     byTemplate.forEach((t, frames) -> {
-                        if (FrameMutator.applicable(c, frames.get(0))) {
+                        if (FrameMutator.applicable(c, frames.get(0), v3)) {
                             eligible.add(t);
                         }
                     });

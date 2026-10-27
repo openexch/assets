@@ -392,7 +392,7 @@ public class IcebergGapTest {
         assertNotEquals("precondition: the slice seq is not the head", r.engine.getDispatchSeq(), slice.dispatchSeq());
         final byte[] before = k.f.image();
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0x51L, 0L, 0);
+        r.orders.applyRequestPendingDispatch(0x51L, 0L, 1024);
         final List<AssetsEngineEvent.MeDispatchReply> replies = new ArrayList<>();
         for (final AssetsEngineEvent e : r.events()) {
             if (e instanceof AssetsEngineEvent.MeDispatchReply x) {
@@ -421,7 +421,7 @@ public class IcebergGapTest {
         assertEquals("end head = engine dispatchSeq", r.engine.getDispatchSeq(), end.headDispatchSeq());
         assertArrayEquals("the replay changes no state", before, k.f.image());
         r.markNow();
-        r.orders.applyRequestPendingDispatch(0x52L, slice.dispatchSeq(), 0);
+        r.orders.applyRequestPendingDispatch(0x52L, slice.dispatchSeq(), 1024);
         for (final AssetsEngineEvent e : r.events()) {
             assertFalse("fromDispatchSeq = the slice seq excludes it", e instanceof AssetsEngineEvent.MeDispatchReply x
                     && x.omsOrderId() == ICE);

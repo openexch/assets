@@ -60,7 +60,7 @@ public class CoreSnapshotSizingTest {
     private static final int SECTION_HEADER_BYTES = 2 + 4;
     private static final int ACCOUNT_ROW_BYTES = 8 + 4 + 6 * 16 + 4;    // userId, numAssets, 6 x (avail, locked), numHolds
     private static final int HOLD_ROW_BYTES = 8 + 4 + 8 + 1;
-    private static final int ORDER_BYTES = 288;
+    private static final int ORDER_BYTES = 304; // RC2 S8 5.1: 288 -> 304 (pendingLegQty, pendingExpectedOldRemaining)
     private static final int USER_RISK_BYTES = 80;
     private static final int MARKET_STATE_BYTES = 117;
     private static final int MARKET_SLOTS = 6;
@@ -95,7 +95,10 @@ public class CoreSnapshotSizingTest {
     }
 
     /** The pinned literals must equal the code's constants, or the arithmetic below checks a layout nobody writes. */
-    /** RC2 S7 16.5: under behaviour 3 the image gains section 10 FEED_STATE (92 bytes): 9 sections. */
+    /**
+     * RC2 S7 16.5: under behaviour 3 the image gains section 10 FEED_STATE (92 bytes); RC2 S8 5.2 adds section 11 ME_LINK
+     * (16-byte head, no backlog entry here): 10 sections.
+     */
     @Test
     public void aV3ImageCarriesTheFeedStateSection() {
         final com.openexchange.assets.application.engine.feed.V3Rig r = com.openexchange.assets.application.engine.feed.V3Rig.bound();
@@ -103,19 +106,19 @@ public class CoreSnapshotSizingTest {
         final int length = BalanceSnapshotCodec.serialize(r.engine, out, 0);
         final long v2Shape = expectedImageBytes(0, 0, 0, 0, Market.ALL.length, Asset.count());
         // section 10 layout v2 (3.8): 92-byte head + freshDigest 8 + digestCount 4 + one digest per entry (cursor 1)
-        assertEquals("v3 = the v1/v2 layout + one section header + 92 + 12 + 8 bytes", v2Shape + SECTION_HEADER_BYTES + 92 + 12 + 8,
-                length);
+        assertEquals("v3 = the v1/v2 layout + section 10 (92 + 12 + 8 bytes) + section 11 (16-byte head)",
+                v2Shape + SECTION_HEADER_BYTES + 92 + 12 + 8 + SECTION_HEADER_BYTES + 16, length);
         final AssetsEngine restored = new AssetsEngine();
         restored.coreConfig().setSupportedBehaviorVersions(1, 2, 3);
         restored.setEventSink(new QuietSink());
         final BalanceSnapshotCodec.Decoded decoded = BalanceSnapshotCodec.deserialize(new UnsafeBuffer(out.byteArray(), 0, length),
                 0, length, restored);
-        assertEquals("sections (1..6, 8 CORE_CONFIG, 9 SESSIONS, 10 FEED_STATE)", 9, decoded.sectionCount);
+        assertEquals("sections (1..6, 8 CORE_CONFIG, 9 SESSIONS, 10 FEED_STATE, 11 ME_LINK)", 10, decoded.sectionCount);
     }
 
     @Test
     public void declaredRecordSizesMatchTheCodeConstants() {
-        assertEquals("order record (S5 contract 1: 33 longs, 4 ints, 1 short, 6 bytes)", ORDER_BYTES, CoreOrder.SNAPSHOT_BYTES);
+        assertEquals("order record (RC2 S8 5.1: 35 longs, 4 ints, 1 short, 6 bytes)", ORDER_BYTES, CoreOrder.SNAPSHOT_BYTES);
         assertEquals("user risk record", USER_RISK_BYTES, UserRisk.SNAPSHOT_BYTES);
         assertEquals("market state record", MARKET_STATE_BYTES, MarketRisk.SNAPSHOT_BYTES);
         assertEquals("market slots (0 = defaults, 1..5)", MARKET_SLOTS, UserRisk.MARKET_SLOTS);
@@ -444,5 +447,24 @@ public class CoreSnapshotSizingTest {
         assertNull(sink.lastReject);
         e.orders().applyCreate(c, START_MS);
         assertEquals("genesis gate is closed", CoreRejectReason.GATE_CLOSED, sink.lastReject);
+    }
+
+    /**
+     * RC2 S8 G9 (FIX-6, 5.0 row 5.1 c): reason 15 ends an order inside its replace window (terminalize does not run
+     * closeReplaceWindow), the pooled record is cleared at removal and reused by the next create, and the image restores.
+     */
+    @Test
+    public void recycledRecordAfterTerminalInsideWindowRestores() {
+        final com.openexchange.assets.application.engine.feed.V3Rig r = S8Support.funded();
+        final long h = S8Support.restingBuy(r, 101);
+        r.amend(1, h, 0, 2 * ONE);
+        assertTrue("precondition: the window carries the reference", r.order(h).pendingLegQty > 0);
+        assertTrue(r.outcome(h, 1, S8Support.AMEND, S8Support.REJECTED, 101, 15, true)); // reason 15, oldCancelled 1
+        assertEquals("the order ended inside its window", null, r.order(h));
+        final long next = r.create(r.limit(1, 0, 100 * ONE, ONE));
+        final CoreOrder reused = r.order(next);
+        assertEquals("cleared at removal: pendingLegQty", 0L, reused.pendingLegQty);
+        assertEquals("cleared at removal: pendingExpectedOldRemaining", 0L, reused.pendingExpectedOldRemaining);
+        S8Support.roundTrip(r.engine, "the recycled record restores (5.1 c holds)");
     }
 }

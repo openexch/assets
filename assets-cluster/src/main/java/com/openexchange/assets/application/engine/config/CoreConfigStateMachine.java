@@ -19,7 +19,7 @@ import java.util.Comparator;
 public final class CoreConfigStateMachine {
 
     /** Behaviour versions this jar can run (contract section 4c). */
-    public static final int[] SUPPORTED_BEHAVIOR_VERSIONS = {1, 2};
+    public static final int[] SUPPORTED_BEHAVIOR_VERSIONS = {1, 2, 3}; // RC2 S8 3.10 item 5: behaviour 3 joins
     public static final int SCALE = 8;
     private static final int MAX_SYMBOL = 16;
     private static final int MAX_CODE = 8;
@@ -68,6 +68,15 @@ public final class CoreConfigStateMachine {
      * never reaches into the engine); they matter only to row 7, the switch to behaviour 3.
      */
     public Decision decide(final CoreConfigCommand c, final boolean globalOpen, final boolean feedVirgin) {
+        return decide(c, globalOpen, feedVirgin, false);
+    }
+
+    /**
+     * {@link #decide(CoreConfigCommand, boolean, boolean)} with the RC2 S8 3.12 input: {@code foreignCoreHold} (some
+     * account holds a hold with {@code orderId >= 1} that is not a live core order's own) refuses row 7, the switch to 3.
+     */
+    public Decision decide(final CoreConfigCommand c, final boolean globalOpen, final boolean feedVirgin,
+                           final boolean foreignCoreHold) {
         if (invalidReason(c) != null) {
             return Decision.INVALID;
         }
@@ -92,7 +101,8 @@ public final class CoreConfigStateMachine {
         }
         // row 7: the switch to 3 needs a recorded genesisId, a feed-virgin core and GLOBAL SUSPENDED (no order can be admitted
         // between the switch and the bind)
-        if (c.behaviorVersion == 3 && recorded.behaviorVersion == 2 && (recorded.genesisId == 0 || !feedVirgin || globalOpen)) {
+        if (c.behaviorVersion == 3 && recorded.behaviorVersion == 2
+                && (recorded.genesisId == 0 || !feedVirgin || globalOpen || foreignCoreHold)) {
             return Decision.INVALID;
         }
         return c.behaviorVersion == recorded.behaviorVersion + 1 ? Decision.SWITCH : Decision.INVALID;

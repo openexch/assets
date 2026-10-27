@@ -138,9 +138,22 @@ public final class SessionEgressQueue {
      * with a fresh QueryFeedPosition at every epoch start.
      */
     private boolean resumable;
+    /** RC2 S8 3.13: at least one offer to this session was delivered (positive result). Transport state. */
+    private boolean delivered;
+    /** RC2 S8 3.13: the session was closed on a discard; everything later is discarded, never delivered. */
+    private boolean discardClosed;
+    private long discardCloseCount;
+    /** Review FIX-2: told at each discard close, so the service-level total outlives this queue's retirement. */
+    private final Runnable onDiscardClose;
 
     public SessionEgressQueue(final ClientSession session) {
+        this(session, () -> { });
+    }
+
+    /** {@code onDiscardClose} runs on the service thread at each RC2 S8 3.13 close (review FIX-2: the monotone total). */
+    public SessionEgressQueue(final ClientSession session, final Runnable onDiscardClose) {
         this.session = session;
+        this.onDiscardClose = onDiscardClose;
     }
 
     public ClientSession session() {
@@ -170,6 +183,16 @@ public final class SessionEgressQueue {
 
     public int peakPendingBytes() {
         return peakPendingBytes;
+    }
+
+    /** RC2 S8 3.13: times this queue reset and closed its session on a NOT_CONNECTED or MAX_POSITION_EXCEEDED discard. */
+    public long discardCloseCount() {
+        return discardCloseCount;
+    }
+
+    /** RC2 S8 3.13: true once the session was closed on a discard (nothing is delivered after it). */
+    public boolean isDiscardClosed() {
+        return discardClosed;
     }
 
     public int channelMask() {
@@ -233,6 +256,7 @@ public final class SessionEgressQueue {
         }
         final int consumed = pending.consume(offerConsumer, DRAIN_LIMIT);
         flushOpenBatch(); // the drain cycle is over for this pass; a batch never waits for more events
+        resetIfDiscardClosed();
         return consumed;
     }
 
@@ -254,6 +278,7 @@ public final class SessionEgressQueue {
         }
         // End of the drain cycle: whatever is still coalescing goes out now (or parks on back-pressure).
         flushOpenBatch();
+        resetIfDiscardClosed();
         return total;
     }
 
@@ -476,7 +501,17 @@ public final class SessionEgressQueue {
         return false;
     }
 
+    /** S8 3.13: the reset of the ceiling path, done outside the ring buffer's consume callback. */
+    private void resetIfDiscardClosed() {
+        if (discardClosed && !isEmpty()) {
+            reset();
+        }
+    }
+
     private boolean offerFrame(final DirectBuffer buffer, final int offset, final int length) {
+        if (discardClosed) {
+            return true; // S8 3.13: closed on a discard; nothing later is delivered on this session
+        }
         final long result;
         try {
             result = session.offer(buffer, offset, length);
@@ -496,11 +531,27 @@ public final class SessionEgressQueue {
             return true; // consumed (lost), so the frames behind it keep flowing
         }
         if (result > 0) {
+            delivered = true;
             return true; // delivered (also covers ClientSession.MOCKED_OFFER on a follower)
         }
         if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION) {
             backPressureCount++;
             return false; // keep this frame and everything after it for the next drain
+        }
+        if (resumable && delivered && (result == Publication.NOT_CONNECTED || result == Publication.MAX_POSITION_EXCEEDED)) {
+            // RC2 S8 3.13 (S12 A-2): a frame on a resumable session is either delivered in order or the session is closed
+            // and the consumer resyncs: reset and close exactly as the ceiling path, never a silent hole
+            discardClosed = true;
+            discardCloseCount++;
+            onDiscardClose.run();
+            System.err.println("CRITICAL: assets egress offer " + result + " on resumable session=" + session.id()
+                    + " after a delivery; closing the session instead of discarding (S8 3.13)");
+            try {
+                session.close();
+            } catch (final RuntimeException ignored) {
+                // already closing: the queue is reset either way and later offers are discarded
+            }
+            return true;
         }
         // CLOSED / MAX_POSITION_EXCEEDED / NOT_CONNECTED: the session is gone. Discard, exactly as the
         // inline path did — the state is safe and the consumer resynchronises through the snapshot
