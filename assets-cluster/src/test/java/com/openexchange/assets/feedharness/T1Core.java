@@ -71,6 +71,8 @@ public final class T1Core {
                     default -> throw new IllegalArgumentException("no T1 key for " + c);
                 };
                 s = T1Session.connect(env, key);
+                final T1Session self = s;
+                s.idle = () -> drainOthers(self); // a reply wait must not let the other sessions' egress back up
                 sessions.put(c, s);
                 if (c == SessionClass.GATEWAY || c == SessionClass.FORWARDER) {
                     final long k = corr++;
@@ -82,6 +84,23 @@ public final class T1Core {
                 }
             }
             return s;
+        }
+
+        /** Drains every session of this invocation (and the pump): see {@link T1Session#drain}. */
+        void drainAll() {
+            drainOthers(null);
+        }
+
+        /** Drains every session but {@code self} (the one waiting for a reply), and the pump. */
+        void drainOthers(final T1Session self) {
+            for (final T1Session s : sessions.values()) {
+                if (s != self) {
+                    s.drain();
+                }
+            }
+            if (pump != null) {
+                pump.drain();
+            }
         }
 
         @Override
@@ -231,11 +250,17 @@ public final class T1Core {
         final long deadline = System.currentTimeMillis() + timeoutMs;
         Report r;
         do {
+            c.drainAll(); // no frame before this report is awaited; a long round's egress must not back up (T1Session.drain)
             r = report(c);
             if (r.lastAppliedJournalSeq() >= seq) {
+                c.drainAll();
                 return true;
             }
-            Thread.sleep(20);
+            final long until = System.currentTimeMillis() + 20;
+            while (System.currentTimeMillis() < until) {
+                c.drainAll();
+                Thread.sleep(1);
+            }
         } while (System.currentTimeMillis() < deadline);
         c.out.println("BARRIER " + seq + " not reached: " + reportJson(r));
         return false;
@@ -326,24 +351,36 @@ public final class T1Core {
         return 0;
     }
 
-    /** The story loop: round r, the journal writes (or the self-test pump), barrier b_r. */
+    static final String RUN_USAGE = "t1-core run <story-dir> (--journal-ctl <fifo> | --pump) [--timeout <ms>] [--from <r>]"
+            + " [--to <r>]";
+
+    /**
+     * The story loop: round r, the journal writes (or the self-test pump), barrier b_r; rounds {@code --from} .. {@code --to}
+     * (default all), so a runner can stop after a round (R-K7: restart the bridge behind the long round) or do one round's
+     * steps itself (R-K6: {@code round}, its own WRITE, the bridge start, {@code barrier}) and resume with {@code --from}.
+     */
     static int runStory(final Ctx c, final String[] args) throws Exception {
         final FeedStory.Story s = FeedStory.read(Path.of(args[2]));
         final String fifo = opt(args, "--journal-ctl");
         final boolean pump = List.of(args).contains("--pump");
         if ((fifo == null) == !pump) {
-            throw new FeedHarnessMain.Usage("t1-core run <story-dir> (--journal-ctl <fifo> | --pump)");
+            throw new FeedHarnessMain.Usage(RUN_USAGE);
         }
         final long timeout = opt(args, "--timeout") == null ? 30_000 : Long.parseLong(opt(args, "--timeout"));
+        final int from = opt(args, "--from") == null ? 0 : Integer.parseInt(opt(args, "--from"));
+        final int to = opt(args, "--to") == null ? s.rounds() - 1 : Integer.parseInt(opt(args, "--to"));
+        if (from < 0 || to >= s.rounds() || from > to) {
+            throw new FeedHarnessMain.Usage(RUN_USAGE + ": rounds " + from + ".." + to + " outside 0.." + (s.rounds() - 1));
+        }
         final long[] barriers = s.barriers();
-        long prev = 0;
-        for (int r = 0; r < s.rounds(); r++) {
+        long prev = from == 0 ? 0 : barriers[from - 1];
+        for (int r = from; r <= to; r++) {
             round(c, s, r);
             if (pump) {
                 if (c.pump == null) {
                     c.pump = ReferencePump.open(c.env);
                 }
-                c.pump.pump(s.frames(r));
+                c.pump.pump(s.frames(r), c::drainAll);
             } else {
                 Files.writeString(Path.of(fifo), "WRITE all " + (prev + 1) + " " + barriers[r] + "\n", StandardCharsets.US_ASCII,
                         StandardOpenOption.WRITE, StandardOpenOption.APPEND);
@@ -353,7 +390,8 @@ public final class T1Core {
             }
             prev = barriers[r];
         }
-        c.out.println("RUN done: " + s.rounds() + " rounds, cursor " + report(c).lastAppliedJournalSeq());
+        c.out.println("RUN done: " + (from == 0 && to == s.rounds() - 1 ? s.rounds() + " rounds"
+                : "rounds " + from + ".." + to) + ", cursor " + report(c).lastAppliedJournalSeq());
         return 0;
     }
 

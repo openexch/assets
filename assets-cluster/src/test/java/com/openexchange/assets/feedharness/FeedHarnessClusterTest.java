@@ -142,6 +142,9 @@ public class FeedHarnessClusterTest {
         } catch (FeedHarnessMain.Exit x) {
             p.println(x.getMessage());
             code = x.code;
+        } catch (FeedHarnessMain.Usage u) {
+            p.println("usage: " + u.getMessage());
+            code = FeedHarnessMain.USAGE;
         } catch (Exception e) {
             p.println("internal: " + e);
             code = FeedHarnessMain.INTERNAL;
@@ -154,9 +157,13 @@ public class FeedHarnessClusterTest {
     private static final List<Path> STORY_DIRS = new ArrayList<>();
 
     static Path story(final long seed) throws Exception {
+        return story(seed, FeedStory.Options.NONE);
+    }
+
+    static Path story(final long seed, final FeedStory.Options options) throws Exception {
         final Path d = Files.createTempDirectory("s9h-story-" + seed);
         STORY_DIRS.add(d);
-        FeedStory.write(FeedStory.build(seed, ROUNDS), d);
+        FeedStory.write(FeedStory.build(seed, ROUNDS, options), d);
         return d;
     }
 
@@ -243,6 +250,39 @@ public class FeedHarnessClusterTest {
         final Out oracle = t1(env, "t1-core", "oracle", dir.toString());
         assertEquals("oracle FAIL: " + oracle.text(), 1, oracle.code());
         assertLatch(oracle, "L false 0"); // never bound: not halted
+    }
+
+    /**
+     * S9c 14.4 / R-K6 on a real core: a {@code --burst 129} story run in two parts, the FRESH round ({@code --to 0}), then
+     * from the burst round on ({@code --from 1}, the shape a runner uses to write the burst as a backlog before its bridge
+     * starts); every burst trade settles and the oracle passes.
+     */
+    @Test
+    public void burstStoryRunInTwoPartsPassesTheOracle() throws Exception {
+        final Map<String, String> env = cluster(1, 23_400, T1Keys.table(true));
+        final Path dir = story(9, FeedStory.Options.burst(129));
+        final FeedStory.Story s = FeedStory.read(dir);
+        Out o = t1(env, "t1-core", "genesis", "--story", dir.toString());
+        assertEquals(o.text(), 0, o.code());
+        o = t1(env, "t1-core", "run", dir.toString(), "--pump", "--to", "0");
+        assertEquals("run --to 0: " + o.text(), 0, o.code());
+        assertTrue(o.text(), o.text().contains("RUN done: rounds 0..0, cursor 1"));
+        o = t1(env, "t1-core", "run", dir.toString(), "--pump", "--from", "1", "--timeout", "30000");
+        assertEquals("run --from 1: " + o.text(), 0, o.code());
+        assertTrue(o.text(), o.text().contains("cursor " + s.length()));
+        o = t1(env, "t1-core", "run", dir.toString(), "--pump", "--from", "3", "--to", "2");
+        assertEquals("an empty round range is a usage error", FeedHarnessMain.USAGE, o.code());
+        o = t1(env, "t1-core", "oracle", dir.toString());
+        assertEquals("oracle: " + o.text(), 0, o.code());
+        assertTrue(o.text(), o.text().startsWith("PASS "));
+        assertLatch(o, "L false 0");
+    }
+
+    /** A {@code --long-round 20000} story through the whole T1 loop on one member (the R-K1 / R-K7 shape, small). */
+    @Test
+    public void longRoundStoryPassesTheOracle() throws Exception {
+        final Map<String, String> env = cluster(1, 23_700, T1Keys.table(true));
+        storyLoop(env, story(10, FeedStory.Options.longRound(20_000)));
     }
 
     @Test

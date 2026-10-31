@@ -29,6 +29,8 @@ public final class T1Session implements EgressListener, AutoCloseable {
     final List<byte[]> frames = new ArrayList<>();
     private long lastKeepAlive = System.currentTimeMillis();
     private int scanned;
+    /** Run on every wait iteration of {@link #await} and {@link #offer}: t1-core drains its other sessions there. */
+    Runnable idle = () -> { };
 
     /** The value of {@code name} in {@code env}, or Exit 78 (rule H5). */
     public static String need(final Map<String, String> env, final String name) {
@@ -84,11 +86,30 @@ public final class T1Session implements EgressListener, AutoCloseable {
 
     public void poll() {
         client.pollEgress();
+        keepAlive();
+    }
+
+    private void keepAlive() {
         final long now = System.currentTimeMillis();
         if (now - lastKeepAlive >= 500) {
             client.sendKeepAlive();
             lastKeepAlive = now;
         }
+    }
+
+    /**
+     * Polls until the egress is empty (bounded) and drops every frame captured so far. A long round (S9c R-K1 / R-K7: 10^6
+     * trades) sends each session of the run its order events and settlements; a session that only polls ten fragments
+     * while it waits falls behind, the core closes it at its 16 MB egress cap, and a reply scan over the kept frames grows
+     * without bound. Called only where no earlier frame can still be awaited (the barrier wait, between pump offers).
+     */
+    public void drain() {
+        for (int i = 0; i < 10_000 && client.pollEgress() > 0; i++) {
+            frames.clear();
+        }
+        keepAlive();
+        frames.clear();
+        scanned = 0;
     }
 
     public void offer(final byte[] frame) {
@@ -99,6 +120,7 @@ public final class T1Session implements EgressListener, AutoCloseable {
                 throw new IllegalStateException("offer not accepted within " + TIMEOUT_MS + " ms");
             }
             poll();
+            idle.run();
             Thread.onSpinWait();
         }
     }
@@ -115,8 +137,10 @@ public final class T1Session implements EgressListener, AutoCloseable {
     /** The first frame (from the beginning of the capture) matching {@code p}, waiting for it. */
     public byte[] await(final Predicate<byte[]> p, final long timeoutMs) {
         final long deadline = System.currentTimeMillis() + timeoutMs;
+        int from = 0; // frames are only appended while waiting: each frame is tested once (a long round's egress)
         while (true) {
-            for (final byte[] f : frames) {
+            for (; from < frames.size(); from++) {
+                final byte[] f = frames.get(from);
                 if (p.test(f)) {
                     return f;
                 }
@@ -125,6 +149,7 @@ public final class T1Session implements EgressListener, AutoCloseable {
                 return null;
             }
             poll();
+            idle.run();
             Thread.onSpinWait();
         }
     }

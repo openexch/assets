@@ -36,25 +36,46 @@ final class HarnessCommands {
         }
     }
 
-    /** {@code story <seed> <rounds> <out-dir>} (6.4). */
+    static final String STORY_USAGE = "story <seed> <rounds> <out-dir> [--burst <n> | --long-round <records>]";
+
+    /** {@code story <seed> <rounds> <out-dir> [--burst <n> | --long-round <records>]} (6.4; the options: S9c 14.4). */
     static int story(final String[] args, final PrintStream err) throws Exception {
-        if (args.length != 4) {
-            throw new FeedHarnessMain.Usage("story <seed> <rounds> <out-dir>");
+        if (args.length != 4 && args.length != 6) {
+            throw new FeedHarnessMain.Usage(STORY_USAGE);
         }
         final long seed;
         final int rounds;
+        FeedStory.Options options = FeedStory.Options.NONE;
         try {
             seed = Long.parseLong(args[1]);
             rounds = Integer.parseInt(args[2]);
-        } catch (NumberFormatException e) {
-            throw new FeedHarnessMain.Usage("story <seed> <rounds> <out-dir>: " + e.getMessage());
+            if (args.length == 6) {
+                final int n = Integer.parseInt(args[5]);
+                options = switch (args[4]) {
+                    case "--burst" -> FeedStory.Options.burst(n);
+                    case "--long-round" -> FeedStory.Options.longRound(n);
+                    default -> throw new FeedHarnessMain.Usage(STORY_USAGE + ": unknown option " + args[4]);
+                };
+                if (n < 1) {
+                    throw new FeedHarnessMain.Usage(STORY_USAGE + ": " + args[4] + " needs a positive count");
+                }
+                options.pairTrades(); // range check: a usage error, not an internal one
+            }
+        } catch (IllegalArgumentException e) { // NumberFormatException included
+            throw new FeedHarnessMain.Usage(STORY_USAGE + ": " + e.getMessage());
         }
         if (rounds < FeedStory.MIN_ROUNDS) {
             throw new FeedHarnessMain.Usage("story: rounds >= " + FeedStory.MIN_ROUNDS);
         }
-        final FeedStory.Story s = FeedStory.build(seed, rounds);
+        final long t0 = System.nanoTime();
+        final FeedStory.Story s = FeedStory.build(seed, rounds, options);
+        final long built = System.nanoTime();
         FeedStory.write(s, Path.of(args[3]));
         err.println("story " + seed + ": " + rounds + " rounds, " + s.length() + " records, clean snapshot " + s.expectedSha256());
+        if (!s.info().isEmpty()) {
+            err.println("story " + seed + ": " + s.info() + "; built in " + (built - t0) / 1_000_000 + " ms, written in "
+                    + (System.nanoTime() - built) / 1_000_000 + " ms");
+        }
         return FeedHarnessMain.OK;
     }
 

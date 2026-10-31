@@ -38,11 +38,32 @@ public final class ReferencePump implements AutoCloseable {
     }
 
     public void pump(final List<byte[]> frames) {
+        pump(frames, () -> { });
+    }
+
+    /**
+     * Offers the frames in order; every 64 offers (and at the end) drains this session's egress and runs {@code between}
+     * (the caller drains its own sessions), so a long round's settlements never back the core's egress up.
+     */
+    public void pump(final List<byte[]> frames, final Runnable between) {
+        session.idle = () -> { // a back-pressured offer keeps every egress drained (nothing is awaited on the pump)
+            session.drain();
+            between.run();
+        };
         for (final byte[] f : frames) {
             session.offer(f);
-            offered++;
+            if (++offered % 64 == 0) {
+                session.drain();
+                between.run();
+            }
         }
-        session.poll();
+        session.drain();
+        between.run();
+    }
+
+    /** Drains this session's egress (the barrier wait calls it between its reports). */
+    public void drain() {
+        session.drain();
     }
 
     public long offered() {

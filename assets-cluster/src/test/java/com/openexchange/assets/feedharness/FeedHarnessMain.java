@@ -122,7 +122,7 @@ public final class FeedHarnessMain {
                 "  fixtures <mejournal-dir> <out-dir>",
                 "  random <seed> <count> <out-dir>",
                 "  e1 <e1-dir> <out-dir>",
-                "  story <seed> <rounds> <out-dir>",
+                "  " + HarnessCommands.STORY_USAGE,
                 "  apply <core.flog> <feed.ffr-or-flog> <out.json>",
                 "  serve",
                 "  t1-journal",

@@ -169,6 +169,12 @@ public final class T1Journal {
         }
 
         void write(final byte[] bytes) {
+            append(bytes);
+            awaitRecorded();
+        }
+
+        /** Offers one record without waiting for the recording (WRITE awaits once after its range: a 10^6 record story). */
+        void append(final byte[] bytes) {
             if (pub == null) {
                 startRecording(termLength);
             }
@@ -180,7 +186,6 @@ public final class T1Journal {
                 }
                 Thread.onSpinWait();
             }
-            awaitRecorded();
         }
 
         @Override
@@ -254,12 +259,7 @@ public final class T1Journal {
                     }, "padded " + a[2]);
                     case "PURGE": return each(a[1], s -> s.client.purgeSegments(s.recordingId, Long.parseLong(a[2])),
                             "purged below " + a[2]);
-                    case "CORRUPT": return each(a[1], s -> {
-                        if (!List.of("schema3", "version2", "block", "length", "head0", "oversize").contains(a[3])) {
-                            throw new IllegalArgumentException("unknown mode " + a[3]);
-                        }
-                        s.corrupt.put(Long.parseLong(a[2]), a[3]);
-                    }, "corrupt " + a[2] + " " + a[3]);
+                    case "CORRUPT": return corrupt(a);
                     case "REGENESIS": return regenesis(a);
                     case "EPOCH": return each(a[1], s -> s.epochFrom.put(Long.parseLong(a[2]), Long.decode(a[3])),
                             "epoch from " + a[2]);
@@ -338,6 +338,46 @@ public final class T1Journal {
             return "OK loaded " + journal.size() + (dense ? " dense" : " by position");
         }
 
+        static final List<String> CORRUPT_MODES = List.of("schema3", "version2", "block", "length", "head0", "oversize", "poison",
+                "none");
+
+        /**
+         * {@code CORRUPT <src|all> <seq> <mode>}: the copy of record seq on that source is written as the mode's variant from
+         * now on (WRITE, RESTART and FILL all take it through {@link #bytesFor}). {@code poison} (S9c 14.4, R-K12c) needs a
+         * loaded journal whose record seq is a Trade: anything else answers ERR and marks nothing. {@code none} removes the
+         * mark, so a later RESTART or FILL writes the valid copy again (the R-K12 / R-K12c recovery: {@code CORRUPT all s
+         * none}, then {@code RESTART all s}).
+         */
+        private String corrupt(final String[] a) {
+            if (a.length != 4) {
+                throw new IllegalArgumentException("CORRUPT <src|all> <seq> <mode>");
+            }
+            final String mode = a[3];
+            if (!CORRUPT_MODES.contains(mode)) {
+                throw new IllegalArgumentException("unknown mode " + mode);
+            }
+            final long n = Long.parseLong(a[2]);
+            if (mode.equals("poison")) {
+                if (n < 1 || n > journal.size()) {
+                    throw new IllegalArgumentException("poison " + n + " outside the loaded journal (" + journal.size() + ")");
+                }
+                final int t = JournalRecords.templateId(journal.get((int) n - 1));
+                if (t != POISON_TEMPLATE) {
+                    throw new IllegalArgumentException("poison " + n + ": record is template " + t + ", not a Trade ("
+                            + POISON_TEMPLATE + ")");
+                }
+            }
+            if (mode.equals("none")) {
+                return each(a[1], s -> s.corrupt.remove(n), "corrupt " + a[2] + " none");
+            }
+            return each(a[1], s -> s.corrupt.put(n, mode), "corrupt " + a[2] + " " + mode);
+        }
+
+        /** The journal template a poison applies to (Trade) and the byte it sets: {@code takerIsBuy}, raw 2. */
+        static final int POISON_TEMPLATE = 1;
+        static final int POISON_OFFSET = 8 + com.match.infrastructure.mejournal.generated.TradeEncoder.takerIsBuyEncodingOffset();
+        static final byte POISON_VALUE = 2;
+
         /** The bytes of record {@code n} (seq or position) as source {@code s} writes it: epoch override and corruption. */
         private byte[] bytesFor(final Source s, final long n) {
             byte[] r = journal.get((int) n - 1);
@@ -363,6 +403,14 @@ public final class T1Journal {
                 case "head0" -> new UnsafeBuffer(c).putLong(8, 0L, ByteOrder.LITTLE_ENDIAN);
                 case "oversize" -> {
                     return java.util.Arrays.copyOf(r, 2000);
+                }
+                case "poison" -> {
+                    // the S9h 4.2 decode-poison row: header, block, seq, meEpoch, egressSeq unchanged; the gate admits it, the
+                    // translation keeps the raw byte, the core refuses it on decode (AssetsSbeDemuxer 61 / 62 v3 path)
+                    if (JournalRecords.templateId(r) != POISON_TEMPLATE) {
+                        throw new IllegalArgumentException("poison on template " + JournalRecords.templateId(r));
+                    }
+                    c[POISON_OFFSET] = POISON_VALUE;
                 }
                 default -> throw new IllegalArgumentException(mode);
             }
@@ -399,9 +447,12 @@ public final class T1Journal {
                     if (s.held.contains(n)) {
                         continue;
                     }
-                    s.write(bytesFor(s, n));
+                    s.append(bytesFor(s, n));
                     s.lastWritten = Math.max(s.lastWritten, n);
                     written++;
+                }
+                if (s.pub != null) {
+                    s.awaitRecorded(); // the reply still follows the recording position covering every record written
                 }
             }
             return "OK wrote " + written;
@@ -430,9 +481,10 @@ public final class T1Journal {
                 s.startRecording(s.termLength);
                 for (long n = from; n <= upTo; n++) {
                     if (!s.held.contains(n)) {
-                        s.write(bytesFor(s, n));
+                        s.append(bytesFor(s, n));
                     }
                 }
+                s.awaitRecorded();
             }, "restarted from " + from);
         }
 
@@ -477,8 +529,9 @@ public final class T1Journal {
             return each(a[1], s -> {
                 s.startRecording(s.termLength);
                 for (final byte[] r : fresh) {
-                    s.write(r);
+                    s.append(r);
                 }
+                s.awaitRecorded();
             }, "regenesis epoch " + a[2] + " " + fresh.size() + " records");
         }
 

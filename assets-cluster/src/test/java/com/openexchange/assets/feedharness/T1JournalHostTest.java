@@ -5,6 +5,7 @@ import io.aeron.Image;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FrameDescriptor;
+import com.openexchange.assets.infrastructure.persistence.CoreApplyRunner;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -220,6 +221,130 @@ public class T1JournalHostTest {
             out.add(JournalRecords.journalSeq(f));
         }
         return out;
+    }
+
+    /**
+     * The seq of the first Trade record with no Trade next to it ({@code inRun} false), or of the first Trade right behind
+     * another Trade ({@code inRun} true: cut there, the run ends in it and it is the last entry of a 62).
+     */
+    static long tradeSeq(final List<byte[]> records, final boolean inRun) {
+        for (int i = 1; i + 1 < records.size(); i++) {
+            final boolean trade = JournalRecords.templateId(records.get(i)) == 1;
+            final boolean before = JournalRecords.templateId(records.get(i - 1)) == 1;
+            final boolean after = JournalRecords.templateId(records.get(i + 1)) == 1;
+            if (trade && (inRun ? before : !before && !after)) {
+                return i + 1;
+            }
+        }
+        throw new AssertionError("no " + (inRun ? "run" : "lone") + " trade in the story");
+    }
+
+    /**
+     * The clean run of the story up to the round holding {@code seq}, that round's records up to {@code seq} with the
+     * written {@code copy} in its place, translated by the reference translator (its gate included) and applied on the
+     * pinned BRIDGE session: what a bridge offering the poisoned copy does to the real core.
+     */
+    static CoreApplyRunner applyWithCopy(final FeedStory.Story s, final long seq, final byte[] copy, final List<byte[]> frames) {
+        final CoreApplyRunner r = FeedStory.bootClean(s.genesis());
+        for (int round = 0; round < s.rounds(); round++) {
+            FeedStory.applyBlock(r, s, round);
+            final List<FeedFiles.Entry> in = new ArrayList<>();
+            boolean last = false;
+            for (final byte[] rec : s.answers().get(round)) {
+                final long q = JournalRecords.journalSeq(rec);
+                if (q <= seq) {
+                    in.add(FeedFiles.Entry.record(q == seq ? copy : rec));
+                }
+                last |= q == seq;
+            }
+            for (final byte[] f : MeJournalReferenceTranslator.translate(in)) {
+                frames.add(f);
+                r.apply(CoreApplyRunner.BRIDGE_SESSION, f, FeedStory.feedTime(s.genesis().t0(), round));
+            }
+            if (last) {
+                return r;
+            }
+        }
+        throw new AssertionError("seq " + seq + " is not in the story");
+    }
+
+    /**
+     * S9c 14.4 / R-K12c: {@code CORRUPT <src> <seq> poison} writes a copy of the Trade at seq whose only difference is
+     * {@code takerIsBuy} raw 2. The reference gate admits it, the reference translator keeps the raw byte (a 61 when the
+     * trade is alone, a 62 entry inside a run), and the real core refuses it on decode and latches SOURCE_SCHEMA with
+     * {@code skip = seq}, its cursor at seq - 1. A non-Trade seq answers ERR and marks nothing; {@code none} removes the
+     * mark so RESTART writes the valid copy again.
+     */
+    @Test
+    public void corruptPoisonIsGateAdmittedAndCoreRefused() {
+        final FeedStory.Story s = FeedStoryTest.story(1);
+        ok("SOURCES 1 " + (PORT_BASE + 20));
+        assertTrue("poison needs a loaded journal", host.handle("CORRUPT 0 2 poison").startsWith("ERR"));
+        ok("LOAD " + journal);
+        final String notTrade = host.handle("CORRUPT 0 1 poison");
+        assertTrue("seq 1 is the FRESH 68, not a Trade: " + notTrade, notTrade.startsWith("ERR") && notTrade.contains("not a Trade"));
+        assertTrue("out of range", host.handle("CORRUPT 0 " + (records.size() + 1) + " poison").startsWith("ERR"));
+        assertTrue("nothing was marked", host.source(0).corrupt.isEmpty());
+        assertEquals("the poison byte is the journal Trade's takerIsBuy", 8 + 84, T1Journal.Host.POISON_OFFSET);
+        final long lone = tradeSeq(records, false);
+        final long inRun = tradeSeq(records, true);
+        ok("CORRUPT 0 " + lone + " poison");
+        ok("CORRUPT 0 " + inRun + " poison");
+        final long upTo = Math.max(lone, inRun);
+        ok("WRITE 0 1 " + upTo);
+        ok("STOP 0");
+        final List<byte[]> got = whole(replay(0, list(0).get(0)));
+        assertEquals(upTo, got.size());
+        for (final long seq : new long[] {lone, inRun}) {
+            final byte[] valid = records.get((int) seq - 1);
+            final byte[] copy = got.get((int) seq - 1);
+            final String what = (seq == lone ? "lone" : "in-run") + " trade " + seq;
+            assertEquals(what + ": same length", valid.length, copy.length);
+            for (int i = 0; i < valid.length; i++) {
+                if (i != T1Journal.Host.POISON_OFFSET) {
+                    assertEquals(what + ": byte " + i + " unchanged", valid[i], copy[i]);
+                }
+            }
+            assertEquals(what + ": takerIsBuy raw 2", 2, copy[T1Journal.Host.POISON_OFFSET]);
+            final ReferenceFrameGate.Verdict v = ReferenceFrameGate.check(copy);
+            assertTrue(what + ": the gate admits it (" + v.reason() + ")", v.admitted());
+            assertEquals(what + ": seq", seq, v.journalSeq());
+            assertEquals(what + ": meEpoch", JournalRecords.meEpoch(valid), v.meEpoch());
+            assertEquals(what + ": egressSeq", JournalRecords.egressSeq(valid), v.egressSeq());
+            final List<byte[]> frames = new ArrayList<>();
+            final CoreApplyRunner r = applyWithCopy(s, seq, copy, frames);
+            final byte[] last = frames.get(frames.size() - 1);
+            final int template = FeedDigests.templateOf(last);
+            assertEquals(what + ": translated as " + (seq == lone ? "a 61" : "a 62 entry"), seq == lone ? 61 : 62, template);
+            if (template == 61) {
+                assertEquals(what + ": the 61 carries takerIsBuy raw 2", 2, last[8 + 68]);
+            }
+            final CoreApplyRunner.Result res = r.result();
+            assertEquals(what + ": the core latches SOURCE_SCHEMA", "SOURCE_SCHEMA", res.latchReason());
+            assertEquals(what + ": skip = seq", seq, res.latchSkip());
+            assertEquals(what + ": expected = seq", seq, res.latchExpected());
+            assertEquals(what + ": the cursor stops before it", seq - 1, res.lastAppliedJournalSeq());
+            assertEquals(what + ": refused on decode", 1L, (long) res.counters().get("decodeRejectCount"));
+            assertEquals(what + ": no apply fault", false, res.applyFailed());
+            // the valid copy reach-clears: offered next, it applies and the latch is gone
+            final List<FeedFiles.Entry> again = List.of(FeedFiles.Entry.record(valid));
+            for (final byte[] f : MeJournalReferenceTranslator.translate(again)) {
+                r.apply(CoreApplyRunner.BRIDGE_SESSION, f, r.engine().getLastLogTime());
+            }
+            assertEquals(what + ": the valid copy applies", seq, r.engine().feed().lastAppliedJournalSeq());
+            assertEquals(what + ": and clears the latch", "NONE", r.engine().feed().latchReason().name());
+        }
+        // composes with RESTART like the other modes; none removes the mark
+        ok("RESTART 0 " + lone);
+        ok("STOP 0");
+        List<long[]> l = list(0);
+        assertEquals("RESTART re-writes the poisoned copy", 2, whole(replay(0, l.get(l.size() - 1))).get(0)[T1Journal.Host.POISON_OFFSET]);
+        ok("CORRUPT 0 " + lone + " none");
+        ok("RESTART 0 " + lone);
+        ok("STOP 0");
+        l = list(0);
+        assertArrayEquals("after none, RESTART writes the valid copy", records.get((int) lone - 1),
+                whole(replay(0, l.get(l.size() - 1))).get(0));
     }
 
     @Test

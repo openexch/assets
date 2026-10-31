@@ -200,6 +200,115 @@ public class FeedStoryTest {
         }
     }
 
+    /** The longest run of adjacent Trade records in a round's answer: {first seq, length}. */
+    static long[] longestTradeRun(final List<byte[]> answer) {
+        long bestFirst = 0;
+        long best = 0;
+        long first = 0;
+        long run = 0;
+        for (final byte[] r : answer) {
+            if (JournalRecords.templateId(r) == 1) {
+                if (run++ == 0) {
+                    first = JournalRecords.journalSeq(r);
+                }
+                if (run > best) {
+                    best = run;
+                    bestFirst = first;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        return new long[] {bestFirst, best};
+    }
+
+    /**
+     * S9c 14.4 / R-K6: {@code --burst 129} puts 129 adjacent trades in round 1, right behind the FRESH round and the two
+     * outcomes of the pair; the translation stages two 64-entry 62s and a lone 61; the model settles them (the builder's
+     * clean run is coherent) and every other round, the coverage included, is the plain story's shape.
+     */
+    @Test
+    public void burstStoryHasAdjacentTradesBehindTheFreshRound() throws Exception {
+        final int n = 129;
+        final FeedStory.Story s = FeedStory.build(7, FeedStory.MIN_ROUNDS, FeedStory.Options.burst(n));
+        for (final String item : FeedStory.COVERAGE) {
+            assertTrue("burst story covers " + item, s.coverage().get(item));
+        }
+        final List<byte[]> r1 = s.answers().get(1);
+        assertEquals("round 1 = 2 outcomes, the burst, 2 FILLED terminals", n + 4, r1.size());
+        assertEquals("the round starts right behind the FRESH round", 2L, JournalRecords.journalSeq(r1.get(0)));
+        assertEquals(3, JournalRecords.templateId(r1.get(0)));
+        assertEquals(3, JournalRecords.templateId(r1.get(1)));
+        final long[] run = longestTradeRun(r1);
+        assertEquals("n adjacent trades", n, run[1]);
+        assertEquals("the burst starts behind the two outcomes", 4L, run[0]);
+        assertEquals(2, JournalRecords.templateId(r1.get(n + 2)));
+        assertEquals(2, JournalRecords.templateId(r1.get(n + 3)));
+        int full62 = 0;
+        int lone61 = 0;
+        for (final byte[] f : s.frames(1)) {
+            full62 += FeedDigests.templateOf(f) == 62 && TranslatorProofs.u16(f, 10) == 64 ? 1 : 0;
+            lone61 += FeedDigests.templateOf(f) == 61 ? 1 : 0;
+        }
+        assertEquals("two cap-64 62s", 2, full62);
+        assertEquals("and the remainder as a 61", 1, lone61);
+        final CoreApplyRunner.Result res = FeedStory.cleanRun(s).result();
+        assertEquals("the model settles every record", s.length(), res.lastAppliedJournalSeq());
+        assertEquals("NONE", res.latchReason());
+        assertEquals(0L, (long) res.counters().get("settleRejectCount"));
+        assertEquals(s.expectedJson(), res.toJson());
+        // story.txt names the round and its range; read() gives it back
+        final Path d = tmp.newFolder("burst").toPath();
+        FeedStory.write(s, d);
+        final String txt = Files.readString(d.resolve("story.txt"));
+        assertTrue(txt, txt.contains("special=burst\nspecial_round=1\nspecial_pairs=1\nspecial_trades=129\nspecial_first_seq=2\n"
+                + "special_last_seq=" + s.barriers()[1] + "\nspecial_first_trade_seq=4\n"));
+        final FeedStory.Story back = FeedStory.read(d);
+        assertEquals(s.info(), back.info());
+        assertEquals(s.length(), back.length());
+        // the CLI writes the same story
+        final Path c = tmp.newFolder("burst-cli").toPath();
+        final FeedHarnessCliTest.Run cli = FeedHarnessCliTest.cli("story", "7", Integer.toString(FeedStory.MIN_ROUNDS), c.toString(),
+                "--burst", Integer.toString(n));
+        assertEquals(cli.err(), 0, cli.code());
+        assertArrayEquals(Files.readAllBytes(d.resolve("SHA256SUMS")), Files.readAllBytes(c.resolve("SHA256SUMS")));
+    }
+
+    /** {@code --long-round R}: round 1 has exactly R records over clamp(R / 10000, 1, 100) pairs; the model settles it. */
+    @Test
+    public void longRoundStoryHasExactlyTheRecordsAsked() {
+        final int records = 30_000;
+        final FeedStory.Story s = FeedStory.build(11, FeedStory.MIN_ROUNDS, FeedStory.Options.longRound(records));
+        final List<byte[]> r1 = s.answers().get(1);
+        assertEquals("round 1 has the records asked", records, r1.size());
+        assertEquals("3", s.info().get("special_pairs"));
+        assertEquals(Integer.toString(records - 12), s.info().get("special_trades"));
+        final int[] t = new int[6];
+        for (final byte[] r : r1) {
+            t[JournalRecords.templateId(r)]++;
+        }
+        assertEquals("6 outcomes", 6, t[3]);
+        assertEquals("6 FILLED terminals", 6, t[2]);
+        assertEquals(records - 12, t[1]);
+        assertEquals("three runs of 9996", 9996, longestTradeRun(r1)[1]);
+        final CoreApplyRunner.Result res = FeedStory.cleanRun(s).result();
+        assertEquals(s.expectedJson(), res.toJson());
+        assertEquals(s.length(), res.lastAppliedJournalSeq());
+        assertTrue("the rounds after it are the plain story's", s.length() > records + 50);
+    }
+
+    /** Option errors are usage errors (64) and write nothing. */
+    @Test
+    public void storyOptionErrorsAreUsage() throws Exception {
+        for (final String[] bad : new String[][] {{"--burst", "0"}, {"--burst", "x"}, {"--long-round", "4"}, {"--nope", "3"},
+                {"--burst", Integer.toString(FeedStory.MAX_SPECIAL_TRADES + 1)}}) {
+            final Path d = tmp.newFolder().toPath();
+            final FeedHarnessCliTest.Run r = FeedHarnessCliTest.cli("story", "1", "8", d.toString(), bad[0], bad[1]);
+            assertEquals(String.join(" ", bad) + ": " + r.err(), FeedHarnessMain.USAGE, r.code());
+            assertTrue("no output", !Files.exists(d.resolve("SHA256SUMS")));
+        }
+    }
+
     /** Review NOTE-9: {@code apply} replays a story from its own files (boot prefix + replay log) to expected.json. */
     @Test
     public void applyReplaysAStoryToItsExpectedResult() throws Exception {

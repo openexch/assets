@@ -56,9 +56,14 @@ public final class FeedStory {
     static final int ME_FILLED = 2;
     static final int ME_CANCELLED = 3;
 
-    /** A built (or read) story. {@code answers.get(r)} are the schema 4 records of round r's ME answer. */
+    /**
+     * A built (or read) story. {@code answers.get(r)} are the schema 4 records of round r's ME answer. {@code info} is empty
+     * for a plain story; a story built with {@link Options} names its special round there (written into story.txt and read
+     * back, so a runner finds the burst's seq range without decoding the journal).
+     */
     public record Story(long seed, CoreApplyRunner.Genesis genesis, List<List<FeedFiles.LogEntry>> blocks,
-                        List<List<byte[]>> answers, String expectedJson, Map<String, Boolean> coverage, List<byte[]> meFrames) {
+                        List<List<byte[]>> answers, String expectedJson, Map<String, Boolean> coverage, List<byte[]> meFrames,
+                        Map<String, String> info) {
 
         public int rounds() {
             return blocks.size();
@@ -180,11 +185,20 @@ public final class FeedStory {
         files.put("story.txt", ("seed=" + s.seed() + "\ngenesis_id=" + g.genesisId() + "\nusers=" + g.users() + "\ndeposit_each="
                 + g.depositEach() + "\nt0=" + g.t0() + "\nrounds=" + s.rounds() + "\nrecords=" + s.length()
                 + "\nbridge_session=" + CoreApplyRunner.BRIDGE_SESSION + "\nbridge_identity=" + CoreApplyRunner.BRIDGE_IDENTITY
-                + "\n").getBytes(StandardCharsets.US_ASCII));
+                + "\n" + infoLines(s.info())).getBytes(StandardCharsets.US_ASCII));
         for (final Map.Entry<String, byte[]> e : files.entrySet()) {
             FeedFiles.writeAtomic(dir.resolve(e.getKey()), e.getValue());
         }
         FeedFiles.writeAtomic(dir.resolve("SHA256SUMS"), FeedFiles.sums(files).getBytes(StandardCharsets.US_ASCII));
+    }
+
+    /** {@code key=value} lines of a story's info, in its order (empty for a plain story: story.txt is unchanged). */
+    private static String infoLines(final Map<String, String> info) {
+        final StringBuilder b = new StringBuilder();
+        for (final Map.Entry<String, String> e : info.entrySet()) {
+            b.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+        }
+        return b.toString();
     }
 
     /** Reads a story directory (every file checked against its SUMS). */
@@ -218,7 +232,13 @@ public final class FeedStory {
             throw new FeedFiles.Refused("journal.fjr has " + answers.size() + " rounds, story.txt says " + rounds);
         }
         final String expected = new String(need(files, "expected.json"), StandardCharsets.US_ASCII).trim();
-        return new Story(Long.parseLong(p.get("seed")), g, blocks, answers, expected, Map.of(), List.of());
+        final Map<String, String> info = new LinkedHashMap<>();
+        for (final Map.Entry<String, String> e : p.entrySet()) {
+            if (e.getKey().startsWith(SPECIAL_PREFIX)) {
+                info.put(e.getKey(), e.getValue());
+            }
+        }
+        return new Story(Long.parseLong(p.get("seed")), g, blocks, answers, expected, Map.of(), List.of(), info);
     }
 
     private static byte[] need(final Map<String, byte[]> files, final String name) {
@@ -232,10 +252,77 @@ public final class FeedStory {
     // ------------------------------------------------------------------ the builder
 
     public static Story build(final long seed, final int rounds) {
+        return build(seed, rounds, Options.NONE);
+    }
+
+    /**
+     * S9c 14.4: a story with one special round, round 1 (the first round after the FRESH round 0: the GLOBAL OPEN needs the
+     * bound epoch, so no order can rest before it). Its core block is the OPEN, the tick and {@code pairs} LIMIT pairs (a buy
+     * and a sell of two users at mid, quantity = the pair's trades x {@link #BURST_QTY}), nothing else; its ME answer is the
+     * 2 x pairs outcomes, then per pair its trades back to back (the earlier leg the maker, {@link #BURST_QTY} each) and the
+     * two FILLED terminals of its last trade. Every other round is the plain story's.
+     * <ul>
+     *   <li>{@code burst = n}: one pair, so the answer is 2 outcomes, n ADJACENT trades, 2 terminals (R-K6: the bridge
+     *   stages n / 64 full 62 frames and a remainder);</li>
+     *   <li>{@code longRound = R}: round 1 has exactly R records, spread over {@code clamp(R / 10000, 1, 100)} pairs (R-K1 /
+     *   R-K7: a long round with 62 runs of 64, remainders and 63s between the runs).</li>
+     * </ul>
+     */
+    public record Options(int burst, int longRound) {
+        public static final Options NONE = new Options(0, 0);
+
+        public static Options burst(final int n) {
+            return new Options(n, 0);
+        }
+
+        public static Options longRound(final int records) {
+            return new Options(0, records);
+        }
+
+        boolean plain() {
+            return burst == 0 && longRound == 0;
+        }
+
+        /** The trades of each pair of round 1 (empty for a plain story). */
+        long[] pairTrades() {
+            if (burst < 0 || longRound < 0 || (burst > 0 && longRound > 0)) {
+                throw new IllegalArgumentException("story options: --burst and --long-round are exclusive and positive");
+            }
+            if (burst > 0) {
+                if (burst > MAX_SPECIAL_TRADES) {
+                    throw new IllegalArgumentException("--burst " + burst + " > " + MAX_SPECIAL_TRADES);
+                }
+                return new long[] {burst};
+            }
+            if (longRound == 0) {
+                return new long[0];
+            }
+            final int pairs = Math.max(1, Math.min(MAX_PAIRS, longRound / 10_000));
+            final long trades = longRound - 4L * pairs;
+            if (trades < pairs || trades > MAX_SPECIAL_TRADES) {
+                throw new IllegalArgumentException("--long-round " + longRound + ": needs " + 5 * pairs + ".."
+                        + (MAX_SPECIAL_TRADES + 4L * pairs) + " records for " + pairs + " pairs");
+            }
+            final long[] t = new long[pairs];
+            for (int i = 0; i < pairs; i++) {
+                t[i] = trades / pairs + (i < trades % pairs ? 1 : 0);
+            }
+            return t;
+        }
+    }
+
+    /** Quantity of every special-round trade (0.001 base: 5M trades buy 5000 base at mid 100, inside every deposit). */
+    public static final long BURST_QTY = ONE / 1000;
+    public static final int MAX_SPECIAL_TRADES = 5_000_000;
+    static final int MAX_PAIRS = 100;
+    public static final int SPECIAL_ROUND = 1;
+    static final String SPECIAL_PREFIX = "special";
+
+    public static Story build(final long seed, final int rounds, final Options options) {
         if (rounds < MIN_ROUNDS) {
             throw new IllegalArgumentException("a story needs at least " + MIN_ROUNDS + " rounds for its coverage, got " + rounds);
         }
-        return new Builder(seed, rounds).run();
+        return new Builder(seed, rounds, options).run();
     }
 
     /** The coverage items of 6.4 (each must be true; the builder refuses a story otherwise). */
@@ -270,6 +357,11 @@ public final class FeedStory {
         private int sinkIndex;
         private boolean bumped;
         private final int feedlessRound;
+        private final Options options;
+        private final long[] pairTrades;
+        /** {buyH, sellH} of each special pair (round 1). */
+        private final List<long[]> pairs = new ArrayList<>();
+        private long specialFirstTradeSeq;
 
         // the reference ME
         private final ArrayDeque<AssetsEngineEvent.MeDispatch> inbox = new ArrayDeque<>();
@@ -290,7 +382,9 @@ public final class FeedStory {
             return named.containsValue(h);
         }
 
-        Builder(final long seed, final int rounds) {
+        Builder(final long seed, final int rounds, final Options options) {
+            this.options = options;
+            this.pairTrades = options.pairTrades();
             this.seed = seed;
             this.rounds = rounds;
             this.rnd = new Random(seed);
@@ -316,7 +410,7 @@ public final class FeedStory {
                 blocks.add(block);
                 answers.add(answer);
             }
-            final Story draft = new Story(seed, g, blocks, answers, "", cov, meFrames);
+            final Story draft = new Story(seed, g, blocks, answers, "", cov, meFrames, Map.of());
             // coverage from the journal as the bridge will send it (translate staging included)
             final List<byte[]> all = new ArrayList<>();
             for (int r = 0; r < rounds; r++) {
@@ -354,7 +448,28 @@ public final class FeedStory {
                     || res.counters().get("decodeRejectCount") != 0 || res.counters().get("settleRejectCount") != 0) {
                 throw new AssertionError("story " + seed + " clean run is not coherent: " + res.toJson());
             }
-            return new Story(seed, g, blocks, answers, res.toJson(), cov, meFrames);
+            return new Story(seed, g, blocks, answers, res.toJson(), cov, meFrames, info(draft));
+        }
+
+        /** story.txt lines of the special round (empty for a plain story). */
+        private Map<String, String> info(final Story draft) {
+            final Map<String, String> m = new LinkedHashMap<>();
+            if (options.plain()) {
+                return m;
+            }
+            long trades = 0;
+            for (final long t : pairTrades) {
+                trades += t;
+            }
+            final long[] b = draft.barriers();
+            m.put("special", options.burst() > 0 ? "burst" : "long-round");
+            m.put("special_round", Integer.toString(SPECIAL_ROUND));
+            m.put("special_pairs", Integer.toString(pairTrades.length));
+            m.put("special_trades", Long.toString(trades));
+            m.put("special_first_seq", Long.toString(b[SPECIAL_ROUND - 1] + 1));
+            m.put("special_last_seq", Long.toString(b[SPECIAL_ROUND]));
+            m.put("special_first_trade_seq", Long.toString(specialFirstTradeSeq));
+            return m;
         }
 
         // ---------------------------------------------------------------- core block
@@ -436,6 +551,10 @@ public final class FeedStory {
             if (round == 1) {
                 core(CoreApplyRunner.ADMIN_SESSION, enc.gate(corr++, OrderEntryGate.GLOBAL, true));
                 coreTick(mid - step(), mid + step(), mid);
+                if (special()) {
+                    specialBlock();
+                    return;
+                }
             }
             switch (round) {
                 case 2 -> {
@@ -484,6 +603,47 @@ public final class FeedStory {
             }
             if (round == rounds - 1) {
                 core(CoreApplyRunner.TREASURY_SESSION, enc.deposit(corr++, 3, 1, ONE, 0xD0L, request++));
+            }
+        }
+
+        private boolean special() {
+            return round == SPECIAL_ROUND && pairTrades.length > 0;
+        }
+
+        /** Round 1 of an {@link Options} story: the LIMIT pairs (users 1/2, 3/4, 5/6 in turn), nothing else. */
+        private void specialBlock() {
+            for (int i = 0; i < pairTrades.length; i++) {
+                final int buyer = 1 + (2 * i) % USERS;
+                final long qty = pairTrades[i] * BURST_QTY;
+                final long b = create(buyer, 0, 0, 0, mid, qty, 0, 0, 0);
+                final long s = create(buyer + 1, 1, 0, 0, mid, qty, 0, 0, 0);
+                if (b == 0 || s == 0) {
+                    throw new AssertionError("story " + seed + ": special pair " + i + " was not accepted by the core");
+                }
+                named.put("PAIR" + i + "B", b);
+                named.put("PAIR" + i + "S", s);
+                pairs.add(new long[] {b, s});
+            }
+        }
+
+        /** Round 1's ME answer after its outcomes: per pair its trades back to back, then its two FILLED terminals. */
+        private void specialAnswer() {
+            for (int i = 0; i < pairs.size(); i++) {
+                final long[] p = pairs.get(i);
+                if (!rest.containsKey(p[0]) || !rest.containsKey(p[1])) {
+                    throw new AssertionError("story " + seed + ": special pair " + i + " is not resting at the ME");
+                }
+                for (long t = 0; t < pairTrades[i]; t++) {
+                    if (specialFirstTradeSeq == 0) {
+                        specialFirstTradeSeq = jseq + 1;
+                    }
+                    if (!meTrade(p[0], p[1], BURST_QTY, false)) {
+                        throw new AssertionError("story " + seed + ": special pair " + i + " trade " + t + " refused");
+                    }
+                }
+                if (rest.containsKey(p[0]) || rest.containsKey(p[1])) {
+                    throw new AssertionError("story " + seed + ": special pair " + i + " not FILLED by its trades");
+                }
             }
         }
 
@@ -552,6 +712,10 @@ public final class FeedStory {
             final int pending = inbox.size();
             for (int i = 0; i < pending; i++) {
                 process(inbox.pollFirst());
+            }
+            if (special()) {
+                specialAnswer();
+                return;
             }
             if (round == 3) {
                 forcedBatch();
