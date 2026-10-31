@@ -8,6 +8,7 @@ import com.openexchange.assets.domain.MoneyJournalSink;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.SubscribeDecoder;
 import com.openexchange.cluster.SnapshotEnvelope;
+import com.openexchange.cluster.log.ShadowEngine;
 import io.aeron.cluster.codecs.CloseReason;
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
@@ -42,7 +43,7 @@ import java.util.concurrent.TimeUnit;
  * <p>Not thread-safe: the owner's apply thread only. Zero allocation on the message, timer, open (beyond what the
  * session registry allocates) and close paths.</p>
  */
-public final class AssetsLogApplier {
+public final class AssetsLogApplier implements ShadowEngine {
 
     public static final int ENGINE_ID_ASSETS = 1;
     /** Timer ids are {@code BASE + leadershipTermId * TIMER_ID_TERM_STRIDE}; anything at or above a base is that kind. */
@@ -92,11 +93,13 @@ public final class AssetsLogApplier {
 
     // ---------------------------------------------------------------- the shadow-engine surface
 
+    @Override
     public int engineId() {
         return ENGINE_ID_ASSETS;
     }
 
     /** Start from genesis: a fresh engine already is genesis state. Only legal on a pristine instance. */
+    @Override
     public void genesis() {
         ensureNotFailed();
         if (!pristine) {
@@ -111,6 +114,7 @@ public final class AssetsLogApplier {
      * invariants. Only legal on a pristine instance: the codec restores INTO the engine and is additive, so a second
      * restore (or a restore after any apply) would merge two states silently.
      */
+    @Override
     public void restore(final DirectBuffer image, final int length) {
         ensureNotFailed();
         if (!pristine) {
@@ -141,6 +145,7 @@ public final class AssetsLogApplier {
     }
 
     /** The snapshot image: the v4 payload at {@link SnapshotEnvelope#payloadOffset()}, sealed; the image starts at 0. */
+    @Override
     public int serialize(final MutableDirectBuffer dst) {
         ensureNotFailed();
         return encode(engine, dst, envelope);
@@ -152,6 +157,7 @@ public final class AssetsLogApplier {
      *
      * @param logPosition the entry's frame-end position; ignored until RCS S4 (RF-3)
      */
+    @Override
     public void onSessionOpen(final long clusterSessionId, final long logPosition, final long timestamp,
                               final byte[] encodedPrincipal) {
         enter();
@@ -171,6 +177,7 @@ public final class AssetsLogApplier {
      *
      * @param logPosition the entry's frame-end position; ignored until RCS S4 (RF-3)
      */
+    @Override
     public void onSessionClose(final long clusterSessionId, final long logPosition, final long timestamp,
                                final CloseReason closeReason) {
         enter();
@@ -189,6 +196,7 @@ public final class AssetsLogApplier {
      *
      * @return false for a well-formed Subscribe, true when the frame went to the engine
      */
+    @Override
     public boolean onSessionMessage(final long clusterSessionId, final long logPosition, final long timestamp,
                                     final DirectBuffer buffer, final int offset, final int length) {
         enter();
@@ -211,6 +219,7 @@ public final class AssetsLogApplier {
      * @param logPosition the entry's frame-end position; ignored until RCS S4 (RF-3)
      * @return {@link #timerKind(long)} of the id
      */
+    @Override
     public int onTimerEvent(final long correlationId, final long logPosition, final long timestamp) {
         enter();
         try {
@@ -230,6 +239,7 @@ public final class AssetsLogApplier {
      * every {@code on*} entry it ends the pristine state, so a replayer restores or declares genesis before the first
      * term entry.
      */
+    @Override
     public void onNewLeadershipTermEvent(final long leadershipTermId, final long logPosition, final long timestamp,
                                          final TimeUnit timeUnit) {
         enter();
