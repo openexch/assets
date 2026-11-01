@@ -97,7 +97,7 @@ public class CoreSnapshotSizingTest {
     /** The pinned literals must equal the code's constants, or the arithmetic below checks a layout nobody writes. */
     /**
      * RC2 S7 16.5: under behaviour 3 the image gains section 10 FEED_STATE (92 bytes); RC2 S8 5.2 adds section 11 ME_LINK
-     * (16-byte head, no backlog entry here): 10 sections.
+     * (16-byte head, no backlog entry here); RC2 S10' adds section 12 FEED_HALTS (24-byte head): 11 sections.
      */
     @Test
     public void aV3ImageCarriesTheFeedStateSection() {
@@ -106,14 +106,15 @@ public class CoreSnapshotSizingTest {
         final int length = BalanceSnapshotCodec.serialize(r.engine, out, 0);
         final long v2Shape = expectedImageBytes(0, 0, 0, 0, Market.ALL.length, Asset.count());
         // section 10 layout v2 (3.8): 92-byte head + freshDigest 8 + digestCount 4 + one digest per entry (cursor 1)
-        assertEquals("v3 = the v1/v2 layout + section 10 (92 + 12 + 8 bytes) + section 11 (16-byte head)",
-                v2Shape + SECTION_HEADER_BYTES + 92 + 12 + 8 + SECTION_HEADER_BYTES + 16, length);
+        // RC2 S10' 4R.1 rule 5: section 12 FEED_HALTS (24-byte head, no record here)
+        assertEquals("v3 = the v1/v2 layout + section 10 (92 + 12 + 8 bytes) + section 11 (16-byte head) + section 12 (24-byte head)",
+                v2Shape + SECTION_HEADER_BYTES + 92 + 12 + 8 + SECTION_HEADER_BYTES + 16 + SECTION_HEADER_BYTES + 24, length);
         final AssetsEngine restored = new AssetsEngine();
         restored.coreConfig().setSupportedBehaviorVersions(1, 2, 3);
         restored.setEventSink(new QuietSink());
         final BalanceSnapshotCodec.Decoded decoded = BalanceSnapshotCodec.deserialize(new UnsafeBuffer(out.byteArray(), 0, length),
                 0, length, restored);
-        assertEquals("sections (1..6, 8 CORE_CONFIG, 9 SESSIONS, 10 FEED_STATE, 11 ME_LINK)", 10, decoded.sectionCount);
+        assertEquals("sections (1..6, 8 CORE_CONFIG, 9 SESSIONS, 10 FEED_STATE, 11 ME_LINK, 12 FEED_HALTS)", 11, decoded.sectionCount);
     }
 
     @Test

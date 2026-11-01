@@ -106,6 +106,11 @@ public final class RecordingAssetsSink implements AssetsEventSink {
     }
 
     @Override
+    public void onGateAutoReopen(long journalSeq, boolean opened, int gateReasons, int laneHalts) {
+        events.add(new AssetsEngineEvent.GateAutoReopen(journalSeq, opened, gateReasons, laneHalts));
+    }
+
+    @Override
     public void onSettleFault(long tradeId, long orderId, long userId, int assetId,
                               long drawnFromAvailable, long uncovered) {
         events.add(new AssetsEngineEvent.SettleFault(tradeId, orderId, userId, assetId,

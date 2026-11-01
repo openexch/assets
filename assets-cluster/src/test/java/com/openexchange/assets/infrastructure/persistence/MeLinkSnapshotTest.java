@@ -174,7 +174,11 @@ public class MeLinkSnapshotTest {
     public void v3ImageWithoutSection11Refused() {
         final byte[] img = image(rich().engine);
         final int[] s11 = section(img, BalanceSnapshotCodec.SECTION_ME_LINK);
-        final byte[] cut = Arrays.copyOf(img, s11[0] - 6); // section 11 is the last one
+        final int[] s12 = section(img, BalanceSnapshotCodec.SECTION_FEED_HALTS);
+        // section 11 is followed by section 12 (RC2 S10'): splice 11 out, keep 12
+        final byte[] cut = new byte[img.length - (s12[0] - s11[0])];
+        System.arraycopy(img, 0, cut, 0, s11[0] - 6);
+        System.arraycopy(img, s12[0] - 6, cut, s11[0] - 6, img.length - (s12[0] - 6));
         new UnsafeBuffer(cut).putInt(HEADER - 4, new UnsafeBuffer(img).getInt(HEADER - 4) - 1);
         final IllegalStateException e = assertThrows(IllegalStateException.class, () -> S8Support.restore(cut));
         assertTrue(e.getMessage(), e.getMessage().contains("no ME_LINK section (11)"));

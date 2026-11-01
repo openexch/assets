@@ -63,7 +63,7 @@ public class FeedHaltTest {
         assertAck(g, "GAP{4, 9}", AdminResult.ACCEPTED, 0);
         g.assertLatch("GAP{4, 9}", FeedHaltReason.GAP, 4, 9, 0, 0);
         g.assertGloballyHalted("GAP{4, 9}");
-        assertEquals("bridgeIdentity recorded, never enforced", 0x77L, g.feed().latchBridgeIdentity());
+        assertEquals("bridgeIdentity keys the lane-halt record (RC2 S10' 4R)", 0x77L, g.feed().laneHaltIdentity(0));
         assertEquals(1L, g.feed().haltAppliedCount());
         final AssetsEngineEvent.OrderFault f = g.feedHaltFaults().get(0);
         assertEquals("FeedHaltApplied tradeId = seen", 9L, f.tradeId());
@@ -193,8 +193,8 @@ public class FeedHaltTest {
             final List<AssetsEngineEvent.OrderFault> faults = r.feedHaltFaults();
             assertEquals(name + ": exactly one latch event", 1, faults.size());
             assertTrue(name + ": latch event amount >= 1 (a clear has 0), got " + faults.get(0), faults.get(0).amount() >= 1);
-            assertEquals(name + ": amount = latchExpectedSeq", r.feed().latchExpectedSeq(), faults.get(0).amount());
-            assertEquals(name + ": tradeId = latchSeenSeq", r.feed().latchSeenSeq(), faults.get(0).tradeId());
+            assertEquals(name + ": amount = latchExpectedSeq", r.latchExpected(), faults.get(0).amount());
+            assertEquals(name + ": tradeId = latchSeenSeq", r.latchSeen(), faults.get(0).tradeId());
         }
     }
 
@@ -213,7 +213,12 @@ public class FeedHaltTest {
                 g.first(AssetsEngineEvent.FeedLatchCleared.class));
         assertEquals("audit tradeId = c", 5L, g.feedHaltFaults().get(0).tradeId());
         assertEquals("audit amount 0", 0L, g.feedHaltFaults().get(0).amount());
-        assertTrue("the gate keeps BRIDGE_HALT until ADMIN OPEN", g.globalHas(com.openexchange.assets.domain.GateReason.BRIDGE_HALT));
+        // RC2 S10' 4R.1 rule 1 (inverts the S7 line "the gate keeps BRIDGE_HALT until ADMIN OPEN"): the GAP reach-clear
+        // clears the BRIDGE_HALT bit by itself, and with no other reason the gate is OPEN again
+        assertFalse("the GAP reach-clear clears BRIDGE_HALT (4R)", g.globalHas(com.openexchange.assets.domain.GateReason.BRIDGE_HALT));
+        assertEquals("the GAP reach-clear reopened the gate (4R)", com.openexchange.assets.domain.GateState.OPEN,
+                g.engine.gate().state(com.openexchange.assets.application.engine.gate.OrderEntryGate.GLOBAL));
+        assertEquals("one automatic reopen counted", 1L, g.feed().gateAutoReopenCount());
         assertTrue(g.sellHitsAt(6, EPOCH, 20, 3, ONE / 8));
         assertEquals(6L, g.cursor());
 

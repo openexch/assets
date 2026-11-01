@@ -212,10 +212,24 @@ public final class V3Rig implements AssetsSbeDemuxer.TransportHooks {
         return acks.get(0);
     }
 
-    /** Assert the latch slot. */
+    /**
+     * Assert the latch. A non-GAP reason is the slot's; since RC2 S10' 4R a GAP is the ONE lane-halt record (the slot empty,
+     * no other record, no overflow): the single-lane meaning the S7 rows were written for.
+     */
     public void assertLatch(final String what, final FeedHaltReason reason, final long expected, final long seen,
                             final long skip, final long tradeId) {
         final FeedState f = engine.feed();
+        if (reason == FeedHaltReason.GAP) {
+            assertEquals(what + ": the reported halt reason", FeedHaltReason.GAP, f.haltReason());
+            assertEquals(what + ": the latch slot is empty under a GAP", FeedHaltReason.NONE, f.latchReason());
+            assertEquals(what + ": exactly one lane-halt record", 1, f.laneHaltCount());
+            assertTrue(what + ": no overflow record", !f.haltOverflow());
+            assertEquals(what + ": GAP record expected", expected, f.laneHaltExpected(0));
+            assertEquals(what + ": GAP record seen", seen, f.laneHaltSeen(0));
+            assertEquals(what + ": a GAP has no skip", 0L, skip);
+            assertEquals(what + ": a GAP has no tradeId", 0L, tradeId);
+            return;
+        }
         assertEquals(what + ": latch reason", reason, f.latchReason());
         assertEquals(what + ": latchExpectedSeq", expected, f.latchExpectedSeq());
         assertEquals(what + ": latchSeenSeq", seen, f.latchSeenSeq());
@@ -224,7 +238,21 @@ public final class V3Rig implements AssetsSbeDemuxer.TransportHooks {
     }
 
     public void assertNotLatched(final String what) {
-        assertEquals(what + ": not latched", FeedHaltReason.NONE, engine.feed().latchReason());
+        assertEquals(what + ": not latched (slot)", FeedHaltReason.NONE, engine.feed().latchReason());
+        assertEquals(what + ": not latched (no lane-halt record)", 0, engine.feed().laneHaltCount());
+        assertTrue(what + ": not latched (no overflow)", !engine.feed().haltOverflow());
+    }
+
+    /** The reported latch's expected seq: the slot's, else the one GAP record's (RC2 S10'). */
+    public long latchExpected() {
+        final FeedState f = engine.feed();
+        return f.slotLatched() || f.laneHaltCount() == 0 ? f.latchExpectedSeq() : f.laneHaltExpected(0);
+    }
+
+    /** The reported latch's seen seq: the slot's, else the one GAP record's (RC2 S10'). */
+    public long latchSeen() {
+        final FeedState f = engine.feed();
+        return f.slotLatched() || f.laneHaltCount() == 0 ? f.latchSeenSeq() : f.laneHaltSeen(0);
     }
 
     public void assertGloballyHalted(final String what) {

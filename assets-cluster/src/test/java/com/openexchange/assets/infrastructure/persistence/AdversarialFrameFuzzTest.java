@@ -249,12 +249,16 @@ public class AdversarialFrameFuzzTest {
             }
             return null;
         }
-        if (p.latched()) {
+        if (p.slotLatched()) {
             q.writeLatch(p.latchReason(), p.latchExpectedSeq(), p.latchSeenSeq(), p.latchSkipSeq(), p.latchTradeId(),
                     p.latchMeEpochSeen(), p.latchBridgeIdentity(), p.latchLogPosition());
         } else {
             q.zeroLatch();
         }
+        // RC2 S10' 4R: a latch also writes the lane-halt table and the holder set (section 12); put the pre-image's back
+        final org.agrona.ExpandableArrayBuffer halts = new org.agrona.ExpandableArrayBuffer(256);
+        final int haltsLength = p.writeHaltSection(halts, 0);
+        q.readHaltSection(halts, 0, haltsLength, 12);
         sandbox.engine.gate().setReasons(com.openexchange.assets.application.engine.gate.OrderEntryGate.GLOBAL,
                 preReplica.engine.gate().reasons(com.openexchange.assets.application.engine.gate.OrderEntryGate.GLOBAL));
         // a refused feed entry observes the log time (it is a log entry the core judged); put the pre-image's back too

@@ -122,7 +122,9 @@ public class NodeMetricsClusterTest {
             assertEquals(2, value(body, "assets_cluster_role"));
             assertEquals(0, value(body, "assets_member_id"));
             assertEquals(1, value(body, "assets_accounts"));
-            assertEquals(1, value(body, "assets_sessions"));
+            // RC2 S10': the egress-queue count was renamed; assets_sessions{class} is the registered-session family
+            assertEquals(1, value(body, "assets_egress_sessions"));
+            assertTrue(body, body.contains("assets_sessions{class=\"BRIDGE\"} "));
             assertEquals(0, value(body, "assets_application_callback_failed"));
             assertTrue(body, value(body, "assets_log_position") > 0);
             assertEquals(-1, value(body, "assets_snapshot_last_bytes"));

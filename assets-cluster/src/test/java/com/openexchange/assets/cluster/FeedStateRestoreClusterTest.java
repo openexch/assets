@@ -308,7 +308,8 @@ public class FeedStateRestoreClusterTest {
             final FeedState restored = node.service.engine().feed();
             assertEquals(GENESIS, restored.boundMeEpoch());
             assertEquals(1L, restored.lastAppliedJournalSeq());
-            assertEquals(com.openexchange.assets.domain.FeedHaltReason.GAP, restored.latchReason());
+            assertEquals(com.openexchange.assets.domain.FeedHaltReason.GAP, restored.haltReason()); // RC2 S10': the GAP record
+            assertEquals("the GAP record survived the cold restart (section 12)", 1, restored.laneHaltCount());
 
             // the missing entries are delivered: the GAP reach-clears, the held entry then applies
             offer(bridge2, engineConfig(2, 2, ConfigDecision.BUMP));
