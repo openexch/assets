@@ -91,12 +91,19 @@ public class BehaviorV3Test {
         assertEquals(AdminResult.ACCEPTED, b.config(2, 2, G).result());
         assertEquals(G, b.engine.coreConfig().recorded().genesisId);
 
-        // row 7, condition 1: no genesisId recorded
+        // row 2 (RCS S3 amendment A7): an ADOPT of genesisId 0 is refused, so nothing is recorded and no switch follows
         final Box z = new Box(true);
-        z.config(1, 1, 0);
-        z.config(2, 2, 0);
+        z.assertInvalid(z.config(1, 1, 0), "A7 ADOPT of genesisId 0");
+        z.assertInvalid(z.config(2, 2, 0), "nothing recorded: no behaviour 2");
         z.assertInvalid(z.config(3, 3, 0), "row 7 recorded genesisId 0");
-        assertEquals(2L, z.engine.coreConfig().behaviorVersion());
+        assertEquals(1L, z.engine.coreConfig().behaviorVersion());
+        // row 7, condition 1, on a record restored from an image written before A7 (genesisId 0)
+        final Box r = new Box(true);
+        final CoreConfigCommand legacy = AssetsScenarioRunner.coreConfigFor(2, 2, 1L, 1L, 1_000_000_000_000_000L, 0L, 1);
+        legacy.genesisId = 0L;
+        r.engine.coreConfig().restore(legacy);
+        r.assertInvalid(r.config(3, 3, 0), "row 7 restored genesisId 0");
+        assertEquals(2L, r.engine.coreConfig().behaviorVersion());
 
         // row 7, condition 2: not feed-virgin (lastAppliedTradeId, consumePosition, dispatchSeq each)
         for (final String breach : new String[] {"lastAppliedTradeId", "consumePosition", "dispatchSeq"}) {
