@@ -32,6 +32,19 @@ public final class OrderEngineMetrics implements Consumer<AssetsMetricsBody> {
         return new OrderEngineMetrics(view, () -> 0L);
     }
 
+    /** The {@code class} label values of {@code assets_sessions} (4R.1 rule 7). */
+    static final String[] SESSION_CLASS_LABELS = {"ADMIN", "TOOL", "BRIDGE", "GATEWAY", "TREASURY", "FORWARDER"};
+
+    private static LongSupplier[] sessionSuppliers(final CoreMetricsView view) {
+        final LongSupplier[] out = new LongSupplier[SESSION_CLASS_LABELS.length];
+        for (int i = 0; i < out.length; i++) {
+            final com.openexchange.assets.infrastructure.generated.SessionClass cls =
+                    com.openexchange.assets.infrastructure.generated.SessionClass.valueOf(SESSION_CLASS_LABELS[i]);
+            out[i] = () -> view.sessionsRegistered(cls);
+        }
+        return out;
+    }
+
     @Override
     public void accept(final AssetsMetricsBody b) {
         // RC1 order counters and the quarantine gauge
@@ -57,6 +70,26 @@ public final class OrderEngineMetrics implements Consumer<AssetsMetricsBody> {
          .gauge("assets_feed_lanes_behind", "Registered BRIDGE lanes whose highest delivered journalSeq is below the cursor",
                  v::feedLanesBehind)
          .counter("assets_feed_lane_overflow_total", "BRIDGE sessions beyond the 8-lane table", v::feedLaneOverflow)
+        // RC2 S10' 4R.1 rule 7 (the B-2 counters and gauges)
+         .counter("assets_feed_duplicate_total", "Feed entries at or below the cursor that byte-matched (every second copy)",
+                 v::feedDuplicateTotal)
+         .counter("assets_feed_halt_applied_total", "FeedHalts that wrote a lane-halt record or the latch slot",
+                 v::feedHaltApplied)
+         .counter("assets_feed_halt_stale_total", "FeedHalts acked DUPLICATE because the cursor had passed them",
+                 v::feedHaltStale)
+         .counter("assets_feed_halt_duplicate_total", "FeedHalts acked DUPLICATE because the core already held them",
+                 v::feedHaltDuplicate)
+         .counter("assets_feed_latch_auto_clear_total", "Latch slots and lane-halt records cleared by their reach condition",
+                 v::feedLatchAutoClear)
+         .counter("assets_feed_gap_rejects_total", "SettleRejected FEED_GAP emitted (an entry above cursor + 1)",
+                 v::feedGapRejects)
+         .counter("assets_gate_auto_reopen_total", "GLOBAL order-entry gate OPENed by a GAP reach-clear (opens, not bit clears)",
+                 v::gateAutoReopen)
+         .gauge("assets_feed_lane_halts", "Open GAP records in the replicated lane-halt table", v::feedLaneHalts)
+         .gauge("assets_feed_halt_table_overflow", "1 while the lane-halt overflow record is set (an operator latch)",
+                 v::feedHaltTableOverflow)
+         .labelledGauge("assets_sessions", "Registered live sessions in the replicated session table, by class", "class",
+                 SESSION_CLASS_LABELS, sessionSuppliers(v))
         // S8 counters (3.10 item 3 table)
          .counter("assets_release_minted_up_to_total", "UP_TO releases minted (M1-M10)", v::releaseMintedUpTo)
          .counter("assets_release_minted_order_total", "ORDER releases minted (M11, M12)", v::releaseMintedOrder)

@@ -25,17 +25,54 @@ public final class SessionRegistry {
 
     private final Long2ObjectHashMap<SessionAuthority> byId = new Long2ObjectHashMap<>();
     private final ArrayList<SessionAuthority> scratch = new ArrayList<>();
+    /**
+     * RC2 S10' 4R.1 rule 7: registered live sessions per class code ({@code assets_sessions{class}}), maintained at every
+     * transition so a metrics scrape reads a plain int and never walks the table. Derived from the replicated table.
+     */
+    private final int[] registeredByClass = new int[CLASS_SLOTS];
+    private static final int CLASS_SLOTS = 16;
 
     /** SessionOpen: parse the principal once. A malformed or missing principal becomes NONE (no authority). */
     public SessionAuthority open(final long sessionId, final byte[] encodedPrincipal) {
         final SessionAuthority a = new SessionAuthority(sessionId, ClusterPrincipal.decode(encodedPrincipal));
-        byId.put(sessionId, a);
+        uncount(byId.put(sessionId, a));
         return a;
     }
 
     /** SessionClose. */
     public void close(final long sessionId) {
-        byId.remove(sessionId);
+        uncount(byId.remove(sessionId));
+    }
+
+    /** Registered live sessions of {@code cls} (RC2 S10' 4R.1 rule 7). */
+    public int registeredCount(final SessionClass cls) {
+        final int code = cls.value();
+        return code >= 0 && code < CLASS_SLOTS ? registeredByClass[code] : 0;
+    }
+
+    private void uncount(final SessionAuthority a) {
+        if (a != null && a.isRegistered()) {
+            registeredByClass[slot(a)]--;
+        }
+    }
+
+    private static int slot(final SessionAuthority a) {
+        final int code = a.sessionClass().value();
+        return code >= 0 && code < CLASS_SLOTS ? code : 0;
+    }
+
+    /**
+     * RC2 S10' 4R.1 rule 2 (S2-3): another REGISTERED, live BRIDGE session already holds {@code identity}. A restarted
+     * lane whose old session has closed finds none (its old row left the table at SessionClose).
+     */
+    private boolean bridgeIdentityHeldByAnother(final long sessionId, final long identity) {
+        for (final SessionAuthority other : byId.values()) {
+            if (other.sessionId() != sessionId && other.isRegistered() && other.sessionClass() == SessionClass.BRIDGE
+                    && other.identity() == identity) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** The authority of a session, or null when the session is unknown to this registry. */
@@ -51,7 +88,8 @@ public final class SessionRegistry {
      * Apply a RegisterSession (replicated). The asserted class must equal the principal's; the session must
      * declare itself resumable (every core session can be closed at its egress ceiling, critic D16);
      * re-registering is allowed and idempotent (DUPLICATE when nothing changed), which is how a client
-     * re-declares after a leader change.
+     * re-declares after a leader change. RC2 S10' (S2-3): a BRIDGE registration whose identity another registered, live
+     * session holds is REJECTED {@code DUPLICATE_IDENTITY}, in every behaviour version.
      */
     public Registration register(final long sessionId, final SessionClass assertedClass, final int channelMask,
                                  final boolean resumable, final int readerKind, final long identity,
@@ -66,7 +104,15 @@ public final class SessionRegistry {
         if (!resumable) {
             return new Registration(AdminResult.REJECTED, CoreRejectReason.NOT_RESUMABLE, false);
         }
+        if (a.sessionClass() == SessionClass.BRIDGE && bridgeIdentityHeldByAnother(sessionId, identity)) {
+            // RC2 S10' S2-3: two live lanes with one identity would share one lane-halt record; the second is refused
+            return new Registration(AdminResult.REJECTED, CoreRejectReason.DUPLICATE_IDENTITY, false);
+        }
+        final boolean was = a.isRegistered();
         final boolean changed = a.register(channelMask, true, readerKind, identity, sourceEpoch);
+        if (!was) {
+            registeredByClass[slot(a)]++;
+        }
         return new Registration(changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, CoreRejectReason.NONE, changed);
     }
 
@@ -84,6 +130,7 @@ public final class SessionRegistry {
             }
         });
         for (final SessionAuthority a : hit) {
+            registeredByClass[slot(a)]--;
             a.revoke();
             revoked.accept(a.sessionId());
         }
@@ -96,6 +143,9 @@ public final class SessionRegistry {
                         final long identity, final long sourceEpoch) {
         final SessionAuthority a = open(sessionId, encodedPrincipal);
         a.restore(registered, channelMask, resumable, readerKind, identity, sourceEpoch);
+        if (registered) {
+            registeredByClass[slot(a)]++;
+        }
     }
 
     /** Visit in ascending session id (the canonical snapshot order). Not reentrant. */

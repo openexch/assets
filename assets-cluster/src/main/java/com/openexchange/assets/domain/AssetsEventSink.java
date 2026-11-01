@@ -170,6 +170,15 @@ public interface AssetsEventSink {
     /** Node-local observability: a latch was cleared by the reach-clear ({@code auto}) or by FeedLatchClear 76. */
     default void onFeedLatchCleared(FeedHaltReason reason, long journalSeq, boolean auto) { }
 
+    /**
+     * Node-local observability (RC2 S10' 4R.1 rule 7, the "auto-reopen" control event; no wire bytes, the AdmissionState
+     * broadcast is the wire signal): the apply that moved the cursor to {@code journalSeq} cleared the GLOBAL BRIDGE_HALT
+     * bit because the last GAP holder went. {@code opened} is true when the gate is now OPEN, false when another reason
+     * (an operator SUSPEND, GENESIS, ME_CAPACITY, ...) keeps it SUSPENDED; {@code gateReasons} is the GLOBAL bitmask after
+     * the clear and {@code laneHalts} the open GAP records (0).
+     */
+    default void onGateAutoReopen(long journalSeq, boolean opened, int gateReasons, int laneHalts) { }
+
     // ---- RC2 S8 (contract section 4). Defaults delegate to the RC1 forms, so every existing sink compiles unchanged; the
     //      engine calls these, the publisher overrides them and writes MeDispatch fields 15 and 16. ----
 

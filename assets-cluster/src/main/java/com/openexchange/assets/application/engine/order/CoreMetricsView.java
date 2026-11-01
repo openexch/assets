@@ -38,10 +38,25 @@ public final class CoreMetricsView {
     public long feedDuplicateUnverified() { return engine.feed().duplicateUnverifiedCount(); }
     public long feedDuplicateMismatch() { return engine.feed().duplicateMismatchCount(); }
     public long feedCursor() { return engine.feed().lastAppliedJournalSeq(); }
-    public long feedLatchReason() { return engine.feed().latchReason().code(); }
+    public long feedLatchReason() { return engine.feed().haltReason().code(); }
     public long gateReasonsGlobal() { return engine.gate().reasons(OrderEntryGate.GLOBAL); }
     public long feedLanesBehind() { return engine.feed().lanesBehind(); }
     public long feedLaneOverflow() { return engine.feed().feedLaneOverflowCount(); }
+
+    // RC2 S10' 4R.1 rule 7 (the B-2 counters)
+    public long feedDuplicateTotal() { return engine.feed().duplicateTotal(); }
+    public long feedHaltApplied() { return engine.feed().haltAppliedCount(); }
+    public long feedHaltStale() { return engine.feed().haltStaleCount(); }
+    public long feedHaltDuplicate() { return engine.feed().haltDuplicateCount(); }
+    public long feedLatchAutoClear() { return engine.feed().latchAutoClearCount(); }
+    public long feedGapRejects() { return engine.feed().gapCount(); }
+    public long gateAutoReopen() { return engine.feed().gateAutoReopenCount(); }
+    public long feedLaneHalts() { return engine.feed().laneHaltCount(); }
+    public long feedHaltTableOverflow() { return engine.feed().haltOverflow() ? 1L : 0L; }
+    /** Registered live sessions of {@code cls} in the replicated session table. */
+    public long sessionsRegistered(final com.openexchange.assets.infrastructure.generated.SessionClass cls) {
+        return engine.sessions().registeredCount(cls);
+    }
 
     // S8 counters
     public long releaseMintedUpTo() { return o().releaseMintedUpToCount(); }

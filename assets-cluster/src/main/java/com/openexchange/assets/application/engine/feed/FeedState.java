@@ -6,9 +6,10 @@ import com.openexchange.assets.domain.FeedHaltReason;
 /**
  * RC2 S7 (contract {@code RC2-me-link/S7/contract.md} section 2.1): the core's replicated view of the ME feed under
  * behaviour v3. {@code lastAppliedJournalSeq} is THE cursor of the new path: no entry applies unless its journalSeq is
- * exactly the next one, so a lost entry can never be applied over (the G29 class). One latch slot records why the
- * feed is halted. Every field above the counters is replicated and snapshotted (layout section 10, 92 bytes, written
- * iff v3); under v1/v2 every field stays 0.
+ * exactly the next one, so a lost entry can never be applied over (the G29 class). One latch slot records a non-GAP
+ * halt; since RC2 S10' 4R a GAP lives in the per-lane halt table (8 records + one overflow record) with the holder set
+ * that decides when the BRIDGE_HALT gate bit clears. Every field above the counters is replicated and snapshotted
+ * (section 10, 92 bytes, and section 12 for the table, both written iff v3); under v1/v2 every field stays 0.
  *
  * <p>The counters are node-local diagnostics (not replicated, not snapshotted), like {@code OrderEngine}'s.</p>
  */
@@ -72,8 +73,22 @@ public final class FeedState {
 
     public long boundMeEpoch() { return boundMeEpoch; }
     public long lastAppliedJournalSeq() { return lastAppliedJournalSeq; }
+    /** The latch SLOT's reason (non-GAP only since RC2 S10' 4R: GAP lives in the lane-halt table). */
     public FeedHaltReason latchReason() { return latchReason; }
-    public boolean latched() { return latchReason != FeedHaltReason.NONE; }
+    /** The latch slot is set (SOURCE_SCHEMA, SETTLE_REFUSED, EPOCH_MISMATCH or SOURCE_UNBOUND). */
+    public boolean slotLatched() { return latchReason != FeedHaltReason.NONE; }
+    /** 4R.1 rule 6: the feed is halted = the slot is set, or a GAP record is open, or the overflow record is set. */
+    public boolean latched() { return latchReason != FeedHaltReason.NONE || haltCount != 0 || haltOverflow; }
+    /**
+     * 4R.1 rule 6: the one {@code haltReason} the report and the latch gauge carry: the highest exit class present. A slot
+     * reason is always class 2 or 3, above GAP's class 1; else GAP when a record or the overflow is open; else NONE.
+     */
+    public FeedHaltReason haltReason() {
+        if (latchReason != FeedHaltReason.NONE) {
+            return latchReason;
+        }
+        return haltCount != 0 || haltOverflow ? FeedHaltReason.GAP : FeedHaltReason.NONE;
+    }
     public long latchExpectedSeq() { return latchExpectedSeq; }
     public long latchSeenSeq() { return latchSeenSeq; }
     public long latchSkipSeq() { return latchSkipSeq; }
@@ -153,6 +168,15 @@ public final class FeedState {
     public void countDuplicateMismatch() { duplicateMismatchCount++; }
     public void countDuplicateUnverified() { duplicateUnverifiedCount++; }
 
+    /** RC2 S10' 4R.1 rule 7: every duplicate over the six feed templates ({@code assets_feed_duplicate_total}). */
+    public long duplicateTotal() {
+        long n = 0;
+        for (final long d : duplicateCount) {
+            n += d;
+        }
+        return n;
+    }
+
     /** Duplicates counted for {@code templateId} in {61, 62, 63, 64, 67, 68}; 0 for any other id. */
     public long duplicateCount(final int templateId) {
         final int i = duplicateSlot(templateId);
@@ -189,6 +213,416 @@ public final class FeedState {
     public long tickEpochDropCount() { return tickEpochDropCount; }
     public long tickUnboundCount() { return tickUnboundCount; }
     public long epochRevokedCount() { return epochRevokedCount; }
+
+    // ---- RC2 S10' 4R (contract S10p/contract.md 4R.1): the replicated lane-halt table, snapshot section 12 ----
+
+    /** At most this many open GAP records (one per bridge identity); a further identity goes to the overflow record. */
+    public static final int LANE_HALT_CAPACITY = 8;
+    /** Holder bits (4R.1 rule 4): the BRIDGE_HALT gate bit is cleared only when no holder is left. */
+    public static final int HOLDER_GAP = 1;
+    public static final int HOLDER_NONGAP_AWAITING_OPEN = 2;
+    public static final int HOLDER_OVERFLOW = 4;
+    static final int HOLDER_KNOWN = HOLDER_GAP | HOLDER_NONGAP_AWAITING_OPEN | HOLDER_OVERFLOW;
+    /** {@link #recordGapHalt} results. */
+    public static final int HALT_DUPLICATE = -1;
+    /** The overflow record's slot index in {@link #recordGapHalt}'s result. */
+    public static final int HALT_OVERFLOW = LANE_HALT_CAPACITY;
+    /**
+     * The session marker of a record that two sessions have written (S2-3): from then on every write is a merge
+     * ({@code seen = max}), whoever sends it, until the record clears. Never a real cluster session id.
+     */
+    public static final long SESSION_SHARED = Long.MIN_VALUE;
+    /** The identity of a GAP the core detected itself (a feed frame above cursor + 1, D1 row 5 / D2 row 3). */
+    public static final long CORE_DETECTED_IDENTITY = 0L;
+    /** {@link #reopenAction} results. */
+    public static final int REOPEN_NONE = 0;
+    public static final int REOPEN_BRIDGE_HALT = 1;
+    public static final int REOPEN_ALL = 2;
+
+    // replicated, kept ascending by identity (the snapshot order is the state order)
+    private final long[] haltIdentity = new long[LANE_HALT_CAPACITY];
+    private final long[] haltExpected = new long[LANE_HALT_CAPACITY];
+    private final long[] haltSeen = new long[LANE_HALT_CAPACITY];
+    private final long[] haltSession = new long[LANE_HALT_CAPACITY];
+    private final long[] haltLogPosition = new long[LANE_HALT_CAPACITY];
+    private int haltCount;
+    private boolean haltOverflow;
+    /** Informational only (NOTE S2-2): the overflow decides nothing by reach; min expected, max seen of what it absorbed. */
+    private long overflowExpected;
+    private long overflowSeen;
+    private int holders;
+    /** Set by {@link #releaseNonGapOnReach} under the AUTO_REOPEN_ANY_REASON seam only. */
+    private boolean nonGapReleased;
+    // node-local
+    long gateAutoReopenCount;
+
+    public int laneHaltCount() { return haltCount; }
+    public long laneHaltIdentity(final int i) { return haltIdentity[checkIndex(i)]; }
+    public long laneHaltExpected(final int i) { return haltExpected[checkIndex(i)]; }
+    public long laneHaltSeen(final int i) { return haltSeen[checkIndex(i)]; }
+    public long laneHaltSession(final int i) { return haltSession[checkIndex(i)]; }
+    public long laneHaltLogPosition(final int i) { return haltLogPosition[checkIndex(i)]; }
+    public boolean haltOverflow() { return haltOverflow; }
+    public long overflowExpected() { return overflowExpected; }
+    public long overflowSeen() { return overflowSeen; }
+    /** A GAP record or the overflow record is open (what {@code 76 {GAP, 0}} clears). */
+    public boolean gapLatched() { return haltCount != 0 || haltOverflow; }
+    /** The holder set {GAP, NONGAP_AWAITING_OPEN, OVERFLOW} as bits ({@code HOLDER_*}). */
+    public int holders() { return holders; }
+    public boolean holds(final int holder) { return (holders & holder) != 0; }
+    public long gateAutoReopenCount() { return gateAutoReopenCount; }
+    public void countGateAutoReopen() { gateAutoReopenCount++; }
+
+    /** The index of {@code identity}'s record, or -1. */
+    public int laneHaltIndex(final long identity) {
+        for (int i = 0; i < haltCount; i++) {
+            if (haltIdentity[i] == identity) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int checkIndex(final int i) {
+        if (i < 0 || i >= haltCount) {
+            throw new IndexOutOfBoundsException("lane-halt record " + i + " of " + haltCount);
+        }
+        return i;
+    }
+
+    /**
+     * 4R.1 rule 2, RC-2: a non-stale GAP FeedHalt (the caller has refused a stale one) writes or replaces its identity's
+     * record. A replace from the record's own session takes the new values (the lane's current view); a replace from
+     * ANOTHER session keeps {@code seen = max(old, new)} and {@code expected = min(old, new)}, so a second holder of an
+     * identity never weakens the first's reach condition (S2-3). That write also marks the record {@link #SESSION_SHARED}:
+     * from then on no session can lower it either, so neither holder weakens the other's (the property test found the
+     * case "B's FeedHalt merged into A's record unchanged, then A lowered its own seen below B's hole"). A ninth identity
+     * while 8 records are open merges into the overflow record. Nothing is written when the result equals what is held.
+     *
+     * @return the record's index ({@code 0..7}), {@link #HALT_OVERFLOW}, or {@link #HALT_DUPLICATE}
+     */
+    public int recordGapHalt(final long identity, final long sessionId, final long expected, final long seen,
+                             final long logPosition) {
+        final int i = laneHaltIndex(identity);
+        if (i >= 0) {
+            final long e;
+            final long s;
+            final long session;
+            if (haltSession[i] != sessionId && !FeedSeams.REPLACE_TAKES_LAST_SEEN.on) {
+                e = Math.min(haltExpected[i], expected);
+                s = Math.max(haltSeen[i], seen);
+                session = SESSION_SHARED;
+            } else {
+                e = expected;
+                s = seen;
+                session = sessionId;
+            }
+            if (e == haltExpected[i] && s == haltSeen[i] && session == haltSession[i]) {
+                return HALT_DUPLICATE;
+            }
+            haltExpected[i] = e;
+            haltSeen[i] = s;
+            haltSession[i] = session;
+            haltLogPosition[i] = logPosition;
+            holders |= HOLDER_GAP;
+            return i;
+        }
+        if (FeedSeams.AUTO_REOPEN_SINGLE_SLOT.on && haltCount != 0) {
+            return HALT_DUPLICATE; // the S7 single slot: the second lane's hole is forgotten
+        }
+        return insertOrOverflow(identity, sessionId, expected, seen, logPosition);
+    }
+
+    /**
+     * A GAP the core detected itself (D1 row 5, D2 row 3): the record of {@link #CORE_DETECTED_IDENTITY}. While that record
+     * is open a further one is suppressed (the S7 rule "a second GAP under a GAP is suppressed": the later frame re-latches
+     * after the clear if it is still out of order).
+     *
+     * @return the record's index, {@link #HALT_OVERFLOW}, or {@link #HALT_DUPLICATE} when suppressed or unchanged
+     */
+    public int recordCoreGap(final long expected, final long seen, final long logPosition) {
+        if (laneHaltIndex(CORE_DETECTED_IDENTITY) >= 0) {
+            return HALT_DUPLICATE;
+        }
+        if (FeedSeams.AUTO_REOPEN_SINGLE_SLOT.on && haltCount != 0) {
+            return HALT_DUPLICATE;
+        }
+        return insertOrOverflow(CORE_DETECTED_IDENTITY, 0L, expected, seen, logPosition);
+    }
+
+    private int insertOrOverflow(final long identity, final long sessionId, final long expected, final long seen,
+                                 final long logPosition) {
+        if (haltCount < LANE_HALT_CAPACITY) {
+            int at = haltCount;
+            while (at > 0 && haltIdentity[at - 1] > identity) {
+                haltIdentity[at] = haltIdentity[at - 1];
+                haltExpected[at] = haltExpected[at - 1];
+                haltSeen[at] = haltSeen[at - 1];
+                haltSession[at] = haltSession[at - 1];
+                haltLogPosition[at] = haltLogPosition[at - 1];
+                at--;
+            }
+            haltIdentity[at] = identity;
+            haltExpected[at] = expected;
+            haltSeen[at] = seen;
+            haltSession[at] = sessionId;
+            haltLogPosition[at] = logPosition;
+            haltCount++;
+            holders |= HOLDER_GAP;
+            return at;
+        }
+        if (haltOverflow) {
+            final long e = Math.min(overflowExpected, expected);
+            final long s = Math.max(overflowSeen, seen);
+            if (e == overflowExpected && s == overflowSeen) {
+                return HALT_DUPLICATE;
+            }
+            overflowExpected = e;
+            overflowSeen = s;
+            return HALT_OVERFLOW;
+        }
+        haltOverflow = true;
+        overflowExpected = expected;
+        overflowSeen = seen;
+        holders |= HOLDER_OVERFLOW;
+        return HALT_OVERFLOW;
+    }
+
+    /**
+     * 4R.1 rule 2, RC-3: every record whose reach condition holds at cursor {@code c} ({@code c >= seen - 1}) is removed;
+     * when this empties the table the GAP holder goes. The overflow never clears by reach.
+     *
+     * @return how many records were removed
+     */
+    public int reachClearRecords(final long c) {
+        if (haltCount == 0) {
+            return 0;
+        }
+        int w = 0;
+        for (int i = 0; i < haltCount; i++) {
+            if (c >= haltSeen[i] - 1) {
+                continue;
+            }
+            haltIdentity[w] = haltIdentity[i];
+            haltExpected[w] = haltExpected[i];
+            haltSeen[w] = haltSeen[i];
+            haltSession[w] = haltSession[i];
+            haltLogPosition[w] = haltLogPosition[i];
+            w++;
+        }
+        final int removed = haltCount - w;
+        for (int i = w; i < haltCount; i++) {
+            haltIdentity[i] = 0L;
+            haltExpected[i] = 0L;
+            haltSeen[i] = 0L;
+            haltSession[i] = 0L;
+            haltLogPosition[i] = 0L;
+        }
+        haltCount = w;
+        if (removed > 0 && w == 0) {
+            holders &= ~HOLDER_GAP;
+        }
+        return removed;
+    }
+
+    /** 4R.1 rule 4: a non-GAP slot write adds NONGAP_AWAITING_OPEN; it stays through that latch's reach-clear or 76. */
+    public void holdAwaitingOpen() {
+        holders |= HOLDER_NONGAP_AWAITING_OPEN;
+    }
+
+    /** A non-GAP reach-clear keeps NONGAP_AWAITING_OPEN (the operator's OPEN); the AUTO_REOPEN_ANY_REASON seam drops it. */
+    public void releaseNonGapOnReach() {
+        if (FeedSeams.AUTO_REOPEN_ANY_REASON.on && (holders & HOLDER_NONGAP_AWAITING_OPEN) != 0) {
+            holders &= ~HOLDER_NONGAP_AWAITING_OPEN;
+            nonGapReleased = true;
+        }
+    }
+
+    /**
+     * 4R.1 rule 2: {@code 76 {GAP, 0}} clears the whole table and the overflow record and adds NONGAP_AWAITING_OPEN, so the
+     * operator's {@code open} is the next step. Returns false (nothing done) when no GAP record and no overflow is open.
+     */
+    public boolean clearGapTable() {
+        if (haltCount == 0 && !haltOverflow) {
+            return false;
+        }
+        for (int i = 0; i < haltCount; i++) {
+            haltIdentity[i] = 0L;
+            haltExpected[i] = 0L;
+            haltSeen[i] = 0L;
+            haltSession[i] = 0L;
+            haltLogPosition[i] = 0L;
+        }
+        haltCount = 0;
+        haltOverflow = false;
+        overflowExpected = 0L;
+        overflowSeen = 0L;
+        holders = (holders & ~(HOLDER_GAP | HOLDER_OVERFLOW)) | HOLDER_NONGAP_AWAITING_OPEN;
+        return true;
+    }
+
+    /** 4R.1 rule 4: ADMIN OPEN of GLOBAL ({@code clearAll}) empties the holder set. */
+    public void clearHolders() {
+        holders = 0;
+    }
+
+    /**
+     * 4R.1 rules 1 and 4, after a reach-clear in the apply: whether the engine clears the BRIDGE_HALT bit now. The bit is
+     * cleared only when a GAP or (seam) non-GAP holder was released in this apply AND the holder set is empty; the seams
+     * OVERFLOW_READS_CLEARED and AUTO_REOPEN_OVER_AWAITING_OPEN ignore their holder, AUTO_REOPEN_CLEARS_ALL asks for
+     * {@code clearAll}.
+     *
+     * @param gapReleased the table was emptied by this apply's reach-clear
+     * @return {@link #REOPEN_NONE}, {@link #REOPEN_BRIDGE_HALT} or {@link #REOPEN_ALL}
+     */
+    public int reopenAction(final boolean gapReleased) {
+        final boolean released = gapReleased || nonGapReleased;
+        nonGapReleased = false;
+        if (!released) {
+            return REOPEN_NONE;
+        }
+        int h = holders;
+        if (FeedSeams.OVERFLOW_READS_CLEARED.on) {
+            h &= ~HOLDER_OVERFLOW;
+        }
+        if (FeedSeams.AUTO_REOPEN_OVER_AWAITING_OPEN.on) {
+            h &= ~HOLDER_NONGAP_AWAITING_OPEN;
+        }
+        if (h != 0) {
+            return REOPEN_NONE;
+        }
+        return FeedSeams.AUTO_REOPEN_CLEARS_ALL.on ? REOPEN_ALL : REOPEN_BRIDGE_HALT;
+    }
+
+    /**
+     * 4R.1 rule 5 (restore, contract S2-4 breach checks on the set): a non-empty table implies GAP in the set, an overflow
+     * record implies OVERFLOW, a set slot implies NONGAP_AWAITING_OPEN; no record may be at its reach (the apply would
+     * have removed it); {@code bridgeHaltBit} is the GLOBAL gate's BRIDGE_HALT bit, set iff the holder set is non-empty.
+     * Null when consistent.
+     */
+    public String haltBreach(final boolean bridgeHaltBit) {
+        if ((holders & ~HOLDER_KNOWN) != 0) {
+            return "holder set 0x" + Integer.toHexString(holders) + " has a bit this build does not know";
+        }
+        if (bridgeHaltBit != (holders != 0)) {
+            return "BRIDGE_HALT bit " + (bridgeHaltBit ? "set" : "clear") + " with holder set 0x" + Integer.toHexString(holders);
+        }
+        if (haltCount != 0 && (holders & HOLDER_GAP) == 0) {
+            return haltCount + " lane-halt records without GAP in the holder set";
+        }
+        if (haltOverflow && (holders & HOLDER_OVERFLOW) == 0) {
+            return "overflow record without OVERFLOW in the holder set";
+        }
+        if (latchReason != FeedHaltReason.NONE && (holders & HOLDER_NONGAP_AWAITING_OPEN) == 0) {
+            return "latch slot " + latchReason + " without NONGAP_AWAITING_OPEN in the holder set";
+        }
+        if (latchReason == FeedHaltReason.GAP) {
+            return "latch slot GAP (GAP lives in the lane-halt table)";
+        }
+        for (int i = 0; i < haltCount; i++) {
+            if (i > 0 && haltIdentity[i] <= haltIdentity[i - 1]) {
+                return "lane-halt identities not strictly ascending at record " + i;
+            }
+            if (haltExpected[i] < 1 || haltSeen[i] <= haltExpected[i]) {
+                return "lane-halt record " + haltIdentity[i] + " {" + haltExpected[i] + ", " + haltSeen[i] + "} breaks 1 <= expected < seen";
+            }
+            if (lastAppliedJournalSeq >= haltSeen[i] - 1) {
+                return "lane-halt record " + haltIdentity[i] + " {" + haltExpected[i] + ", " + haltSeen[i]
+                        + "} is at its reach with the cursor at " + lastAppliedJournalSeq;
+            }
+        }
+        if (!haltOverflow && (overflowExpected != 0 || overflowSeen != 0)) {
+            return "overflow fields set without the overflow record";
+        }
+        return null;
+    }
+
+    /** Below behaviour 3 the table, the overflow and the holder set are empty. */
+    public boolean haltTableEmpty() {
+        return haltCount == 0 && !haltOverflow && holders == 0;
+    }
+
+    /** Section 12 head and entry sizes. */
+    public static final int HALT_SECTION_VERSION = 1;
+    public static final int HALT_SECTION_HEAD_BYTES = 24;
+    public static final int HALT_SECTION_ENTRY_BYTES = 40;
+
+    /**
+     * Section 12 FEED_HALTS payload (4R.1 rule 5), native byte order: {@code version u8 @0} (1), {@code holders u8 @1},
+     * {@code overflow u8 @2} (0/1), reserved u8 @3, {@code count u32 @4}, {@code overflowExpected i64 @8},
+     * {@code overflowSeen i64 @16}, then {@code count} x 40 B {identity, expected, seen, sessionId, logPosition} ascending by
+     * identity. Returns the end position.
+     */
+    public int writeHaltSection(final org.agrona.MutableDirectBuffer dst, final int at) {
+        final int count = FeedSeams.LANE_TABLE_NOT_SNAPSHOTTED.on ? 0 : haltCount;
+        dst.putByte(at, (byte) HALT_SECTION_VERSION);
+        dst.putByte(at + 1, (byte) holders);
+        dst.putByte(at + 2, (byte) (haltOverflow ? 1 : 0));
+        dst.putByte(at + 3, (byte) 0);
+        dst.putInt(at + 4, count);
+        dst.putLong(at + 8, overflowExpected);
+        dst.putLong(at + 16, overflowSeen);
+        int q = at + HALT_SECTION_HEAD_BYTES;
+        for (int i = 0; i < count; i++) {
+            dst.putLong(q, haltIdentity[i]);
+            dst.putLong(q + 8, haltExpected[i]);
+            dst.putLong(q + 16, haltSeen[i]);
+            dst.putLong(q + 24, haltSession[i]);
+            dst.putLong(q + 32, haltLogPosition[i]);
+            q += HALT_SECTION_ENTRY_BYTES;
+        }
+        return q;
+    }
+
+    /** The payload length {@link #writeHaltSection} writes. */
+    public int haltSectionLength() {
+        return HALT_SECTION_HEAD_BYTES + HALT_SECTION_ENTRY_BYTES * (FeedSeams.LANE_TABLE_NOT_SNAPSHOTTED.on ? 0 : haltCount);
+    }
+
+    /**
+     * Restore section 12 (fail closed). The version byte is read FIRST: a version this build does not know refuses the
+     * restore naming the section id and the version (S2-4). Then the length, the byte ranges and the identity order; the
+     * state breaches run in {@link #haltBreach} once the gate is restored.
+     */
+    public void readHaltSection(final org.agrona.DirectBuffer src, final int at, final int length, final int sectionId) {
+        if (length < 1) {
+            throw new IllegalStateException("balance snapshot FEED_HALTS section (" + sectionId + ") is empty: no version byte");
+        }
+        final int version = src.getByte(at) & 0xFF;
+        if (version != HALT_SECTION_VERSION && !FeedSeams.UNKNOWN_SECTION_VERSION_ACCEPTED.on) {
+            throw new IllegalStateException("balance snapshot section " + sectionId + " (FEED_HALTS) version " + version
+                    + " is not known to this build (it reads version " + HALT_SECTION_VERSION + "); restore refused");
+        }
+        if (length < HALT_SECTION_HEAD_BYTES) {
+            throw new IllegalStateException("balance snapshot FEED_HALTS section (" + sectionId + ") is " + length
+                    + " bytes, below its " + HALT_SECTION_HEAD_BYTES + "-byte head");
+        }
+        final int h = src.getByte(at + 1) & 0xFF;
+        final int overflow = src.getByte(at + 2) & 0xFF;
+        final long count = src.getInt(at + 4) & 0xFFFFFFFFL;
+        if ((h & ~HOLDER_KNOWN) != 0 || overflow > 1 || src.getByte(at + 3) != 0) {
+            throw new IllegalStateException("balance snapshot FEED_HALTS section (" + sectionId + "): holders 0x"
+                    + Integer.toHexString(h) + ", overflow " + overflow + " or a reserved byte this build does not know");
+        }
+        if (count > LANE_HALT_CAPACITY || length != HALT_SECTION_HEAD_BYTES + HALT_SECTION_ENTRY_BYTES * count) {
+            throw new IllegalStateException("balance snapshot FEED_HALTS section (" + sectionId + "): " + count
+                    + " records in " + length + " bytes (at most " + LANE_HALT_CAPACITY + ")");
+        }
+        haltCount = (int) count;
+        int q = at + HALT_SECTION_HEAD_BYTES;
+        for (int i = 0; i < haltCount; i++) {
+            haltIdentity[i] = src.getLong(q);
+            haltExpected[i] = src.getLong(q + 8);
+            haltSeen[i] = src.getLong(q + 16);
+            haltSession[i] = src.getLong(q + 24);
+            haltLogPosition[i] = src.getLong(q + 32);
+            q += HALT_SECTION_ENTRY_BYTES;
+        }
+        haltOverflow = overflow == 1;
+        overflowExpected = src.getLong(at + 8);
+        overflowSeen = src.getLong(at + 16);
+        holders = h;
+    }
 
     // ---- RC2 S8 3.10 item 3: the demuxer's bridge lane table, node-local (never replicated, never snapshotted) ----
     long lanesBehind;

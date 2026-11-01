@@ -51,7 +51,18 @@ public enum CoreRejectReason {
     /** v7 (RC2 S1, served by S8): terminal REJECTED after an INVALID 8 outcome on a pending command, or the REPLACED abort of an AMEND. */
     ME_INVALID(42),
     /** v7 (RC2 S8, appended D-S8-1): terminal REJECTED or the REPLACED abort after RELEASED 7 on a pending command. */
-    ME_RELEASED(43);
+    ME_RELEASED(43),
+    /**
+     * RC2 S10' 4R.1 rule 2 (S2-3): a BRIDGE RegisterSession whose identity a different registered, live session holds.
+     * AdminAck only: the AdminAck reason is a {@code uint8} on the wire, so this code is not in the money-schema
+     * {@code CoreRejectReason} enum (no schema change in S10') and is never put on an OrderReject.
+     */
+    DUPLICATE_IDENTITY(44);
+
+    /** True for a code that only an AdminAck carries (not in the money-schema enum). */
+    public boolean adminAckOnly() {
+        return this == DUPLICATE_IDENTITY;
+    }
 
     private final int code;
 

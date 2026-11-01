@@ -19,6 +19,10 @@ public final class AssetsMetricsBody {
     private final AssetsNodeMetrics metrics;
     private final Map<String, LongSupplier> counters = new LinkedHashMap<>();
     private final Map<String, LongSupplier> gauges = new LinkedHashMap<>();
+    private final Map<String, Labelled> labelledGauges = new LinkedHashMap<>();
+
+    /** One gauge family with one label: {@code name{label="v"} value} per entry, one HELP and TYPE line. */
+    private record Labelled(String help, String label, String[] values, LongSupplier[] suppliers) { }
 
     public AssetsMetricsBody(final AssetsNodeMetrics metrics) {
         this.metrics = metrics;
@@ -32,6 +36,19 @@ public final class AssetsMetricsBody {
 
     public AssetsMetricsBody gauge(final String name, final String help, final LongSupplier value) {
         gauges.put(name + " " + help, value);
+        return this;
+    }
+
+    /**
+     * RC2 S10' 4R.1 rule 7: a gauge family with one label ({@code assets_sessions{class="BRIDGE"}}); {@code values[i]} is
+     * read from {@code suppliers[i]}. A family name must not also be registered unlabelled.
+     */
+    public AssetsMetricsBody labelledGauge(final String name, final String help, final String label, final String[] values,
+                                           final LongSupplier[] suppliers) {
+        if (values.length != suppliers.length) {
+            throw new IllegalArgumentException(name + ": " + values.length + " label values for " + suppliers.length + " suppliers");
+        }
+        labelledGauges.put(name, new Labelled(help, label, values.clone(), suppliers.clone()));
         return this;
     }
 
@@ -50,6 +67,15 @@ public final class AssetsMetricsBody {
         }
         for (final Map.Entry<String, LongSupplier> e : gauges.entrySet()) {
             appendSeries(sb, e.getKey(), "gauge", e.getValue().getAsLong());
+        }
+        for (final Map.Entry<String, Labelled> e : labelledGauges.entrySet()) {
+            final Labelled l = e.getValue();
+            sb.append("# HELP ").append(e.getKey()).append(' ').append(l.help()).append('\n');
+            sb.append("# TYPE ").append(e.getKey()).append(" gauge\n");
+            for (int i = 0; i < l.values().length; i++) {
+                sb.append(e.getKey()).append('{').append(l.label()).append("=\"").append(l.values()[i]).append("\"} ")
+                        .append(l.suppliers()[i].getAsLong()).append('\n');
+            }
         }
 
         appendSeries(sb, "assets_cluster_role Cluster role code (0 follower, 1 candidate, 2 leader)",
