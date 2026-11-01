@@ -23,9 +23,10 @@ import org.agrona.MutableDirectBuffer;
  * dependency. An infrastructure adapter: it reads the {@link Account} aggregates through their public
  * accessors and writes bytes; the domain never knows about serialization.
  *
- * <p><b>PAYLOAD v4 (RC1 S2; the contract is {@code notebook/.../RC1-core/S2/snapshot-v4-layout.md}):</b></p>
+ * <p><b>PAYLOAD v5 (RC1 S2's v4, {@code notebook/.../RC1-core/S2/snapshot-v4-layout.md}, plus section 12 under RC2
+ * S10' 4R, whose cutover is a clean genesis: the tag moved from -4 to -5 so a v4 image is refused):</b></p>
  * <pre>
- *   [layoutTag          : long]   // LAYOUT_V4_TAG (-4); anything else is refused
+ *   [layoutTag          : long]   // LAYOUT_V5_TAG (-5, RC2 S10' 4R); anything else is refused
  *   [lastAppliedTradeId : long]
  *   [consumePosition    : long]
  *   [journalSeq         : long]
@@ -61,7 +62,10 @@ import org.agrona.MutableDirectBuffer;
  */
 public final class BalanceSnapshotCodec {
 
+    /** RC1 S2's v4 tag; refused since RC2 S10' (clean genesis). */
     public static final long LAYOUT_V4_TAG = -4L;
+    /** RC2 S10' 4R.1 rule 5: the layout tag after section 12 FEED_HALTS joined the v3 image. */
+    public static final long LAYOUT_V5_TAG = -5L;
 
     public static final short SECTION_ACCOUNTS = 1;
     public static final short SECTION_ORDERS = 2;
@@ -85,6 +89,12 @@ public final class BalanceSnapshotCodec {
      * 3; presence tracked as for section 10. meLedgerCapacity and meBehaviorVersion stay in section 10.
      */
     public static final short SECTION_ME_LINK = 11;
+    /**
+     * RC2 S10' 4R.1 rule 5: the lane-halt table, the overflow record and the holder set, in their own section with their
+     * own version byte ({@code FeedState#writeHaltSection}); an unknown version is refused naming section and version.
+     * Written iff the recorded behaviour is 3 or more and mandatory then, refused below 3.
+     */
+    public static final short SECTION_FEED_HALTS = 12;
     /** Section 11 head and entry sizes (S8 5.2). */
     public static final int ME_LINK_HEAD_BYTES = 16;
     public static final int ME_LINK_ENTRY_BYTES = 56;
@@ -135,7 +145,7 @@ public final class BalanceSnapshotCodec {
     public static int serialize(AssetsEngine engine, MutableDirectBuffer dst, int offset) {
         final int[] pos = {offset};
 
-        dst.putLong(pos[0], LAYOUT_V4_TAG);
+        dst.putLong(pos[0], LAYOUT_V5_TAG);
         pos[0] += 8;
         dst.putLong(pos[0], engine.getLastAppliedTradeId());
         pos[0] += 8;
@@ -158,7 +168,7 @@ public final class BalanceSnapshotCodec {
         // 9 SESSIONS on this build (RC1 S4); 7 and 8 land with their slices.
         final boolean withConfig = engine.coreConfig().recorded() != null;
         final boolean withFeed = engine.behaviorV3(); // RC2 S7 3.7: section 10 iff behaviour >= 3
-        dst.putInt(pos[0], (withConfig ? 8 : 7) + (withFeed ? 2 : 0)); // RC2 S8: section 11 with section 10
+        dst.putInt(pos[0], (withConfig ? 8 : 7) + (withFeed ? 3 : 0)); // RC2 S8: 11 with 10; RC2 S10': 12 with them
         pos[0] += 4;
         pos[0] = writeAccountsSection(engine, dst, pos[0]);
         pos[0] = writeOrdersSection(engine, dst, pos[0]);
@@ -173,6 +183,7 @@ public final class BalanceSnapshotCodec {
         if (withFeed) {
             pos[0] = writeFeedStateSection(engine, dst, pos[0]);
             pos[0] = writeMeLinkSection(engine, dst, pos[0]);
+            pos[0] = writeFeedHaltsSection(engine, dst, pos[0]);
         }
 
         return pos[0] - offset;
@@ -562,6 +573,15 @@ public final class BalanceSnapshotCodec {
         engine.feed().restoreDigests(src.getLong(start + 92), window);
     }
 
+    /** Section 12 FEED_HALTS (RC2 S10' 4R.1 rule 5): the payload is the feed package's versioned layout. */
+    private static int writeFeedHaltsSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
+        final FeedState f = engine.feed();
+        int p = start;
+        dst.putShort(p, SECTION_FEED_HALTS); p += 2;
+        dst.putInt(p, f.haltSectionLength()); p += 4;
+        return f.writeHaltSection(dst, p);
+    }
+
     /** Section 11 ME_LINK (S8 5.2), native byte order; reserved bytes 0. */
     private static int writeMeLinkSection(AssetsEngine engine, MutableDirectBuffer dst, int start) {
         final OrderEngine oe = engine.orders();
@@ -796,9 +816,9 @@ public final class BalanceSnapshotCodec {
         }
         final long tag = src.getLong(pos);
         pos += 8;
-        if (tag != LAYOUT_V4_TAG) {
-            throw new IllegalStateException("balance snapshot layout tag " + tag + " refused: this build reads only v4 ("
-                    + LAYOUT_V4_TAG + "); pre-v4 images are not restored (clean genesis)");
+        if (tag != LAYOUT_V5_TAG) {
+            throw new IllegalStateException("balance snapshot layout tag " + tag + " refused: this build reads only v5 ("
+                    + LAYOUT_V5_TAG + "); older images are not restored (clean genesis)");
         }
         final long lastAppliedTradeId = src.getLong(pos);
         pos += 8;
@@ -839,6 +859,7 @@ public final class BalanceSnapshotCodec {
         int previousId = 0;
         boolean feedSection = false;
         boolean linkSection = false;
+        boolean haltsSection = false;
         for (int s = 0; s < sectionCount; s++) {
             if (end - pos < SECTION_HEADER) {
                 throw new IllegalStateException("balance snapshot section " + s + " header runs past the payload");
@@ -927,6 +948,10 @@ public final class BalanceSnapshotCodec {
                     readMeLinkSection(src, pos, sectionLength, engine);
                     linkSection = true;
                     break;
+                case SECTION_FEED_HALTS:
+                    engine.feed().readHaltSection(src, pos, sectionLength, SECTION_FEED_HALTS);
+                    haltsSection = true;
+                    break;
                 default:
                     throw new IllegalStateException("balance snapshot section id " + id
                             + " is not known to this build (layout page sections 2..8 land with their slices)");
@@ -950,6 +975,14 @@ public final class BalanceSnapshotCodec {
         }
         if (!v3 && linkSection) {
             throw new IllegalStateException("balance snapshot below behaviour 3 carries an ME_LINK section (11)");
+        }
+        // RC2 S10' 4R.1 rule 5: section 12 exactly as section 10
+        if (v3 && !haltsSection) {
+            throw new IllegalStateException("balance snapshot of a behaviour-" + engine.coreConfig().behaviorVersion()
+                    + " core has no FEED_HALTS section (12)");
+        }
+        if (!v3 && haltsSection) {
+            throw new IllegalStateException("balance snapshot below behaviour 3 carries a FEED_HALTS section (12)");
         }
         engine.orders().rebuildDerived(); // S8 1.5: the derived index and gauges, every behaviour
         return new Decoded(lastAppliedTradeId, consumePosition, journalSeq, lastLogTime, accounts, holds,

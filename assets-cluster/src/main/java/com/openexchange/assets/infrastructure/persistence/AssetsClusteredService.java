@@ -335,7 +335,8 @@ public final class AssetsClusteredService implements ClusteredService {
                 .counter("assets_resumable_sessions_closed_total",
                         "Sessions closed at their egress queue ceiling instead of blocking the engine (every core session is resumable)",
                         () -> resumableSessionsClosed)
-                .gauge("assets_sessions", "Client sessions with an egress queue on this node", () -> egressQueues.length)
+                // RC2 S10': assets_sessions{class} is the registered-session family (OrderEngineMetrics); this was its old name
+                .gauge("assets_egress_sessions", "Client sessions with an egress queue on this node", () -> egressQueues.length)
                 .gauge("assets_egress_pending_bytes", "Bytes queued for egress across sessions (-1 until the leader counters exist)",
                         () -> egressPendingBytes == null ? -1 : egressPendingBytes.get())
                 .gauge("assets_egress_peak_pending_bytes", "Peak of assets_egress_pending_bytes (-1 until the leader counters exist)",

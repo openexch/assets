@@ -19,15 +19,15 @@ import java.util.Objects;
  *       ({@code ShadowIdentity.requireProducible}).</li>
  *   <li>{@link #journalEnabled}, {@link #journalSeq}: the REPLICATED money-journal arming and its dense seq, never the
  *       node-local sink.</li>
- *   <li>{@link #payloadLayoutHint}: 4, the v4 snapshot layout ({@code BalanceSnapshotCodec.LAYOUT_V4_TAG = -4});
- *       diagnostic only.</li>
+ *   <li>{@link #payloadLayoutHint}: 5, the v5 snapshot layout ({@code BalanceSnapshotCodec.LAYOUT_V5_TAG = -5}, RC2
+ *       S10'); diagnostic only.</li>
  * </ul>
  * No clock, environment, role or {@code Cluster} reaches it (the applier closure scan covers it).
  */
 public final class AssetsShadowIdentity implements ShadowIdentitySource {
 
-    /** The v4 snapshot layout the applier's image carries. */
-    public static final int PAYLOAD_LAYOUT_V4 = 4;
+    /** The snapshot layout the applier's image carries (v5 since RC2 S10' section 12). */
+    public static final int PAYLOAD_LAYOUT_V5 = 5;
 
     private final AssetsEngine engine;
 
@@ -54,6 +54,6 @@ public final class AssetsShadowIdentity implements ShadowIdentitySource {
 
     @Override
     public int payloadLayoutHint() {
-        return PAYLOAD_LAYOUT_V4;
+        return PAYLOAD_LAYOUT_V5;
     }
 }

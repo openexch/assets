@@ -566,7 +566,7 @@ public final class AssetsEngine {
     public void reportFeedPosition(long correlationId) {
         // RC2 S7 3.6: the v7 tail is the FeedState (all zero under v1/v2: S1's 0, 0, FALSE, NONE)
         sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled, feed.boundMeEpoch(),
-                feed.lastAppliedJournalSeq(), feed.latched(), feed.latchReason());
+                feed.lastAppliedJournalSeq(), feed.latched(), feed.haltReason()); // RC2 S10' 4R.1 rule 6
     }
 
     /** Settle legs that faulted (drew from available / left an uncovered residue) since boot. */
@@ -834,9 +834,20 @@ public final class AssetsEngine {
         if (v3 && feed.boundMeEpoch() == 0 && gate.state(OrderEntryGate.GLOBAL) != GateState.SUSPENDED) {
             throw new IllegalStateException("restored v3 core is unbound with GLOBAL " + gate.state(OrderEntryGate.GLOBAL));
         }
-        // review F-3: every latch adds BRIDGE_HALT on GLOBAL and only ADMIN OPEN clears it, refused while latched
-        if (v3 && feed.latched() && (gate.reasons(OrderEntryGate.GLOBAL) & (1 << GateReason.BRIDGE_HALT.code())) == 0) {
-            throw new IllegalStateException("restored v3 core is latched " + feed.latchReason() + " without BRIDGE_HALT on GLOBAL");
+        // review F-3: every latch adds BRIDGE_HALT on GLOBAL; ADMIN OPEN is refused while latched
+        final boolean bridgeHaltBit = (gate.reasons(OrderEntryGate.GLOBAL) & (1 << GateReason.BRIDGE_HALT.code())) != 0;
+        if (v3 && feed.latched() && !bridgeHaltBit) {
+            throw new IllegalStateException("restored v3 core is latched " + feed.haltReason() + " without BRIDGE_HALT on GLOBAL");
+        }
+        // RC2 S10' 4R.1 rule 5: the lane-halt table, the overflow record and the holder set agree with the gate bit
+        if (!v3 && !feed.haltTableEmpty()) {
+            throw new IllegalStateException("restored lane-halt table is not empty below behaviour 3");
+        }
+        if (v3) {
+            final String h = feed.haltBreach(bridgeHaltBit);
+            if (h != null) {
+                throw new IllegalStateException("restored lane-halt table fails its invariants: " + h);
+            }
         }
         // review F-3: EPOCH_MISMATCH is raised only against a bound epoch (D1 row 3, a non-stale 66)
         if (feed.latchReason() == FeedHaltReason.EPOCH_MISMATCH && feed.boundMeEpoch() == 0) {
@@ -897,6 +908,9 @@ public final class AssetsEngine {
         if (decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.SWITCH
                 && c.behaviorVersion == 3) {
             gate.convertToReasonSet(); // RC2 S7 6.1: same apply as the switch, no egress
+            if ((gate.reasons(OrderEntryGate.GLOBAL) & (1 << GateReason.BRIDGE_HALT.code())) != 0) {
+                feed.holdAwaitingOpen(); // RC2 S10' 4R.1 rule 4: a kept BRIDGE_HALT bit always has a holder (an ADMIN-set one)
+            }
         }
         final AdminResult result;
         switch (decision) {
@@ -1294,7 +1308,10 @@ public final class AssetsEngine {
         return false;
     }
 
-    /** FeedHalt 66 (D3a), BRIDGE, v3 only. */
+    /**
+     * FeedHalt 66 (D3a), BRIDGE, v3 only. A GAP writes or replaces its {@code bridgeIdentity}'s lane-halt record (RC2 S10'
+     * 4R.1 rule 2); every other reason uses the latch slot as in S7.
+     */
     public void applyFeedHalt(long sessionId, long correlationId, FeedHaltReason reason, long meEpochSeen,
                               long expectedJournalSeq, long seenJournalSeq, long bridgeIdentity, long timestamp) {
         if (!behaviorV3()) {
@@ -1329,6 +1346,19 @@ public final class AssetsEngine {
             sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
             return;
         }
+        if (reason == FeedHaltReason.GAP) {
+            // 4R.1 rule 2: a new or changed record is ACCEPTED, an identical one DUPLICATE; a ninth identity -> overflow
+            final int at = feed.recordGapHalt(bridgeIdentity, sessionId, expectedJournalSeq, seenJournalSeq, logPosition);
+            if (at == FeedState.HALT_DUPLICATE) {
+                feed.countHaltDuplicate();
+                sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+                return;
+            }
+            feed.countHaltApplied();
+            sink.onAdminAck(correlationId, 66, AdminResult.ACCEPTED, 0, 0L);
+            gapEffects(at, 0L);
+            return;
+        }
         if (feed.latchReason() == reason || latchDecision(reason, 0L) != L_WRITE) {
             if (feed.latchReason() != reason && latchDecision(reason, 0L) == L_SUPPRESS) {
                 feed.countLatchSuppressed();
@@ -1345,7 +1375,10 @@ public final class AssetsEngine {
                 reason == FeedHaltReason.EPOCH_MISMATCH ? meEpochSeen : 0L, bridgeIdentity, 0L);
     }
 
-    /** FeedLatchClear 76 (D3b, total), ADMIN, v3 only. */
+    /**
+     * FeedLatchClear 76 (D3b, total), ADMIN, v3 only. {@code 76 {GAP, 0}} clears the whole lane-halt table and the overflow
+     * record and leaves the BRIDGE_HALT bit to the operator's OPEN (RC2 S10' 4R.1 rules 2 and 4).
+     */
     public void applyFeedLatchClear(long correlationId, FeedHaltReason reason, long journalSeq, long timestamp) {
         if (!behaviorV3()) {
             return;
@@ -1355,13 +1388,29 @@ public final class AssetsEngine {
             sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L); // genesis only
             return;
         }
-        if (!feed.latched() || feed.latchReason() != reason) {
+        if (reason == FeedHaltReason.GAP) {
+            if (!feed.gapLatched()) {
+                sink.onAdminAck(correlationId, 76, AdminResult.DUPLICATE, 0, 0L);
+                return;
+            }
+            if (journalSeq != 0) {
+                sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L); // GAP skips nothing
+                return;
+            }
+            feed.clearGapTable();
+            feed.countLatchClear();
+            sink.onAdminAck(correlationId, 76, AdminResult.ACCEPTED, 0, 0L);
+            sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, journalSeq, 0L, logPosition);
+            sink.onFeedLatchCleared(reason, journalSeq, false);
+            return;
+        }
+        if (feed.latchReason() != reason) {
             sink.onAdminAck(correlationId, 76, AdminResult.DUPLICATE, 0, 0L);
             return;
         }
         final long skip = feed.latchSkipSeq();
-        final boolean clearOnly = journalSeq == 0 && (reason == FeedHaltReason.GAP || skip == 0);
-        final boolean skipIt = reason != FeedHaltReason.GAP && skip != 0 && journalSeq == skip;
+        final boolean clearOnly = journalSeq == 0 && skip == 0;
+        final boolean skipIt = skip != 0 && journalSeq == skip;
         if (!clearOnly && !skipIt) {
             sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
             return;
@@ -1381,9 +1430,13 @@ public final class AssetsEngine {
         sink.onAdminAck(correlationId, 76, AdminResult.ACCEPTED, 0, 0L);
         sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, journalSeq, 0L, logPosition);
         sink.onFeedLatchCleared(reason, journalSeq, false);
+        if (skipIt) {
+            // the skip moved the cursor: a GAP record it reached goes (NONGAP_AWAITING_OPEN keeps the bit for the OPEN)
+            reopen(feed.reopenAction(clearReachedRecords(journalSeq)), journalSeq);
+        }
     }
 
-    /** D4 internal clear of one engine-owned bit (S8's D4 auto-clear; no S7 caller). Only under v3. */
+    /** D4 internal clear of one engine-owned bit (S8's ME_CAPACITY auto-clear). Only under v3. */
     public void clearGateInternally(int marketId, GateReason reason) {
         if (behaviorV3() && gate.clearReason(marketId, reason)) {
             emitAdmission(marketId, false);
@@ -1474,7 +1527,11 @@ public final class AssetsEngine {
         reachClear();
     }
 
-    /** 3.3 reach-clear: the only automatic exit; it never moves the cursor and never reopens the gate. */
+    /**
+     * 3.3 reach-clear, the only automatic exit; it never moves the cursor. RC2 S10' 4R: the slot (SOURCE_SCHEMA,
+     * SETTLE_REFUSED) clears and KEEPS its NONGAP_AWAITING_OPEN holder; every lane-halt record whose {@code c >= seen - 1}
+     * goes; when that empties the table and the holder set is empty, the BRIDGE_HALT bit (only it) is cleared (4R.1 rule 1).
+     */
     private void reachClear() {
         if (!feed.latched()) {
             return;
@@ -1483,18 +1540,52 @@ public final class AssetsEngine {
         final FeedHaltReason reason = feed.latchReason();
         final boolean reached;
         switch (reason) {
-            case GAP: reached = c >= feed.latchSeenSeq() - 1; break;
             case SOURCE_SCHEMA:
             case SETTLE_REFUSED: reached = feed.latchSkipSeq() != 0 ? c >= feed.latchSkipSeq() : c >= feed.latchExpectedSeq(); break;
-            default: reached = false; break;
+            default: reached = false; break; // NONE, and the genesis-only EPOCH_MISMATCH / SOURCE_UNBOUND
         }
-        if (!reached) {
+        if (reached) {
+            feed.zeroLatch();
+            feed.countLatchAutoClear();
+            sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, c, 0L, logPosition);
+            sink.onFeedLatchCleared(reason, 0L, true);
+            feed.releaseNonGapOnReach(); // keeps the holder (the operator's OPEN); only the ANY_REASON seam drops it
+        }
+        reopen(feed.reopenAction(clearReachedRecords(c)), c);
+    }
+
+    /** 4R.1 rule 2: remove the lane-halt records reached at {@code c}; true when that removed the GAP holder. */
+    private boolean clearReachedRecords(final long c) {
+        final boolean held = feed.holds(FeedState.HOLDER_GAP);
+        final int n = feed.reachClearRecords(c);
+        for (int i = 0; i < n; i++) {
+            feed.countLatchAutoClear();
+            sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, c, 0L, logPosition);
+            sink.onFeedLatchCleared(FeedHaltReason.GAP, 0L, true);
+        }
+        return n > 0 && held && !feed.holds(FeedState.HOLDER_GAP);
+    }
+
+    /**
+     * 4R.1 rules 1 and 5: clear the GLOBAL BRIDGE_HALT bit (never {@code clearAll}: ADMIN, GENESIS, ME_CAPACITY, ... stay).
+     * Idempotent: {@code clearReason} is false when the bit is not set, and then nothing is broadcast or counted.
+     * {@code assets_gate_auto_reopen_total} counts opens, not bit clears.
+     */
+    private void reopen(final int action, final long c) {
+        if (action == FeedState.REOPEN_NONE) {
             return;
         }
-        feed.zeroLatch();
-        feed.countLatchAutoClear();
-        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, c, 0L, logPosition);
-        sink.onFeedLatchCleared(reason, 0L, true);
+        final boolean cleared = action == FeedState.REOPEN_ALL ? gate.clearAll(OrderEntryGate.GLOBAL)
+                : gate.clearReason(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
+        if (!cleared) {
+            return;
+        }
+        emitAdmission(OrderEntryGate.GLOBAL, false);
+        final boolean opened = gate.state(OrderEntryGate.GLOBAL) == GateState.OPEN;
+        if (opened) {
+            feed.countGateAutoReopen();
+        }
+        sink.onGateAutoReopen(c, opened, gate.reasons(OrderEntryGate.GLOBAL), feed.laneHaltCount());
     }
 
     /** Exit class of a latch reason (5.1): 1 auto, 2 admin, 3 genesis. */
@@ -1509,9 +1600,9 @@ public final class AssetsEngine {
         }
     }
 
-    /** 5.1 precedence of a new latch against the one slot. */
+    /** 5.1 precedence of a new (non-GAP) latch against the one slot. */
     private int latchDecision(final FeedHaltReason reason, final long skip) {
-        if (!feed.latched()) {
+        if (!feed.slotLatched()) {
             return L_WRITE;
         }
         final int next = exitClass(reason);
@@ -1528,9 +1619,21 @@ public final class AssetsEngine {
         return L_SUPPRESS;
     }
 
-    /** 5.1 / 5.2: raise, replace, merge or suppress a latch. */
+    /**
+     * 5.1 / 5.2: raise, replace, merge or suppress a latch. RC2 S10' 4R: a GAP the core detected itself goes to the lane-halt
+     * table as the record of {@link FeedState#CORE_DETECTED_IDENTITY} (suppressed while that record is open).
+     */
     private void latch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
                        final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {
+        if (reason == FeedHaltReason.GAP) {
+            final int at = feed.recordCoreGap(expected, seen, logPosition);
+            if (at == FeedState.HALT_DUPLICATE) {
+                feed.countLatchSuppressed();
+            } else {
+                gapEffects(at, rawTradeId);
+            }
+            return;
+        }
         switch (latchDecision(reason, skip)) {
             case L_WRITE:
                 writeLatch(reason, expected, seen, skip, tradeId, meEpochSeen, bridgeIdentity, rawTradeId);
@@ -1543,13 +1646,31 @@ public final class AssetsEngine {
         }
     }
 
-    /** 5.2 latching effects: the fields, the BRIDGE_HALT bit, the FeedHaltApplied OrderFault, the node-local sink call. */
+    /**
+     * 5.2 latching effects of a slot (non-GAP) latch: the fields, the NONGAP_AWAITING_OPEN holder (RC2 S10' 4R.1 rule 4), the
+     * BRIDGE_HALT bit, the FeedHaltApplied OrderFault, the node-local sink call.
+     */
     private void writeLatch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
                             final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {
         feed.writeLatch(reason, expected, seen, skip, tradeId, meEpochSeen, bridgeIdentity, logPosition);
+        feed.holdAwaitingOpen();
         suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
         sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, seen, expected, logPosition);
         sink.onFeedLatch(reason, expected, seen, skip, rawTradeId);
+    }
+
+    /**
+     * 5.2 latching effects of a lane-halt record (index {@code at}) or the overflow record ({@link FeedState#HALT_OVERFLOW}):
+     * the BRIDGE_HALT bit (the holder was added by the table), the FeedHaltApplied OrderFault with the record's values, the
+     * node-local sink call.
+     */
+    private void gapEffects(final int at, final long rawTradeId) {
+        final boolean overflow = at == FeedState.HALT_OVERFLOW;
+        final long expected = overflow ? feed.overflowExpected() : feed.laneHaltExpected(at);
+        final long seen = overflow ? feed.overflowSeen() : feed.laneHaltSeen(at);
+        suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, seen, expected, logPosition);
+        sink.onFeedLatch(FeedHaltReason.GAP, expected, seen, 0L, rawTradeId);
     }
 
     /** The AdmissionState of one gate with its reason set (all four emission sites go through here or pass it). */
@@ -1703,6 +1824,9 @@ public final class AssetsEngine {
                 return; // X13: GLOBAL stays closed until the ME epoch is bound
             }
             changed = gate.clearAll(marketId);
+            if (marketId == OrderEntryGate.GLOBAL) {
+                feed.clearHolders(); // RC2 S10' 4R.1 rule 4: ADMIN OPEN empties the holder set
+            }
         }
         sink.onAdminAck(correlationId, 73, changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, 0, 0L);
         if (changed) {
