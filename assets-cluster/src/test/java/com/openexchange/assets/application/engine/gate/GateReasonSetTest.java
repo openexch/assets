@@ -56,16 +56,17 @@ public class GateReasonSetTest {
         assertEquals(AdminResult.REJECTED, refused.result());
         assertEquals(CoreRejectReason.FEED_HALTED.code(), refused.reason());
         assertEquals("nothing cleared", bit(GateReason.BRIDGE_HALT), r.globalReasons());
-        // the gap is filled (4..7 applied): the latch reach-clears, the bit stays until ADMIN OPEN, which now passes
+        // the gap is filled (4..7 applied): the GAP record reach-clears and (RC2 S10' 4R.1 rule 1) clears the BRIDGE_HALT
+        // bit by itself; no other reason is left, so the gate is OPEN and an ADMIN OPEN answers DUPLICATE
         for (long t = 1; t <= 3; t++) {
             assertTrue(r.sellHits(t, ONE / 8));
         }
         r.assertNotLatched("gap filled");
-        assertEquals(bit(GateReason.BRIDGE_HALT), r.globalReasons());
-        final AssetsEngineEvent.AdminAck open = admin(r, G, GateState.OPEN, GateReason.ADMIN);
-        assertEquals(AdminResult.ACCEPTED, open.result());
         assertEquals(0, r.globalReasons());
         assertEquals(GateState.OPEN, r.engine.gate().state(G));
+        final AssetsEngineEvent.AdminAck open = admin(r, G, GateState.OPEN, GateReason.ADMIN);
+        assertEquals(AdminResult.DUPLICATE, open.result());
+        assertEquals(0, r.globalReasons());
     }
 
     @Test

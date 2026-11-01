@@ -60,6 +60,10 @@ public class OrderEngineMetricsTest {
         "assets_me_capacity_estimate", "assets_pending_commands", "assets_release_backlog", "assets_release_backlog_parked",
         "assets_release_backlog_oldest_seq", "assets_me_capacity_parked", "assets_core_behavior_version", "assets_pending_oldest_seq",
         "assets_egress_discard_closes_total",
+        // RC2 S10' 4R.1 rule 7
+        "assets_feed_duplicate_total", "assets_feed_halt_applied_total", "assets_feed_halt_stale_total",
+        "assets_feed_halt_duplicate_total", "assets_feed_latch_auto_clear_total", "assets_feed_gap_rejects_total",
+        "assets_gate_auto_reopen_total", "assets_feed_lane_halts", "assets_feed_halt_table_overflow",
     };
 
     @Test
@@ -118,10 +122,11 @@ public class OrderEngineMetricsTest {
 
     // ---------------------------------------------------------------- lanesBehind (3.10 item 3)
 
-    private static int register(final V3Rig r) {
+    /** A BRIDGE RegisterSession; two live lanes need two identities since RC2 S10' (DUPLICATE_IDENTITY). */
+    private static int register(final V3Rig r, final long identity) {
         final RegisterSessionEncoder e = new RegisterSessionEncoder().wrapAndApplyHeader(r.buffer(), 0, r.header())
-                .correlationId(8_080).sessionClass(SessionClass.BRIDGE).readerKind((short) 0).resumable(BoolFlag.TRUE).identity(0)
-                .sourceEpoch(0);
+                .correlationId(8_080).sessionClass(SessionClass.BRIDGE).readerKind((short) 0).resumable(BoolFlag.TRUE)
+                .identity(identity).sourceEpoch(0);
         final EgressChannelsEncoder ch = e.channels().clear();
         ch.acks(true).control(true);
         return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
@@ -134,13 +139,56 @@ public class OrderEngineMetricsTest {
         return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
     }
 
+    /** RC2 S10' 4R.1 rule 7: the B-2 counters and gauges read the engine, and assets_sessions{class} is one family. */
+    @Test
+    public void laneHaltCountersAndSessionsByClass() {
+        final V3Rig r = V3Rig.open();
+        r.twoParty();
+        final long a = r.openSession(51, SessionClass.BRIDGE);
+        final long b = r.openSession(52, SessionClass.BRIDGE);
+        r.dispatch(a, register(r, 1));
+        r.dispatch(b, register(r, 2));
+        r.engine.applyFeedHalt(51, 1L, com.openexchange.assets.domain.FeedHaltReason.GAP, 0L, 4, 6, 1, r.now);
+        r.engine.applyFeedHalt(52, 2L, com.openexchange.assets.domain.FeedHaltReason.GAP, 0L, 4, 6, 2, r.now);
+        r.engine.applyFeedHalt(52, 3L, com.openexchange.assets.domain.FeedHaltReason.GAP, 0L, 4, 6, 2, r.now); // DUPLICATE
+        r.engine.applyFeedHalt(52, 4L, com.openexchange.assets.domain.FeedHaltReason.GAP, 0L, 2, 3, 2, r.now); // stale
+        Map<String, Long> m = scrape(r.engine.metricsView());
+        assertEquals(2L, (long) m.get("assets_feed_halt_applied_total"));
+        assertEquals(1L, (long) m.get("assets_feed_halt_duplicate_total"));
+        assertEquals(1L, (long) m.get("assets_feed_halt_stale_total"));
+        assertEquals(2L, (long) m.get("assets_feed_lane_halts"));
+        assertEquals(0L, (long) m.get("assets_feed_halt_table_overflow"));
+        assertEquals("GAP is the reported latch", 1L, (long) m.get("assets_feed_latch_reason"));
+        assertTrue(r.sellHits(1, V3Rig.ONE / 16));
+        assertTrue(r.sellHits(2, V3Rig.ONE / 16)); // c = 5: both records reach, the gate reopens
+        assertTrue(r.sellHitsAt(5, V3Rig.EPOCH, r.egress, 2, V3Rig.ONE / 16)); // a byte-equal duplicate of 5
+        assertFalse(r.sellHitsAt(9, V3Rig.EPOCH, r.egress + 1, 3, V3Rig.ONE / 16)); // FEED_GAP: a core-detected record
+        m = scrape(r.engine.metricsView());
+        assertEquals(2L, (long) m.get("assets_feed_latch_auto_clear_total"));
+        assertEquals(1L, (long) m.get("assets_gate_auto_reopen_total"));
+        assertEquals(1L, (long) m.get("assets_feed_duplicate_total"));
+        assertEquals(1L, (long) m.get("assets_feed_gap_rejects_total"));
+        assertEquals("the core-detected record", 1L, (long) m.get("assets_feed_lane_halts"));
+        final String body = new AssetsMetricsBody(new AssetsNodeMetrics()).include(OrderEngineMetrics.of(r.engine.metricsView()))
+                .render();
+        assertEquals("one HELP line for the family", 1, body.split("# HELP assets_sessions ", -1).length - 1);
+        assertTrue(body, body.contains("assets_sessions{class=\"BRIDGE\"} 2\n"));
+        for (final String cls : new String[] {"ADMIN", "TOOL", "GATEWAY", "TREASURY", "FORWARDER"}) {
+            assertTrue(body, body.contains("assets_sessions{class=\"" + cls + "\"} 0\n"));
+        }
+        assertFalse("no unlabelled assets_sessions sample", body.contains("\nassets_sessions "));
+        r.engine.sessions().close(b);
+        assertTrue(new AssetsMetricsBody(new AssetsNodeMetrics()).include(OrderEngineMetrics.of(r.engine.metricsView())).render()
+                .contains("assets_sessions{class=\"BRIDGE\"} 1\n"));
+    }
+
     @Test
     public void lanesBehindFollowsTwoBridgeLanes() {
         final V3Rig r = V3Rig.open();
         final long a = r.openSession(51, SessionClass.BRIDGE);
         final long b = r.openSession(52, SessionClass.BRIDGE);
-        r.dispatch(a, register(r));
-        r.dispatch(b, register(r));
+        r.dispatch(a, register(r, 1));
+        r.dispatch(b, register(r, 2));
         for (long js = 2; js <= 4; js++) {
             r.dispatch(a, bump(r, js));
         }

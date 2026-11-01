@@ -58,7 +58,7 @@ public class AssetsShadowIdentityTest {
             final Arm arm = new Arm().genesis();
             final ShadowIdentitySource id = AeShadowRig.identityOf(arm.applier);
             assertEquals("fresh engine", 0L, id.genesisId());
-            assertEquals(4, id.payloadLayoutHint());
+            assertEquals("the v5 layout (RC2 S10' section 12)", 5, id.payloadLayoutHint());
             final List<LogFrame> frames = log.frames().frames();
             long previous = -1;
             boolean refusedBeforeAdopt = false;

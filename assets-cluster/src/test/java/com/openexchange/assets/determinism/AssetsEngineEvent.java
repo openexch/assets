@@ -31,7 +31,8 @@ public sealed interface AssetsEngineEvent
                 AssetsEngineEvent.MeDispatch, AssetsEngineEvent.DepositReject, AssetsEngineEvent.ConfigApplied,
         AssetsEngineEvent.OrderFault, AssetsEngineEvent.OrderSnapshotEntry, AssetsEngineEvent.OrderSnapshotEnd,
         AssetsEngineEvent.PendingDispatchEnd, AssetsEngineEvent.MeDispatchReply,
-        AssetsEngineEvent.FeedLatch, AssetsEngineEvent.FeedLatchCleared, AssetsEngineEvent.ReleaseEffect {
+        AssetsEngineEvent.FeedLatch, AssetsEngineEvent.FeedLatchCleared, AssetsEngineEvent.ReleaseEffect,
+        AssetsEngineEvent.GateAutoReopen {
 
     String render();
 
@@ -352,6 +353,15 @@ public sealed interface AssetsEngineEvent
         @Override
         public String render() {
             return String.format("FEEDCLEAR reason=%s jseq=%d auto=%d", reason.name(), journalSeq, auto ? 1 : 0);
+        }
+    }
+
+    /** RC2 S10' 4R.1 rule 7: the node-local "auto-reopen" control event (the BRIDGE_HALT bit cleared by a GAP reach). */
+    record GateAutoReopen(long journalSeq, boolean opened, int gateReasons, int laneHalts) implements AssetsEngineEvent {
+        @Override
+        public String render() {
+            return String.format("AUTOREOPEN jseq=%d opened=%d reasons=0x%x laneHalts=%d", journalSeq, opened ? 1 : 0, gateReasons,
+                    laneHalts);
         }
     }
 }

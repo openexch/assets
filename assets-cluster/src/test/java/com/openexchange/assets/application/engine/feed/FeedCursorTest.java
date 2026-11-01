@@ -210,8 +210,12 @@ public class FeedCursorTest {
         assertTrue("seq 2 resent applies", r.configAt(2, EPOCH, 9, 2, 2, 4096, 12, ConfigDecision.BUMP));
         assertEquals(2L, r.cursor());
         assertEquals(2L, r.feed().meConfigVersion());
-        // the BRIDGE_HALT bit stays until ADMIN OPEN, which passes now that the epoch is bound and the latch is gone
-        assertTrue(r.globalHas(GateReason.BRIDGE_HALT));
+        // RC2 S10' 4R: the GAP reach-clear cleared the BRIDGE_HALT bit at the bind, but GENESIS keeps the gate SUSPENDED
+        // (a bit clear, not an open: no reopen counted); ADMIN OPEN passes now that the epoch is bound
+        assertFalse(r.globalHas(GateReason.BRIDGE_HALT));
+        assertTrue(r.globalHas(GateReason.GENESIS));
+        assertEquals(GateState.SUSPENDED, r.engine.gate().state(OrderEntryGate.GLOBAL));
+        assertEquals(0L, r.feed().gateAutoReopenCount());
         r.mark();
         r.adminGate(OrderEntryGate.GLOBAL, GateState.OPEN, GateReason.ADMIN);
         assertEquals(com.openexchange.assets.domain.AdminResult.ACCEPTED, r.onlyAck().result());

@@ -226,7 +226,7 @@ public class AssetsShadowRoundTripTest {
         assertEquals(ve.header().journalEnabledFlag(), scratch.engine().isMoneyJournalEnabled());
         assertEquals(ve.header().journalSeq(), scratch.engine().getJournalSeq());
         assertTrue(ShadowIdentity.matches(ve.header(), AeShadowRig.identityOf(scratch)));
-        assertEquals(4, ve.header().payloadLayoutHint());
+        assertEquals("the v5 layout (RC2 S10' section 12)", 5, ve.header().payloadLayoutHint());
         final Outcome o = host(fixture.aeron(), fixture.archive(), verdicts, ve, Host.PRODUCTION,
                 AeShadowRig::identityOf);
         assertSameEndState(o, "the genuine shadow");

@@ -188,8 +188,17 @@ public class MoneySchemaV7LayoutTest {
         assertEquals(41, CoreRejectReason.ME_LANE_INACTIVE.code());
         assertEquals(42, CoreRejectReason.ME_INVALID.code());
         for (final CoreRejectReason c : CoreRejectReason.values()) {
+            if (c.adminAckOnly()) {
+                // RC2 S10' (S2-3): an AdminAck-only code (AdminAck.reason is a uint8): never in the schema enum, no schema change
+                for (final com.openexchange.assets.infrastructure.generated.CoreRejectReason g
+                        : com.openexchange.assets.infrastructure.generated.CoreRejectReason.values()) {
+                    assertTrue(c + " is not a money-schema value", !g.name().equals(c.name()) && g.value() != c.code());
+                }
+                continue;
+            }
             assertEquals(c.name(), c.code(), com.openexchange.assets.infrastructure.generated.CoreRejectReason.valueOf(c.name()).value());
         }
+        assertEquals(44, CoreRejectReason.DUPLICATE_IDENTITY.code());
         for (final OrderFaultKind k : OrderFaultKind.values()) {
             assertEquals(k.name(), k.code(), com.openexchange.assets.infrastructure.generated.OrderFaultKind.valueOf(k.name()).value());
         }

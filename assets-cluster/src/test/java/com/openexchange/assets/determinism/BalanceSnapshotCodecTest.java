@@ -48,7 +48,7 @@ public class BalanceSnapshotCodecTest {
         AssetsEngine orig = engineWithState();
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int len = serialize(orig, buf);
-        assertEquals("v4 tag leads the payload", BalanceSnapshotCodec.LAYOUT_V4_TAG, buf.getLong(0));
+        assertEquals("the v5 tag leads the payload (RC2 S10')", BalanceSnapshotCodec.LAYOUT_V5_TAG, buf.getLong(0));
 
         AssetsEngine restored = new AssetsEngine();
         BalanceSnapshotCodec.Decoded d = BalanceSnapshotCodec.deserialize(buf, 0, len, restored);
@@ -221,7 +221,7 @@ public class BalanceSnapshotCodecTest {
     public void anImageWithNoSectionsIsAnEmptyLedger() {
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int p = 0;
-        buf.putLong(p, BalanceSnapshotCodec.LAYOUT_V4_TAG); p += 8;
+        buf.putLong(p, BalanceSnapshotCodec.LAYOUT_V5_TAG); p += 8;
         for (int i = 0; i < 7; i++) { buf.putLong(p, 0L); p += 8; }
         buf.putByte(p, (byte) 0); p += 1;
         buf.putInt(p, 0); p += 4;

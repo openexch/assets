@@ -1,0 +1,87 @@
+name: Feed harness
+
+# RC2 S9h contract 9.1 (review FIX-3): every main commit builds the TEST-SCOPE feed harness jar
+# (assets-cluster -Pfeed-harness: the Java reference translator, serve, story, t1-journal, t1-core)
+# and publishes it, addressed by its commit, as the release asset
+#   harness-<sha>/assets-feed-harness.jar (+ .sha256)
+# cluster-tools pins it by sha256 (dependencies.lock feed_harness_*; scripts/fetch-deps.sh --harness with
+# CT_ARTIFACT_BASE_URL=https://github.com/openexch/assets and feed_harness_url
+# releases/download/harness-<sha>/assets-feed-harness.jar). The jar is never in a release manifest and
+# never deployed to a box: the release is a prerelease named harness-<sha>, not a version tag.
+#
+# Gates before publishing:
+#   - the jar is built twice (the second after clean) and must hash the same (reproducible, S9h 2.3 / N-5);
+#   - its META-INF/feed-harness.properties must say main_tree_equals_ref=true (S9h 9.2: the harness commit's
+#     src/main equals the core cluster-tools pins; a production change needs a money_schema_ref bump first)
+#     and assets_worktree_dirty=false;
+#   - plain `java -jar ... version` and `random` must run with no JVM flag (review FIX-2).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: feed-harness-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # the release asset
+      packages: read    # com.match:match-common (match.journal.version) from GitHub Packages
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # FeedHarnessJarBuilder reads HEAD's commit time and git ls-tree of money_schema_ref
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Build the harness jar (twice, the second after clean)
+        run: |
+          set -euo pipefail
+          mvn -B -s .mvn-settings.xml -pl assets-cluster -am -Pfeed-harness -DskipTests package
+          sha256sum assets-cluster/target/assets-feed-harness.jar | cut -d' ' -f1 > "$RUNNER_TEMP/first.sha256"
+          mvn -B -s .mvn-settings.xml -pl assets-cluster -am -Pfeed-harness -DskipTests clean package
+          sha256sum assets-cluster/target/assets-feed-harness.jar | cut -d' ' -f1 > "$RUNNER_TEMP/second.sha256"
+          if ! cmp -s "$RUNNER_TEMP/first.sha256" "$RUNNER_TEMP/second.sha256"; then
+            echo "::error::the harness jar is not reproducible: $(cat "$RUNNER_TEMP/first.sha256") vs $(cat "$RUNNER_TEMP/second.sha256")"
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the build properties and plain java -jar
+        run: |
+          set -euo pipefail
+          JAR=assets-cluster/target/assets-feed-harness.jar
+          java -jar "$JAR" version | tee props.txt
+          grep -qx 'main_tree_equals_ref=true' props.txt || { echo "::error::src/main differs from money_schema_ref"; exit 1; }
+          grep -qx 'assets_worktree_dirty=false' props.txt || { echo "::error::built from a dirty tree"; exit 1; }
+          grep -qx "assets_commit=${GITHUB_SHA}" props.txt || { echo "::error::the jar names another commit"; exit 1; }
+          mkdir -p smoke && java -jar "$JAR" random 1 1000 smoke && (cd smoke && sha256sum -c SHA256SUMS)
+
+      - name: Publish harness-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cp assets-cluster/target/assets-feed-harness.jar assets-feed-harness.jar
+          sha256sum assets-feed-harness.jar > assets-feed-harness.jar.sha256
+          TAG="harness-${GITHUB_SHA}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG exists: a commit is published once (the pin names its bytes)"
+            gh release download "$TAG" -p assets-feed-harness.jar.sha256 -O published.sha256
+            cmp -s published.sha256 assets-feed-harness.jar.sha256 || { echo "::error::$TAG holds other bytes"; exit 1; }
+          else
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "feed harness ${GITHUB_SHA::12}" \
+              --notes "Test-scope S9h feed harness jar built from ${GITHUB_SHA}; not a release, never deployed." \
+              assets-feed-harness.jar assets-feed-harness.jar.sha256
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

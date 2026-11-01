@@ -66,11 +66,10 @@ public class MeCapacityGateTest {
             h[i] = create(r);
         }
         assertTrue(globalHas(r, GateReason.ME_CAPACITY));
-        // BRIDGE_HALT joins: an entry two ahead latches GAP (the reach-clear later clears the latch, not the bit)
-        final long next = r.jseq + 1;
-        assertFalse(r.outcomeAt(next + 1, V3Rig.EPOCH, ++r.egress, h[1], 0, CREATE, APPLIED, 1_002, 0, false));
+        // BRIDGE_HALT joins: a lane's FeedHalt GAP for a hole this test never fills (since RC2 S10' 4R a GAP the cursor
+        // reaches clears the bit by itself, so the hole must stay open for BRIDGE_HALT to be the "other reason")
+        r.halt(com.openexchange.assets.domain.FeedHaltReason.GAP, 0, 1_000_000L, 1_000_005L, 0x9);
         assertTrue(globalHas(r, GateReason.BRIDGE_HALT));
-        r.jseq = next - 1;
         for (int i = 0; i < 8; i++) {
             final MeOutcomeView v = r.outcomeView(h[i], 0, CREATE, APPLIED, 1_001 + i, 0);
             v.ledgerSize = 0; // the ME recorded nothing it keeps (the confirmations are not modelled here)

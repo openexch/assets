@@ -264,9 +264,10 @@ public class S7VerifierFeedTest {
             } else if (a < 73) {
                 // the runbook-safe 76 rows only: a GAP or a skip-0 latch cleared with journalSeq 0 (never a skip)
                 final FeedState f = c.engine.feed();
-                if (f.latched() && f.latchSkipSeq() == 0 && (f.latchReason() == FeedHaltReason.GAP
-                        || f.latchReason() == FeedHaltReason.SOURCE_SCHEMA)) {
-                    c.engine.applyFeedLatchClear(7_600L + step, f.latchReason(), 0L, c.rig.now);
+                // RC2 S10': the reported reason (a GAP lives in the lane-halt table, the slot holds the rest)
+                if (f.latched() && f.latchSkipSeq() == 0 && (f.haltReason() == FeedHaltReason.GAP
+                        || f.haltReason() == FeedHaltReason.SOURCE_SCHEMA)) {
+                    c.engine.applyFeedLatchClear(7_600L + step, f.haltReason(), 0L, c.rig.now);
                 }
                 what = "76 clear";
             } else if (a < 80) {
@@ -502,7 +503,7 @@ public class S7VerifierFeedTest {
         r.deposit(3, USD, 10_000 * ONE);
         final long o3 = r.create(r.limit(3, 0, PX, ONE)); // pending CREATE attempt 0
         assertFalse(r.sellHitsAt(6, EPOCH, 60, 2, Q)); // hole at 4..5: GAP
-        assertEquals(FeedHaltReason.GAP, c.engine.feed().latchReason());
+        assertEquals(FeedHaltReason.GAP, c.engine.feed().haltReason());
         // the exactly-next entry still applies while latched: CAPACITY for order 3
         assertTrue(r.outcomeAt(4, EPOCH, 40, o3, 0, V3Rig.KIND_CREATE, 3, 0, 0, false));
         final int both = (1 << GateReason.BRIDGE_HALT.code()) | (1 << GateReason.ME_CAPACITY.code());
@@ -521,14 +522,15 @@ public class S7VerifierFeedTest {
         r.adminGate(OrderEntryGate.GLOBAL, GateState.OPEN, GateReason.ADMIN);
         assertEquals(CoreRejectReason.FEED_HALTED.code(), lastAck(r).reason());
         assertNotNull("CAPACITY keeps the dispatch pending", r.order(o3));
-        // the hole heals: reach-clear, gate still shut, ADMIN OPEN now accepted
+        // the hole heals: the GAP reach-clear clears BRIDGE_HALT and, ME_CAPACITY being clear already, the gate is OPEN by
+        // itself (RC2 S10' 4R.1 rule 1; S7 kept it shut until ADMIN OPEN), so the ADMIN OPEN answers DUPLICATE
         assertTrue(r.sellHitsAt(5, EPOCH, 50, 1, Q));
         r.assertNotLatched("healed");
-        assertEquals(GateState.SUSPENDED, c.engine.gate().state(OrderEntryGate.GLOBAL));
+        assertEquals(GateState.OPEN, c.engine.gate().state(OrderEntryGate.GLOBAL));
         assertTrue(r.sellHitsAt(6, EPOCH, 60, 2, Q));
         r.mark();
         r.adminGate(OrderEntryGate.GLOBAL, GateState.OPEN, GateReason.ADMIN);
-        assertEquals(AdminResult.ACCEPTED, lastAck(r).result());
+        assertEquals(AdminResult.DUPLICATE, lastAck(r).result());
         assertEquals(0, r.globalReasons());
         c.engine.verifyRestoredInvariants();
     }
@@ -540,7 +542,7 @@ public class S7VerifierFeedTest {
         final V3Rig r = c.rig;
         assertTrue(r.sellHitsAt(4, EPOCH, 40, 1, Q));
         assertFalse(r.sellHitsAt(6, EPOCH, 60, 3, Q));
-        assertEquals(FeedHaltReason.GAP, c.engine.feed().latchReason());
+        assertEquals(FeedHaltReason.GAP, c.engine.feed().haltReason());
         r.mark();
         assertTrue(r.sellHitsAt(5, EPOCH, 50, 2, Q));
         assertEquals(1, r.feedHaltFaults().size());
@@ -554,7 +556,7 @@ public class S7VerifierFeedTest {
         assertEquals("two DUPLICATEs, no event", 0, r.events().size());
         assertEquals(dup + 2, c.engine.feed().duplicateCount(62));
         assertArrayEquals(healed, money(c));
-        assertTrue("BRIDGE_HALT stays until ADMIN OPEN", r.globalHas(GateReason.BRIDGE_HALT));
+        assertFalse("the GAP reach-clear cleared BRIDGE_HALT (RC2 S10' 4R)", r.globalHas(GateReason.BRIDGE_HALT));
         c.deliverBatch(List.of(new Entry(K_TRADE, 5, 50, 2, 0), new Entry(K_TRADE, 6, 60, 3, 0)), -1);
         assertEquals(6L, c.cursor());
         assertEquals(3L, c.engine.getLastAppliedTradeId());
@@ -590,7 +592,7 @@ public class S7VerifierFeedTest {
                     assertEquals(FeedHaltReason.SOURCE_UNBOUND, u.feed().latchReason());
                     continue;
                 }
-                assertEquals(reason, c.engine.feed().latchReason());
+                assertEquals(reason, c.engine.feed().haltReason());
                 final long holdBuy = r.locked(1, USD);
                 final long holdSell = r.locked(2, BTC);
                 final long[] before = money(c);

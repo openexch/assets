@@ -280,7 +280,7 @@ public class BehaviorV3Test {
         try (Stream<Path> s = Files.list(dir)) {
             scenarios = s.filter(p -> p.toString().endsWith(".scenario")).sorted().collect(Collectors.toList());
         }
-        assertEquals("the corpus: 38 scenarios", 38, scenarios.size());
+        assertEquals("the corpus: 39 scenarios (RC2 S10' adds feed_lane_halts_auto_reopen)", 39, scenarios.size());
         for (final Path p : scenarios) {
             final String name = p.getFileName().toString().replace(".scenario", "");
             final String golden = Files.readString(dir.resolve(name + ".golden"), StandardCharsets.UTF_8);
