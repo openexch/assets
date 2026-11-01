@@ -116,7 +116,8 @@ public class G29V7PathTest {
             assertEquals("detail = the first missing journalSeq", ACKED + BATCH + 1, sr.detail());
         }
         assertEquals("the first refusal names batch 3's first journalSeq", ACKED + 2 * BATCH + 1, rejected.get(0).journalPosition());
-        victim.assertLatch("lost batch 2", FeedHaltReason.GAP, ACKED + BATCH + 1, ACKED + 2 * BATCH + 1, 0, 0);
+        // RC2 S10' review FIX-1: the later refusals (the two terminals) merge into the core's GAP record: seen = max
+        victim.assertLatch("lost batch 2", FeedHaltReason.GAP, ACKED + BATCH + 1, ACKED + TRADES + 2, 0, 0);
         victim.assertGloballyHalted("lost batch 2");
 
         // nothing past the hole applied: 64 settled, the high-water and the cursor stay at the end of batch 1
@@ -159,12 +160,15 @@ public class G29V7PathTest {
         batch(victim, 2);
         assertEquals(BATCH, victim.count(AssetsEngineEvent.Settled.class));
         assertEquals(2L * BATCH, victim.engine.getLastAppliedTradeId());
-        victim.assertNotLatched("batch 2 healed the hole");
-        assertEquals(new AssetsEngineEvent.FeedLatchCleared(FeedHaltReason.GAP, 0L, true),
-                victim.first(AssetsEngineEvent.FeedLatchCleared.class));
+        // RC2 S10' review FIX-1: the core's record merged the refused terminals (seen = 197), so the gate stays shut until
+        // every frame the core refused has been redelivered; batch 2 alone does not clear it
+        victim.assertLatch("batch 2 applied, the refused batch 3 and terminals still owed", FeedHaltReason.GAP,
+                ACKED + BATCH + 1, ACKED + TRADES + 2, 0, 0);
+        assertEquals(0, victim.count(AssetsEngineEvent.FeedLatchCleared.class));
         // the bridge resends from the reported cursor: batch 3 and the terminals now apply in order
         batch(victim, 3);
         terminals(victim);
+        victim.assertNotLatched("the redelivery passed every refused frame");
         assertEquals(TRADES, victim.engine.getLastAppliedTradeId());
         assertEquals(ACKED + TRADES + 2, victim.cursor());
         assertNull(victim.order(1));

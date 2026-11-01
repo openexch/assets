@@ -282,6 +282,39 @@ final class AutoReopenScenarios {
         return out;
     }
 
+    /**
+     * Review FIX-1: the core refuses a frame at 7 (hole 4..6) and later one at 9: the identity-0 record merges to seen 9,
+     * so the fill of 4..6 does not open the gate below the hole at 7..8 the core observed; filling 7..8 opens it once.
+     */
+    static void aLaterCoreDetectedHoleKeepsTheGateClosed() {
+        final V3Rig r = book();
+        assertFalse(r.sellHitsAt(7, EPOCH, r.egress + 1, 1, ONE / 16)); // D1 row 5: hole 4..6
+        assertFalse(r.sellHitsAt(9, EPOCH, r.egress + 1, 1, ONE / 16)); // a later frame: hole up to 8
+        r.mark();
+        fill(r, 3); // c = 6: the first frame's reach
+        assertEquals("OPEN below a hole the core refused", GateState.SUSPENDED, state(r));
+        assertEquals("no broadcast", 0, broadcasts(r).size());
+        fill(r, 2); // c = 8: past the later hole
+        assertEquals("never reopened after the later hole filled", GateState.OPEN, state(r));
+        assertEquals("one reopen", 1L, opens(broadcasts(r)));
+    }
+
+    /** 4R.1 rule 4 (review NOTE-9): a SETTLE_REFUSED reach-clear clears the slot and keeps the bit (the operator's OPEN). */
+    static void settleRefusedReachClearKeepsTheBit() {
+        final V3Rig r = book();
+        assertFalse("tradeId 9 is not lastAppliedTradeId + 1: SETTLE_REFUSED, skip 4",
+                r.sellHitsAt(4, EPOCH, r.egress + 1, 9, ONE / 16));
+        r.mark();
+        assertTrue("the valid entry at 4 applies", r.sellHitsAt(4, EPOCH, r.egress + 1, 1, ONE / 16)); // c >= skip
+        r.jseq = 4;
+        assertEquals("OPEN after a SETTLE_REFUSED reach-clear", GateState.SUSPENDED, state(r));
+        assertEquals("BRIDGE_HALT kept", bit(GateReason.BRIDGE_HALT), r.globalReasons());
+        assertEquals("no broadcast", 0, broadcasts(r).size());
+        assertEquals("the operator's OPEN passes (nothing latched)", AdminResult.ACCEPTED,
+                admin(r, GateState.OPEN, GateReason.ADMIN).result());
+        assertEquals(GateState.OPEN, state(r));
+    }
+
     /** C4: a GAP holder added and removed twice in one run; two reopens. */
     static void twoHaltsInOneRunReopenTwice() {
         final V3Rig r = book();

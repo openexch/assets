@@ -149,12 +149,16 @@ public class LaneHaltTableTest {
         assertEquals(7L, f.laneHaltSeen(0));
         assertEquals("gap rejects counted", 1L, f.gapCount());
         assertFalse(r.sellHitsAt(9, EPOCH, r.egress + 1, 1, ONE / 16));
-        assertEquals("a second core-detected GAP is suppressed", 7L, f.laneHaltSeen(0));
-        assertEquals(1L, f.latchSuppressedCount());
+        assertEquals("a second core-detected GAP merges: seen = max (review FIX-1)", 9L, f.laneHaltSeen(0));
+        assertEquals("expected = min", 4L, f.laneHaltExpected(0));
+        assertEquals(0L, f.latchSuppressedCount());
         assertEquals("a lane's FeedHalt is its own record", AdminResult.ACCEPTED, gap(r, 77, 1, 4, 12));
         assertEquals(2, f.laneHaltCount());
-        fill(r, 3); // c = 6: the core's record reaches, lane 1's does not
+        fill(r, 3); // c = 6: below both records' reach
+        assertEquals(2, f.laneHaltCount());
+        fill(r, 2); // c = 8: the core's merged record reaches, lane 1's does not
         assertEquals(1, f.laneHaltCount());
+        assertEquals(1L, f.laneHaltIdentity(0));
         assertEquals(GateState.SUSPENDED, state(r));
     }
 
@@ -305,14 +309,23 @@ public class LaneHaltTableTest {
         assertEquals(CoreRejectReason.UNAUTHORIZED_CLASS.code(), registerAck(r, 63, SessionClass.BRIDGE, 7).reason());
     }
 
+    /** Review FIX-2: below behaviour 3 a logged RegisterSession replays with the result it was recorded with. */
     @Test
-    public void duplicateIdentityHoldsBelowBehaviourThreeToo() {
+    public void duplicateIdentityIsNotExclusiveBelowBehaviourThree() {
         final V3Rig r = V3Rig.v2();
         r.openSession(51, SessionClass.BRIDGE);
         r.openSession(52, SessionClass.BRIDGE);
         assertEquals(AdminResult.ACCEPTED, registerAck(r, 51, SessionClass.BRIDGE, 3).result());
-        assertEquals("C7: one rule in every state", CoreRejectReason.DUPLICATE_IDENTITY.code(),
-                registerAck(r, 52, SessionClass.BRIDGE, 3).reason());
+        assertEquals("v1/v2: the second holder is ACCEPTED as before S10'", AdminResult.ACCEPTED,
+                registerAck(r, 52, SessionClass.BRIDGE, 3).result());
+        assertEquals(2, r.engine.sessions().registeredCount(SessionClass.BRIDGE));
+        // the same engine after the switch to behaviour 3: the rule applies from that apply on
+        com.openexchange.assets.determinism.V3Genesis.widen(r.engine);
+        r.engine.applyCoreConfig(com.openexchange.assets.determinism.V3Genesis.config(3, 3), r.now);
+        assertTrue(r.engine.behaviorV3());
+        r.openSession(53, SessionClass.BRIDGE);
+        assertEquals("v3: one live session per BRIDGE identity", CoreRejectReason.DUPLICATE_IDENTITY.code(),
+                registerAck(r, 53, SessionClass.BRIDGE, 3).reason());
     }
 
     @Test

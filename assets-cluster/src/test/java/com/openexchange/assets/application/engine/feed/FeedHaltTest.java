@@ -158,12 +158,16 @@ public class FeedHaltTest {
         assertEquals("a merge emits no latch event", 0, m.feedHaltFaults().size());
         assertEquals(0, m.count(AssetsEngineEvent.FeedLatch.class));
 
-        // a second GAP under a GAP is suppressed (it re-latches on the next out-of-order entry after a clear)
+        // RC2 S10' review FIX-1: a second core-detected GAP MERGES into the identity-0 record (seen = max; S7 suppressed
+        // it, safe only while the gate stayed shut until ADMIN OPEN); an unchanged one is suppressed
         final V3Rig gg = book();
         assertFalse(gg.sellHitsAt(7, EPOCH, gg.egress + 1, 1, ONE / 4));
         gg.assertLatch("GAP 7", FeedHaltReason.GAP, 4, 7, 0, 0);
         assertFalse(gg.sellHitsAt(9, EPOCH, gg.egress + 1, 1, ONE / 4));
-        gg.assertLatch("GAP 9 suppressed", FeedHaltReason.GAP, 4, 7, 0, 0);
+        gg.assertLatch("GAP 9 merged", FeedHaltReason.GAP, 4, 9, 0, 0);
+        assertEquals(0L, gg.feed().latchSuppressedCount());
+        assertFalse(gg.sellHitsAt(8, EPOCH, gg.egress + 1, 1, ONE / 4));
+        gg.assertLatch("GAP 8 changes nothing", FeedHaltReason.GAP, 4, 9, 0, 0);
         assertEquals(1L, gg.feed().latchSuppressedCount());
     }
 

@@ -41,6 +41,7 @@ public class LaneHaltPropertyTest {
     private long stale;
     private long nonGapBlocked;
     private long restores;
+    private long coreMerges;
 
     @Test
     public void lanesHolesAndTheGate() {
@@ -48,8 +49,8 @@ public class LaneHaltPropertyTest {
             run(seed);
         }
         System.out.printf("[LANE-HALT-PROPERTY] seeds=%d autoReopens=%d twoRecordReopens=%d overflowOperatorClears=%d "
-                        + "crossSessionMerges=%d stale=%d nonGapBlocked=%d restores=%d%n", SEEDS, autoReopens, twoRecordReopens,
-                overflowOperatorClears, crossSessionMerges, stale, nonGapBlocked, restores);
+                        + "crossSessionMerges=%d stale=%d nonGapBlocked=%d restores=%d coreMerges=%d%n", SEEDS, autoReopens, twoRecordReopens,
+                overflowOperatorClears, crossSessionMerges, stale, nonGapBlocked, restores, coreMerges);
         assertTrue("non-vacuity: automatic reopens", autoReopens > 0);
         assertTrue("non-vacuity: reopens after two concurrent records", twoRecordReopens > 0);
         assertTrue("non-vacuity: overflows cleared by the operator", overflowOperatorClears > 0);
@@ -57,6 +58,7 @@ public class LaneHaltPropertyTest {
         assertTrue("non-vacuity: stale FeedHalts", stale > 0);
         assertTrue("non-vacuity: GAP reaches blocked by NONGAP_AWAITING_OPEN", nonGapBlocked > 0);
         assertTrue("non-vacuity: restores", restores > 0);
+        assertTrue("non-vacuity: core-detected GAPs merged into the identity-0 record", coreMerges > 0);
     }
 
     /** One identity's requirement: its hole is open while {@code c < seen - 1}. */
@@ -86,7 +88,26 @@ public class LaneHaltPropertyTest {
             final String what;
             final int bitsBefore = r.globalReasons();
             boolean adminOpened = false;
-            if (a < 40) {
+            if (a < 7) {
+                // review FIX-1 / NOTE-9: a frame above c + 1, refused: the core's own GAP record (identity 0) merges seen = max
+                final long s = c + 2 + rnd.nextInt(5);
+                assertTrue(!r.configAt(s, V3Rig.EPOCH, ++r.egress, r.feed().meConfigVersion() + 1,
+                        com.openexchange.assets.determinism.V3Genesis.ME_BEHAVIOR, com.openexchange.assets.determinism.V3Genesis.ME_CAPACITY,
+                        com.openexchange.assets.determinism.V3Genesis.ME_MAX_WIRE, com.openexchange.assets.domain.ConfigDecision.BUMP));
+                final Need n = open(need, FeedState.CORE_DETECTED_IDENTITY, c);
+                if (n != null) {
+                    n.seen = Math.max(n.seen, s);
+                    coreMerges++;
+                } else if (openCount(need, c) < FeedState.LANE_HALT_CAPACITY) {
+                    final Need m = new Need();
+                    m.seen = s;
+                    m.session = -1;
+                    need.put(FeedState.CORE_DETECTED_IDENTITY, m);
+                } else {
+                    overflow = true;
+                }
+                what = "core-detected GAP {" + (c + 1) + ", " + s + "}";
+            } else if (a < 40) {
                 final long identity = 1 + rnd.nextInt(10);
                 final long session = identity * 1000 + (rnd.nextInt(7) == 0 ? 2 : 1);
                 final long expected;
