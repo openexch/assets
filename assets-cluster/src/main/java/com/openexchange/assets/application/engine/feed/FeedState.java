@@ -335,14 +335,27 @@ public final class FeedState {
 
     /**
      * A GAP the core detected itself (D1 row 5, D2 row 3): the record of {@link #CORE_DETECTED_IDENTITY}. While that record
-     * is open a further one is suppressed (the S7 rule "a second GAP under a GAP is suppressed": the later frame re-latches
-     * after the clear if it is still out of order).
+     * is open a later one MERGES into it ({@code seen = max}, {@code expected = min}, review FIX-1): under the automatic
+     * reopen, S7's "suppress the second GAP" would let the record's reach open the gate below a hole the core itself
+     * refused a frame at. The CORE_GAP_SUPPRESSED seam restores the S7 suppression.
      *
-     * @return the record's index, {@link #HALT_OVERFLOW}, or {@link #HALT_DUPLICATE} when suppressed or unchanged
+     * @return the record's index, {@link #HALT_OVERFLOW}, or {@link #HALT_DUPLICATE} when unchanged (or suppressed)
      */
     public int recordCoreGap(final long expected, final long seen, final long logPosition) {
-        if (laneHaltIndex(CORE_DETECTED_IDENTITY) >= 0) {
-            return HALT_DUPLICATE;
+        final int i = laneHaltIndex(CORE_DETECTED_IDENTITY);
+        if (i >= 0) {
+            if (FeedSeams.CORE_GAP_SUPPRESSED.on) {
+                return HALT_DUPLICATE;
+            }
+            final long e = Math.min(haltExpected[i], expected);
+            final long s = Math.max(haltSeen[i], seen);
+            if (e == haltExpected[i] && s == haltSeen[i]) {
+                return HALT_DUPLICATE;
+            }
+            haltExpected[i] = e;
+            haltSeen[i] = s;
+            haltLogPosition[i] = logPosition;
+            return i;
         }
         if (FeedSeams.AUTO_REOPEN_SINGLE_SLOT.on && haltCount != 0) {
             return HALT_DUPLICATE;

@@ -26,7 +26,9 @@ enum FeedSeams {
     /** RC-2: a replace from another session takes the new {@code seen} instead of {@code max(old, new)}. */
     REPLACE_TAKES_LAST_SEEN,
     /** RC-1: section 12 accepts a version byte this build does not know (read as version 1). */
-    UNKNOWN_SECTION_VERSION_ACCEPTED;
+    UNKNOWN_SECTION_VERSION_ACCEPTED,
+    /** Review FIX-1: a second core-detected GAP is suppressed (the S7 rule) instead of merged into the identity-0 record. */
+    CORE_GAP_SUPPRESSED;
 
     /** Package-private and mutable only from this package: false in every production process. */
     boolean on;

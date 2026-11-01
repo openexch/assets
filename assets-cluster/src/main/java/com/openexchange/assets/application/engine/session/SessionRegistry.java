@@ -88,12 +88,22 @@ public final class SessionRegistry {
      * Apply a RegisterSession (replicated). The asserted class must equal the principal's; the session must
      * declare itself resumable (every core session can be closed at its egress ceiling, critic D16);
      * re-registering is allowed and idempotent (DUPLICATE when nothing changed), which is how a client
-     * re-declares after a leader change. RC2 S10' (S2-3): a BRIDGE registration whose identity another registered, live
-     * session holds is REJECTED {@code DUPLICATE_IDENTITY}, in every behaviour version.
+     * re-declares after a leader change. Identities are not exclusive here (the behaviour 1/2 rule).
      */
     public Registration register(final long sessionId, final SessionClass assertedClass, final int channelMask,
                                  final boolean resumable, final int readerKind, final long identity,
                                  final long sourceEpoch) {
+        return register(sessionId, assertedClass, channelMask, resumable, readerKind, identity, sourceEpoch, false);
+    }
+
+    /**
+     * {@link #register} with RC2 S10' S2-3: when {@code exclusiveBridgeIdentity} (the engine passes behaviour >= 3, so a
+     * v1/v2 log replays with the result it was recorded with, review FIX-2), a BRIDGE registration whose identity another
+     * registered, live session holds is REJECTED {@code DUPLICATE_IDENTITY}.
+     */
+    public Registration register(final long sessionId, final SessionClass assertedClass, final int channelMask,
+                                 final boolean resumable, final int readerKind, final long identity,
+                                 final long sourceEpoch, final boolean exclusiveBridgeIdentity) {
         final SessionAuthority a = byId.get(sessionId);
         if (a == null || a.sessionClass() == SessionClass.UNSET) {
             return new Registration(AdminResult.REJECTED, CoreRejectReason.UNAUTHORIZED_CLASS, false);
@@ -104,7 +114,8 @@ public final class SessionRegistry {
         if (!resumable) {
             return new Registration(AdminResult.REJECTED, CoreRejectReason.NOT_RESUMABLE, false);
         }
-        if (a.sessionClass() == SessionClass.BRIDGE && bridgeIdentityHeldByAnother(sessionId, identity)) {
+        if (exclusiveBridgeIdentity && a.sessionClass() == SessionClass.BRIDGE
+                && bridgeIdentityHeldByAnother(sessionId, identity)) {
             // RC2 S10' S2-3: two live lanes with one identity would share one lane-halt record; the second is refused
             return new Registration(AdminResult.REJECTED, CoreRejectReason.DUPLICATE_IDENTITY, false);
         }
