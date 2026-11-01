@@ -445,6 +445,9 @@ public class S10pVerbsClusterTest {
     @Test
     public void duplicateIdentityIsFreedWhenTheDeadSessionTimesOut() throws Exception {
         final Map<String, String> env = rig.cluster(1, 26_100, T1Keys.table(true));
+        // DUPLICATE_IDENTITY applies under behaviour 3 only (review FIX-2): CoreConfig 1 -> 2 -> 3 first
+        final FeedHarnessClusterTest.Out g = t1(env, "t1-core", "genesis", "--genesis-id", "777001");
+        assertEquals(g.text(), 0, g.code());
         final long identity = 0xC1L;
         // the lane that will "die": registered, then never polled again (no keepalive, no close): a kill -9
         final T1Session dead = T1Session.connect(env, "T1_BRIDGE_KEY");

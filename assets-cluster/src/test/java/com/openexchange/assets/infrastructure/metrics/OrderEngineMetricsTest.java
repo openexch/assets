@@ -173,7 +173,7 @@ public class OrderEngineMetricsTest {
                 .render();
         assertEquals("one HELP line for the family", 1, body.split("# HELP assets_sessions ", -1).length - 1);
         assertTrue(body, body.contains("assets_sessions{class=\"BRIDGE\"} 2\n"));
-        for (final String cls : new String[] {"ADMIN", "TOOL", "GATEWAY", "TREASURY", "FORWARDER"}) {
+        for (final String cls : new String[] {"ADMIN", "TOOL", "GATEWAY", "TREASURY", "FORWARDER", "REPLICA"}) {
             assertTrue(body, body.contains("assets_sessions{class=\"" + cls + "\"} 0\n"));
         }
         assertFalse("no unlabelled assets_sessions sample", body.contains("\nassets_sessions "));
