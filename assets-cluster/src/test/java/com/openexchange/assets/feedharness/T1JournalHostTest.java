@@ -444,6 +444,13 @@ public class T1JournalHostTest {
         assertEquals("a refused HOLE held nothing", List.of(1L, 2L, 3L, 4L, 5L, 6L), seqs(whole(replay(0, list(0).get(0)))));
     }
 
+    /** The lane A finding's RED: the old WRITE appends seq 1 a second time after a fresh-only regenesis. */
+    @Test
+    public void freshOnlyRewriteOfSeqOneIsCaught() {
+        FeedHarnessNegativeControlsTest.red(FeedHarnessSeams.FRESH_ONLY_REWRITES_SEQ1, "seq 1 twice in the new recording",
+                this::regenesisFreshOnlyThenWriteCarriesTheNewEpoch);
+    }
+
     @Test
     public void regenesisFreshOnlyThenWriteCarriesTheNewEpoch() {
         ok("SOURCES 1 " + (PORT_BASE + 90));
@@ -451,25 +458,32 @@ public class T1JournalHostTest {
         ok("WRITE 0 1 6");
         final int before = list(0).size();
         assertTrue(ok("REGENESIS 0 777001 --fresh-only").contains("fresh-only"));
-        ok("WRITE 0 1 6"); // the loaded journal again, seq 1 included, under the new epoch
+        final String wrote = ok("WRITE 0 1 6"); // seq 1 counts as written: skipped, 2..6 written
         ok("STOP 0");
         final List<long[]> l = list(0);
         assertEquals("--fresh-only starts a new recording", before + 1, l.size());
         final List<byte[]> f = whole(replay(0, l.get(l.size() - 1)));
-        assertEquals("the FRESH, then seq 1 again (byte-identical), then 2..6", 7, f.size());
+        assertEquals("seq 1 twice in the new recording", List.of(1L, 2L, 3L, 4L, 5L, 6L), seqs(f));
+        assertTrue("seq 1 skipped: " + wrote, wrote.contains("OK wrote 5"));
         assertEquals("the first frame is a 68", 5, JournalRecords.templateId(f.get(0)));
         assertEquals("FRESH", 0, f.get(0)[8 + 38]);
         assertEquals("seq 1", 1L, JournalRecords.journalSeq(f.get(0)));
         assertEquals("the new epoch", 777001L, JournalRecords.meEpoch(f.get(0)));
-        assertArrayEquals("the story's FRESH relabelled, so a WRITE of seq 1 is a byte-equal duplicate", f.get(0), f.get(1));
+        assertArrayEquals("the FRESH is the story's seq 1 relabelled", JournalRecords.withHead(records.get(0), 1, 777001L,
+                JournalRecords.egressSeq(records.get(0))), f.get(0));
         for (int i = 1; i < f.size(); i++) {
-            final byte[] story = records.get(i - 1);
+            final byte[] story = records.get(i);
             assertEquals("seqs unchanged", JournalRecords.journalSeq(story), JournalRecords.journalSeq(f.get(i)));
             assertEquals("the new epoch on every WRITE", 777001L, JournalRecords.meEpoch(f.get(i)));
             assertEquals("egressSeqs unchanged", JournalRecords.egressSeq(story), JournalRecords.egressSeq(f.get(i)));
             assertArrayEquals("only the epoch differs", JournalRecords.withHead(story, JournalRecords.journalSeq(story), 777001L,
                     JournalRecords.egressSeq(story)), f.get(i));
         }
+        // a new recording (RESTART here) clears the floor: its own seqs are written again
+        ok("RESTART 0 2");
+        ok("STOP 0");
+        final List<long[]> l2 = list(0);
+        assertEquals(List.of(2L, 3L, 4L, 5L, 6L), seqs(whole(replay(0, l2.get(l2.size() - 1)))));
         final String bad = host.handle("REGENESIS 0 0 --fresh-only");
         assertTrue("epoch 0 refused: " + bad, bad.startsWith("ERR"));
     }

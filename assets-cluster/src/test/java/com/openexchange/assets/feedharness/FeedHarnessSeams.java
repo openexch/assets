@@ -54,7 +54,9 @@ public enum FeedHarnessSeams {
     /** RC2 S10' 4.5 item 7: {@code gate --watch} does not print the second transition it receives. */
     GATE_WATCH_DROPS_ONE,
     /** RC2 S10' 4.5 item 4: {@code oracle --genesis} ignored (the model keeps the story's epoch). */
-    GENESIS_OVERRIDE_IGNORED;
+    GENESIS_OVERRIDE_IGNORED,
+    /** RC2 S10' lane A finding: WRITE after {@code REGENESIS --fresh-only} appends seq 1 again (the old behaviour). */
+    FRESH_ONLY_REWRITES_SEQ1;
 
     private static final Set<FeedHarnessSeams> ON = EnumSet.noneOf(FeedHarnessSeams.class);
 

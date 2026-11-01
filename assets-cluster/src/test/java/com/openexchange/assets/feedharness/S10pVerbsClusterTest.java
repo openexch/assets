@@ -195,8 +195,8 @@ public class S10pVerbsClusterTest {
         }
         // the cancelled order leaves the order store and its hold goes with it
         o = t1(env, "t1-core", "dump", "--orders", ids.toString());
-        assertTrue("the order is gone (an ERR now): " + o.text(), o.code() == FeedHarnessMain.USAGE
-                && o.text().contains("ERR unknown order " + live[0]));
+        assertTrue("the order is gone (ABSENT now): " + o.text(), o.code() == 0
+                && o.text().contains("ABSENT " + live[0] + "\n"));
         try (T1Session admin = T1Session.connect(env, "T1_ADMIN_KEY")) {
             for (final String l : CanonicalDump.of(admin)) {
                 assertTrue("no O or H line left: " + l, !l.startsWith("O " + live[0] + " ") && !l.startsWith("H " + live[0] + " "));
@@ -242,10 +242,16 @@ public class S10pVerbsClusterTest {
             }
         }
         final List<String> got = new ArrayList<>(List.of(o.text().trim().split("\n")));
-        assertTrue(got.get(got.size() - 1), got.remove(got.size() - 1).equals("DUMP orders=3 lines=" + expected.size()));
+        assertTrue(got.get(got.size() - 1), got.remove(got.size() - 1).equals("DUMP orders=3 absent=0 lines=" + expected.size()));
         assertEquals("the subset is the full dump's lines, in its order", expected, got);
-        Files.writeString(ids, "424242\n");
-        assertEquals("an unknown order is an ERR", FeedHarnessMain.USAGE, t1(env, "t1-core", "dump", "--orders", ids.toString()).code());
+        // an id not in the store prints ABSENT and the remaining ids continue (not an ERR)
+        Files.writeString(ids, "424242\n" + picked.get(0) + "\n" + picked.get(1) + "\n" + picked.get(2) + "\n");
+        final FeedHarnessClusterTest.Out a = t1(env, "t1-core", "dump", "--orders", ids.toString());
+        assertEquals(a.text(), 0, a.code());
+        final List<String> withAbsent = new ArrayList<>(List.of(a.text().trim().split("\n")));
+        assertEquals("ABSENT 424242", withAbsent.remove(0));
+        assertEquals("DUMP orders=4 absent=1 lines=" + expected.size(), withAbsent.remove(withAbsent.size() - 1));
+        assertEquals("the present ids still print every line", expected, withAbsent);
     }
 
     // ------------------------------------------------------------------ item 2: the --extra writer

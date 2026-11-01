@@ -91,6 +91,12 @@ public final class T1Journal {
         final Map<Long, String> corrupt = new TreeMap<>();
         final TreeMap<Long, Long> epochFrom = new TreeMap<>();
         long lastWritten;
+        /**
+         * RC2 S10' (lane A finding): seqs {@code <= writtenFloor} are already in the ACTIVE recording and WRITE skips them,
+         * so a {@code WRITE all 1 ..} after {@code REGENESIS --fresh-only} does not append seq 1 a second time
+         * (SEQ_REGRESSION_IN_RECORDING). Set by the fresh-only regenesis, cleared by every new recording.
+         */
+        long writtenFloor;
         final List<long[]> replays = new ArrayList<>();
         final List<Subscription> holdSubs = new ArrayList<>();
 
@@ -133,6 +139,7 @@ public final class T1Journal {
 
         void startRecording(final int term) {
             stopRecording();
+            writtenFloor = 0;
             pub = client.addRecordedExclusivePublication(term == 64 * 1024 ? JOURNAL_CHANNEL
                     : "aeron:ipc?term-length=" + term, JOURNAL_STREAM);
             final CountersReader counters = client.context().aeron().countersReader();
@@ -444,7 +451,8 @@ public final class T1Journal {
                     throw new IllegalStateException("source " + s.index + " is killed");
                 }
                 for (long n = from; n <= to; n++) {
-                    if (s.held.contains(n)) {
+                    if (s.held.contains(n)
+                            || (n <= s.writtenFloor && !FeedHarnessSeams.on(FeedHarnessSeams.FRESH_ONLY_REWRITES_SEQ1))) {
                         continue;
                     }
                     s.append(bytesFor(s, n));
@@ -579,6 +587,7 @@ public final class T1Journal {
                 s.epochFrom.clear();
                 s.epochFrom.put(1L, epoch);
                 s.lastWritten = 1;
+                s.writtenFloor = 1; // seq 1 counts as written: a later WRITE from 1 skips it
             }, "regenesis epoch " + epoch + " fresh-only");
         }
 
