@@ -40,7 +40,8 @@ import java.util.TreeMap;
  *       (exit 1). {@code --seam BREAK_LOCKED} is the 4.3 negative control: it adds 1 to the first non-zero locked before the
  *       check, so the check must FAIL naming that user and asset.</li>
  *   <li>{@code dump --orders <file>}: the canonical dump lines of the listed orders (one id per line), their H lines and
- *       their users' B lines, exactly as the full dump prints them.</li>
+ *       their users' B lines, exactly as the full dump prints them; an id not in the order store prints
+ *       {@code ABSENT <id>} and the rest continue (an ended order leaves the store).</li>
  *   <li>{@code gate --watch <ms> [--until <s>]}: one GATEWAY session; the initial state (the RegisterSession's ORIGIN
  *       AdmissionState) as {@code INITIAL ...}, then every GLOBAL AdmissionState broadcast as
  *       {@code t=<monotonic ms> state=<OPEN|SUSPENDED> reasons=<bitmask> names=<A,B> wall=<epoch ms>}; {@code t} is
@@ -271,8 +272,14 @@ final class T1CoreVerbs {
         }
         final Dump d = dump(c);
         final Set<Long> users = new HashSet<>();
-        for (final long id : ids) {
-            users.add(d.userOf(id)); // an unknown order is an ERR (C7)
+        int absent = 0;
+        for (final long id : new java.util.TreeSet<>(ids)) {
+            if (!d.orders().containsKey(id)) {
+                c.out.println("ABSENT " + id); // not in the order store (unknown, or ended and removed): reported, not fatal
+                absent++;
+                continue;
+            }
+            users.add(d.userOf(id));
         }
         int n = 0;
         for (final String l : d.lines()) {
@@ -287,7 +294,7 @@ final class T1CoreVerbs {
                 n++;
             }
         }
-        c.out.println("DUMP orders=" + ids.size() + " lines=" + n);
+        c.out.println("DUMP orders=" + ids.size() + " absent=" + absent + " lines=" + n);
         return 0;
     }
 
