@@ -331,6 +331,26 @@ public class AssetsShadowEngineConformanceTest {
         assertTrue("the service wrapper is not in the applier closure", !report.classes().contains(ACS));
     }
 
+    /**
+     * RCS S3 11.8, assets leg: the closure from {@code AssetsShadowIdentity} (named as a string, so this file compiles
+     * before the class exists and the scan fails closed without it) is RF-6 clean. It reaches the engine and the
+     * generated codecs; its size is recorded and is the floor (76 classes measured at RCS S3 on 6fcf66b + S3).
+     */
+    @Test
+    public void theShadowIdentityClosureNeverSchedules() {
+        final String asi = "com/openexchange/assets/infrastructure/persistence/AssetsShadowIdentity";
+        final NeverSchedulesScan.Report report = NeverSchedulesScan.scanClosure(assetsRoots(), asi,
+                "com/openexchange/assets/", NeverSchedulesScan.Rules.rf6());
+        System.out.println("GREEN scan: closure from " + asi + " = " + report.classesScanned() + " classes, findings "
+                + report.findings().size());
+        assertTrue("RF-6 findings in the AssetsShadowIdentity closure: " + report.findings(), report.clean());
+        assertTrue("the closure reaches the engine", report.classes().stream()
+                .anyMatch(n -> n.equals("com/openexchange/assets/application/engine/AssetsEngine")));
+        assertTrue("the service wrapper is not in the closure", !report.classes().contains(ACS));
+        assertTrue("the closure shrank below the floor: " + report.classesScanned() + " < 76",
+                report.classesScanned() >= 76);
+    }
+
     @Test
     public void positiveControlTheServiceWrapperIsFlagged() {
         final NeverSchedulesScan.Report report = NeverSchedulesScan.scanClosure(assetsRoots(), ACS,

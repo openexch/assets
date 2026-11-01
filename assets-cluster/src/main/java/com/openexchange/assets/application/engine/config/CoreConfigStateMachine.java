@@ -81,7 +81,10 @@ public final class CoreConfigStateMachine {
             return Decision.INVALID;
         }
         if (recorded == null) {
-            return c.behaviorVersion == 1 ? Decision.ADOPT : Decision.INVALID;
+            // RCS S3 amendment A7: the nonce becomes the shadow identity (H10, alias g<genesisId>) and the replica's
+            // genesis (RC2 S1 BLOCKER-3), so ADOPT records only [1, 2^63 - 1]; 0 or a negative draw is refused here,
+            // before anything is recorded, instead of producing a cluster that can never shadow
+            return c.behaviorVersion == 1 && c.genesisId > 0 ? Decision.ADOPT : Decision.INVALID;
         }
         // row 2b: a genesisId other than the recorded one is a re-genesis attempt
         if (c.genesisId != recorded.genesisId) {

@@ -63,8 +63,11 @@ final class CoreFrameEncoders {
 
     /** RC2 S7: the producer epoch every ME-sourced frame carries (1 in the v1/v2 story; the bound genesisId at v3). */
     long meEpoch = 1L;
-    /** RC2 S7: the genesisId every CoreConfig frame carries (0 in the v1/v2 story). */
-    long genesisId = 0L;
+    /**
+     * RC2 S7: the genesisId every CoreConfig frame carries. RCS S3 amendment A7: the core ADOPTs only
+     * {@code genesisId >= 1}, so the v1/v2 story carries the same nonce as the v3 story ({@link CoreFrameStory#GENESIS}).
+     */
+    long genesisId = CoreFrameStory.GENESIS;
 
     private final UnsafeBuffer buf = new UnsafeBuffer(new byte[4096]);
     private final MessageHeaderEncoder header = new MessageHeaderEncoder();

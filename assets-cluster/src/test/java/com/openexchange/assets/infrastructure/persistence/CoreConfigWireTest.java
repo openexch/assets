@@ -62,7 +62,8 @@ public class CoreConfigWireTest {
         /** Encode {@code c} with the generated CoreConfigEncoder (markets and assets groups); returns the frame length. */
         int coreConfig(final CoreConfigCommand c) {
             final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(buf, 0, header)
-                    .correlationId(c.correlationId).configVersion(c.configVersion).behaviorVersion(c.behaviorVersion);
+                    .correlationId(c.correlationId).configVersion(c.configVersion).behaviorVersion(c.behaviorVersion)
+                    .genesisId(c.genesisId); // RCS S3 A7: an ADOPT needs genesisId >= 1
             final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(c.markets.length);
             for (final CoreConfigCommand.MarketDef d : c.markets) {
                 m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAssetId())

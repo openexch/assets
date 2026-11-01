@@ -515,11 +515,18 @@ public final class AssetsScenarioRunner {
 
     // ---- parsing helpers (the text conventions live in the kit) ----
 
+    /**
+     * RCS S3 amendment A7: the core ADOPTs only {@code genesisId >= 1}, so every test CoreConfig carries this nonce
+     * unless a test sets another one (the v3 genesis uses the same value, {@code V3Genesis.GENESIS_ID}).
+     */
+    public static final long DEFAULT_GENESIS_ID = 0x5EEDL;
+
     /** The compiled Market.ALL / Asset tables as a CoreConfig command (RC1 S7 DSL and tests). */
     public static com.openexchange.assets.domain.commands.CoreConfigCommand coreConfigFor(long version, long behavior, long tick,
             long min, long max, long lot, long correlationId) {
         final com.openexchange.assets.domain.commands.CoreConfigCommand c = new com.openexchange.assets.domain.commands.CoreConfigCommand();
         c.reset();
+        c.genesisId = DEFAULT_GENESIS_ID;
         c.correlationId = correlationId;
         c.configVersion = version;
         c.behaviorVersion = behavior;

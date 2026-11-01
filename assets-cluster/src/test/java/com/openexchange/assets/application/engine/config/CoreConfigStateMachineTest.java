@@ -237,7 +237,7 @@ public final class CoreConfigStateMachineTest {
         engine.applyCoreConfig(c, now);
         assertOnlyAck(c.correlationId, AdminResult.REJECTED, INVALID);
         assertEquals(0x5EEDL, sm.recorded().genesisId);
-        final CoreConfigCommand none = base(2, 2); // genesisId 0 against a recorded 0x5EED: a re-genesis attempt too
+        final CoreConfigCommand none = withGenesis(base(2, 2), 0L); // 0 against a recorded 0x5EED: a re-genesis too
         engine.applyCoreConfig(none, now);
         assertEquals(1L, sm.behaviorVersion());
     }
@@ -246,10 +246,11 @@ public final class CoreConfigStateMachineTest {
 
     @Test public void row7_targetThreeNeedsGenesisIdFeedVirginAndGlobalSuspended() {
         sm.setSupportedBehaviorVersions(1, 2, 3);
-        adoptV1();
-        engine.applyCoreConfig(base(2, 2), now);
+        // a recorded genesisId 0 can no longer be ADOPTed (RCS S3 A7); it can still be restored from an image recorded
+        // before A7, and row 7 must keep refusing the switch on it
+        sm.restore(withGenesis(base(2, 2), 0L));
         mark();
-        final CoreConfigCommand c = base(3, 3);
+        final CoreConfigCommand c = withGenesis(base(3, 3), 0L);
         engine.applyCoreConfig(c, now);
         assertOnlyAck(c.correlationId, AdminResult.REJECTED, INVALID);
         assertEquals("recorded genesisId 0: no switch to 3", 2L, sm.behaviorVersion());
@@ -262,6 +263,49 @@ public final class CoreConfigStateMachineTest {
         assertEquals(CoreConfigStateMachine.Decision.INVALID, fresh.decide(withGenesis(base(3, 3), 9L), true, true));
         assertEquals(CoreConfigStateMachine.Decision.INVALID, fresh.decide(withGenesis(base(3, 3), 9L), false, false));
         assertEquals(CoreConfigStateMachine.Decision.SWITCH, fresh.decide(withGenesis(base(3, 3), 9L), false, true));
+    }
+
+    // ------------------------------------------------------------------ RCS S3 amendment A7: ADOPT needs genesisId >= 1
+
+    /** Every violation of A7 at ADOPT, named; empty when the row holds. */
+    java.util.List<String> a7Violations() {
+        final java.util.List<String> out = new java.util.ArrayList<>();
+        for (final long g : new long[] {0L, -1L, -42L, Long.MIN_VALUE}) {
+            final CoreConfigStateMachine m = new CoreConfigStateMachine();
+            final CoreConfigStateMachine.Decision d = m.decide(withGenesis(base(1, 1), g), false, true);
+            if (d != CoreConfigStateMachine.Decision.INVALID) {
+                out.add("ADOPT of genesisId " + g + " accepted (" + d + ")");
+            }
+        }
+        for (final long g : new long[] {1L, 0x5EEDL, Long.MAX_VALUE}) {
+            final CoreConfigStateMachine m = new CoreConfigStateMachine();
+            if (m.decide(withGenesis(base(1, 1), g), false, true) != CoreConfigStateMachine.Decision.ADOPT) {
+                out.add("ADOPT of genesisId " + g + " refused");
+            }
+        }
+        return out;
+    }
+
+    @Test public void a7_adoptRefusesAGenesisIdBelowOne() {
+        final java.util.List<String> v = a7Violations();
+        assertTrue(String.join("; ", v), v.isEmpty());
+        // through the engine: refused, nothing recorded, behaviour stays 1, INVALID on the ack
+        final CoreConfigCommand zero = withGenesis(base(1, 1), 0L);
+        mark();
+        engine.applyCoreConfig(zero, now);
+        assertOnlyAck(zero.correlationId, AdminResult.REJECTED, INVALID);
+        assertNull("nothing recorded", sm.recorded());
+        final CoreConfigCommand negative = withGenesis(base(1, 1), -42L);
+        mark();
+        engine.applyCoreConfig(negative, now);
+        assertOnlyAck(negative.correlationId, AdminResult.REJECTED, INVALID);
+        assertNull(sm.recorded());
+        assertEquals(1L, sm.behaviorVersion());
+        final CoreConfigCommand one = withGenesis(base(1, 1), 1L);
+        mark();
+        engine.applyCoreConfig(one, now);
+        assertEquals(1L, sm.recorded().genesisId);
+        System.out.println("GREEN A7 core: ADOPT refuses genesisId 0, -1, -42, MIN; adopts 1, 0x5EED, MAX");
     }
 
     private static CoreConfigCommand withGenesis(final CoreConfigCommand c, final long genesisId) {
