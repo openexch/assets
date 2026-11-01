@@ -1036,8 +1036,10 @@ public final class AssetsEngine {
                 return refused;
             }
         }
+        // RC2 S10' S2-3: one live BRIDGE session per identity under behaviour 3 only (review FIX-2: a v1/v2 log replays as
+        // recorded; below v3 there is no lane-halt table for two holders to share)
         final SessionRegistry.Registration r = sessions.register(sessionId, assertedClass, channelMask, resumable,
-                readerKind, identity, sourceEpoch);
+                readerKind, identity, sourceEpoch, behaviorV3());
         sink.onAdminAck(correlationId, 80, r.result(), r.reason().code(), 0L);
         if (r.result() != AdminResult.REJECTED) {
             emitAdmission(OrderEntryGate.GLOBAL, true);
@@ -1431,7 +1433,9 @@ public final class AssetsEngine {
         sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, journalSeq, 0L, logPosition);
         sink.onFeedLatchCleared(reason, journalSeq, false);
         if (skipIt) {
-            // the skip moved the cursor: a GAP record it reached goes (NONGAP_AWAITING_OPEN keeps the bit for the OPEN)
+            // the skip moved the cursor: a GAP record it reached goes. NONGAP_AWAITING_OPEN is always held here (writeLatch
+            // added it, only clearAll removes it, and OPEN is refused while the slot is set), so this never opens the gate
+            // (review NOTE-7); it only keeps "no record at its reach" true.
             reopen(feed.reopenAction(clearReachedRecords(journalSeq)), journalSeq);
         }
     }
@@ -1621,7 +1625,8 @@ public final class AssetsEngine {
 
     /**
      * 5.1 / 5.2: raise, replace, merge or suppress a latch. RC2 S10' 4R: a GAP the core detected itself goes to the lane-halt
-     * table as the record of {@link FeedState#CORE_DETECTED_IDENTITY} (suppressed while that record is open).
+     * table as the record of {@link FeedState#CORE_DETECTED_IDENTITY}; a later one merges into it ({@code seen = max}); an
+     * unchanged merge counts as suppressed.
      */
     private void latch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
                        final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {

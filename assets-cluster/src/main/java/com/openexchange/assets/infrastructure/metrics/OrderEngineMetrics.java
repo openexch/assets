@@ -33,7 +33,7 @@ public final class OrderEngineMetrics implements Consumer<AssetsMetricsBody> {
     }
 
     /** The {@code class} label values of {@code assets_sessions} (4R.1 rule 7). */
-    static final String[] SESSION_CLASS_LABELS = {"ADMIN", "TOOL", "BRIDGE", "GATEWAY", "TREASURY", "FORWARDER"};
+    static final String[] SESSION_CLASS_LABELS = {"ADMIN", "TOOL", "BRIDGE", "GATEWAY", "TREASURY", "FORWARDER", "REPLICA"};
 
     private static LongSupplier[] sessionSuppliers(final CoreMetricsView view) {
         final LongSupplier[] out = new LongSupplier[SESSION_CLASS_LABELS.length];
