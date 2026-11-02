@@ -129,6 +129,8 @@ public final class OrderEngine {
     private long rejectedCount;
     private long cancelledCount;
     private long staleTicks;
+    /** RC2 S13 7.2: ticks applied past the version check (node-local, not snapshotted, like {@link #staleTicks}). */
+    private long tickAppliedCount;
     // RC2 S7 (node-local)
     private long legRegressionCount;
     private long oldCancelledIgnoredCount;
@@ -998,6 +1000,7 @@ public final class OrderEngine {
             staleTicks++;
             return;
         }
+        tickAppliedCount++;
         m.bookVersion = bookVersion;
         m.bestBid = bestBid;
         m.bestAsk = bestAsk;
@@ -2852,4 +2855,5 @@ public final class OrderEngine {
     public long rejectedCount() { return rejectedCount; }
     public long cancelledCount() { return cancelledCount; }
     public long staleTicks() { return staleTicks; }
+    public long tickAppliedCount() { return tickAppliedCount; }
 }

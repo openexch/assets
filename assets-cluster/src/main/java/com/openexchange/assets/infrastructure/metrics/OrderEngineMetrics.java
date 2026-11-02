@@ -45,6 +45,26 @@ public final class OrderEngineMetrics implements Consumer<AssetsMetricsBody> {
         return out;
     }
 
+    /** The {@code market} label values of the per-market quote gauges (RC2 S13 7.2): marketId 1..5. */
+    static final String[] MARKET_LABELS = marketLabels();
+
+    private static String[] marketLabels() {
+        final String[] out = new String[com.openexchange.assets.application.engine.order.OrderEngine.MARKETS];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = Integer.toString(i + 1);
+        }
+        return out;
+    }
+
+    private static LongSupplier[] marketSuppliers(final java.util.function.IntToLongFunction read) {
+        final LongSupplier[] out = new LongSupplier[MARKET_LABELS.length];
+        for (int i = 0; i < out.length; i++) {
+            final int marketId = i + 1;
+            out[i] = () -> read.applyAsLong(marketId);
+        }
+        return out;
+    }
+
     @Override
     public void accept(final AssetsMetricsBody b) {
         // RC1 order counters and the quarantine gauge
@@ -136,6 +156,24 @@ public final class OrderEngineMetrics implements Consumer<AssetsMetricsBody> {
                  v::pendingOldestSeq)
          .counter("assets_egress_discard_closes_total",
                  "Resumable sessions closed on a NOT_CONNECTED or MAX_POSITION_EXCEEDED discard after a delivery (S8 3.13)",
-                 discardCloses);
+                 discardCloses)
+        // RC2 S13 7.2 (W-CORE1): the K4 MarketTick counters and the per-market quote
+         .counter("assets_ticks_applied_total", "MarketTicks applied (version above the stored one)", v::ticksApplied)
+         .counter("assets_ticks_stale_total", "MarketTicks dropped at or below the stored bookVersion", v::ticksStale)
+         .counter("assets_ticks_invalid_total", "MarketTicks dropped as malformed, crossed or for an unknown market (a forwarder defect)",
+                 v::ticksInvalid)
+         .counter("assets_ticks_epoch_drop_total", "MarketTicks dropped for a foreign meEpoch (a forwarder defect)", v::ticksEpochDrop)
+         .counter("assets_ticks_unbound_total", "MarketTicks dropped before the core bound an ME epoch (expected at genesis)",
+                 v::ticksUnbound)
+         .labelledGauge("assets_market_book_version", "bookVersion of the last applied tick, by market", "market", MARKET_LABELS,
+                 marketSuppliers(v::marketBookVersion))
+         .labelledGauge("assets_market_best_bid", "Best bid (8 dp) of the last applied tick, by market", "market", MARKET_LABELS,
+                 marketSuppliers(v::marketBestBid))
+         .labelledGauge("assets_market_best_ask", "Best ask (8 dp) of the last applied tick, by market", "market", MARKET_LABELS,
+                 marketSuppliers(v::marketBestAsk))
+         .labelledGauge("assets_market_last_trade_id", "Last trade id the core holds, by market", "market", MARKET_LABELS,
+                 marketSuppliers(v::marketLastTradeId))
+         .labelledGauge("assets_market_tick_cluster_ms", "Cluster time (ms) of the last applied tick, by market (0 = none)", "market",
+                 MARKET_LABELS, marketSuppliers(v::marketTickClusterMs));
     }
 }
