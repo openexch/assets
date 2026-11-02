@@ -88,3 +88,17 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "A TOOL/ADMIN Hold or Release named a core orderId under behaviour 3 and was refused (S8 3.12)"
+
+      # RC2 S13 10.3 (W-CORE1). assets_ticks_unbound_total is exported and NOT alerted: the core registers a forwarder before it
+      # binds the ME epoch, so ticks before the bind are counted there legitimately (S13 7.1).
+      - alert: CoreTickEpochDrops
+        expr: increase(assets_ticks_epoch_drop_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "A MarketTick carried a foreign meEpoch and was dropped (a forwarder defect: it must not send one it can recognise)"
+
+      - alert: CoreTickInvalid
+        expr: increase(assets_ticks_invalid_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "A malformed, crossed or unknown-market MarketTick reached the core (no correct forwarder sends one)"

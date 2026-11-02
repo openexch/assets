@@ -91,6 +91,74 @@ public class OrderEngineMetricsTest {
         assertEquals("the summed SEQ discard closes", 7L, (long) m.get("assets_egress_discard_closes_total"));
     }
 
+    /** RC2 S13 7.2: every rendered line (labelled ones too), "name" or "name{label=\"v\"}" -> value. */
+    static Map<String, Long> scrapeAll(final CoreMetricsView view) {
+        final AssetsMetricsBody body = new AssetsMetricsBody(new AssetsNodeMetrics()).include(OrderEngineMetrics.of(view, () -> 7L));
+        final Map<String, Long> out = new HashMap<>();
+        for (final String line : body.render().split("\n")) {
+            if (line.startsWith("assets_")) {
+                final int sp = line.lastIndexOf(' ');
+                try {
+                    out.put(line.substring(0, sp), Long.parseLong(line.substring(sp + 1)));
+                } catch (final NumberFormatException ignored) {
+                    // a seconds gauge of the base body, not ours
+                }
+            }
+        }
+        return out;
+    }
+
+    private static long series(final Map<String, Long> m, final String name) {
+        final Long v = m.get(name);
+        if (v == null) {
+            throw new AssertionError("missing " + name);
+        }
+        return v;
+    }
+
+    /** RC2 S13 7.2 (W-CORE1): the five tick counters and the per-market quote gauges, after 3 applied, 2 stale, 1 invalid, 1 epoch, 1 unbound. */
+    @Test
+    public void tickCountersAndMarketQuoteGauges() {
+        final V3Rig r = V3Rig.unbound();
+        final var oe = r.engine.orders();
+        final long px = 100 * V3Rig.ONE;
+        oe.applyMarketTick(1, 1, px - V3Rig.ONE, px + V3Rig.ONE, px, 5L, V3Rig.EPOCH, r.now);       // unbound: counted, not applied
+        r.bindFresh();
+        oe.applyMarketTick(1, 1, px - V3Rig.ONE, px + V3Rig.ONE, px, 5L, V3Rig.EPOCH, r.now);       // applied 1 (trade 5)
+        oe.applyMarketTick(1, 2, px - 2 * V3Rig.ONE, px + 2 * V3Rig.ONE, 0L, 0L, V3Rig.EPOCH, r.now); // applied 2 (no trade info)
+        oe.applyMarketTick(1, 3, px - 3 * V3Rig.ONE, px + 3 * V3Rig.ONE, 0L, 0L, V3Rig.EPOCH, r.now + 7); // applied 3
+        oe.applyMarketTick(1, 3, px - V3Rig.ONE, px + V3Rig.ONE, 0L, 0L, V3Rig.EPOCH, r.now);       // stale 1 (same version)
+        oe.applyMarketTick(1, 2, px - V3Rig.ONE, px + V3Rig.ONE, 0L, 0L, V3Rig.EPOCH, r.now);       // stale 2 (older version)
+        oe.applyMarketTick(1, 4, px + V3Rig.ONE, px - V3Rig.ONE, 0L, 0L, V3Rig.EPOCH, r.now);       // invalid (crossed)
+        oe.applyMarketTick(1, 9, px - V3Rig.ONE, px + V3Rig.ONE, 0L, 0L, V3Rig.EPOCH + 1, r.now);   // epoch drop
+        final Map<String, Long> m = scrapeAll(r.engine.metricsView());
+        assertEquals("labels follow the core's market count", com.openexchange.assets.application.engine.order.OrderEngine.MARKETS,
+                OrderEngineMetrics.MARKET_LABELS.length);
+        assertEquals("five markets", 5, OrderEngineMetrics.MARKET_LABELS.length);
+        final String body = new AssetsMetricsBody(new AssetsNodeMetrics()).include(OrderEngineMetrics.of(r.engine.metricsView(), () -> 7L)).render();
+        for (final String c : new String[] {"applied", "stale", "invalid", "epoch_drop", "unbound"}) {
+            assertTrue("counter type of " + c, body.contains("# TYPE assets_ticks_" + c + "_total counter"));
+        }
+        assertEquals(3L, series(m, "assets_ticks_applied_total"));
+        assertEquals(2L, series(m, "assets_ticks_stale_total"));
+        assertEquals(1L, series(m, "assets_ticks_invalid_total"));
+        assertEquals(1L, series(m, "assets_ticks_epoch_drop_total"));
+        assertEquals(1L, series(m, "assets_ticks_unbound_total"));
+        assertEquals(3L, series(m, "assets_market_book_version{market=\"1\"}"));
+        assertEquals(px - 3 * V3Rig.ONE, series(m, "assets_market_best_bid{market=\"1\"}"));
+        assertEquals(px + 3 * V3Rig.ONE, series(m, "assets_market_best_ask{market=\"1\"}"));
+        assertEquals("the trade id stays at the last positive trade", 5L, series(m, "assets_market_last_trade_id{market=\"1\"}"));
+        assertEquals("cluster time of the last applied tick", oe.market(1).lastTickTs, series(m, "assets_market_tick_cluster_ms{market=\"1\"}"));
+        assertTrue("the applied tick moved the cluster time", oe.market(1).lastTickTs > 0L);
+        for (int k = 2; k <= 5; k++) {
+            for (final String g : new String[] {"book_version", "best_bid", "best_ask", "last_trade_id", "tick_cluster_ms"}) {
+                assertEquals("untouched market " + k + " " + g, 0L, series(m, "assets_market_" + g + "{market=\"" + k + "\"}"));
+            }
+        }
+        assertFalse("no market 0 or 6 series", m.containsKey("assets_market_book_version{market=\"0\"}")
+                || m.containsKey("assets_market_book_version{market=\"6\"}"));
+    }
+
     @Test
     public void theViewReadsPlainValuesOnly() throws Exception {
         // 1.6: never a walk of the backlog, the index or OrderStore from the scrape thread

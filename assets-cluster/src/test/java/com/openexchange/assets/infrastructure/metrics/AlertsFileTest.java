@@ -35,7 +35,7 @@ public class AlertsFileTest {
         final String alerts = Files.readString(GRAFANA.resolve("alerts.yml"));
         for (final String name : new String[] {"FeedDuplicateMismatch", "FeedUnverifiedNoLaneBehind", "FeedUnverifiedLong", "FeedLatched",
                 "GlobalGateClosed", "MeLinkFault", "MeCapacityWhileOpen", "ReleaseBacklogParked", "DispatchStuck", "ReleasePathStuck",
-                "MeCapacityParked", "CoreOrderMoneyRefused"}) {
+                "MeCapacityParked", "CoreOrderMoneyRefused", "CoreTickEpochDrops", "CoreTickInvalid"}) {
             assertTrue("alert " + name, alerts.contains("alert: " + name));
         }
         final Map<String, Long> registered = OrderEngineMetricsTest.scrape(V3Rig.open().engine.metricsView());
@@ -49,6 +49,26 @@ public class AlertsFileTest {
         for (final String s : named) {
             assertTrue("alerts.yml names " + s + ", which the registrar does not register", registered.containsKey(s));
         }
+    }
+
+    @Test
+    public void tickAlertsPageAndUnboundIsNotAlerted() throws Exception {
+        // RC2 S13 10.3 / 7.1: epoch drops and invalid ticks page; unbound drops are expected at genesis and never alerted
+        final String alerts = Files.readString(GRAFANA.resolve("alerts.yml")).replaceAll("(?m)^\\s*#.*$", "");
+        final Map<String, String> exprs = Map.of("CoreTickEpochDrops", "expr: increase(assets_ticks_epoch_drop_total[5m]) > 0",
+                "CoreTickInvalid", "expr: increase(assets_ticks_invalid_total[5m]) > 0");
+        for (final Map.Entry<String, String> e : exprs.entrySet()) {
+            final String name = e.getKey();
+            final int at = alerts.indexOf("alert: " + name);
+            assertTrue("alert " + name + " present", at >= 0);
+            final int next = alerts.indexOf("- alert:", at + 5);
+            final String block = alerts.substring(at, next < 0 ? alerts.length() : next);
+            assertTrue(name + " pages", block.contains("severity: page"));
+            assertTrue(name + " reads exactly: " + e.getValue(), block.contains(e.getValue()));
+        }
+        assertTrue("assets_ticks_unbound_total is exported", OrderEngineMetricsTest.scrape(V3Rig.open().engine.metricsView())
+                .containsKey("assets_ticks_unbound_total"));
+        assertTrue("and not named by any alert", !alerts.contains("assets_ticks_unbound_total"));
     }
 
     @Test

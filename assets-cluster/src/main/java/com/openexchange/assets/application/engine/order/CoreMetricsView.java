@@ -94,4 +94,17 @@ public final class CoreMetricsView {
     public long capacityParked() { return o().capacityParked(); }
     public long pendingOldestSeq() { return o().pendingOldestSeq(); }
     public long coreBehaviorVersion() { return engine.coreConfig().behaviorVersion(); }
+
+    // RC2 S13 7.2 (W-CORE1): tick counters and the per-market quote the core holds. Plain reads of node-local counters and of
+    // MarketRisk fields the service thread maintains (marketId 1..5; slot 0 is unused).
+    public long ticksApplied() { return o().tickAppliedCount(); }
+    public long ticksStale() { return o().staleTicks(); }
+    public long ticksInvalid() { return o().invalidTickCount(); }
+    public long ticksEpochDrop() { return engine.feed().tickEpochDropCount(); }
+    public long ticksUnbound() { return engine.feed().tickUnboundCount(); }
+    public long marketBookVersion(final int marketId) { return o().market(marketId).bookVersion; }
+    public long marketBestBid(final int marketId) { return o().market(marketId).bestBid; }
+    public long marketBestAsk(final int marketId) { return o().market(marketId).bestAsk; }
+    public long marketLastTradeId(final int marketId) { return o().market(marketId).lastTradeId; }
+    public long marketTickClusterMs(final int marketId) { return o().market(marketId).lastTickTs; }
 }
