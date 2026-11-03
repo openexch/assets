@@ -21,7 +21,7 @@ import java.util.TreeMap;
 public final class MainTree {
 
     /** The core the harness is graded against (cluster-tools {@code money_schema_ref}). */
-    public static final String MONEY_SCHEMA_REF = "d3f98809021859f89effadcfbf482ab2ff661145";
+    public static final String MONEY_SCHEMA_REF = "c61ecfa7081ee5e1a67e35cae73783edc1b86ee0";
 
     private MainTree() {
     }
