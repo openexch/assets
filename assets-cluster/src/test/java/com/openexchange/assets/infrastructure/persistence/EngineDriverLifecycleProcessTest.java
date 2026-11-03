@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -56,8 +57,17 @@ public class EngineDriverLifecycleProcessTest {
         System.out.println("W9 driver kill -9: exit=" + exit.code + " after " + exit.ms + " ms");
         final String out = node.log();
         assertEquals("driver death must exit 1 (took " + exit.ms + " ms): " + out, 1, exit.code);
-        assertTrue("within the 10 s client driver timeout plus the close: " + exit.ms, exit.ms < 18_000);
-        assertTrue("the lifecycle closed the node after the fault: " + out, out.contains("closed after FATAL"));
+        assertTrue("within the 10 s client driver timeout plus the halt: " + exit.ms, exit.ms < 18_000);
+        // W9b: driver loss halts on the reporting thread before its Aeron client unmaps the CnC (no component close)
+        assertTrue("the lifecycle halted on the driver loss: " + out,
+                out.contains("media driver lost in EXTERNAL driver mode")
+                        && out.contains("halting now, no component close"));
+        assertFalse("no JVM crash: " + out, out.contains("A fatal error has been detected by the Java Runtime"));
+        assertFalse("no Aeron default error handler exit: " + out, out.contains("exiting client..."));
+        try (Stream<Path> files = Files.list(node.base)) {
+            assertEquals("no hs_err file", List.of(), files.filter(f -> f.getFileName().toString().startsWith("hs_err"))
+                    .toList());
+        }
     }
 
     @Test
@@ -94,7 +104,7 @@ public class EngineDriverLifecycleProcessTest {
 
     private record Exit(int code, long ms) { }
 
-    private record Node(Process driver, Process engine, Path logFile) {
+    private record Node(Process driver, Process engine, Path logFile, Path base) {
         String log() throws IOException {
             return Files.readString(logFile);
         }
@@ -114,7 +124,7 @@ public class EngineDriverLifecycleProcessTest {
         final Path log = base.resolve("engine.log");
         final Process engine = engine(base, aeronDir, probePort, log, extraEnv);
         awaitReady(engine, probePort, log, 90_000);
-        return new Node(driver, engine, log);
+        return new Node(driver, engine, log, base);
     }
 
     private static String childClasspath() {
@@ -144,7 +154,7 @@ public class EngineDriverLifecycleProcessTest {
     private Process engine(final Path base, final Path aeronDir, final int probePort, final Path log,
                            final Map<String, String> extraEnv) throws IOException {
         final List<String> cmd = java();
-        cmd.addAll(List.of("-cp", childClasspath(), ENGINE_MAIN));
+        cmd.addAll(List.of("-XX:ErrorFile=" + base.resolve("hs_err_pid%p.log"), "-cp", childClasspath(), ENGINE_MAIN));
         final ProcessBuilder pb = new ProcessBuilder(cmd);
         final Map<String, String> env = pb.environment();
         env.put("BASE_DIR", base.resolve("state").toString());

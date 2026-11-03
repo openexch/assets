@@ -6,9 +6,9 @@ import com.zaxxer.hikari.HikariDataSource;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import org.agrona.CloseHelper;
-import org.agrona.concurrent.ShutdownSignalBarrier;
 
 import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
 
 /**
  * Money projector entry point: AE money journal (Aeron Archive recording) -> Postgres.
@@ -57,19 +57,48 @@ public final class ProjectorMain {
                     + config.metricsPort, e);
         }
 
-        final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
+        // SIGTERM: this hook is the whole stop. The JVM exits with the signal's status (143) once it returns; nothing
+        // calls System.exit or halt. No agrona ShutdownSignalBarrier: constructing one registers agrona's own static
+        // shutdown hook, which waits for close() on every barrier it signalled (agrona 2.6.0
+        // ShutdownSignalBarrier.java:96-100, 251-279) and nothing called it, so the JVM never exited after this
+        // hook finished in about 1 ms; docker killed it at its 10 s stop timeout (137, RC2 S16 W6).
+        final CountDownLatch stopped = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            agent.stop();
             try {
-                thread.join(5_000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                agent.stop();
+                // Wakes the agent out of a blocking archive connect (AeronArchive.connect waits up to its message
+                // timeout per endpoint and honours only an interrupt) or a backoff sleep. A flush cut short rolls
+                // back; the projector resumes from the Postgres high-water (idempotent ON CONFLICT).
+                thread.interrupt();
+                try {
+                    thread.join(5_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                metricsServer.stop();
+                CloseHelper.quietClose(driver);
+                dataSource.close();
+            } finally {
+                stopped.countDown();
             }
-            metricsServer.stop();
-            CloseHelper.quietClose(driver);
-            dataSource.close();
         }, "projector-shutdown"));
-        barrier.await();
+        // Park main until the stop: a projector halted on a gap keeps serving /health (halted=true).
+        awaitUninterruptibly(stopped);
+    }
+
+    private static void awaitUninterruptibly(final CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private ProjectorMain() {
