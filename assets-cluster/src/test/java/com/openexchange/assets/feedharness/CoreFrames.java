@@ -113,9 +113,14 @@ public final class CoreFrames {
     }
 
     public byte[] gate(long corr, int market, boolean open) {
+        return gate(corr, market, open, GateReason.ADMIN);
+    }
+
+    /** RC2 S17 W12 (G1): an OPEN of GLOBAL after a halt that needed the operator names BRIDGE_HALT. */
+    public byte[] gate(long corr, int market, boolean open, GateReason reason) {
         zero();
         return out(new OrderEntryGateEncoder().wrapAndApplyHeader(buf, 0, header).correlationId(corr).marketId(market)
-                .state(open ? GateState.OPEN : GateState.SUSPENDED).reason(GateReason.ADMIN).encodedLength());
+                .state(open ? GateState.OPEN : GateState.SUSPENDED).reason(reason).encodedLength());
     }
 
     public byte[] tick(int market, long version, long bid, long ask, long last, long meEpoch) {

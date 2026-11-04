@@ -148,10 +148,14 @@ public final class SessionRegistry {
         return hit.size();
     }
 
-    /** Restore one row (snapshot section 9). */
+    /**
+     * Restore one row (snapshot section 9). RC2 S17 W12 (R0): a row without a valid principal is pre-S6 history; the
+     * kit's {@link com.openexchange.cluster.auth.PrincipalGate} throws before the row is written.
+     */
     public void restore(final long sessionId, final byte[] encodedPrincipal, final boolean registered,
                         final int channelMask, final boolean resumable, final int readerKind,
                         final long identity, final long sourceEpoch) {
+        com.openexchange.cluster.auth.PrincipalGate.requireClass(encodedPrincipal, "restored session", sessionId, -1L);
         final SessionAuthority a = open(sessionId, encodedPrincipal);
         a.restore(registered, channelMask, resumable, readerKind, identity, sourceEpoch);
         if (registered) {

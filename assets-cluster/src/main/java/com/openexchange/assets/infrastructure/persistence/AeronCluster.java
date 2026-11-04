@@ -176,8 +176,8 @@ public final class AeronCluster {
                         feedRuntime == null ? null
                                 : feedRuntime.start(aeronDir,
                                         clusterConfig.archiveContext().errorHandler());
-                ConsensusModule ignored1 = ConsensusModule.launch(
-                        clusterConfig.consensusModuleContext().terminationHook(lifecycle::onClusterTermination));
+                ConsensusModule ignored1 = watchQuorum(lifecycle, ConsensusModule.launch(
+                        clusterConfig.consensusModuleContext().terminationHook(lifecycle::onClusterTermination)));
                 ClusteredServiceContainer ignored2 = ClusteredServiceContainer.launch(
                         clusterConfig.clusteredServiceContext().terminationHook(lifecycle::onClusterTermination))) {
             lifecycle.awaitStop();
@@ -189,7 +189,7 @@ public final class AeronCluster {
             final com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime journalRuntime,
             final com.openexchange.assets.infrastructure.feed.BalanceFeedRuntime feedRuntime) {
         try (
-                ClusteredMediaDriver ignored = ClusteredMediaDriver.launch(
+                ClusteredMediaDriver ignored = watchQuorum(lifecycle, ClusteredMediaDriver.launch(
                         clusterConfig.mediaDriverContext()
                                 .dirDeleteOnStart(true)
                                 .dirDeleteOnShutdown(true)
@@ -204,7 +204,7 @@ public final class AeronCluster {
                                 .publicationTermBufferLength(16 * 1024 * 1024)
                                 .mtuLength(8192),
                         clusterConfig.archiveContext(),
-                        clusterConfig.consensusModuleContext().terminationHook(lifecycle::onClusterTermination));
+                        clusterConfig.consensusModuleContext().terminationHook(lifecycle::onClusterTermination)));
                 // Journal writer is a driver/archive client: start only after ClusteredMediaDriver
                 // is up, and let it outlive the container so the ring drains through shutdown.
                 com.openexchange.assets.infrastructure.journal.MoneyJournalRuntime ignoredJournal =
@@ -221,6 +221,22 @@ public final class AeronCluster {
                         clusterConfig.clusteredServiceContext().terminationHook(lifecycle::onClusterTermination))) {
             lifecycle.awaitStop();
         }
+    }
+
+    /**
+     * RC2 S17 W12 (R-KIT-Q): the kit's quorum watchdog, started the moment the consensus module has launched (after the
+     * external-driver wait, before the service container): exit 1 when no leader is ever known within
+     * ENGINE_QUORUM_WAIT_MS. Returns the module so it stays in the try-with-resources.
+     */
+    private static ConsensusModule watchQuorum(final EngineLifecycle lifecycle, final ConsensusModule module) {
+        lifecycle.watchQuorum(module.context());
+        return module;
+    }
+
+    /** Embedded mode: the consensus module inside the clustered media driver. */
+    private static ClusteredMediaDriver watchQuorum(final EngineLifecycle lifecycle, final ClusteredMediaDriver driver) {
+        lifecycle.watchQuorum(driver.consensusModule().context());
+        return driver;
     }
 
     private static File getBaseDir(final int nodeId) {

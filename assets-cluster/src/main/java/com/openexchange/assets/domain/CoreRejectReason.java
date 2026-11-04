@@ -57,11 +57,17 @@ public enum CoreRejectReason {
      * AdminAck only: the AdminAck reason is a {@code uint8} on the wire, so this code is not in the money-schema
      * {@code CoreRejectReason} enum (no schema change in S10') and is never put on an OrderReject.
      */
-    DUPLICATE_IDENTITY(44);
+    DUPLICATE_IDENTITY(44),
+    /**
+     * RC2 S17 W12 (G1): an OPEN of GLOBAL while a halt holder awaits the operator's acknowledgement
+     * (HOLDER_NONGAP_AWAITING_OPEN) that does not name BRIDGE_HALT. AdminAck only, like {@link #DUPLICATE_IDENTITY}:
+     * a uint8 on AdminAck.reason, not in the money-schema enum, no schema change.
+     */
+    HALT_HOLDER_PENDING(45);
 
     /** True for a code that only an AdminAck carries (not in the money-schema enum). */
     public boolean adminAckOnly() {
-        return this == DUPLICATE_IDENTITY;
+        return this == DUPLICATE_IDENTITY || this == HALT_HOLDER_PENDING;
     }
 
     private final int code;

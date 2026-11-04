@@ -1828,6 +1828,14 @@ public final class AssetsEngine {
                 sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.ME_LANE_INACTIVE.code(), 0L);
                 return; // X13: GLOBAL stays closed until the ME epoch is bound
             }
+            if (marketId == OrderEntryGate.GLOBAL && reason != GateReason.BRIDGE_HALT
+                    && (feed.holders() & FeedState.HOLDER_NONGAP_AWAITING_OPEN) != 0) {
+                // RC2 S17 W12 (G1): a halt holder (a non-GAP reach-clear, 76 {GAP, 0}, 76 {SOURCE_SCHEMA|SETTLE_REFUSED})
+                // is released only by an OPEN that names what it clears. Holder bits ride the snapshot and the OPEN's
+                // reason is a log entry, so the outcome is replicated and replay-safe.
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.HALT_HOLDER_PENDING.code(), 0L);
+                return;
+            }
             changed = gate.clearAll(marketId);
             if (marketId == OrderEntryGate.GLOBAL) {
                 feed.clearHolders(); // RC2 S10' 4R.1 rule 4: ADMIN OPEN empties the holder set

@@ -128,6 +128,95 @@ public class GateReasonSetTest {
         assertEquals(CoreRejectReason.ME_LANE_INACTIVE.code(), lane.reason());
     }
 
+    /** RC2 S17 W12: HALT_HOLDER_PENDING (45), the AdminAck-only refusal of an OPEN that names nothing it clears. */
+    private static final int HALT_HOLDER_PENDING = 45;
+
+    /**
+     * RC2 S17 W12 (G1, A6): the measured X-7 sequence. A SOURCE_SCHEMA FeedHalt on an unbound core latches; the bind
+     * record reach-clears the slot and leaves the holder; OPEN(GLOBAL, ADMIN) is then REJECTED 45 (it used to be
+     * ACCEPTED, the 4.3 s window); a second FeedHalt latches again; OPEN(GLOBAL, BRIDGE_HALT) while latched keeps the
+     * existing order of refusals (40 FEED_HALTED first).
+     */
+    @Test
+    public void anOpenWhileAHaltHolderIsHeldMustNameBridgeHalt() {
+        final V3Rig r = V3Rig.unbound();
+        r.halt(FeedHaltReason.SOURCE_SCHEMA, 0, 1, 1, 0);
+        assertTrue("SOURCE_SCHEMA e1 latched", r.feed().latched());
+        assertTrue("BRIDGE_HALT set", r.globalHas(GateReason.BRIDGE_HALT));
+        r.mark();
+        assertTrue(r.bindFresh());
+        assertTrue("the bind reach-cleared the slot", !r.feed().latched());
+        assertEquals("the holder is kept", com.openexchange.assets.application.engine.feed.FeedState.HOLDER_NONGAP_AWAITING_OPEN,
+                r.feed().holders());
+        assertTrue("the bit is kept", r.globalHas(GateReason.BRIDGE_HALT));
+        assertEquals("no broadcast", 0, r.all(AssetsEngineEvent.AdmissionState.class).stream()
+                .filter(a -> a.marketId() == G && !a.toOrigin()).count());
+
+        final AssetsEngineEvent.AdminAck refused = admin(r, G, GateState.OPEN, GateReason.ADMIN);
+        assertEquals(AdminResult.REJECTED, refused.result());
+        assertEquals("HALT_HOLDER_PENDING", HALT_HOLDER_PENDING, refused.reason());
+        assertEquals(GateState.SUSPENDED, r.engine.gate().state(G));
+        assertEquals("no broadcast for a refused OPEN", 0, r.count(AssetsEngineEvent.AdmissionState.class));
+
+        r.halt(FeedHaltReason.SOURCE_SCHEMA, 0, 2, 2, 0);
+        assertTrue("e2 latched again", r.feed().latched());
+        final AssetsEngineEvent.AdminAck latched = admin(r, G, GateState.OPEN, GateReason.BRIDGE_HALT);
+        assertEquals(AdminResult.REJECTED, latched.result());
+        assertEquals("the latch refusal comes first", CoreRejectReason.FEED_HALTED.code(), latched.reason());
+        assertEquals(GateState.SUSPENDED, r.engine.gate().state(G));
+    }
+
+    /**
+     * RC2 S17 W12 (G1, A8): replay safety over a 76. {GAP, 0} clears the table and sets the holder; the holder rides the
+     * snapshot, so a restored engine refuses OPEN(ADMIN) with 45 exactly as the straight one; OPEN(BRIDGE_HALT) opens.
+     */
+    @Test
+    public void theHolderSurvivesASnapshotAndStillNeedsTheAcknowledgement() {
+        final V3Rig r = V3Rig.open();
+        r.twoParty();
+        r.halt(FeedHaltReason.GAP, 0, 4, 8, 0);
+        r.mark();
+        r.clear(FeedHaltReason.GAP, 0);
+        assertEquals("76 {GAP, 0}", AdminResult.ACCEPTED, r.onlyAck().result());
+        assertEquals(com.openexchange.assets.application.engine.feed.FeedState.HOLDER_NONGAP_AWAITING_OPEN, r.feed().holders());
+        for (final V3Rig rig : new V3Rig[] {r.fork(), r}) {
+            final AssetsEngineEvent.AdminAck refused = admin(rig, G, GateState.OPEN, GateReason.ADMIN);
+            assertEquals(AdminResult.REJECTED, refused.result());
+            assertEquals(HALT_HOLDER_PENDING, refused.reason());
+            final AssetsEngineEvent.AdminAck ack = admin(rig, G, GateState.OPEN, GateReason.BRIDGE_HALT);
+            assertEquals(AdminResult.ACCEPTED, ack.result());
+            assertEquals(GateState.OPEN, rig.engine.gate().state(G));
+            assertEquals("the acknowledgement empties the holder set", 0, rig.feed().holders());
+        }
+    }
+
+    /** RC2 S17 W12 (G1, A12): the controls. Only an OPEN of GLOBAL with a holder held changes. */
+    @Test
+    public void openControlsWithoutAHolderAreUnchanged() {
+        // clean genesis: no holder, OPEN(ADMIN) ACCEPTED
+        final V3Rig fresh = V3Rig.bound();
+        assertEquals(0, fresh.feed().holders());
+        assertEquals(AdminResult.ACCEPTED, admin(fresh, G, GateState.OPEN, GateReason.ADMIN).result());
+        // a non-GLOBAL market is unaffected by a GLOBAL holder
+        final V3Rig r = V3Rig.open();
+        r.twoParty();
+        r.halt(FeedHaltReason.GAP, 0, 4, 8, 0);
+        r.clear(FeedHaltReason.GAP, 0);
+        assertEquals(com.openexchange.assets.application.engine.feed.FeedState.HOLDER_NONGAP_AWAITING_OPEN, r.feed().holders());
+        admin(r, 1, GateState.SUSPENDED, GateReason.ADMIN);
+        assertEquals("market 1 opens with ADMIN", AdminResult.ACCEPTED, admin(r, 1, GateState.OPEN, GateReason.ADMIN).result());
+        // 76 {SOURCE_SCHEMA, skip} then OPEN(ADMIN): 45
+        final V3Rig s = V3Rig.open();
+        s.twoParty();
+        s.poison(61, 4, V3Rig.EPOCH, 0);
+        s.mark();
+        s.clear(FeedHaltReason.SOURCE_SCHEMA, 4);
+        assertEquals(AdminResult.ACCEPTED, s.onlyAck().result());
+        final AssetsEngineEvent.AdminAck refused = admin(s, G, GateState.OPEN, GateReason.ADMIN);
+        assertEquals(AdminResult.REJECTED, refused.result());
+        assertEquals(HALT_HOLDER_PENDING, refused.reason());
+    }
+
     @Test
     public void globalStaysClosedUntilBound() {
         final V3Rig r = V3Rig.unbound();

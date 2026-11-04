@@ -303,7 +303,10 @@ public class S7VerifierFeedTest {
         assertEquals(0L, c.locked(1, USD));
         assertEquals(0L, c.locked(2, BTC));
         if (!c.engine.feed().latched()) {
-            c.engine.applyOrderEntryGate(9L, OrderEntryGate.GLOBAL, GateState.OPEN, GateReason.ADMIN, c.rig.now);
+            // RC2 S17 W12 (G1): after a halt that left a holder, the operator's OPEN names BRIDGE_HALT
+            final boolean holder = (c.engine.feed().holders() & FeedState.HOLDER_NONGAP_AWAITING_OPEN) != 0;
+            c.engine.applyOrderEntryGate(9L, OrderEntryGate.GLOBAL, GateState.OPEN,
+                    holder ? GateReason.BRIDGE_HALT : GateReason.ADMIN, c.rig.now);
         }
         final List<String> renders = new ArrayList<>();
         final java.util.Map<String, Integer> stats = new java.util.TreeMap<>();
