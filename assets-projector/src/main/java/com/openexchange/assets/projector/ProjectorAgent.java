@@ -12,6 +12,7 @@ import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.DirectBuffer;
+import org.agrona.ErrorHandler;
 import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
 
@@ -55,6 +56,8 @@ public final class ProjectorAgent implements Runnable {
     private final String aeronDirectoryName;
     private final ProjectorState state;
     private final PostgresMoneyJournalStore store;
+    /** The archive clients' Aeron error handler (RC2 S17 W10 D1: the lifecycle's); null = Aeron's default. */
+    private final ErrorHandler aeronErrorHandler;
 
     private final MessageHeaderDecoder journalHeader = new MessageHeaderDecoder();
     private final JournalOpeningBalanceDecoder openingDecoder = new JournalOpeningBalanceDecoder();
@@ -72,10 +75,17 @@ public final class ProjectorAgent implements Runnable {
 
     public ProjectorAgent(final ProjectorConfig config, final String aeronDirectoryName,
                           final ProjectorState state, final PostgresMoneyJournalStore store) {
+        this(config, aeronDirectoryName, state, store, null);
+    }
+
+    public ProjectorAgent(final ProjectorConfig config, final String aeronDirectoryName,
+                          final ProjectorState state, final PostgresMoneyJournalStore store,
+                          final ErrorHandler aeronErrorHandler) {
         this.config = config;
         this.aeronDirectoryName = aeronDirectoryName;
         this.state = state;
         this.store = store;
+        this.aeronErrorHandler = aeronErrorHandler;
     }
 
     public void stop() {
@@ -122,7 +132,8 @@ public final class ProjectorAgent implements Runnable {
                 ProjectorConfig.MONEY_JOURNAL_CHANNEL,
                 ProjectorConfig.REPLAY_STREAM_ID,
                 aeronDirectoryName,
-                config.localHost)) {
+                config.localHost,
+                aeronErrorHandler)) {
             state.journalSource = source.endpoint();
             followChain(source);
         }

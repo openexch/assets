@@ -21,7 +21,7 @@ public final class ProjectorConfig {
     public static final int MONEY_JOURNAL_STREAM_ID = 4101;
     /** Channel fragment for listRecordingsForUri; a prefix that matches "aeron:ipc?term-length=4m". */
     public static final String MONEY_JOURNAL_CHANNEL = "aeron:ipc";
-    /** Local replay stream id (own media driver, so it cannot collide with the bridge's 9101). */
+    /** Local replay stream id: distinct from the bridge's 9101, so the two never collide on a shared driver. */
     public static final int REPLAY_STREAM_ID = 9161;
 
     /** AE consensus-archive control endpoints, first-healthy-wins (every node journals identically). */

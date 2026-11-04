@@ -36,8 +36,8 @@
         <!-- cluster-kit, Aeron and Agrona are pinned identical to the match engine so the two
              Aeron clusters share a substrate and one aeronmd can drive both. SBE is pinned
              independently of match. -->
-        <cluster-kit.version>0.1.10-runtime.20261103.rc2s16w9b.ga8a30d8</cluster-kit.version>
-        <aeron.version>1.53.0</aeron.version>
+        <cluster-kit.version>0.1.11-runtime.20261104.rc2s17.g80502de</cluster-kit.version>
+        <aeron.version>1.53.1</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <sbe.version>1.40.1</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
