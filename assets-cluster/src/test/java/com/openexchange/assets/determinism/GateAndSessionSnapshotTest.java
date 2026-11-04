@@ -66,7 +66,8 @@ public class GateAndSessionSnapshotTest {
         a.setEventSink(new RecordingAssetsSink());
         a.sessions().open(30, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.BRIDGE), 3).encode());
         a.sessions().open(10, ClusterPrincipal.forUsers(AssetsSessionClasses.toKit(SessionClass.TREASURY), 4, 7, 9).encode());
-        a.sessions().open(20, new byte[0]); // a session whose principal was unreadable
+        // RC2 S17 W12 (R0): a restored row needs a principal; the class-0 row is the refusal below
+        a.sessions().open(20, ClusterPrincipal.anyUser(AssetsSessionClasses.toKit(SessionClass.GATEWAY), 2).encode());
         a.sessions().register(30, SessionClass.BRIDGE, 0b101, true, 2, 77, 5);
         final byte[] image = bytes(a);
         final AssetsEngine b = restore(image);
@@ -83,12 +84,23 @@ public class GateAndSessionSnapshotTest {
         assertFalse(treasury.isRegistered());
         assertTrue(treasury.allowsUser(9));
         assertFalse(treasury.allowsUser(8));
-        assertEquals(SessionClass.UNSET, b.sessions().get(20).sessionClass());
+        assertEquals(SessionClass.GATEWAY, b.sessions().get(20).sessionClass());
         assertNull(b.sessions().get(40));
         assertArrayEquals(image, bytes(b));
         // a closed session leaves the table and the bytes
         b.sessions().close(20);
         assertEquals(List.of(10L, 30L), b.sessions().sessionIds());
+
+        // RC2 S17 W12 (R0, restored session): a row whose principal is unreadable is pre-S6 history and refused
+        final AssetsEngine c = new AssetsEngine();
+        c.setEventSink(new RecordingAssetsSink());
+        c.sessions().open(20, new byte[0]);
+        final byte[] principalLess = bytes(c);
+        final IllegalStateException refused = org.junit.Assert.assertThrows(IllegalStateException.class,
+                () -> restore(principalLess));
+        assertTrue(refused.getMessage(), refused.getMessage().startsWith(
+                "CRITICAL: principal-less session in log: pre-S6 history, clean genesis required (restored session, "
+                        + "clusterSessionId=20"));
     }
 
     @Test

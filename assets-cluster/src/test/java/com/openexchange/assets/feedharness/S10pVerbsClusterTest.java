@@ -161,7 +161,10 @@ public class S10pVerbsClusterTest {
         // probeCreateAcceptedWhenOpen (the non-vacuity of the GATE_CLOSED line): 76 {GAP, 0}, OPEN, the same probe
         o = t1(env, "t1-core", "latch-clear", "1", "0");
         assertTrue(o.text(), o.text().contains("ref=76 result=ACCEPTED"));
+        // RC2 S17 W12 (G1): the 76 set the halt holder; a plain OPEN names nothing it clears and is refused 45
         o = t1(env, "t1-core", "open");
+        assertTrue(o.text(), o.text().contains("ref=73 result=REJECTED reason=HALT_HOLDER_PENDING"));
+        o = t1(env, "t1-core", "open", "--ack-halt");
         assertTrue(o.text(), o.text().contains("ref=73 result=ACCEPTED"));
         // at a resting order's own price and side (inside the collar), for that order's user and market
         o = t1(env, "t1-core", "probe-create", Long.toString(live[1]), Long.toString(live[2]), "--side", live[6] == 0 ? "buy" : "sell",

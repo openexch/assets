@@ -219,10 +219,32 @@ public final class T1Core {
         return 0;
     }
 
+    static int openMarket(final String[] args) {
+        for (int i = 2; i < args.length; i++) {
+            if (!args[i].startsWith("--")) {
+                return Integer.parseInt(args[i]);
+            }
+        }
+        return 0;
+    }
+
+    static com.openexchange.assets.infrastructure.generated.GateReason openReason(final String[] args) {
+        for (int i = 2; i < args.length; i++) {
+            if (args[i].equals("--ack-halt")) {
+                return com.openexchange.assets.infrastructure.generated.GateReason.BRIDGE_HALT;
+            }
+            if (args[i].startsWith("--")) {
+                throw new IllegalArgumentException("t1-core open [market] [--ack-halt]: unknown option " + args[i]);
+            }
+        }
+        return com.openexchange.assets.infrastructure.generated.GateReason.ADMIN;
+    }
+
     static String ack(final byte[] f) {
         final AdminAckDecoder d = new AdminAckDecoder().wrapAndApplyHeader(new UnsafeBuffer(f), 0, new MessageHeaderDecoder());
         final int reason = d.reason();
-        final String reasonName = reason == 40 ? "FEED_HALTED" : reason == 41 ? "ME_LANE_INACTIVE" : Integer.toString(reason);
+        final String reasonName = reason == 40 ? "FEED_HALTED" : reason == 41 ? "ME_LANE_INACTIVE"
+                : reason == 45 ? "HALT_HOLDER_PENDING" : Integer.toString(reason);
         return "ADMINACK ref=" + d.refTemplateId() + " result=" + d.result() + " reason=" + reasonName;
     }
 
@@ -284,11 +306,15 @@ public final class T1Core {
         return false;
     }
 
+    /**
+     * {@code open [market] [--ack-halt]}: RC2 S17 W12 (G1) the default OPEN names ADMIN; {@code --ack-halt} names
+     * BRIDGE_HALT, the acknowledgement an OPEN of GLOBAL needs while a halt holder is held (else 45 HALT_HOLDER_PENDING).
+     */
     static int open(final Ctx c, final String[] args) throws Exception {
-        final int market = args.length > 2 ? Integer.parseInt(args[2]) : 0;
+        final int market = openMarket(args);
         final T1Session admin = c.session(SessionClass.ADMIN);
         final long k = c.corr++;
-        admin.offer(new CoreFrames().gate(k, market, true));
+        admin.offer(new CoreFrames().gate(k, market, true, openReason(args)));
         c.out.println(ack(admin.reply(k, 110)));
         return 0;
     }

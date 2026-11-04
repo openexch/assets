@@ -100,6 +100,168 @@ public class EngineDriverLifecycleProcessTest {
         assertTrue("the close finished, not the bound: " + out, out.contains("stopped cleanly on JVM shutdown"));
     }
 
+    /**
+     * RC2 S17 W12 (R-KIT-Q on the AE): a lone member of a three-member cluster (its peers halted on a refused state or
+     * never started) exits 1 within ENGINE_QUORUM_WAIT_MS plus the fatal grace, never stays up unready.
+     */
+    @Test
+    public void aLoneMemberOfThreeExitsOneWithinTheQuorumWait() throws Exception {
+        final Path base = dir("assets-w12-lone-");
+        final Path aeronDir = shmDir("assets-w12-lone-aeron-");
+        final Process driver = driver(aeronDir, base.resolve("driver.log"));
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        while (!Files.exists(aeronDir.resolve("cnc.dat"))) {
+            assertTrue("driver did not start", System.nanoTime() < deadline && driver.isAlive());
+            Thread.sleep(50);
+        }
+        final Path log = base.resolve("engine.log");
+        final long t0 = System.nanoTime();
+        final Process engine = engine(base, aeronDir, freePort(), log,
+                Map.of("CLUSTER_ADDRESSES", "localhost,localhost,localhost", "ENGINE_QUORUM_WAIT_MS", "3000"));
+        final Exit exit = awaitExit(engine, 30_000, t0);
+        System.out.println("W12 lone member, quorum wait 3000 ms: exit=" + exit.code + " after " + exit.ms + " ms");
+        final String out = Files.readString(log);
+        assertEquals("a lone member exits 1: " + out, 1, exit.code);
+        assertTrue(out, out.contains("no cluster quorum observed within 3000 ms since the consensus module launched"));
+    }
+
+    /** Review V11: the same on the embedded driver (the watchdog on the ClusteredMediaDriver's consensus module). */
+    @Test
+    public void aLoneMemberOfThreeExitsOneWithinTheQuorumWaitEmbeddedDriver() throws Exception {
+        final Path base = dir("assets-w12-lone-emb-");
+        final Path shm = shmDir("assets-w12-lone-emb-aeron-");
+        final Path log = base.resolve("engine.log");
+        final long t0 = System.nanoTime();
+        final Map<String, String> env = new java.util.HashMap<>(Map.of("CLUSTER_ADDRESSES", "localhost,localhost,localhost",
+                "ENGINE_QUORUM_WAIT_MS", "3000", "TRANSPORT_DRIVER_MODE", "embedded"));
+        final Process engine = engine(base, shm, freePort(), log, env, List.of("-Daeron.dir=" + shm.resolve("aeron")));
+        final Exit exit = awaitExit(engine, 30_000, t0);
+        System.out.println("W12 lone member (embedded), quorum wait 3000 ms: exit=" + exit.code + " after " + exit.ms
+                + " ms");
+        final String out = Files.readString(log);
+        assertEquals("a lone member exits 1: " + out, 1, exit.code);
+        assertTrue("embedded, not external: " + out, out.contains("driverMode=EMBEDDED")
+                && !out.contains("Driver mode EXTERNAL"));
+        assertTrue(out, out.contains("no cluster quorum observed within 3000 ms since the consensus module launched"));
+    }
+
+    /**
+     * Review V1/V9 on the AE: the consensus module sits in INIT while the service's onStart runs (its snapshot load in
+     * production). onStart is held for three quorum waits by a JDWP breakpoint; the node must never trip, reach
+     * /ready once released, and stay up. Embedded driver, single member.
+     */
+    @Test
+    public void aLongServiceOnStartInInitNeverTripsTheWatchdog() throws Exception {
+        final Path base = dir("assets-w12-v9-");
+        final Path shm = shmDir("assets-w12-v9-aeron-");
+        final int jdwp = freePort();
+        final int probePort = freePort();
+        final long waitMs = 2_000;
+        final Path log = base.resolve("engine.log");
+        final Process engine = engine(base, shm, probePort, log,
+                new java.util.HashMap<>(Map.of("ENGINE_QUORUM_WAIT_MS", Long.toString(waitMs), "TRANSPORT_DRIVER_MODE",
+                        "embedded")),
+                List.of("-Daeron.dir=" + shm.resolve("aeron"),
+                        "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:" + jdwp));
+        try (OnStartHold hold = new OnStartHold(jdwp,
+                "com.openexchange.assets.infrastructure.persistence.AssetsClusteredService", 3 * waitMs)) {
+            awaitReady(engine, probePort, log, 90_000);
+            assertTrue("the breakpoint held onStart", hold.held.get());
+        }
+        Thread.sleep(waitMs + EngineLifecycleDefaults.FATAL_GRACE_MS);
+        final String out = Files.readString(log);
+        assertTrue("still running after an onStart three waits long: " + out, engine.isAlive());
+        assertFalse(out, out.contains("no cluster quorum observed"));
+        assertTrue(out, out.contains("quorum watchdog armed: exit 1 if no leader is known within " + waitMs + " ms"));
+    }
+
+    private static final class EngineLifecycleDefaults {
+        static final long FATAL_GRACE_MS = com.openexchange.cluster.EngineLifecycle.DEFAULT_FATAL_EXIT_GRACE_MS;
+    }
+
+    /**
+     * RC2 S17 W12 review V9: hold the service container's onStart for {@code holdMs} with a JDWP breakpoint (the
+     * child starts with suspend=y), so the consensus module dwells in INIT waiting for the service's ack, exactly as
+     * during a long snapshot load. Only the service thread is suspended; the watchdog thread keeps polling. Returns
+     * true once the breakpoint was hit, held and released.
+     */
+    static final class OnStartHold implements AutoCloseable {
+        private final com.sun.jdi.VirtualMachine vm;
+        final java.util.concurrent.atomic.AtomicBoolean held = new java.util.concurrent.atomic.AtomicBoolean();
+        private final Thread events;
+
+        OnStartHold(final int port, final String serviceClass, final long holdMs) throws Exception {
+            final com.sun.jdi.connect.AttachingConnector connector = com.sun.jdi.Bootstrap.virtualMachineManager()
+                    .attachingConnectors().stream().filter(c -> c.name().equals("com.sun.jdi.SocketAttach"))
+                    .findFirst().orElseThrow();
+            final Map<String, com.sun.jdi.connect.Connector.Argument> args = connector.defaultArguments();
+            args.get("hostname").setValue("127.0.0.1");
+            args.get("port").setValue(Integer.toString(port));
+            com.sun.jdi.VirtualMachine attached = null;
+            final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+            while (attached == null) {
+                try {
+                    attached = connector.attach(args);
+                } catch (final java.io.IOException notYet) {
+                    if (System.nanoTime() > deadline) {
+                        throw notYet;
+                    }
+                    Thread.sleep(100);
+                }
+            }
+            vm = attached;
+            final com.sun.jdi.request.ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
+            prepare.addClassFilter(serviceClass);
+            prepare.enable();
+            events = new Thread(() -> {
+                try {
+                    while (true) {
+                        final com.sun.jdi.event.EventSet set = vm.eventQueue().remove();
+                        boolean release = false;
+                        for (final com.sun.jdi.event.Event e : set) {
+                            if (e instanceof com.sun.jdi.event.ClassPrepareEvent cp) {
+                                final com.sun.jdi.Method onStart = cp.referenceType().methodsByName("onStart").get(0);
+                                final com.sun.jdi.request.BreakpointRequest bp =
+                                        vm.eventRequestManager().createBreakpointRequest(onStart.location());
+                                bp.setSuspendPolicy(com.sun.jdi.request.EventRequest.SUSPEND_EVENT_THREAD);
+                                bp.enable();
+                            } else if (e instanceof com.sun.jdi.event.BreakpointEvent) {
+                                System.out.println("[W12-V9] onStart held for " + holdMs + " ms");
+                                Thread.sleep(holdMs);
+                                vm.eventRequestManager().deleteAllBreakpoints();
+                                held.set(true);
+                                release = true;
+                            } else if (e instanceof com.sun.jdi.event.VMDisconnectEvent
+                                    || e instanceof com.sun.jdi.event.VMDeathEvent) {
+                                return;
+                            }
+                        }
+                        set.resume();
+                        if (release) {
+                            vm.dispose();
+                            return;
+                        }
+                    }
+                } catch (final InterruptedException | com.sun.jdi.VMDisconnectedException done) {
+                    // the child exited or the hold ended
+                }
+            }, "w12-onstart-hold");
+            events.setDaemon(true);
+            events.start();
+            vm.resume(); // suspend=y: the child waits for the debugger before main
+        }
+
+        @Override
+        public void close() {
+            events.interrupt();
+            try {
+                vm.dispose();
+            } catch (final RuntimeException ignored) {
+                // already disposed or disconnected
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------------------------
 
     private record Exit(int code, long ms) { }
@@ -153,7 +315,13 @@ public class EngineDriverLifecycleProcessTest {
 
     private Process engine(final Path base, final Path aeronDir, final int probePort, final Path log,
                            final Map<String, String> extraEnv) throws IOException {
+        return engine(base, aeronDir, probePort, log, extraEnv, List.of());
+    }
+
+    private Process engine(final Path base, final Path aeronDir, final int probePort, final Path log,
+                           final Map<String, String> extraEnv, final List<String> jvmArgs) throws IOException {
         final List<String> cmd = java();
+        cmd.addAll(jvmArgs);
         cmd.addAll(List.of("-XX:ErrorFile=" + base.resolve("hs_err_pid%p.log"), "-cp", childClasspath(), ENGINE_MAIN));
         final ProcessBuilder pb = new ProcessBuilder(cmd);
         final Map<String, String> env = pb.environment();

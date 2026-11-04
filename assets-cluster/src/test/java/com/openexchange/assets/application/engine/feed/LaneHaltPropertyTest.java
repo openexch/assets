@@ -178,7 +178,15 @@ public class LaneHaltPropertyTest {
                 admin = true;
                 what = "ADMIN SUSPEND";
             } else if (a < 97) {
-                final AdminResult ack = AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.ADMIN).result();
+                // RC2 S17 W12 (G1): while a halt holder is held, an OPEN must name BRIDGE_HALT; the operator's
+                // OPEN(ADMIN) is refused 45 first (unless the latch refusal comes first), then acknowledged
+                final boolean holder = (r.feed().holders() & FeedState.HOLDER_NONGAP_AWAITING_OPEN) != 0;
+                if (holder && !((bitsBefore & BRIDGE_BIT) != 0 && r.feed().latched())) {
+                    assertEquals(seed + "/" + step + " OPEN(ADMIN) with a holder", 45,
+                            AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.ADMIN).reason());
+                }
+                final AdminResult ack = AutoReopenScenarios.admin(r, GateState.OPEN,
+                        holder ? GateReason.BRIDGE_HALT : GateReason.ADMIN).result();
                 final boolean latched = openCount(need, c) > 0 || overflow || slot;
                 if ((bitsBefore & BRIDGE_BIT) != 0 && latched) {
                     assertEquals(seed + "/" + step + " ADMIN OPEN while latched", AdminResult.REJECTED, ack);

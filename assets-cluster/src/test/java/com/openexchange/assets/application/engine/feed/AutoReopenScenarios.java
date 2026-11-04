@@ -177,9 +177,16 @@ final class AutoReopenScenarios {
         assertEquals("OPEN after a SOURCE_SCHEMA reach-clear", GateState.SUSPENDED, state(r));
         assertEquals("BRIDGE_HALT kept", bit(GateReason.BRIDGE_HALT), r.globalReasons());
         assertEquals("no broadcast", 0, broadcasts(r).size());
-        assertEquals("the operator's OPEN passes (nothing latched)", AdminResult.ACCEPTED,
-                admin(r, GateState.OPEN, GateReason.ADMIN).result());
+        // RC2 S17 W12 (G1): an OPEN that does not name BRIDGE_HALT is refused while the holder is held
+        final AssetsEngineEvent.AdminAck refused = admin(r, GateState.OPEN, GateReason.ADMIN);
+        assertEquals("OPEN(ADMIN) refused", AdminResult.REJECTED, refused.result());
+        assertEquals("HALT_HOLDER_PENDING", 45, refused.reason());
+        assertEquals(GateState.SUSPENDED, state(r));
+        r.mark();
+        assertEquals("the operator's acknowledgement passes (nothing latched)", AdminResult.ACCEPTED,
+                admin(r, GateState.OPEN, GateReason.BRIDGE_HALT).result());
         assertEquals(GateState.OPEN, state(r));
+        assertEquals("one broadcast at the acknowledgement", 1, broadcasts(r).size());
     }
 
     /** 4R.1 rule 4: EPOCH_MISMATCH never reaches; a GAP record clearing under it reopens nothing. */
@@ -213,7 +220,9 @@ final class AutoReopenScenarios {
         fill(r, 2); // c = 6: the GAP record reaches
         assertEquals("OPEN after a SOURCE_SCHEMA skip that awaited OPEN", GateState.SUSPENDED, state(r));
         assertEquals("no broadcast", 0, broadcasts(r).size());
-        assertEquals("the operator's OPEN", AdminResult.ACCEPTED, admin(r, GateState.OPEN, GateReason.ADMIN).result());
+        // RC2 S17 W12 (G1): the holder the 76 skip left is released only by the acknowledgement form
+        assertEquals("OPEN(ADMIN) names nothing it clears", 45, admin(r, GateState.OPEN, GateReason.ADMIN).reason());
+        assertEquals("the operator's OPEN", AdminResult.ACCEPTED, admin(r, GateState.OPEN, GateReason.BRIDGE_HALT).result());
         assertEquals(GateState.OPEN, state(r));
     }
 
@@ -246,7 +255,9 @@ final class AutoReopenScenarios {
         r.clear(FeedHaltReason.GAP, 0);
         assertEquals("76 {GAP, 0} clears the table and the overflow", AdminResult.ACCEPTED, r.onlyAck().result());
         assertEquals("the bit waits for the operator's OPEN", GateState.SUSPENDED, state(r));
-        assertEquals(AdminResult.ACCEPTED, admin(r, GateState.OPEN, GateReason.ADMIN).result());
+        // RC2 S17 W12 (G1): 76 {GAP, 0} sets the holder: the OPEN must name BRIDGE_HALT
+        assertEquals(45, admin(r, GateState.OPEN, GateReason.ADMIN).reason());
+        assertEquals(AdminResult.ACCEPTED, admin(r, GateState.OPEN, GateReason.BRIDGE_HALT).result());
         assertEquals(GateState.OPEN, state(r));
     }
 
@@ -310,9 +321,16 @@ final class AutoReopenScenarios {
         assertEquals("OPEN after a SETTLE_REFUSED reach-clear", GateState.SUSPENDED, state(r));
         assertEquals("BRIDGE_HALT kept", bit(GateReason.BRIDGE_HALT), r.globalReasons());
         assertEquals("no broadcast", 0, broadcasts(r).size());
-        assertEquals("the operator's OPEN passes (nothing latched)", AdminResult.ACCEPTED,
-                admin(r, GateState.OPEN, GateReason.ADMIN).result());
+        // RC2 S17 W12 (G1): an OPEN that does not name BRIDGE_HALT is refused while the holder is held
+        final AssetsEngineEvent.AdminAck refused = admin(r, GateState.OPEN, GateReason.ADMIN);
+        assertEquals("OPEN(ADMIN) refused", AdminResult.REJECTED, refused.result());
+        assertEquals("HALT_HOLDER_PENDING", 45, refused.reason());
+        assertEquals(GateState.SUSPENDED, state(r));
+        r.mark();
+        assertEquals("the operator's acknowledgement passes (nothing latched)", AdminResult.ACCEPTED,
+                admin(r, GateState.OPEN, GateReason.BRIDGE_HALT).result());
         assertEquals(GateState.OPEN, state(r));
+        assertEquals("one broadcast at the acknowledgement", 1, broadcasts(r).size());
     }
 
     /** C4: a GAP holder added and removed twice in one run; two reopens. */

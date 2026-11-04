@@ -271,12 +271,40 @@ public final class AssetsClusteredService implements ClusteredService {
     /** Bounded wait for the archive to ingest the published snapshot bytes. */
     private static final long SNAPSHOT_RECORD_DEADLINE_MS = 10_000;
 
+    /**
+     * RC2 S17 W12 (R0 on the AE, the X-3(a) pattern of {@link #restoreFromImage} and the ME's haltPrincipalLess): the
+     * applier threw the kit's PrincipalLessSessionException (a principal-less SessionOpen, a frame from an id the
+     * registry does not hold, or a restored principal-less session). Print the CRITICAL line, close readiness in this
+     * callback, stop the process; the caller rethrows (test hooks may return, the production halt does not).
+     */
+    private void haltPrincipalLess(final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+        failApplicationCallback();
+        System.err.println(principalLess.getMessage());
+        failFast.run();
+    }
+
+    /**
+     * RC2 S17 W12 (R0): the sessions the container restored before onStart (Aeron's own snapshot) go through the kit
+     * gate at the log position every member shares. Package-private for AeSessionAuthorityTest.
+     */
+    void checkRestoredSessions(final Cluster cluster) {
+        try {
+            cluster.forEachClientSession(session -> com.openexchange.cluster.auth.PrincipalGate.requireClass(
+                    session.encodedPrincipal(), "restored session", session.id(), cluster.logPosition()));
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess);
+            throw principalLess;
+        }
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         ensureApplicationHealthy();
         applicationCallbackDepth++;
         try {
             applyOnStart(cluster, snapshotImage);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException halted) {
+            throw halted; // R0 already logged, fenced and ran failFast
         } catch (RuntimeException | Error failure) {
             failApplicationCallback();
             throw failure;
@@ -298,6 +326,7 @@ public final class AssetsClusteredService implements ClusteredService {
             loadSnapshot(snapshotImage);
             seedBalanceFeedFromSnapshot();
         }
+        checkRestoredSessions(cluster);
         startNodeEndpoint();
         startDurability(cluster);
         // Started, not ready: the snapshot is loaded but the log replay may
@@ -585,6 +614,9 @@ public final class AssetsClusteredService implements ClusteredService {
         applicationCallbackDepth++;
         try {
             applyOnSessionOpen(session, timestamp);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess);
+            throw principalLess;
         } catch (RuntimeException | Error failure) {
             failApplicationCallback();
             throw failure;
@@ -636,6 +668,9 @@ public final class AssetsClusteredService implements ClusteredService {
         applicationCallbackDepth++;
         try {
             applyOnSessionMessage(session, timestamp, buffer, offset, length, header);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess);
+            throw principalLess;
         } catch (RuntimeException | Error failure) {
             // The demuxer already classified this: decode poison never gets here (dropped + counted), so
             // anything that does is an APPLICATION FAULT after a possible mutation. Close readiness in
@@ -684,6 +719,14 @@ public final class AssetsClusteredService implements ClusteredService {
         int templateId = -1;
         long dispatchStartNs = 0L;
         long dispatchEndNs = 0L;
+        if (session != null && !applier.holdsSession(session.id())) {
+            // RC2 S17 W12 (R0, ingress frame): a container session with no registry row. Every SessionOpen the
+            // registry applied has a class (the applier's kit gate), so this is a divergence between the container's
+            // sessions and the replicated table: halt, never serve. A null session (an id the container does not
+            // hold) keeps RCS S1 RF-1: dispatched with no authority.
+            com.openexchange.cluster.auth.PrincipalGate.requireClass(null, "ingress frame", session.id(),
+                    header.position());
+        }
         if (applier.isTransportSubscribe(buffer, offset, length)) {
             subscribeTransport(session, buffer, offset, length);
         } else {
@@ -1040,13 +1083,20 @@ public final class AssetsClusteredService implements ClusteredService {
     void restoreFromImage(final DirectBuffer image, final int imageLength) {
         try {
             // Empty image, envelope, decode, framing and invariants are all checked by the applier.
-            applier.restore(image, imageLength);
+            try {
+                applier.restore(image, imageLength);
+            } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+                haltPrincipalLess(principalLess); // a restored session row without a principal (section 9)
+                throw principalLess;
+            }
             final BalanceSnapshotCodec.Decoded decoded = applier.lastRestored();
             System.out.println("[SNAPSHOT] restored orders=" + engine.orders().orders().size() + " accounts=" + decoded.accountCount
                     + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
                     + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq
                     + " lastLogTime=" + decoded.lastLogTime + " sections=" + decoded.sectionCount
                     + " deadlines=" + engine.deadlines().size() + " enveloped=true verified=true");
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            throw principalLess;
         } catch (final RuntimeException refused) {
             failApplicationCallback();
             System.err.println("FATAL snapshot refused: " + refused.getMessage()

@@ -133,8 +133,10 @@ public class LaneHaltTableTest {
         r.mark();
         r.clear(FeedHaltReason.GAP, 0);
         assertEquals("nothing left to clear", AdminResult.DUPLICATE, r.onlyAck().result());
-        assertEquals(AdminResult.ACCEPTED, AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.ADMIN).result());
-        assertEquals("ADMIN OPEN empties the holder set", 0, f.holders());
+        // RC2 S17 W12 (G1): the holder the 76 set needs the acknowledgement form
+        assertEquals(45, AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.ADMIN).reason());
+        assertEquals(AdminResult.ACCEPTED, AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.BRIDGE_HALT).result());
+        assertEquals("the acknowledgement empties the holder set", 0, f.holders());
         assertEquals("C5: an operator-cleared overflow, no automatic reopen counted", 0L, f.gateAutoReopenCount());
     }
 
@@ -248,7 +250,9 @@ public class LaneHaltTableTest {
         fill(r, 2);
         assertEquals("the table emptied: GAP goes, NONGAP stays", FeedState.HOLDER_NONGAP_AWAITING_OPEN, f.holders());
         assertTrue((r.globalReasons() & (1 << GateReason.BRIDGE_HALT.code())) != 0);
-        assertEquals(AdminResult.ACCEPTED, AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.ADMIN).result());
+        // RC2 S17 W12 (G1): the holder is released only by the acknowledgement
+        assertEquals(45, AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.ADMIN).reason());
+        assertEquals(AdminResult.ACCEPTED, AutoReopenScenarios.admin(r, GateState.OPEN, GateReason.BRIDGE_HALT).result());
         assertEquals(0, f.holders());
         r.engine.verifyRestoredInvariants();
     }

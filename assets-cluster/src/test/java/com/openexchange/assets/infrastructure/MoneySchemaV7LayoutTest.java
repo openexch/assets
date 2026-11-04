@@ -199,6 +199,10 @@ public class MoneySchemaV7LayoutTest {
             assertEquals(c.name(), c.code(), com.openexchange.assets.infrastructure.generated.CoreRejectReason.valueOf(c.name()).value());
         }
         assertEquals(44, CoreRejectReason.DUPLICATE_IDENTITY.code());
+        // RC2 S17 W12 (G1, A10): HALT_HOLDER_PENDING is AdminAck-only, code 45, absent from the schema enum
+        final CoreRejectReason pending = CoreRejectReason.valueOf("HALT_HOLDER_PENDING");
+        assertEquals(45, pending.code());
+        assertTrue("HALT_HOLDER_PENDING is AdminAck-only", pending.adminAckOnly());
         for (final OrderFaultKind k : OrderFaultKind.values()) {
             assertEquals(k.name(), k.code(), com.openexchange.assets.infrastructure.generated.OrderFaultKind.valueOf(k.name()).value());
         }

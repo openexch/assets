@@ -165,6 +165,10 @@ public final class AssetsLogApplier implements ShadowEngine {
             if (engine.sessions().get(clusterSessionId) != null) {
                 throw new IllegalStateException("clashing open clusterSessionId=" + clusterSessionId);
             }
+            // RC2 S17 W12 (R0, kit rule): a principal-less SessionOpen is pre-S6 history; no row is written. The
+            // owner decides what a refusal means (the live service fail-fasts; a reader or a shadow stops).
+            com.openexchange.cluster.auth.PrincipalGate.requireClass(encodedPrincipal, "session open",
+                    clusterSessionId, logPosition);
             engine.sessions().open(clusterSessionId, encodedPrincipal);
         } catch (final RuntimeException | Error failure) {
             failed = true;
@@ -192,7 +196,8 @@ public final class AssetsLogApplier implements ShadowEngine {
     /**
      * A session message. A well-formed Subscribe is a transport concern and changes nothing here (returns false).
      * Anything else stamps the position and is dispatched under the authority of {@code clusterSessionId}
-     * (an id unknown to the registry dispatches with no authority).
+     * (an id unknown to the registry dispatches with no authority: RCS S1 RF-1, kept by RC2 S17 W12; every logged
+     * open now has a class, see {@link #onSessionOpen}).
      *
      * @return false for a well-formed Subscribe, true when the frame went to the engine
      */
@@ -282,6 +287,11 @@ public final class AssetsLogApplier implements ShadowEngine {
     }
 
     // ---------------------------------------------------------------- read access and the static codec path
+
+    /** RC2 S17 W12 (R0, ingress frame): a read-only probe of the replicated session table. */
+    public boolean holdsSession(final long clusterSessionId) {
+        return engine.sessions().get(clusterSessionId) != null;
+    }
 
     public AssetsEngine engine() {
         return engine;
