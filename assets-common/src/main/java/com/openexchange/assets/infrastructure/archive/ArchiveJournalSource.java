@@ -5,6 +5,7 @@ import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.CloseHelper;
+import org.agrona.ErrorHandler;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -98,6 +99,25 @@ public final class ArchiveJournalSource implements AutoCloseable {
             final int replayStreamId,
             final String aeronDirectoryName,
             final String replayHost) {
+        return connectFirstHealthy(archiveEndpoints, controlStreamId, journalStreamId, channelUri, replayStreamId,
+                aeronDirectoryName, replayHost, null);
+    }
+
+    /**
+     * As above, with {@code errorHandler} as the archive client's error handler: it receives the errors of the
+     * Aeron client this source creates (driver loss included) instead of Aeron's default handler, which prints and
+     * exits the JVM with -1 on a driver timeout. {@code null} keeps Aeron's default (the settlement bridge's path).
+     * RC2 S17 W10 (D1): the money projector routes them through the kit's {@code EngineLifecycle}.
+     */
+    public static ArchiveJournalSource connectFirstHealthy(
+            final List<String> archiveEndpoints,
+            final int controlStreamId,
+            final int journalStreamId,
+            final String channelUri,
+            final int replayStreamId,
+            final String aeronDirectoryName,
+            final String replayHost,
+            final ErrorHandler errorHandler) {
         final String host = replayHost == null || replayHost.isBlank() ? "localhost" : replayHost.trim();
         Exception last = null;
         for (final String endpoint : archiveEndpoints) {
@@ -106,7 +126,8 @@ public final class ArchiveJournalSource implements AutoCloseable {
                         .aeronDirectoryName(aeronDirectoryName)
                         .controlRequestChannel("aeron:udp?endpoint=" + endpoint.trim())
                         .controlRequestStreamId(controlStreamId)
-                        .controlResponseChannel("aeron:udp?endpoint=" + host + ":0"));
+                        .controlResponseChannel("aeron:udp?endpoint=" + host + ":0")
+                        .errorHandler(errorHandler));
                 return new ArchiveJournalSource(archive, endpoint.trim(), controlStreamId, journalStreamId,
                         channelUri, replayStreamId, host);
             } catch (Exception e) {
