@@ -42,9 +42,9 @@
         <sbe.version>1.40.1</sbe.version>
         <disruptor.version>4.0.0</disruptor.version>
         <!-- Postgres + pool for the money projector (versions match the OMS repo). -->
-        <postgresql.version>42.7.14</postgresql.version>
+        <postgresql.version>42.7.13</postgresql.version>
         <hikari.version>7.1.0</hikari.version>
-        <slf4j.version>2.0.20</slf4j.version>
+        <slf4j.version>2.0.18</slf4j.version>
         <!-- match repo (settlement-journal codecs consumed by assets-bridge): an IMMUTABLE
              1.0.<utcstamp>.g<sha> from GitHub Packages, deployed by match CI on every main push.
              The trailing g<sha> names the exact match commit these wire bytes came from.
@@ -184,7 +184,7 @@
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>exec-maven-plugin</artifactId>
-                    <version>3.6.4</version>
+                    <version>3.6.3</version>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
