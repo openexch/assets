@@ -19,6 +19,7 @@ import com.openexchange.assets.infrastructure.generated.SubscribeEncoder;
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.cluster.ClusteredMediaDriver;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -154,6 +155,7 @@ public class RequestOriginEgressClusterTest {
 
         final List<String> hosts = List.of("localhost");
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
@@ -303,6 +305,7 @@ public class RequestOriginEgressClusterTest {
     private static AeronCluster connect(final EgressListener listener, final String aeronDir,
                                         final List<String> hosts) {
         return AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                 .egressListener(listener)
                 .egressChannel("aeron:udp?endpoint=localhost:0")
                 .ingressChannel("aeron:udp?term-length=16m|mtu=8192")
@@ -337,7 +340,7 @@ public class RequestOriginEgressClusterTest {
 
     private int encodeDeposit(long correlationId, long userId, int assetId, long amount) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
-                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(correlationId).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
         return MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength();
     }
 

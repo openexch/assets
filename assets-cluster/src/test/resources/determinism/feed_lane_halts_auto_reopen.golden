@@ -1,0 +1,112 @@
+ADMINACK corr=7001 ref=70 result=ADOPTED reason=0 cfg=1
+CONFIGAPPLIED kind=CORE market=0 version=1
+ADMINACK corr=7002 ref=70 result=ACCEPTED reason=0 cfg=2
+CONFIGAPPLIED kind=CORE market=0 version=2
+ADMINACK corr=7003 ref=70 result=ACCEPTED reason=0 cfg=3
+CONFIGAPPLIED kind=CORE market=0 version=3
+ADMINACK corr=1 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+DEPOSITACK corr=0 u=100 asset=0 amt=100000000000 newAvail=100000000000
+BALANCE u=100 asset=0 avail=100000000000 locked=0
+ADMINACK corr=2 ref=66 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=SUSPENDED reason=BRIDGE_HALT breaker=off broadcast
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=4 amount=2
+FEEDLATCH reason=GAP expected=2 seen=4 skip=0 rawTradeId=0
+ADMINACK corr=3 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=7 amount=5
+FEEDLATCH reason=GAP expected=5 seen=7 skip=0 rawTradeId=0
+FEEDPOS corr=4 consumePos=1 lastTradeId=0 journal=off epoch=24301 jseq=1 halted=TRUE haltReason=GAP
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=3 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+FEEDPOS corr=5 consumePos=2 lastTradeId=0 journal=off epoch=24301 jseq=3 halted=TRUE haltReason=GAP
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=6 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+AUTOREOPEN jseq=6 opened=1 reasons=0x0 laneHalts=0
+FEEDPOS corr=6 consumePos=5 lastTradeId=0 journal=off epoch=24301 jseq=6 halted=FALSE haltReason=NONE
+ADMINACK corr=7 ref=66 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=SUSPENDED reason=BRIDGE_HALT breaker=off broadcast
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=9 amount=7
+FEEDLATCH reason=GAP expected=7 seen=9 skip=0 rawTradeId=0
+ADMINACK corr=8 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=SUSPENDED reason=ADMIN breaker=off broadcast reasons=0x5
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=8 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ADMISSION market=0 gate=SUSPENDED reason=ADMIN breaker=off broadcast
+AUTOREOPEN jseq=8 opened=0 reasons=0x1 laneHalts=0
+ADMINACK corr=9 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+ADMINACK corr=10 ref=66 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=SUSPENDED reason=BRIDGE_HALT breaker=off broadcast
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=14 amount=9
+FEEDLATCH reason=GAP expected=9 seen=14 skip=0 rawTradeId=0
+ADMINACK corr=11 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=14 amount=9
+FEEDLATCH reason=GAP expected=9 seen=14 skip=0 rawTradeId=0
+ADMINACK corr=12 ref=66 result=DUPLICATE reason=0 cfg=0
+FEEDPOS corr=13 consumePos=11 lastTradeId=0 journal=off epoch=24301 jseq=12 halted=TRUE haltReason=GAP
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=13 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+AUTOREOPEN jseq=13 opened=1 reasons=0x0 laneHalts=0
+ADMINACK corr=14 ref=66 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=SUSPENDED reason=BRIDGE_HALT breaker=off broadcast
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=14 amount=14
+FEEDLATCH reason=SOURCE_SCHEMA expected=14 seen=14 skip=0 rawTradeId=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=14 amount=0
+FEEDCLEAR reason=SOURCE_SCHEMA jseq=0 auto=1
+FEEDPOS corr=15 consumePos=13 lastTradeId=0 journal=off epoch=24301 jseq=14 halted=FALSE haltReason=NONE
+ADMINACK corr=16 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+ADMINACK corr=21 ref=66 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=SUSPENDED reason=BRIDGE_HALT breaker=off broadcast
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=22 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=23 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=24 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=25 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=26 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=27 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=28 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ADMINACK corr=29 ref=66 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=17 amount=15
+FEEDLATCH reason=GAP expected=15 seen=17 skip=0 rawTradeId=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=16 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=1
+FEEDPOS corr=30 consumePos=15 lastTradeId=0 journal=off epoch=24301 jseq=16 halted=TRUE haltReason=GAP
+ADMINACK corr=31 ref=73 result=REJECTED reason=40 cfg=0
+ADMINACK corr=32 ref=76 result=ACCEPTED reason=0 cfg=0
+ORDERFAULT kind=FEED_HALT order=0 u=0 market=0 trade=0 amount=0
+FEEDCLEAR reason=GAP jseq=0 auto=0
+ADMINACK corr=33 ref=73 result=ACCEPTED reason=0 cfg=0
+ADMISSION market=0 gate=OPEN reason=ADMIN breaker=off broadcast
+FEEDPOS corr=34 consumePos=15 lastTradeId=0 journal=off epoch=24301 jseq=16 halted=FALSE haltReason=NONE

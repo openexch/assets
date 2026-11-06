@@ -1,0 +1,20 @@
+# RC1 S6 (contract 1, 3.1, 3.2; spec R2): a BUY TRAILING_STOP with delta 5 arms at the admission ask (92) and
+# holds (ask + delta) x (1 + 500 bps) x qty = 97 x 1.05 x 1 = 101.85. A lower ask moves the arm down to 90 and
+# that tick does not fire (the advance consumes it); 93 - 90 < 5 does not fire; 95 - 90 >= 5 fires a MARKET BUY
+# child with budget = hold remaining. A stale tick and a crossed tick change nothing. The child fills at 95 and
+# the parent ends FILLED with the 6.85 residual released.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=1000.0
+DEPOSIT u=2 asset=1 amt=5.0
+MARKETTICK market=1 bid=91.0 ask=92.0 ver=1
+CREATE u=1 market=1 side=0 type=5 qty=1.0 delta=5.0 rid=1       # order 1: armed, arm 92, hold 101.85
+CREATE u=2 market=1 side=1 type=0 px=95.0 qty=1.0 rid=2         # order 2: resting SELL
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=201
+MARKETTICK market=1 bid=89.0 ask=90.0 ver=2                     # arm 92 -> 90, no trigger
+MARKETTICK market=1 bid=92.0 ask=93.0 ver=3                     # 93 - 90 = 3 < 5
+MARKETTICK market=1 bid=92.0 ask=96.0 ver=3                     # stale bookVersion: dropped
+MARKETTICK market=1 bid=97.0 ask=96.0 ver=4                     # crossed: invalid, dropped
+MARKETTICK market=1 bid=94.0 ask=95.0 ver=4                     # 95 - 90 = 5 >= 5: fires
+MEOUTCOME order=1 kind=0 attempt=1 result=0 leg=101
+METRADE id=1 market=1 taker=1 maker=2 px=95.0 qty=1.0 takerBuy=1  # parent FILLED, residual 6.85 released

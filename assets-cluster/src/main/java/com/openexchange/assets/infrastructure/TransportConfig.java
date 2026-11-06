@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.infrastructure;
 
-import io.aeron.CncFileDescriptor;
 import io.aeron.CommonContext;
 import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.BusySpinIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
 
-import java.io.File;
 import java.util.function.Supplier;
 
 /**
@@ -21,13 +19,9 @@ import java.util.function.Supplier;
  */
 public final class TransportConfig {
 
-    private static final Logger log = Logger.getLogger(TransportConfig.class);
-
     public enum DriverMode { EXTERNAL, EMBEDDED }
 
     public enum IdleMode { BUSY_SPIN, BACKOFF }
-
-    public static final long EXTERNAL_DRIVER_TIMEOUT_MS = 30_000;
 
     private TransportConfig() {
     }
@@ -111,25 +105,6 @@ public final class TransportConfig {
             sb.append("|interface=").append(iface);
         }
         return sb.toString();
-    }
-
-    /** Block until an external media driver is up (its cnc.dat exists) or the timeout elapses. */
-    public static void awaitExternalDriver(final String aeronDir, final long timeoutMs) {
-        final File cncFile = new File(aeronDir, CncFileDescriptor.CNC_FILE);
-        final long deadline = System.currentTimeMillis() + timeoutMs;
-        while (!cncFile.exists()) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new IllegalStateException(
-                        "No external media driver found at " + aeronDir + " after " + timeoutMs + "ms.");
-            }
-            try {
-                Thread.sleep(100);
-            } catch (final InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted waiting for external media driver at " + aeronDir, e);
-            }
-        }
-        log.info("External media driver detected at %s", aeronDir);
     }
 
     private static String envOrProp(final String envName, final String propName, final String defaultValue) {

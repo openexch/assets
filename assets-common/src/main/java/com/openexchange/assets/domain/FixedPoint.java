@@ -59,6 +59,36 @@ public final class FixedPoint {
      *
      * @throws OverflowException if the true result does not fit in a signed long
      */
+    /**
+     * Would {@link #multiply(long, long)} succeed? The exact fits-check without the throw, for apply paths
+     * that must validate before they mutate: the true result fits in a signed long iff the 128-bit
+     * product divided by the scale does, which this evaluates with the same wide arithmetic.
+     */
+    public static boolean multiplyFits(long a, long b) {
+        final long hi = Math.multiplyHigh(a, b);
+        final long lo = a * b;
+        if (hi == (lo >> 63)) {
+            return true; // the raw product fits; dividing by the scale can only shrink it
+        }
+        final long ua = Math.abs(a);
+        final long ub = Math.abs(b);
+        // Unsigned 128-bit product P = (phi : plo). q = P / SCALE_FACTOR fits iff q < 2^63 for a positive
+        // result, q <= 2^63 for a negative one. SCALE_FACTOR is even, so 2^63 * SCALE_FACTOR is the
+        // 128-bit value (SCALE_FACTOR / 2 : 0).
+        final long phi = Math.unsignedMultiplyHigh(ua, ub);
+        final long plo = ua * ub;
+        final int cmp = Long.compareUnsigned(phi, SCALE_FACTOR >>> 1);
+        if (cmp < 0) {
+            return true;
+        }
+        if (cmp > 0) {
+            return false;
+        }
+        // phi == SCALE_FACTOR / 2: P >= 2^63 * SCALE_FACTOR, so a positive result never fits; a negative
+        // one fits exactly when q == 2^63, i.e. the low word is below one scale unit.
+        return (a ^ b) < 0 && Long.compareUnsigned(plo, SCALE_FACTOR) < 0;
+    }
+
     public static long multiply(long a, long b) {
         final long hi = Math.multiplyHigh(a, b);
         final long lo = a * b;

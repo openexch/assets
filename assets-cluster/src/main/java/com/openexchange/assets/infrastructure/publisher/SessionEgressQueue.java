@@ -8,7 +8,11 @@ import com.openexchange.assets.infrastructure.generated.HoldAckDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.assets.infrastructure.generated.MeDispatchBatchEncoder;
+import com.openexchange.assets.infrastructure.generated.MeDispatchDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderEventBatchEncoder;
+import com.openexchange.assets.infrastructure.generated.OrderEventDecoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
 import io.aeron.Publication;
@@ -91,6 +95,16 @@ public final class SessionEgressQueue {
     private int parkedBatchLength;
     private final UnsafeBuffer batchScratch = new UnsafeBuffer(new byte[BATCH_SCRATCH_CAPACITY]);
 
+    // RC1 S4 (critic G8): OrderEvent (102 -> 103, cap 48) and MeDispatch (104 -> 105, cap 64) batch by COPYING
+    // the single frame's body bytes into a raw staging area; the batch entry layout equals the single block.
+    static final int ORDER_EVENT_BATCH_CAP = 48;
+    static final int ME_DISPATCH_BATCH_CAP = 64;
+    private static final int RAW_STAGE_CAPACITY = Math.max(ORDER_EVENT_BATCH_CAP * OrderEventDecoder.BLOCK_LENGTH,
+            ME_DISPATCH_BATCH_CAP * MeDispatchDecoder.BLOCK_LENGTH);
+    private final UnsafeBuffer rawStage = new UnsafeBuffer(new byte[RAW_STAGE_CAPACITY]);
+    private final OrderEventBatchEncoder orderEventBatchEncoder = new OrderEventBatchEncoder();
+    private final MeDispatchBatchEncoder meDispatchBatchEncoder = new MeDispatchBatchEncoder();
+
     private final MessageHeaderDecoder frameHeaderDecoder = new MessageHeaderDecoder();
     private final BalanceUpdateDecoder balanceUpdateDecoder = new BalanceUpdateDecoder();
     private final HoldAckDecoder holdAckDecoder = new HoldAckDecoder();
@@ -103,6 +117,7 @@ public final class SessionEgressQueue {
     private final HoldSnapshotBatchEncoder holdSnapshotBatchEncoder = new HoldSnapshotBatchEncoder();
 
     private long backPressureCount;
+    private long oversizeDrops;
     private int peakPendingBytes;
     /**
      * Which BROADCAST egress channels this session wants — replies to its own commands bypass this
@@ -123,9 +138,22 @@ public final class SessionEgressQueue {
      * with a fresh QueryFeedPosition at every epoch start.
      */
     private boolean resumable;
+    /** RC2 S8 3.13: at least one offer to this session was delivered (positive result). Transport state. */
+    private boolean delivered;
+    /** RC2 S8 3.13: the session was closed on a discard; everything later is discarded, never delivered. */
+    private boolean discardClosed;
+    private long discardCloseCount;
+    /** Review FIX-2: told at each discard close, so the service-level total outlives this queue's retirement. */
+    private final Runnable onDiscardClose;
 
     public SessionEgressQueue(final ClientSession session) {
+        this(session, () -> { });
+    }
+
+    /** {@code onDiscardClose} runs on the service thread at each RC2 S8 3.13 close (review FIX-2: the monotone total). */
+    public SessionEgressQueue(final ClientSession session, final Runnable onDiscardClose) {
         this.session = session;
+        this.onDiscardClose = onDiscardClose;
     }
 
     public ClientSession session() {
@@ -148,8 +176,23 @@ public final class SessionEgressQueue {
         return backPressureCount;
     }
 
+    /** Frames lost for this session because they exceeded the publication's max message length. */
+    public long oversizeDrops() {
+        return oversizeDrops;
+    }
+
     public int peakPendingBytes() {
         return peakPendingBytes;
+    }
+
+    /** RC2 S8 3.13: times this queue reset and closed its session on a NOT_CONNECTED or MAX_POSITION_EXCEEDED discard. */
+    public long discardCloseCount() {
+        return discardCloseCount;
+    }
+
+    /** RC2 S8 3.13: true once the session was closed on a discard (nothing is delivered after it). */
+    public boolean isDiscardClosed() {
+        return discardClosed;
     }
 
     public int channelMask() {
@@ -213,6 +256,7 @@ public final class SessionEgressQueue {
         }
         final int consumed = pending.consume(offerConsumer, DRAIN_LIMIT);
         flushOpenBatch(); // the drain cycle is over for this pass; a batch never waits for more events
+        resetIfDiscardClosed();
         return consumed;
     }
 
@@ -234,6 +278,7 @@ public final class SessionEgressQueue {
         }
         // End of the drain cycle: whatever is still coalescing goes out now (or parks on back-pressure).
         flushOpenBatch();
+        resetIfDiscardClosed();
         return total;
     }
 
@@ -260,7 +305,7 @@ public final class SessionEgressQueue {
             if (openBatchTemplateId != 0 && openBatchTemplateId != batchable && !flushOpenBatch()) {
                 return false;
             }
-            if (openBatchCount == BATCH_CAP && !flushOpenBatch()) {
+            if (openBatchCount == capFor(batchable) && !flushOpenBatch()) {
                 return false;
             }
             stage(batchable, buffer, offset);
@@ -293,8 +338,20 @@ public final class SessionEgressQueue {
             case SettlementAppliedDecoder.TEMPLATE_ID:
             case HoldSnapshotEntryDecoder.TEMPLATE_ID:
                 return templateId;
+            case OrderEventDecoder.TEMPLATE_ID:
+                return length == MessageHeaderDecoder.ENCODED_LENGTH + OrderEventDecoder.BLOCK_LENGTH ? templateId : 0;
+            case MeDispatchDecoder.TEMPLATE_ID:
+                return length == MessageHeaderDecoder.ENCODED_LENGTH + MeDispatchDecoder.BLOCK_LENGTH ? templateId : 0;
             default:
                 return 0;
+        }
+    }
+
+    private static int capFor(final int templateId) {
+        switch (templateId) {
+            case OrderEventDecoder.TEMPLATE_ID: return ORDER_EVENT_BATCH_CAP;
+            case MeDispatchDecoder.TEMPLATE_ID: return ME_DISPATCH_BATCH_CAP;
+            default: return BATCH_CAP;
         }
     }
 
@@ -331,6 +388,10 @@ public final class SessionEgressQueue {
                 stagedFields[2][i] = holdSnapshotEntryDecoder.assetId();
                 stagedFields[3][i] = holdSnapshotEntryDecoder.remaining();
             }
+            case OrderEventDecoder.TEMPLATE_ID -> rawStage.putBytes(i * OrderEventDecoder.BLOCK_LENGTH, buffer,
+                    offset + MessageHeaderDecoder.ENCODED_LENGTH, OrderEventDecoder.BLOCK_LENGTH);
+            case MeDispatchDecoder.TEMPLATE_ID -> rawStage.putBytes(i * MeDispatchDecoder.BLOCK_LENGTH, buffer,
+                    offset + MessageHeaderDecoder.ENCODED_LENGTH, MeDispatchDecoder.BLOCK_LENGTH);
             default -> throw new IllegalStateException("not a batchable templateId: " + templateId);
         }
     }
@@ -410,6 +471,19 @@ public final class SessionEgressQueue {
                 }
                 return MessageHeaderEncoder.ENCODED_LENGTH + holdSnapshotBatchEncoder.encodedLength();
             }
+            case OrderEventDecoder.TEMPLATE_ID -> {
+                // Group header via the encoder (block length + count), entry bytes copied verbatim.
+                orderEventBatchEncoder.wrapAndApplyHeader(batchScratch, 0, batchHeaderEncoder).eventsCount(count);
+                final int body = MessageHeaderEncoder.ENCODED_LENGTH + 4;
+                batchScratch.putBytes(body, rawStage, 0, count * OrderEventDecoder.BLOCK_LENGTH);
+                return body + count * OrderEventDecoder.BLOCK_LENGTH;
+            }
+            case MeDispatchDecoder.TEMPLATE_ID -> {
+                meDispatchBatchEncoder.wrapAndApplyHeader(batchScratch, 0, batchHeaderEncoder).dispatchesCount(count);
+                final int body = MessageHeaderEncoder.ENCODED_LENGTH + 4;
+                batchScratch.putBytes(body, rawStage, 0, count * MeDispatchDecoder.BLOCK_LENGTH);
+                return body + count * MeDispatchDecoder.BLOCK_LENGTH;
+            }
             default -> throw new IllegalStateException(
                     "open batch with unknown templateId: " + openBatchTemplateId);
         }
@@ -427,14 +501,57 @@ public final class SessionEgressQueue {
         return false;
     }
 
+    /** S8 3.13: the reset of the ceiling path, done outside the ring buffer's consume callback. */
+    private void resetIfDiscardClosed() {
+        if (discardClosed && !isEmpty()) {
+            reset();
+        }
+    }
+
     private boolean offerFrame(final DirectBuffer buffer, final int offset, final int length) {
-        final long result = session.offer(buffer, offset, length);
+        if (discardClosed) {
+            return true; // S8 3.13: closed on a discard; nothing later is delivered on this session
+        }
+        final long result;
+        try {
+            result = session.offer(buffer, offset, length);
+        } catch (final IllegalArgumentException oversize) {
+            // The frame exceeds this session publication's max message length (term length / 8, minus
+            // the 32-byte cluster session header). This offer runs inside the apply callback: letting
+            // the exception reach the apply-failure fence would halt the leader, and the next leader
+            // would re-form the same frame (ME 202789c). Count the loss and move on; the consumer
+            // resynchronises through the snapshot queries.
+            final long n = ++oversizeDrops;
+            if (n == 1 || n % 1000 == 0) {
+                System.err.println("CRITICAL: assets egress frame exceeds the session's max message length"
+                        + " (session=" + session.id() + " via=" + session.responseChannel()
+                        + " len=" + length + " totalOversize=" + n + "): " + oversize.getMessage()
+                        + " — frame lost for this session; raise the egress term length");
+            }
+            return true; // consumed (lost), so the frames behind it keep flowing
+        }
         if (result > 0) {
+            delivered = true;
             return true; // delivered (also covers ClientSession.MOCKED_OFFER on a follower)
         }
         if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION) {
             backPressureCount++;
             return false; // keep this frame and everything after it for the next drain
+        }
+        if (resumable && delivered && (result == Publication.NOT_CONNECTED || result == Publication.MAX_POSITION_EXCEEDED)) {
+            // RC2 S8 3.13 (S12 A-2): a frame on a resumable session is either delivered in order or the session is closed
+            // and the consumer resyncs: reset and close exactly as the ceiling path, never a silent hole
+            discardClosed = true;
+            discardCloseCount++;
+            onDiscardClose.run();
+            System.err.println("CRITICAL: assets egress offer " + result + " on resumable session=" + session.id()
+                    + " after a delivery; closing the session instead of discarding (S8 3.13)");
+            try {
+                session.close();
+            } catch (final RuntimeException ignored) {
+                // already closing: the queue is reset either way and later offers are discarded
+            }
+            return true;
         }
         // CLOSED / MAX_POSITION_EXCEEDED / NOT_CONNECTED: the session is gone. Discard, exactly as the
         // inline path did — the state is safe and the consumer resynchronises through the snapshot
