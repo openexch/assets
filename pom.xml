@@ -52,7 +52,7 @@
         <match.version>1.0-runtime.20260927.r00.g7ea66bf</match.version>
         <!-- RC2 S9h (D-S9h-1): the ME journal schema 4 codecs (match 421226c) for the TEST-scope feed harness of
              assets-cluster only. Separate from match.version on purpose: the frozen assets-bridge keeps schema 3. -->
-        <match.journal.version>1.0-runtime.20260929.r02h</match.journal.version>
+        <match.journal.version>1.0.20261106224552.g2b242ed</match.journal.version>
         <!-- Benchmark loadgen histograms (assets-loadgen only; not in any engine hot path). -->
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
         <!-- RC2 S10' review FIX-3: reproducible jars (maven-jar / shade entry times), so the pinned AE jar sha comes from a
