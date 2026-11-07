@@ -1,0 +1,28 @@
+# RC1 S7 (contract sections 3 and 5): CoreConfig v1 is ADOPTED with behaviour 1 and admission does not check tick,
+# band or lot: an off-tick, an out-of-band and an off-lot order are all admitted. CoreConfig v2 (behaviour 2) is
+# ACCEPTED and switches at its log position: from the next command on the same shapes are refused structurally
+# (PRICE_OFF_TICK, PRICE_OUT_OF_BAND, QTY_OFF_LOT: no rate budget, no stored request, no hold, no record), an
+# on-tick in-band on-lot order passes, a MARKET order skips the price rules but keeps the lot rule, a STOP_LOSS
+# follows the tick rule on its stopPrice, and the v1 orders stay live. A resend of v2 is a DUPLICATE; a snapshot
+# keeps v2. Every market carries tick 0.5, band [10, 1000], lot 0.1.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=100000.0
+DEPOSIT u=2 asset=1 amt=10.0
+CORECONFIG ver=1 behavior=1 tick=0.5 min=10.0 max=1000.0 lot=0.1 corr=71    # ADOPTED, behaviour 1
+CREATE u=1 market=1 side=0 type=0 px=100.3 qty=1.0 rid=1                    # order 1: off tick, admitted under v1
+CREATE u=1 market=1 side=0 type=0 px=5.0 qty=1.0 rid=2                      # order 2: below min, admitted under v1
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=0.15 rid=3                   # order 3: off lot, admitted under v1
+CORECONFIG ver=2 behavior=2 tick=0.5 min=10.0 max=1000.0 lot=0.1 corr=72    # ACCEPTED: behaviour 2 from here on
+CREATE u=1 market=1 side=0 type=0 px=100.3 qty=1.0 rid=4                    # PRICE_OFF_TICK
+CREATE u=1 market=1 side=0 type=0 px=5.0 qty=1.0 rid=5                      # PRICE_OUT_OF_BAND (below min)
+CREATE u=1 market=1 side=0 type=0 px=1000.5 qty=1.0 rid=6                   # PRICE_OUT_OF_BAND (above max)
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=0.15 rid=7                   # QTY_OFF_LOT
+CREATE u=1 market=1 side=0 type=0 px=100.5 qty=1.0 rid=4                    # rid 4 was not stored: admitted (order 4)
+CREATE u=2 market=1 side=1 type=1 qty=0.2 rid=8                             # MARKET: price rules skipped (order 5)
+CREATE u=2 market=1 side=1 type=1 qty=0.15 rid=9                            # MARKET keeps the lot rule: QTY_OFF_LOT
+CREATE u=2 market=1 side=1 type=3 qty=1.0 stop=99.3 rid=10                  # STOP_LOSS stopPrice off tick: PRICE_OFF_TICK
+CORECONFIG ver=2 behavior=2 tick=0.5 min=10.0 max=1000.0 lot=0.1 corr=73    # DUPLICATE, no-op
+SNAPSHOT
+CREATE u=1 market=1 side=0 type=0 px=100.3 qty=1.0 rid=11                   # still behaviour 2 after the restore
+CANCEL u=1 order=1 rid=12                                                   # the v1 off-tick order is live: cancellable

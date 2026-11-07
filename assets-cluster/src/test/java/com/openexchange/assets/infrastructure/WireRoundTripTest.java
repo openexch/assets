@@ -39,6 +39,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * End-to-end validation of the cluster seams (not just compilation): an SBE ingress message decoded by
@@ -273,7 +274,7 @@ public class WireRoundTripTest {
                 .takerOrderId(2).takerUserId(200).makerOrderId(1).makerUserId(100)
                 .price(FixedPoint.fromDouble(60000.0)).quantity(FixedPoint.fromDouble(1.0))
                 .takerIsBuy(BoolFlag.TRUE).journalPosition(6_000L);
-        demuxer.dispatch(ingress, 0,
+        demuxer.dispatchTrusted(ingress, 0,
                 MessageHeaderEncoder.ENCODED_LENGTH + batchEncoder.encodedLength(), 1000L);
 
         // Only trade 2 applied: exactly one settle's egress (4 balance lines + 1 SETTLED).
@@ -364,20 +365,20 @@ public class WireRoundTripTest {
 
     private void deposit(AssetsSbeDemuxer demuxer, long corr, long userId, int assetId, long amount) {
         depositEncoder.wrapAndApplyHeader(ingress, 0, header)
-                .correlationId(corr).userId(userId).assetId(assetId).amount(amount);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + depositEncoder.encodedLength(), 1000L);
+                .correlationId(corr).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + depositEncoder.encodedLength(), 1000L);
     }
 
     private void withdraw(AssetsSbeDemuxer demuxer, long corr, long userId, int assetId, long amount) {
         withdrawEncoder.wrapAndApplyHeader(ingress, 0, header)
-                .correlationId(corr).userId(userId).assetId(assetId).amount(amount);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + withdrawEncoder.encodedLength(), 1000L);
+                .correlationId(corr).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + withdrawEncoder.encodedLength(), 1000L);
     }
 
     private void hold(AssetsSbeDemuxer demuxer, long corr, long orderId, long userId, int assetId, long amount) {
         holdEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .correlationId(corr).orderId(orderId).userId(userId).assetId(assetId).amount(amount);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdEncoder.encodedLength(), 1000L);
     }
 
     private void settle(AssetsSbeDemuxer demuxer, long tradeId, int marketId, long takerOrder, long takerUser,
@@ -395,33 +396,33 @@ public class WireRoundTripTest {
                 .price(price).quantity(qty)
                 .takerIsBuy(takerIsBuy ? BoolFlag.TRUE : BoolFlag.FALSE)
                 .journalPosition(journalPosition);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + settleEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + settleEncoder.encodedLength(), 1000L);
     }
 
     private void terminalRelease(AssetsSbeDemuxer demuxer, long journalPosition, long orderId, long userId) {
         terminalReleaseEncoder.wrapAndApplyHeader(ingress, 0, header)
                 .journalPosition(journalPosition).orderId(orderId).userId(userId).timestamp(1000L);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + terminalReleaseEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + terminalReleaseEncoder.encodedLength(), 1000L);
     }
 
     private void queryFeedPosition(AssetsSbeDemuxer demuxer, long corr) {
         queryFeedPosEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + queryFeedPosEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + queryFeedPosEncoder.encodedLength(), 1000L);
     }
 
     private void initTradeHighWater(AssetsSbeDemuxer demuxer, long tradeId, long consumePosition) {
         initEncoder.wrapAndApplyHeader(ingress, 0, header).tradeId(tradeId).consumePosition(consumePosition);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + initEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + initEncoder.encodedLength(), 1000L);
     }
 
     private void requestBalanceSnapshot(AssetsSbeDemuxer demuxer, long corr) {
         balSnapReqEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + balSnapReqEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + balSnapReqEncoder.encodedLength(), 1000L);
     }
 
     private void requestHoldSnapshot(AssetsSbeDemuxer demuxer, long corr) {
         holdSnapReqEncoder.wrapAndApplyHeader(ingress, 0, header).correlationId(corr);
-        demuxer.dispatch(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdSnapReqEncoder.encodedLength(), 1000L);
+        demuxer.dispatchTrusted(ingress, 0, MessageHeaderEncoder.ENCODED_LENGTH + holdSnapReqEncoder.encodedLength(), 1000L);
     }
 
     /**
@@ -439,9 +440,9 @@ public class WireRoundTripTest {
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldAck");
         p.onHoldReject(1, 2, 3, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "HoldReject");
-        p.onDepositAck(1, 2, 0, 100, 100);
+        p.onDepositAck(1, 2, 0, 100, 100, false);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "DepositAck");
-        p.onWithdrawAck(1, 2, 0, 100, 0);
+        p.onWithdrawAck(1, 2, 0, 100, 0, false);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawAck");
         p.onWithdrawReject(1, 2, 0, 100, com.openexchange.assets.domain.RejectReason.INSUFFICIENT_FUNDS);
         assertChannel(egress, AssetsEventPublisher.CH_ACKS, "WithdrawReject");
@@ -477,9 +478,9 @@ public class WireRoundTripTest {
         final CapturingEgress egress = new CapturingEgress();
         final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> queryReply[0]);
 
-        p.onDepositAck(1, 2, 0, 100, 100);
+        p.onDepositAck(1, 2, 0, 100, 100, false);
         assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "DepositAck");
-        p.onWithdrawAck(1, 2, 0, 100, 0);
+        p.onWithdrawAck(1, 2, 0, 100, 0, false);
         assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "WithdrawAck");
         p.onHoldAck(1, 2, 3, 0, 100);
         assertRouting(egress, AssetsEventPublisher.Routing.ORIGIN, "HoldAck");
@@ -509,6 +510,350 @@ public class WireRoundTripTest {
         queryReply[0] = false;
         p.onBalanceUpdate(2, 0, 100, 0);
         assertRouting(egress, AssetsEventPublisher.Routing.BROADCAST, "live BalanceUpdate after the reply");
+    }
+
+    // ---- RC2 S1 (contract 8.1 assets, 8.3): money-schema v7 templates and tails ----
+
+    /** Copies every emitted frame (the publisher reuses one scratch buffer). */
+    private static final class RawEgress implements AssetsEventPublisher.Egress {
+        final List<byte[]> frames = new ArrayList<>();
+
+        @Override
+        public void emit(MutableDirectBuffer buffer, int offset, int length, int channel, AssetsEventPublisher.Routing routing) {
+            final byte[] copy = new byte[length];
+            buffer.getBytes(offset, copy);
+            frames.add(copy);
+        }
+
+        UnsafeBuffer last() {
+            return new UnsafeBuffer(frames.get(frames.size() - 1));
+        }
+    }
+
+    private static MessageHeaderDecoder headerOf(final UnsafeBuffer b) {
+        return new MessageHeaderDecoder().wrap(b, 0);
+    }
+
+    /** An OrderEvent whose body is all 0xFF where the order carries a long: dirties the publisher scratch. */
+    private static UnsafeBuffer dirtyScratch(final AssetsEventPublisher p, final RawEgress egress) {
+        final com.openexchange.assets.application.engine.order.CoreOrder o = new com.openexchange.assets.application.engine.order.CoreOrder();
+        o.clear();
+        o.orderId = -1; o.userId = -1; o.price = -1; o.stopPrice = -1; o.quantity = -1; o.filledQty = -1; o.remainingQty = -1;
+        o.holdAmount = -1; o.clientOrderIdHigh = -1; o.clientOrderIdLow = -1; o.createdAtMs = -1; o.currentLegId = -1;
+        o.marketId = -1;
+        o.timeInForce = 1;
+        p.onOrderEvent(-1L, -1L, o, com.openexchange.assets.domain.EventKind.ACK_NEW,
+                com.openexchange.assets.domain.CoreRejectReason.NONE, -1L, -1L, -1L, -1L, -1L);
+        return egress.last();
+    }
+
+    @Test
+    public void v7NewTemplatesRoundTrip() {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[2048]);
+        final MessageHeaderEncoder he = new MessageHeaderEncoder();
+        final MessageHeaderDecoder hd = new MessageHeaderDecoder();
+
+        new com.openexchange.assets.infrastructure.generated.FeedHaltEncoder().wrapAndApplyHeader(b, 0, he).correlationId(1)
+                .reason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.SETTLE_REFUSED).meEpochSeen(2)
+                .expectedJournalSeq(3).seenJournalSeq(4).bridgeIdentity(5);
+        final var fh = new com.openexchange.assets.infrastructure.generated.FeedHaltDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(66, hd.templateId());
+        assertEquals(7, hd.version());
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L), List.of(fh.correlationId(), fh.meEpochSeen(), fh.expectedJournalSeq(),
+                fh.seenJournalSeq(), fh.bridgeIdentity()));
+        assertEquals(com.openexchange.assets.infrastructure.generated.FeedHaltReason.SETTLE_REFUSED, fh.reason());
+
+        for (final int n : new int[] {0, 1, 48}) {
+            final var re = new com.openexchange.assets.infrastructure.generated.MeCommandReleaseEncoder().wrapAndApplyHeader(b, 0, he)
+                    .egressSeq(10).journalSeq(11).meEpoch(12).releaseSeq(13).ledgerSize(14).ledgerCapacity(15).tombstoneRanges(16);
+            final var g = re.releasesCount(n);
+            for (int i = 0; i < n; i++) {
+                g.next().commandIdHigh(100 + i).idLowFloor(4 * i)
+                        .scope(i % 2 == 0 ? com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO
+                                : com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER)
+                        .result(com.openexchange.assets.infrastructure.generated.ReleaseResult.get((short) (i % 3)))
+                        .removed(i);
+            }
+            assertEquals(MessageHeaderEncoder.ENCODED_LENGTH + 44 + 4 + 22 * n, MessageHeaderEncoder.ENCODED_LENGTH + re.encodedLength());
+            final var rd = new com.openexchange.assets.infrastructure.generated.MeCommandReleaseDecoder().wrapAndApplyHeader(b, 0, hd);
+            assertEquals(List.of(10L, 11L, 12L, 13L), List.of(rd.egressSeq(), rd.journalSeq(), rd.meEpoch(), rd.releaseSeq()));
+            assertEquals(List.of(14, 15, 16), List.of(rd.ledgerSize(), rd.ledgerCapacity(), rd.tombstoneRanges()));
+            int i = 0;
+            for (final var e : rd.releases()) {
+                assertEquals(100 + i, e.commandIdHigh());
+                assertEquals(4L * i, e.idLowFloor());
+                assertEquals(i % 2, e.scopeRaw());
+                assertEquals(i % 3, e.resultRaw());
+                assertEquals(i, e.removed());
+                i++;
+            }
+            assertEquals(n, i);
+        }
+
+        new com.openexchange.assets.infrastructure.generated.MeEngineConfigEncoder().wrapAndApplyHeader(b, 0, he)
+                .egressSeq(20).journalSeq(1).meEpoch(21).configVersion(3).behaviorVersion(2).ledgerCapacity(100_000L)
+                .maxWireVersion(12).decision(com.openexchange.assets.infrastructure.generated.ConfigDecision.BUMP);
+        final var ec = new com.openexchange.assets.infrastructure.generated.MeEngineConfigDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(List.of(20L, 1L, 21L, 3L, 2L, 100_000L), List.of(ec.egressSeq(), ec.journalSeq(), ec.meEpoch(),
+                ec.configVersion(), ec.behaviorVersion(), ec.ledgerCapacity()));
+        assertEquals(12, ec.maxWireVersion());
+        assertEquals(com.openexchange.assets.infrastructure.generated.ConfigDecision.BUMP, ec.decision());
+
+        new com.openexchange.assets.infrastructure.generated.FeedLatchClearEncoder().wrapAndApplyHeader(b, 0, he).correlationId(30)
+                .haltReason(com.openexchange.assets.infrastructure.generated.FeedHaltReason.GAP).journalSeq(31);
+        final var lc = new com.openexchange.assets.infrastructure.generated.FeedLatchClearDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(76, hd.templateId());
+        assertEquals(30, lc.correlationId());
+        assertEquals(com.openexchange.assets.infrastructure.generated.FeedHaltReason.GAP, lc.haltReason());
+        assertEquals(31, lc.journalSeq());
+
+        new com.openexchange.assets.infrastructure.generated.RegisterSessionEncoder().wrapAndApplyHeader(b, 0, he).correlationId(40)
+                .sessionClass(com.openexchange.assets.infrastructure.generated.SessionClass.REPLICA).readerKind((short) 0)
+                .resumable(BoolFlag.TRUE).identity(0).sourceEpoch(0);
+        final var rs = new com.openexchange.assets.infrastructure.generated.RegisterSessionDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(7, rs.sessionClassRaw());
+        assertEquals(com.openexchange.assets.infrastructure.generated.SessionClass.REPLICA, rs.sessionClass());
+    }
+
+    @Test
+    public void v7FeedAndBatchTailsRoundTrip() {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[8192]);
+        final MessageHeaderEncoder he = new MessageHeaderEncoder();
+        final MessageHeaderDecoder hd = new MessageHeaderDecoder();
+        new com.openexchange.assets.infrastructure.generated.MeCommandOutcomeEncoder().wrapAndApplyHeader(b, 0, he)
+                .result(8).meEpoch(1).journalSeq(2).timeInForce((short) 2).expectedOldRemaining(3).ledgerSize(4)
+                .ledgerCapacity(5).behaviorVersion(6);
+        final var oc = new com.openexchange.assets.infrastructure.generated.MeCommandOutcomeDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(List.of(8L, 1L, 2L, 2L, 3L, 4L, 5L, 6L), List.of((long) oc.result(), oc.meEpoch(), oc.journalSeq(),
+                (long) oc.timeInForce(), oc.expectedOldRemaining(), (long) oc.ledgerSize(), (long) oc.ledgerCapacity(),
+                oc.behaviorVersion()));
+
+        new com.openexchange.assets.infrastructure.generated.MeJournalTerminalEncoder().wrapAndApplyHeader(b, 0, he)
+                .journalSeq(9).rejectReason((short) 254);
+        final var jt = new com.openexchange.assets.infrastructure.generated.MeJournalTerminalDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals(9, jt.journalSeq());
+        assertEquals(254, jt.rejectReason());
+
+        final var tb = new com.openexchange.assets.infrastructure.generated.MeJournalTradeBatchEncoder().wrapAndApplyHeader(b, 0, he);
+        final var tg = tb.tradesCount(64);
+        for (int i = 0; i < 64; i++) {
+            tg.next().tradeId(i).journalSeq(1_000 + i);
+        }
+        assertEquals(6988, MessageHeaderEncoder.ENCODED_LENGTH + tb.encodedLength());
+        int i = 0;
+        for (final var t : new com.openexchange.assets.infrastructure.generated.MeJournalTradeBatchDecoder().wrapAndApplyHeader(b, 0, hd).trades()) {
+            assertEquals(1_000 + i, t.journalSeq());
+            i++;
+        }
+        assertEquals(64, i);
+
+        final var ob = new com.openexchange.assets.infrastructure.generated.OrderEventBatchEncoder().wrapAndApplyHeader(b, 0, he);
+        final var og = ob.eventsCount(48);
+        for (int k = 0; k < 48; k++) {
+            og.next().orderId(k).meReason((short) (k == 0 ? 255 : k));
+        }
+        assertEquals(8028, MessageHeaderEncoder.ENCODED_LENGTH + ob.encodedLength());
+        i = 0;
+        for (final var e : new com.openexchange.assets.infrastructure.generated.OrderEventBatchDecoder().wrapAndApplyHeader(b, 0, hd).events()) {
+            assertEquals(i == 0 ? 255 : i, e.meReason());
+            i++;
+        }
+        assertEquals(48, i);
+
+        final var db = new com.openexchange.assets.infrastructure.generated.MeDispatchBatchEncoder().wrapAndApplyHeader(b, 0, he);
+        final var dg = db.dispatchesCount(64);
+        for (int k = 0; k < 64; k++) {
+            dg.next().dispatchSeq(k).releaseScope(com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER)
+                    .expectedOldRemaining(k * 10L);
+        }
+        i = 0;
+        for (final var d : new com.openexchange.assets.infrastructure.generated.MeDispatchBatchDecoder().wrapAndApplyHeader(b, 0, hd).dispatches()) {
+            assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER, d.releaseScope());
+            assertEquals(i * 10L, d.expectedOldRemaining());
+            i++;
+        }
+        assertEquals(64, i);
+    }
+
+    /** 4.6: the publisher writes the S1 value of every appended egress field, over a dirty scratch buffer. */
+    @Test
+    public void publisherWritesTheS1ValuesOfTheV7Tails() {
+        final RawEgress egress = new RawEgress();
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> false);
+
+        // 17 FeedPositionReport: 0, 0, FALSE, NONE
+        UnsafeBuffer dirty = dirtyScratch(p, egress);
+        // precondition: every v7 field of 17 (meEpoch @25, lastAppliedJournalSeq @33, feedHalted @41, haltReason @42)
+        // starts over nonzero scratch bytes
+        assertTrue(dirty.getLong(MessageHeaderEncoder.ENCODED_LENGTH + 25) != 0);
+        assertTrue(dirty.getLong(MessageHeaderEncoder.ENCODED_LENGTH + 33) != 0);
+        assertTrue(dirty.getByte(MessageHeaderEncoder.ENCODED_LENGTH + 41) != 0);
+        assertTrue(dirty.getByte(MessageHeaderEncoder.ENCODED_LENGTH + 42) != 0);
+        assertTrue(dirty.getInt(MessageHeaderEncoder.ENCODED_LENGTH + 23) != 0); // 109 gateReasons @23
+        p.onFeedPositionReport(1L, 2L, 3L, true);
+        UnsafeBuffer f = egress.last();
+        final FeedPositionReportDecoder fp = new FeedPositionReportDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(43, headerOf(f).blockLength());
+        assertEquals(0L, fp.meEpoch());
+        assertEquals(0L, fp.lastAppliedJournalSeq());
+        assertEquals(BoolFlag.FALSE, fp.feedHalted());
+        assertEquals(com.openexchange.assets.infrastructure.generated.FeedHaltReason.NONE, fp.haltReason());
+
+        // 109 AdmissionState: OPEN -> 0, SUSPENDED -> 1 << gateReason
+        final Object[][] gates = {
+            {com.openexchange.assets.domain.GateState.OPEN, com.openexchange.assets.domain.GateReason.ADMIN, 0L},
+            {com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.ADMIN, 1L},
+            {com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.GENESIS, 1L << 5},
+            {com.openexchange.assets.domain.GateState.SUSPENDED, com.openexchange.assets.domain.GateReason.ME_BEHAVIOR, 1L << 8},
+        };
+        for (final Object[] g : gates) {
+            dirtyScratch(p, egress);
+            p.onAdmissionState(1, (com.openexchange.assets.domain.GateState) g[0], (com.openexchange.assets.domain.GateReason) g[1],
+                    false, 5L, 6L, false);
+            f = egress.last();
+            final var as = new com.openexchange.assets.infrastructure.generated.AdmissionStateDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+            assertEquals(g[0] + "/" + g[1], (long) g[2], as.gateReasons().getRaw());
+            assertEquals(((com.openexchange.assets.domain.GateReason) g[1]).code(), as.gateReasonRaw());
+        }
+
+        // 102 OrderEvent: meReason 255 (not ME-sourced)
+        dirtyScratch(p, egress);
+        f = egress.last();
+        final OrderEventDecoderView oe = new OrderEventDecoderView(f);
+        assertEquals(255, oe.meReason());
+
+        // 104 MeDispatch (broadcast and the ORIGIN reply): releaseScope 0, expectedOldRemaining 0
+        dirty = dirtyScratch(p, egress);
+        assertTrue(dirty.getLong(MessageHeaderEncoder.ENCODED_LENGTH + 81) != 0);
+        p.onMeDispatch(1L, 2L, 3L, com.openexchange.assets.domain.DispatchKind.CREATE, 4L, 5L, 6L, 1, 0, 0, 7L, 8L, 9L, 0);
+        f = egress.last();
+        var md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(89, headerOf(f).blockLength());
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+        assertEquals(0L, md.expectedOldRemaining());
+        dirtyScratch(p, egress);
+        p.onMeDispatchReply(1L, 2L, 3L, com.openexchange.assets.domain.DispatchKind.CANCEL, 4L, 5L, 6L, 1, 0, 0, 7L, 8L, 9L, 0);
+        f = egress.last();
+        md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+        assertEquals(0L, md.expectedOldRemaining());
+    }
+
+    /**
+     * RC2 S8 section 4 (W7, D-S8-1): the three appended enum values on the wire (OrderFault kinds 7 and 8, CoreRejectReason
+     * 43 on an OrderReject) and the publisher's MeDispatch fields 15 and 16 (releaseScope on RELEASE_ID, the AMEND
+     * reference), BROADCAST and ORIGIN alike.
+     */
+    @Test
+    public void s8EnumAppendsAndDispatchFieldsRoundTrip() {
+        final RawEgress egress = new RawEgress();
+        final AssetsEventPublisher p = new AssetsEventPublisher(egress, () -> false);
+        for (final com.openexchange.assets.domain.OrderFaultKind k : new com.openexchange.assets.domain.OrderFaultKind[] {
+                com.openexchange.assets.domain.OrderFaultKind.ME_INVALID, com.openexchange.assets.domain.OrderFaultKind.ME_AMEND_MISMATCH}) {
+            p.onOrderFault(k, 11L, 12L, 1, 0L, 13L, 14L);
+            final UnsafeBuffer f = egress.last();
+            final var d = new com.openexchange.assets.infrastructure.generated.OrderFaultDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+            assertEquals(k.code(), d.kindRaw());
+            assertEquals(k.name(), d.kind().name());
+            assertEquals(13L, d.amount());
+        }
+        assertEquals(7, com.openexchange.assets.domain.OrderFaultKind.ME_INVALID.code());
+        assertEquals(8, com.openexchange.assets.domain.OrderFaultKind.ME_AMEND_MISMATCH.code());
+        assertEquals(43, com.openexchange.assets.domain.CoreRejectReason.ME_RELEASED.code());
+        p.onOrderReject(5L, 0L, 0L, 1L, 2L, 1, 50, com.openexchange.assets.domain.CoreRejectReason.ME_RELEASED, 255, 0L, 9L);
+        UnsafeBuffer f = egress.last();
+        final var rej = new com.openexchange.assets.infrastructure.generated.OrderRejectDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.CoreRejectReason.ME_RELEASED, rej.reason());
+        // 104 fields 15 and 16
+        p.onMeDispatch(1L, 2L, 7L, com.openexchange.assets.domain.DispatchKind.RELEASE_ID, 0L, 0L, 0L, 0, 0, 0, 0L, 0L, 0L, 0,
+                com.openexchange.assets.domain.ReleaseScope.ORDER, 0L);
+        f = egress.last();
+        var md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.ORDER, md.releaseScope());
+        assertEquals(7L, md.commandIdLow());
+        p.onMeDispatchReply(1L, 2L, 6L, com.openexchange.assets.domain.DispatchKind.AMEND, 3L, 2L, 101L, 1, 0, 0, 100L, 50L, 0L, 0,
+                com.openexchange.assets.domain.ReleaseScope.UP_TO, 75L);
+        f = egress.last();
+        md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(75L, md.expectedOldRemaining());
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+        // releaseScope is written 0 on every other kind, whatever the caller passes (S1 4.4)
+        p.onMeDispatch(1L, 2L, 6L, com.openexchange.assets.domain.DispatchKind.CANCEL, 3L, 2L, 101L, 1, 0, 0, 0L, 0L, 0L, 0,
+                com.openexchange.assets.domain.ReleaseScope.ORDER, 0L);
+        f = egress.last();
+        md = new com.openexchange.assets.infrastructure.generated.MeDispatchDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        assertEquals(com.openexchange.assets.infrastructure.generated.ReleaseScope.UP_TO, md.releaseScope());
+    }
+
+    private static final class OrderEventDecoderView {
+        private final com.openexchange.assets.infrastructure.generated.OrderEventDecoder d;
+
+        OrderEventDecoderView(final UnsafeBuffer f) {
+            d = new com.openexchange.assets.infrastructure.generated.OrderEventDecoder().wrapAndApplyHeader(f, 0, headerOf(f));
+        }
+
+        int meReason() {
+            return d.meReason();
+        }
+    }
+
+    /**
+     * 4.4 row 70 as served by RC2 S7 (contract 7.1 rows 2 and 2b; the S1 form of this test pinned "decoded, neither
+     * compared nor recorded" and said S7 turns the other-nonce resend into a re-genesis REJECT): genesisId is recorded at
+     * ADOPT as sent, carried by section 8 layout v2, and any later config with another nonce is REJECTED INVALID.
+     */
+    @Test
+    public void coreConfigGenesisIdIsRecordedAndComparedFromS7() {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[2048]);
+        final MessageHeaderEncoder he = new MessageHeaderEncoder();
+        final MessageHeaderDecoder hd = new MessageHeaderDecoder();
+        final int len = coreConfig(b, he, 0x1234_5678_9ABCL);
+        final var cd = new com.openexchange.assets.infrastructure.generated.CoreConfigDecoder().wrapAndApplyHeader(b, 0, hd);
+        assertEquals("round trip", 0x1234_5678_9ABCL, cd.genesisId());
+
+        final AssetsEngine engine = new AssetsEngine();
+        final com.openexchange.assets.determinism.RecordingAssetsSink sink = new com.openexchange.assets.determinism.RecordingAssetsSink();
+        engine.setEventSink(sink);
+        engine.setConfigFailFast(() -> { throw new AssertionError("the compiled tables must pass the cross-check"); });
+        final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, new SettlementProjector(engine));
+        demuxer.dispatchTrusted(b, 0, len, 1_000L);
+        assertEquals(1, engine.coreConfig().adoptedCount());
+        assertEquals("recorded as sent (S7 7.1 row 2)", 0x1234_5678_9ABCL, engine.coreConfig().recorded().genesisId);
+        final org.agrona.ExpandableArrayBuffer img = new org.agrona.ExpandableArrayBuffer();
+        final int imgLen = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, img);
+
+        // the same config under another nonce is a re-genesis attempt: REJECTED INVALID (row 2b), nothing recorded
+        demuxer.dispatchTrusted(b, 0, coreConfig(b, he, 42L), 1_000L);
+        assertEquals(0, engine.coreConfig().duplicateCount());
+        assertEquals(1, engine.coreConfig().rejectCount());
+        assertEquals(0, demuxer.decodeRejectCount());
+        final var ack = (com.openexchange.assets.determinism.AssetsEngineEvent.AdminAck) sink.events().get(sink.events().size() - 1);
+        assertEquals(com.openexchange.assets.domain.AdminResult.REJECTED, ack.result());
+        assertEquals(com.openexchange.assets.domain.CoreRejectReason.INVALID.code(), ack.reason());
+        assertEquals(0x1234_5678_9ABCL, engine.coreConfig().recorded().genesisId);
+        final org.agrona.ExpandableArrayBuffer img2 = new org.agrona.ExpandableArrayBuffer();
+        final int imgLen2 = com.openexchange.assets.infrastructure.persistence.BalanceSnapshotCodec.serialize(engine, img2);
+        final byte[] a = new byte[imgLen];
+        final byte[] c = new byte[imgLen2];
+        img.getBytes(0, a);
+        img2.getBytes(0, c);
+        org.junit.Assert.assertArrayEquals("the refused re-genesis leaves no trace in the image", a, c);
+    }
+
+    /** The compiled market and asset tables as a behaviour-1 CoreConfig (what the cross-check accepts). */
+    private static int coreConfig(final UnsafeBuffer b, final MessageHeaderEncoder he, final long genesisId) {
+        final var e = new com.openexchange.assets.infrastructure.generated.CoreConfigEncoder().wrapAndApplyHeader(b, 0, he)
+                .correlationId(1).configVersion(1).behaviorVersion(1).genesisId(genesisId);
+        final var m = e.marketsCount(com.openexchange.assets.domain.Market.ALL.length);
+        for (final com.openexchange.assets.domain.Market d : com.openexchange.assets.domain.Market.ALL) {
+            m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id()).quoteAssetId(d.quoteAsset().id())
+                    .tickSize(1).minPrice(1).maxPrice(Long.MAX_VALUE / 4).lotSize(1);
+        }
+        final var a = e.assetsCount(Asset.values().length);
+        for (final Asset d : Asset.values()) {
+            a.next().assetId(d.id()).code(d.name()).scale((short) 8);
+        }
+        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
     }
 
     private static void assertChannel(CapturingEgress egress, int expected, String what) {

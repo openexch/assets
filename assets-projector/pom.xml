@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.openexchange.assets</groupId>
         <artifactId>assets</artifactId>
-        <version>0.1.0-SNAPSHOT</version>
+        <version>0.1.0-runtime.20260928.r02d.g571248f</version>
     </parent>
 
     <artifactId>assets-projector</artifactId>
@@ -22,6 +22,13 @@
         <dependency>
             <groupId>com.openexchange.assets</groupId>
             <artifactId>assets-common</artifactId>
+        </dependency>
+
+        <!-- RC2 S17 W10: the engines' driver wait setting (EngineLifecycle.driverWaitMs); already on the classpath
+             (and in the shaded jar) through assets-common, declared because the projector now uses it directly. -->
+        <dependency>
+            <groupId>com.openexchange</groupId>
+            <artifactId>cluster-kit</artifactId>
         </dependency>
 
         <!-- Aeron (full: embedded media driver + archive replay client for the journal recording) -->

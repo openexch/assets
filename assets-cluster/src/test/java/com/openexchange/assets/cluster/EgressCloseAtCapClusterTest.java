@@ -12,6 +12,7 @@ import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import io.aeron.cluster.ClusteredMediaDriver;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -55,6 +56,8 @@ public class EgressCloseAtCapClusterTest {
 
     private static final int PORT_BASE = 19500; // disjoint from boot smoke (19300) and cadence (19400)
     private static final long USER = 5151L;
+    /** Deposits in flight ahead of the healthy session's view; their egress stays far below the cap. */
+    private static final int FLOOD_WINDOW = 256;
 
     /** Captures the last observed available balance, batch or single (v5 coalescing). */
     private static final class BalanceEgress implements EgressListener {
@@ -97,6 +100,7 @@ public class EgressCloseAtCapClusterTest {
 
         final List<String> hosts = List.of("localhost");
         final AssetsClusteredService service = new AssetsClusteredService();
+        TestAuth.install();
         final ClusterConfig cfg = ClusterConfig.create(0, hosts, PORT_BASE, service);
         cfg.baseDir(baseDir);
         cfg.aeronDirectoryName(aeronDir);
@@ -127,6 +131,7 @@ public class EgressCloseAtCapClusterTest {
             container = ClusteredServiceContainer.launch(cfg.clusteredServiceContext());
 
             wedged = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.BRIDGE))
                     .egressListener((clusterSessionId, timestamp, buffer, offset, length, header) -> { })
                     // 64K term: transport back-pressure after ~32KB un-polled, so the session's queue
                     // is what accumulates toward the (lowered) cap.
@@ -137,6 +142,7 @@ public class EgressCloseAtCapClusterTest {
                             hosts, PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET))
                     .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10)));
             healthy = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(TestAuth.credentials(SessionClass.TOOL))
                     .egressListener(healthyEgress)
                     .egressChannel("aeron:udp?endpoint=localhost:0")
                     .ingressChannel("aeron:udp?term-length=16m|mtu=8192")
@@ -147,18 +153,29 @@ public class EgressCloseAtCapClusterTest {
 
             // Step 1 of the resume protocol: the wedged client identifies itself as a feed consumer.
             // After this offer it never polls egress again — the metal-drill wedge, in miniature.
+            // RC1 S3: the resumable mark is now the replicated RegisterSession, not a QueryFeedPosition side effect.
+            TestAuth.register(wedged, SessionClass.BRIDGE);
             offer(wedged, encodeQueryFeedPosition(0xFEEDL));
 
             // Pump: every deposit's egress fans out to BOTH sessions' queues. The healthy session
             // drains; the wedged one absorbs ~32KB in its response publication, then its queue grows
             // to the 64KB cap, where the engine must CLOSE it rather than block.
+            // The cap applies to EVERY session, so the flood is windowed: at most FLOOD_WINDOW deposits
+            // are ahead of what the healthy session has observed (USER's available balance counts the
+            // applied deposits it has seen). An open-loop flood leaves tens of thousands of deposits
+            // queued in ingress when the wedged session closes, and their egress then overflows the
+            // healthy session's 64KB queue too, closing it as well.
+            final long unit = FixedPoint.fromDouble(1.0);
             final long floodDeadline = System.currentTimeMillis() + 60_000;
             int sent = 0;
             while (service.resumableSessionsClosed() == 0) {
                 assertTrue("cap not reached before the deadline (deposits sent=" + sent + ")",
                         System.currentTimeMillis() < floodDeadline);
-                offer(healthy, encodeDeposit(USER, Asset.USD.id(), FixedPoint.fromDouble(1.0)));
-                sent++;
+                final long seen = Math.max(0L, healthyEgress.lastAvail.get()) / unit;
+                if (sent - seen < FLOOD_WINDOW) {
+                    offer(healthy, encodeDeposit(USER, Asset.USD.id(), unit));
+                    sent++;
+                }
                 healthy.pollEgress();
             }
 
@@ -172,6 +189,9 @@ public class EgressCloseAtCapClusterTest {
             boolean terminal = false;
             final long terminalDeadline = System.currentTimeMillis() + 20_000;
             while (!terminal && System.currentTimeMillis() < terminalDeadline) {
+                // Deposits offered during the flood are still being applied, and every session's queue
+                // is capped. The healthy consumer must keep draining or it is closed at its cap too.
+                healthy.pollEgress();
                 try {
                     wedged.pollEgress();
                     terminal = wedged.isClosed();
@@ -215,7 +235,7 @@ public class EgressCloseAtCapClusterTest {
 
     private int encodeDeposit(long userId, int assetId, long amount) {
         depositEnc.wrapAndApplyHeader(ingress, 0, headerEnc)
-                .correlationId(0L).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(0L).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
         return MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength();
     }
 

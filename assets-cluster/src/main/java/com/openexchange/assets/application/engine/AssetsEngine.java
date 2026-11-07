@@ -1,12 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.assets.application.engine;
 
+import com.openexchange.assets.application.engine.feed.FeedState;
+import com.openexchange.assets.application.engine.gate.OrderEntryGate;
+import com.openexchange.assets.application.engine.order.CoreMetricsView;
+import com.openexchange.assets.application.engine.order.MeOutcomeView;
+import com.openexchange.assets.application.engine.order.MeReleaseView;
+import com.openexchange.assets.application.engine.order.OrderEngine;
+import com.openexchange.assets.application.engine.session.SessionAuthority;
+import com.openexchange.assets.application.engine.session.SessionRegistry;
+import com.openexchange.assets.application.engine.time.DeadlineIndex;
+import com.openexchange.assets.domain.AdminResult;
+import com.openexchange.assets.domain.ConfigDecision;
+import com.openexchange.assets.domain.CoreRejectReason;
+import com.openexchange.assets.domain.FeedHaltReason;
+import com.openexchange.assets.domain.OrderFaultKind;
+import com.openexchange.assets.domain.GateReason;
+import com.openexchange.assets.domain.GateState;
+import com.openexchange.assets.infrastructure.generated.SessionClass;
 import com.openexchange.assets.domain.Account;
+import com.openexchange.assets.domain.Asset;
 import com.openexchange.assets.domain.AssetsEventSink;
 import com.openexchange.assets.domain.FixedPoint;
 import com.openexchange.assets.domain.Market;
 import com.openexchange.assets.domain.MoneyJournalSink;
 import com.openexchange.assets.domain.RejectReason;
+import com.openexchange.assets.domain.SettleRejectReason;
 import com.openexchange.assets.domain.SettlementService;
 import com.openexchange.assets.domain.commands.DepositCommand;
 import com.openexchange.assets.domain.commands.HoldCommand;
@@ -21,6 +40,7 @@ import org.agrona.collections.Long2ObjectHashMap;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 /**
  * Application-layer orchestrator for the Assets Engine — the deterministic state machine that turns a
@@ -69,6 +89,39 @@ public final class AssetsEngine {
     private long suppressedFeedReleaseCount = 0L;
     /** Holds exhausted by a settle (remaining hit 0) and reaped at settle time — never tombstoned. */
     private long exhaustedHoldsReaped = 0L;
+    /** Feed settles refused before any mutation (SettleRejected emitted). Alarm target. */
+    private long settleRejectCount = 0L;
+
+    // ---- RC1 S2: replicated v4 scalars and the derived deadline index ----
+    /**
+     * Monotone log time: {@code max(timestamp, previous)} over every applied entry (risk spec rule). The
+     * cluster timestamp is written by the leader and is not assumed never to step backwards across a
+     * leadership change; every window, GTD sweep and TTL compares against THIS value, so a backwards
+     * step can only delay a deadline, never grant one twice. Snapshotted.
+     */
+    private long lastLogTime = 0L;
+    /** Replicated dense order id counter (RC1 S4 mints from it; 0 until then). Snapshotted. */
+    private long nextOrderId = 0L;
+    /** OrderEvent dense sequence (RC1 S4). Snapshotted. */
+    private long eventSeq = 0L;
+    /** MeDispatch dense sequence (RC1 S4). Snapshotted. */
+    private long dispatchSeq = 0L;
+    /**
+     * The ONE deadline index (K3-D). DERIVED: rebuilt on restore from the records that own the deadlines
+     * (GTD orders, replace windows, requestId TTLs land in S4/S5), never serialized. The service arms the
+     * single sweep timer while it is non-empty; {@link #sweep} pops what is due.
+     */
+    private final DeadlineIndex deadlines = new DeadlineIndex();
+    /** RC1 S3 (K6): every live session's authority; replicated-derived, snapshotted (section 9). */
+    private final SessionRegistry sessions = new SessionRegistry();
+    /** RC1 S3 (K5 item 3): the replicated order-entry gate; snapshotted (section 5). */
+    private final OrderEntryGate gate = new OrderEntryGate();
+    /** RC1 S4: order lifecycle, risk and the requestId table (sections 2, 3, 4, 6). */
+    private final OrderEngine orders = new OrderEngine(this);
+    /** Commands refused for session authority (class, scope, registration). Alarm target, not snapshotted. */
+    private long unauthorisedCount = 0L;
+    /** The log position of the entry being applied; set by the service, carried on control egress. Transient. */
+    private long logPosition = 0L;
 
     // Money journal (dark by default): a dead, perfectly-predicted branch per applied command when
     // off; when armed, every APPLIED movement is emitted through the port with a dense journalSeq.
@@ -122,6 +175,7 @@ public final class AssetsEngine {
      * stays logical (does not carry it), so egress output is trivially wall-clock independent.
      */
     public void applyCommand(int type, Object command, long timestamp) {
+        observeLogTime(timestamp);
         switch (type) {
             case CMD_DEPOSIT:         applyDeposit((DepositCommand) command, timestamp); break;
             case CMD_WITHDRAW:        applyWithdraw((WithdrawCommand) command, timestamp); break;
@@ -135,35 +189,102 @@ public final class AssetsEngine {
     }
 
     private void applyDeposit(DepositCommand c, long timestamp) {
+        // Validate, THEN mutate (RC1 S1, K5): a rejected command creates no account. Everything that can
+        // refuse a deposit on a NEW account is decidable before the account exists (a fresh account's
+        // headroom is Long.MAX_VALUE, so only the amount and the asset can reject it).
+        if (!validAsset(c.getAssetId())) {
+            return; // the demuxer already counted and refused this; defensive only
+        }
+        final long fingerprint = OrderEngine.moneyFingerprint(c.getUserId(), c.getAssetId(), c.getAmount());
+        if (c.hasRequestId()) {
+            final var seen = orders.requests().get(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow());
+            if (seen != null) {
+                if (seen.fingerprint != fingerprint) {
+                    sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                            c.getAssetId(), c.getAmount(), RejectReason.REQUEST_ID_MISMATCH);
+                    return;
+                }
+                final Account existing = accounts.get(c.getUserId());
+                sink.onDepositAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                        existing == null ? 0L : existing.available(c.getAssetId()), true);
+                return;
+            }
+        }
+        if (c.getAmount() <= 0) {
+            sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                    c.getAssetId(), c.getAmount(), RejectReason.INVALID_AMOUNT);
+            return; // no money effect, no account
+        }
+        final Account known = accounts.get(c.getUserId());
+        if (known != null && c.getAmount() > known.headroom(c.getAssetId())) {
+            sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                    c.getAssetId(), c.getAmount(), RejectReason.BALANCE_OVERFLOW);
+            return;
+        }
         captureOpeningEpochIfArmed();
         Account a = getOrCreateAccount(c.getUserId());
         RejectReason r = a.deposit(c.getAssetId(), c.getAmount());
         if (r.accepted()) {
             // Ack (echoing the correlationId) precedes the balance update, matching hold's order.
             sink.onDepositAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
-                    a.available(c.getAssetId()));
+                    a.available(c.getAssetId()), false);
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
             if (journalEnabled) {
                 emitOpeningEpochIfPending();
                 journal.onDeposit(++journalSeq, c.getUserId(), c.getAssetId(), c.getAmount(),
                         a.available(c.getAssetId()) + a.locked(c.getAssetId()), timestamp);
             }
+            if (c.hasRequestId()) {
+                orders.rememberMoney(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow(), fingerprint,
+                        com.openexchange.assets.application.engine.order.RequestTable.KIND_DEPOSIT, c.getAmount(), lastLogTime);
+            }
+        } else {
+            sink.onDepositReject(c.getCorrelationId(), c.getRequestIdHigh(), c.getRequestIdLow(), c.getUserId(),
+                    c.getAssetId(), c.getAmount(), r);
         }
-        // A rejected deposit (non-positive amount) is a client error with no money effect and no ack.
     }
 
     private void applyWithdraw(WithdrawCommand c, long timestamp) {
+        if (!validAsset(c.getAssetId())) {
+            return; // never a throw, never an account
+        }
+        final long fingerprint = OrderEngine.moneyFingerprint(c.getUserId(), c.getAssetId(), c.getAmount());
+        if (c.hasRequestId()) {
+            final var seen = orders.requests().get(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow());
+            if (seen != null) {
+                // money commands are remembered only when ACCEPTED (a refused one may be retried as-is)
+                if (seen.fingerprint != fingerprint) {
+                    sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(), RejectReason.REQUEST_ID_MISMATCH);
+                } else {
+                    final Account existing = accounts.get(c.getUserId());
+                    sink.onWithdrawAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                            existing == null ? 0L : existing.available(c.getAssetId()), true);
+                }
+                return;
+            }
+        }
+        Account a = accounts.get(c.getUserId());
+        if (a == null) {
+            // An unknown user holds nothing: the same reject the account itself would give, without
+            // creating the account to find that out.
+            sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                    c.getAmount() <= 0 ? RejectReason.INVALID_AMOUNT : RejectReason.INSUFFICIENT_FUNDS);
+            return;
+        }
         captureOpeningEpochIfArmed();
-        Account a = getOrCreateAccount(c.getUserId());
         RejectReason r = a.withdraw(c.getAssetId(), c.getAmount());
         if (r.accepted()) {
             sink.onWithdrawAck(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(),
-                    a.available(c.getAssetId()));
+                    a.available(c.getAssetId()), false);
             sink.onBalanceUpdate(c.getUserId(), c.getAssetId(), a.available(c.getAssetId()), a.locked(c.getAssetId()));
             if (journalEnabled) {
                 emitOpeningEpochIfPending();
                 journal.onWithdraw(++journalSeq, c.getUserId(), c.getAssetId(), c.getAmount(),
                         a.available(c.getAssetId()) + a.locked(c.getAssetId()), timestamp);
+            }
+            if (c.hasRequestId()) {
+                orders.rememberMoney(c.getUserId(), c.getRequestIdHigh(), c.getRequestIdLow(), fingerprint,
+                        com.openexchange.assets.application.engine.order.RequestTable.KIND_WITHDRAW, c.getAmount(), lastLogTime);
             }
         } else {
             sink.onWithdrawReject(c.getCorrelationId(), c.getUserId(), c.getAssetId(), c.getAmount(), r);
@@ -171,7 +292,20 @@ public final class AssetsEngine {
     }
 
     private void applyHold(HoldCommand c) {
-        Account a = getOrCreateAccount(c.getUserId());
+        if (!validAsset(c.getAssetId())) {
+            return; // never a throw, never an account
+        }
+        if (behaviorV3() && c.getOrderId() >= 1) {
+            // RC2 S8 3.12 (D-S8-10): under v3 the core owns every orderId >= 1; the engine guard for every caller (no reply)
+            coreOrderHoldRefusedCount++;
+            return;
+        }
+        Account a = accounts.get(c.getUserId());
+        if (a == null) {
+            sink.onHoldReject(c.getCorrelationId(), c.getOrderId(), c.getUserId(), c.getAssetId(), c.getAmount(),
+                    c.getAmount() <= 0 ? RejectReason.INVALID_AMOUNT : RejectReason.INSUFFICIENT_FUNDS);
+            return;
+        }
         RejectReason r = a.hold(c.getOrderId(), c.getAssetId(), c.getAmount(), c.isOmsManagedRelease());
         if (r.accepted()) {
             sink.onHoldAck(c.getCorrelationId(), c.getOrderId(), c.getUserId(), c.getAssetId(), c.getAmount());
@@ -185,6 +319,12 @@ public final class AssetsEngine {
         Account a = accounts.get(c.getUserId());
         if (a == null) {
             return; // unknown user: nothing held
+        }
+        if (behaviorV3() && c.getOrderId() >= 1) {
+            // RC2 S8 3.12 (supersedes S7 7.2 row 4): a core order's hold has ONE release owner, terminalize (S5 3.2), live or
+            // dead; the engine guard for every caller (no reply, nothing moves)
+            coreOrderReleaseRefusedCount++;
+            return;
         }
         int assetId = a.holdAssetId(c.getOrderId());
         if (assetId < 0) {
@@ -202,11 +342,40 @@ public final class AssetsEngine {
     }
 
     private void applySettle(SettleCommand c, long timestamp) {
+        settle(c, timestamp);
+    }
+
+    /**
+     * Apply a trade. Returns {@code false} when the trade was REFUSED before any mutation (unknown market,
+     * non-positive price or quantity, notional overflow, bad party): a {@code SettleRejected} is emitted,
+     * nothing moves, and the caller must NOT advance the journal cursor past it. Every one of these
+     * used to be a throw out of the apply path, which would have latched this replica and, on replay,
+     * every replica. A duplicate (tradeId at or below the high-water) is an idempotent no-op and returns
+     * {@code true}: it was consumed, just not applied again.
+     */
+    public boolean settle(SettleCommand c, long timestamp) {
+        observeLogTime(timestamp);
         if (c.getTradeId() <= lastAppliedTradeId) {
-            return; // already applied (monotonic, gap-free): idempotent no-op, journals nothing
+            return true; // already applied (monotonic, gap-free): idempotent no-op, journals nothing
+        }
+        final Market m = marketOrNull(c.getMarketId());
+        if (m == null) {
+            return refuseSettle(c, SettleRejectReason.UNKNOWN_MARKET, c.getMarketId());
+        }
+        if (c.getPrice() <= 0) {
+            return refuseSettle(c, SettleRejectReason.INVALID_PRICE, c.getPrice());
+        }
+        if (c.getQuantity() <= 0) {
+            return refuseSettle(c, SettleRejectReason.INVALID_QUANTITY, c.getQuantity());
+        }
+        if (c.getTakerUserId() <= 0 || c.getMakerUserId() <= 0) {
+            return refuseSettle(c, SettleRejectReason.INVALID_PARTY,
+                    c.getTakerUserId() <= 0 ? c.getTakerUserId() : c.getMakerUserId());
+        }
+        if (!FixedPoint.multiplyFits(c.getPrice(), c.getQuantity())) {
+            return refuseSettle(c, SettleRejectReason.NOTIONAL_OVERFLOW, c.getPrice());
         }
         captureOpeningEpochIfArmed();
-        Market m = Market.fromId(c.getMarketId());
         int base = m.baseAsset().id();
         int quote = m.quoteAsset().id();
         long baseAmt = c.getQuantity();
@@ -279,6 +448,25 @@ public final class AssetsEngine {
                     seller.available(base) + seller.locked(base), seller.available(quote) + seller.locked(quote),
                     timestamp);
         }
+        return true;
+    }
+
+    private boolean refuseSettle(SettleCommand c, SettleRejectReason reason, long detail) {
+        settleRejectCount++;
+        sink.onSettleRejected(c.getTradeId(), c.getMarketId(), c.getJournalPosition(), reason, detail);
+        return false;
+    }
+
+    private static boolean validAsset(int assetId) {
+        return assetId >= 0 && assetId < Asset.count();
+    }
+
+    /** Non-throwing market lookup: the apply path must never throw on input. */
+    private static Market marketOrNull(int marketId) {
+        if (marketId < 1 || marketId >= Market.ALL.length + 1) {
+            return null;
+        }
+        return Market.ALL[marketId - 1].marketId() == marketId ? Market.ALL[marketId - 1] : null;
     }
 
     // ---- money journal (movements only; holds/releases never journal: they do not change totals) ----
@@ -329,6 +517,12 @@ public final class AssetsEngine {
      */
     private void applyInitHighWater(InitTradeHighWaterCommand c) {
         boolean virgin = lastAppliedTradeId == 0L && consumePosition == 0L && accounts.isEmpty();
+        if (behaviorV3()) {
+            // RC2 S7 7.2 row 5: the primer would break the dense tradeId the v3 cursor relies on (3.4)
+            LOG.warn("InitTradeHighWater REFUSED (behaviour v3): requested tradeId=%d consumePosition=%d",
+                    c.getTradeId(), c.getConsumePosition());
+            return;
+        }
         if (!virgin) {
             LOG.warn("InitTradeHighWater REFUSED (ledger not virgin): requested tradeId=%d consumePosition=%d; "
                             + "current lastAppliedTradeId=%d consumePosition=%d accountCount=%d",
@@ -370,7 +564,9 @@ public final class AssetsEngine {
      * through the sink. Read-only; deterministic on every replica (egress is leader-gated downstream).
      */
     public void reportFeedPosition(long correlationId) {
-        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled);
+        // RC2 S7 3.6: the v7 tail is the FeedState (all zero under v1/v2: S1's 0, 0, FALSE, NONE)
+        sink.onFeedPositionReport(correlationId, consumePosition, lastAppliedTradeId, journalEnabled, feed.boundMeEpoch(),
+                feed.lastAppliedJournalSeq(), feed.latched(), feed.haltReason()); // RC2 S10' 4R.1 rule 6
     }
 
     /** Settle legs that faulted (drew from available / left an uncovered residue) since boot. */
@@ -386,6 +582,11 @@ public final class AssetsEngine {
     /** Holds exhausted by a settle (drawn to remaining=0) and reaped at settle time since boot. */
     public long getExhaustedHoldsReaped() {
         return exhaustedHoldsReaped;
+    }
+
+    /** Feed settles refused before any mutation (SettleRejected emitted) since boot. Alarm target. */
+    public long getSettleRejectCount() {
+        return settleRejectCount;
     }
 
     /**
@@ -510,5 +711,1139 @@ public final class AssetsEngine {
     /** Restore the journal sequence from a snapshot (recovery only). */
     public void setJournalSeq(long value) {
         this.journalSeq = value;
+    }
+
+    // ---- RC1 S2: log time, the deadline sweep, restore verification ----
+
+    public void observeLogTime(long timestamp) {
+        if (timestamp > lastLogTime) {
+            lastLogTime = timestamp;
+        }
+    }
+
+    /** The derived deadline index; owners add and remove entries, the sweep pops them. */
+    public DeadlineIndex deadlines() {
+        return deadlines;
+    }
+
+    /**
+     * The deadline sweep (one cluster TimerEvent, applied on every replica): pop every entry due at or
+     * before the monotone log time and apply its expiry. One-shot per entry, so a sweep that fires twice
+     * at the same time applies nothing the second time (what makes re-arming after a restore safe).
+     * Expiry semantics per kind land with their slices (GTD/replace in S5, requestId TTL in S4); this
+     * build pops and counts.
+     *
+     * @return entries popped
+     */
+    public int sweep(long timestamp) {
+        observeLogTime(timestamp);
+        return deadlines.popDue(lastLogTime, this::onDeadline);
+    }
+
+    private void onDeadline(long deadlineMs, long id, int kind) {
+        orders.onDeadline(deadlineMs, id, kind, lastLogTime);
+    }
+
+    public long getLastLogTime() {
+        return lastLogTime;
+    }
+
+    /** Restore only. */
+    public void setLastLogTime(long value) {
+        this.lastLogTime = value;
+    }
+
+    public long getNextOrderId() {
+        return nextOrderId;
+    }
+
+    /** Restore only. */
+    public void setNextOrderId(long value) {
+        this.nextOrderId = value;
+    }
+
+    public long getEventSeq() {
+        return eventSeq;
+    }
+
+    /** Restore only. */
+    public void setEventSeq(long value) {
+        this.eventSeq = value;
+    }
+
+    public long getDispatchSeq() {
+        return dispatchSeq;
+    }
+
+    /** Restore only. */
+    public void setDispatchSeq(long value) {
+        this.dispatchSeq = value;
+    }
+
+    /**
+     * The structural invariants a restored ledger must satisfy before this node serves (layout page §3):
+     * no negative balance, and for every (account, asset) {@code locked == Σ remaining} over that asset's
+     * holds. Bytes that break them are a corrupt or foreign snapshot; the caller stops the node.
+     *
+     * @throws IllegalStateException naming the first breach
+     */
+    public void verifyRestoredInvariants() {
+        final int assets = Asset.count();
+        final long[] sumHold = new long[assets];
+        final Account[] offender = new Account[1];
+        final String[] breach = new String[1];
+        forEachAccountByUserId(acc -> {
+            if (breach[0] != null) {
+                return;
+            }
+            java.util.Arrays.fill(sumHold, 0L);
+            acc.forEachHold((orderId, assetId, remaining, oms) -> {
+                if (assetId >= 0 && assetId < assets) {
+                    sumHold[assetId] += remaining;
+                }
+            });
+            for (int a = 0; a < assets && breach[0] == null; a++) {
+                if (acc.available(a) < 0 || acc.locked(a) < 0) {
+                    breach[0] = "negative balance user=" + acc.userId() + " asset=" + a
+                            + " available=" + acc.available(a) + " locked=" + acc.locked(a);
+                } else if (acc.locked(a) != sumHold[a]) {
+                    breach[0] = "locked != sum(holds) user=" + acc.userId() + " asset=" + a
+                            + " locked=" + acc.locked(a) + " holds=" + sumHold[a];
+                }
+                offender[0] = acc;
+            }
+        });
+        if (breach[0] != null) {
+            throw new IllegalStateException("restored ledger fails its invariants: " + breach[0]);
+        }
+        // RC2 S7 6.3 and 2.1: the gate reason sets and the feed state
+        final boolean v3 = behaviorV3();
+        for (int m = 0; m <= OrderEntryGate.MARKETS; m++) {
+            final String g = gate.restoreBreach(m, v3);
+            if (g != null) {
+                throw new IllegalStateException("restored gates fail their invariants: " + g);
+            }
+        }
+        final String f = feed.invariantBreach(lastAppliedTradeId);
+        if (f != null) {
+            throw new IllegalStateException("restored feed state fails its invariants: " + f);
+        }
+        if (!v3 && (feed.boundMeEpoch() != 0 || feed.lastAppliedJournalSeq() != 0 || feed.latched())) {
+            throw new IllegalStateException("restored feed state is not empty below behaviour 3");
+        }
+        if (v3 && feed.boundMeEpoch() == 0 && gate.state(OrderEntryGate.GLOBAL) != GateState.SUSPENDED) {
+            throw new IllegalStateException("restored v3 core is unbound with GLOBAL " + gate.state(OrderEntryGate.GLOBAL));
+        }
+        // review F-3: every latch adds BRIDGE_HALT on GLOBAL; ADMIN OPEN is refused while latched
+        final boolean bridgeHaltBit = (gate.reasons(OrderEntryGate.GLOBAL) & (1 << GateReason.BRIDGE_HALT.code())) != 0;
+        if (v3 && feed.latched() && !bridgeHaltBit) {
+            throw new IllegalStateException("restored v3 core is latched " + feed.haltReason() + " without BRIDGE_HALT on GLOBAL");
+        }
+        // RC2 S10' 4R.1 rule 5: the lane-halt table, the overflow record and the holder set agree with the gate bit
+        if (!v3 && !feed.haltTableEmpty()) {
+            throw new IllegalStateException("restored lane-halt table is not empty below behaviour 3");
+        }
+        if (v3) {
+            final String h = feed.haltBreach(bridgeHaltBit);
+            if (h != null) {
+                throw new IllegalStateException("restored lane-halt table fails its invariants: " + h);
+            }
+        }
+        // review F-3: EPOCH_MISMATCH is raised only against a bound epoch (D1 row 3, a non-stale 66)
+        if (feed.latchReason() == FeedHaltReason.EPOCH_MISMATCH && feed.boundMeEpoch() == 0) {
+            throw new IllegalStateException("restored EPOCH_MISMATCH latch on an unbound feed");
+        }
+        // RC2 S8 5.1 a-d (every behaviour; d under v3) and 5.2 rules 1-7 (v3), each with its live rule (5.0)
+        final String o = orders.orderRestoreBreach(v3);
+        if (o != null) {
+            throw new IllegalStateException("restored orders fail their invariants: " + o);
+        }
+        if (v3) {
+            final String l = orders.meLinkRestoreBreach();
+            if (l != null) {
+                throw new IllegalStateException("restored ME link (section 11) fails its invariants: " + l);
+            }
+            orders.countRestoreDiagnostics();
+        }
+        orders.rebuildDerived();
+    }
+
+    // ---- RC1 S3: session authority and the order-entry gate ----
+
+    public SessionRegistry sessions() {
+        return sessions;
+    }
+
+    public OrderEntryGate gate() {
+        return gate;
+    }
+
+    public OrderEngine orders() {
+        return orders;
+    }
+
+    // ---- RC1 S7: CoreConfig and the behaviour version ----
+
+    private final com.openexchange.assets.application.engine.config.CoreConfigStateMachine coreConfig =
+            new com.openexchange.assets.application.engine.config.CoreConfigStateMachine();
+    /** Node-local fail-fast hook for the CoreConfig cross-check (A-9 rule); the service installs its halt. */
+    private Runnable configFailFast = () -> { };
+
+    public com.openexchange.assets.application.engine.config.CoreConfigStateMachine coreConfig() {
+        return coreConfig;
+    }
+
+    public void setConfigFailFast(Runnable failFast) {
+        this.configFailFast = failFast;
+    }
+
+    /** CoreConfig (70), ADMIN class: contract S7 section 3, then the node-local cross-check (section 4). */
+    public void applyCoreConfig(com.openexchange.assets.domain.commands.CoreConfigCommand c, long timestamp) {
+        observeLogTime(timestamp);
+        // RC2 S8 3.12: one O(holds) walk inside the switching apply only (review 2 NOTE-E kept: one boolean into decide)
+        final boolean foreignCoreHold = c.behaviorVersion == 3 && coreConfig.behaviorVersion() == 2 && foreignHoldInCoreRange();
+        final var decision = coreConfig.decide(c, gate.state(OrderEntryGate.GLOBAL) == GateState.OPEN, feedVirgin(),
+                foreignCoreHold);
+        final long version = coreConfig.apply(decision, c);
+        if (decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.SWITCH
+                && c.behaviorVersion == 3) {
+            gate.convertToReasonSet(); // RC2 S7 6.1: same apply as the switch, no egress
+            if ((gate.reasons(OrderEntryGate.GLOBAL) & (1 << GateReason.BRIDGE_HALT.code())) != 0) {
+                feed.holdAwaitingOpen(); // RC2 S10' 4R.1 rule 4: a kept BRIDGE_HALT bit always has a holder (an ADMIN-set one)
+            }
+        }
+        final AdminResult result;
+        switch (decision) {
+            case ADOPT: result = AdminResult.ADOPTED; break;
+            case ACCEPT:
+            case SWITCH: result = AdminResult.ACCEPTED; break;
+            case DUPLICATE: result = AdminResult.DUPLICATE; break;
+            case STALE: result = AdminResult.STALE; break;
+            default: result = AdminResult.REJECTED; break;
+        }
+        sink.onAdminAck(c.correlationId, 70, result, result == AdminResult.REJECTED ? CoreRejectReason.INVALID.code() : 0, version);
+        if (decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.ADOPT
+                || decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.ACCEPT
+                || decision == com.openexchange.assets.application.engine.config.CoreConfigStateMachine.Decision.SWITCH) {
+            sink.onConfigApplied(com.openexchange.assets.domain.ConfigKind.CORE, 0, version, logPosition);
+            crossCheckConfigOrFail(decision.name());
+        }
+    }
+
+    /**
+     * RC2 S8 3.12 switch precondition: some account holds a hold with {@code orderId >= 1} that is not the hold of a live
+     * core order of that same account (a TOOL/ADMIN hold written under v1/v2 in what becomes the core's id space).
+     */
+    private boolean foreignHoldInCoreRange() {
+        final boolean[] found = {false};
+        forEachAccount(acc -> {
+            if (found[0]) {
+                return;
+            }
+            acc.forEachHold((orderId, assetId, remaining, oms) -> {
+                if (orderId >= 1) {
+                    final var o = orders.orders().get(orderId);
+                    if (o == null || o.userId != acc.userId()) {
+                        found[0] = true;
+                    }
+                }
+            });
+        });
+        return found[0];
+    }
+
+    /** Section 4: a node whose compiled truth differs from the declared config must not serve (never a reject). */
+    public void crossCheckConfigOrFail(String context) {
+        final String mismatch = coreConfig.crossCheck();
+        if (mismatch != null) {
+            LOG.error("CORE-CONFIG CRITICAL (%s): this node differs from the cluster's declared config: %s; exiting (fail-fast)",
+                    context, mismatch);
+            configFailFast.run();
+        }
+    }
+
+    // ---- RC1 S5: hold and gate effects owned by the order lifecycle (single release owner) ----
+
+    /**
+     * Release {@code amount} of the order's hold back to available ({@code amount < 0} = everything left) and
+     * publish the balance line. Returns the amount actually released (0 when there is no such hold).
+     */
+    public long releaseOrderHold(long userId, long orderId, long amount) {
+        final Account a = accounts.get(userId);
+        if (a == null) {
+            return 0L;
+        }
+        final int assetId = a.holdAssetId(orderId);
+        if (assetId < 0) {
+            return 0L;
+        }
+        final long released = a.release(orderId, amount);
+        sink.onBalanceUpdate(userId, assetId, a.available(assetId), a.locked(assetId));
+        return released;
+    }
+
+    /** An internal gate transition (no AdminAck): MeCommandOutcome CAPACITY, bridge halt, apply fault. */
+    public void suspendGateInternally(int marketId, GateReason reason) {
+        // v3 (D4): add the bit, AdmissionState only when it is new; v1/v2: the RC1 overwrite
+        if (behaviorV3() ? gate.addReason(marketId, reason) : gate.set(marketId, GateState.SUSPENDED, reason)) {
+            emitAdmission(marketId, false);
+        }
+    }
+
+    public AssetsEventSink eventSink() {
+        return sink;
+    }
+
+    /** The service sets this before dispatching a log entry; control egress carries it as an ordering key. */
+    public void setLogPosition(long position) {
+        this.logPosition = position;
+    }
+
+    public long getLogPosition() {
+        return logPosition;
+    }
+
+    public long getUnauthorisedCount() {
+        return unauthorisedCount;
+    }
+
+    /**
+     * A command refused before any mutation for a session-authority reason (class mismatch, foreign user,
+     * unregistered session): a deterministic ORIGIN reject naming the template, never a fence event.
+     */
+    public void rejectUnauthorised(int refTemplateId, long correlationId, long userId, CoreRejectReason reason, long detail) {
+        unauthorisedCount++;
+        sink.onOrderReject(correlationId, 0L, 0L, userId, 0L, 0, refTemplateId, reason, 255, detail, lastLogTime);
+    }
+
+    /**
+     * RegisterSession (replicated): assert the class, require resumable, record the declaration; reply
+     * AdminAck plus the global gate state so a gateway learns admission at connect.
+     *
+     * @return the registration outcome (the service closes the session on REJECTED)
+     */
+    public SessionRegistry.Registration applyRegisterSession(long sessionId, long correlationId, SessionClass assertedClass,
+                                                              int channelMask, boolean resumable, int readerKind,
+                                                              long identity, long sourceEpoch, long timestamp) {
+        observeLogTime(timestamp);
+        if (behaviorV3() && feed.boundMeEpoch() != 0 && sourceEpoch != 0 && sourceEpoch != feed.boundMeEpoch()) {
+            // RC2 S7 D8a: a FORWARDER/BRIDGE declaring another ME epoch after the bind; the registry is not called
+            final SessionAuthority a = sessions.get(sessionId);
+            if (a != null && (a.sessionClass() == SessionClass.FORWARDER || a.sessionClass() == SessionClass.BRIDGE)) {
+                final SessionRegistry.Registration refused =
+                        new SessionRegistry.Registration(AdminResult.REJECTED, CoreRejectReason.INVALID, false);
+                sink.onAdminAck(correlationId, 80, refused.result(), refused.reason().code(), 0L);
+                return refused;
+            }
+        }
+        // RC2 S10' S2-3: one live BRIDGE session per identity under behaviour 3 only (review FIX-2: a v1/v2 log replays as
+        // recorded; below v3 there is no lane-halt table for two holders to share)
+        final SessionRegistry.Registration r = sessions.register(sessionId, assertedClass, channelMask, resumable,
+                readerKind, identity, sourceEpoch, behaviorV3());
+        sink.onAdminAck(correlationId, 80, r.result(), r.reason().code(), 0L);
+        if (r.result() != AdminResult.REJECTED) {
+            emitAdmission(OrderEntryGate.GLOBAL, true);
+        }
+        return r;
+    }
+
+    // ---- RC2 S7: behaviour v3, the ME feed (contract RC2-me-link/S7/contract.md sections 2-5, 10) ----
+
+    private final FeedState feed = new FeedState();
+    /** v5 money templates refused under v3 (7.2 row 3). Node-local. */
+    private long v5MoneyRefusedCount;
+    /** RC2 S8 3.12: Hold 3 / Release 4 naming {@code orderId >= 1} under v3, refused (demuxer step or engine guard). */
+    private long coreOrderHoldRefusedCount;
+    private long coreOrderReleaseRefusedCount;
+
+    private static final int V_APPLY = 0;
+    private static final int V_DUPLICATE = 1;
+    private static final int V_REFUSED = 2;
+    private static final int L_WRITE = 0;
+    private static final int L_MERGE = 1;
+    private static final int L_SUPPRESS = 2;
+    private static final long MAX_LEDGER_CAPACITY = (1L << 31) - 1;
+    private static final int MIN_WIRE = 12;
+    private static final int MAX_WIRE = 65534;
+
+    /** The replicated feed view of behaviour v3 (all zero under v1/v2). */
+    public FeedState feed() {
+        return feed;
+    }
+
+    private final CoreMetricsView metricsView = new CoreMetricsView(this);
+
+    /** RC2 S8 3.10 item 3: read-only plain longs (feed + order) for the {@code OrderEngineMetrics} registrar. */
+    public CoreMetricsView metricsView() {
+        return metricsView;
+    }
+
+    /** {@code coreConfig().behaviorVersion() >= 3}: every S7 rule is active only then (section 0). */
+    public boolean behaviorV3() {
+        return coreConfig.behaviorVersion() >= 3;
+    }
+
+    public long v5MoneyRefusedCount() {
+        return v5MoneyRefusedCount;
+    }
+
+    public long coreOrderHoldRefusedCount() {
+        return coreOrderHoldRefusedCount;
+    }
+
+    public long coreOrderReleaseRefusedCount() {
+        return coreOrderReleaseRefusedCount;
+    }
+
+    /** The demuxer's 7.2 row 3 step: a v5 money template refused under v3, for every authority. */
+    public void refuseV5Money(final int templateId, final long correlationId, final long userId, final int classCode) {
+        v5MoneyRefusedCount++;
+        rejectUnauthorised(templateId, correlationId, userId, CoreRejectReason.UNAUTHORIZED_CLASS, classCode);
+    }
+
+    /**
+     * RC2 S8 3.12: the demuxer's step for Hold 3 / Release 4 from TOOL or ADMIN (the trusted path included) naming
+     * {@code orderId >= 1} under v3: counted and refused with the ORIGIN {@code OrderReject{UNAUTHORIZED_CLASS}}; nothing
+     * applies.
+     */
+    public void refuseCoreOrderMoney(final int templateId, final long correlationId, final long userId, final int classCode) {
+        if (templateId == 3) {
+            coreOrderHoldRefusedCount++;
+        } else {
+            coreOrderReleaseRefusedCount++;
+        }
+        rejectUnauthorised(templateId, correlationId, userId, CoreRejectReason.UNAUTHORIZED_CLASS, classCode);
+    }
+
+    /** MeJournalTrade 61. Returns true on APPLY and DUPLICATE, false on REFUSE (a 62 batch stops at the first false). */
+    public boolean onMeTrade(long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId, long takerUserId,
+                             long makerLegId, long makerUserId, long price, long quantity, boolean takerIsBuy, long meTimestamp,
+                             long takerOmsOrderId, long makerOmsOrderId, long meEpoch, long timestamp) {
+        return onMeTradeEntry(61, egressSeq, journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId,
+                price, quantity, takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch, timestamp);
+    }
+
+    /** One 61, or one 62 entry ({@code templateId} names which, for the duplicate counter). */
+    public boolean onMeTradeEntry(int templateId, long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId,
+                                  long takerUserId, long makerLegId, long makerUserId, long price, long quantity, boolean takerIsBuy,
+                                  long meTimestamp, long takerOmsOrderId, long makerOmsOrderId, long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyTrade(egressSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId, price, quantity,
+                    takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch, timestamp);
+            return true;
+        }
+        observeLogTime(timestamp);
+        final long digest = tradeDigest(egressSeq, journalSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId,
+                price, quantity, takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch);
+        final int verdict = admit(templateId, journalSeq, meEpoch, egressSeq, tradeId, marketId, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        // 3.4: the second invariant (dense tradeId) and the S5 apply; a refusal latches SETTLE_REFUSED, skip s,
+        // latchTradeId = L + 1 (never the frame's tradeId, review 2 BLOCKER-A)
+        final long nextTradeId = lastAppliedTradeId + 1;
+        if (!orders.applyTradeV3(journalSeq, egressSeq, tradeId, marketId, takerLegId, takerUserId, makerLegId, makerUserId,
+                price, quantity, takerIsBuy, meTimestamp, takerOmsOrderId, makerOmsOrderId, meEpoch, timestamp)) {
+            feed.countSettleRefused();
+            latch(FeedHaltReason.SETTLE_REFUSED, journalSeq, journalSeq, journalSeq, nextTradeId, 0L, 0L, tradeId);
+            return false;
+        }
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /** MeJournalTerminal 63. Under v1/v2 the RC1 apply (meReason unused). */
+    public boolean onMeTerminal(long egressSeq, long journalSeq, long legId, long userId, int marketId, int statusCode,
+                                int meRejectReason, long meTimestamp, long omsOrderId, long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyTerminal(egressSeq, legId, userId, marketId, statusCode, meTimestamp, omsOrderId, meEpoch, timestamp);
+            return true;
+        }
+        observeLogTime(timestamp);
+        final long digest = terminalDigest(egressSeq, journalSeq, legId, userId, marketId, statusCode, meRejectReason, meTimestamp,
+                omsOrderId, meEpoch);
+        final int verdict = admit(63, journalSeq, meEpoch, egressSeq, 0L, marketId, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        orders.applyTerminal(egressSeq, legId, userId, marketId, statusCode, meTimestamp, omsOrderId, meEpoch, timestamp,
+                meRejectReason);
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    private final MeOutcomeView s7Outcome = new MeOutcomeView();
+    private final MeReleaseView s7Release = new MeReleaseView();
+
+    /**
+     * MeCommandOutcome 64, the S7 signature (kept, FIX-7): under v1/v2 the RC1 apply ({@code oldCancelled} unused); under v3
+     * the view form with the section 2 defaults for the 64 tail.
+     */
+    public boolean onMeOutcome(long egressSeq, long journalSeq, long commandIdHigh, long commandIdLow, long userId,
+                               long omsOrderId, long oldOrderId, long price, long quantity, long budget, int marketId,
+                               int commandKind, int result, long legId, int reason, boolean oldCancelled, long meTimestamp,
+                               long meEpoch, long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyOutcome(egressSeq, commandIdHigh, commandIdLow, userId, omsOrderId, oldOrderId, price, quantity, budget,
+                    marketId, commandKind, result, legId, reason, meTimestamp, meEpoch, timestamp);
+            return true;
+        }
+        return onMeOutcome(orders.outcomeWithDefaults(s7Outcome, egressSeq, journalSeq, commandIdHigh, commandIdLow, userId,
+                omsOrderId, oldOrderId, price, quantity, budget, marketId, commandKind, result, legId, reason, oldCancelled,
+                meTimestamp, meEpoch), timestamp);
+    }
+
+    /**
+     * MeCommandOutcome 64 with every field (RC2 S8 section 2): under v3 D1 admission with the widened digest (3.10 item 2),
+     * then the S8 tables; under v1/v2 the RC1 apply of the fields it knows.
+     */
+    public boolean onMeOutcome(final MeOutcomeView v, final long timestamp) {
+        if (!behaviorV3()) {
+            orders.applyOutcome(v.egressSeq, v.commandIdHigh, v.commandIdLow, v.userId, v.omsOrderId, v.oldOrderId, v.price,
+                    v.quantity, v.budget, v.marketId, v.commandKind, v.result, v.orderId, v.reason, v.meTimestamp, v.meEpoch,
+                    timestamp);
+            return true;
+        }
+        observeLogTime(timestamp);
+        final long digest = outcomeDigest(v);
+        final int verdict = admit(64, v.journalSeq, v.meEpoch, v.egressSeq, 0L, v.marketId, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        orders.applyOutcomeV3(v, timestamp);
+        commit(v.journalSeq, v.egressSeq, digest);
+        return true;
+    }
+
+    /**
+     * MeCommandRelease 67, the S7 signature (kept, FIX-7): {@code releaseSeq 0}, {@code ledgerSize = meLedgerSize},
+     * {@code ledgerCapacity = meLedgerCapacity}, {@code tombstoneRanges 0}, no entries.
+     */
+    public boolean onMeRelease(long egressSeq, long journalSeq, long meEpoch, long timestamp) {
+        final MeReleaseView v = s7Release.reset();
+        v.egressSeq = egressSeq;
+        v.journalSeq = journalSeq;
+        v.meEpoch = meEpoch;
+        v.ledgerSize = orders.meLedgerSize();
+        v.ledgerCapacity = feed.meLedgerCapacity();
+        return onMeRelease(v, timestamp);
+    }
+
+    /** MeCommandRelease 67, v3 only (RC2 S8 3.2): D1 with the widened digest, then the content against the backlog. */
+    public boolean onMeRelease(final MeReleaseView v, final long timestamp) {
+        if (!behaviorV3()) {
+            return false; // not served below v3 (the demuxer counts it unhandled)
+        }
+        observeLogTime(timestamp);
+        final long digest = releaseDigest(v);
+        final int verdict = admit(67, v.journalSeq, v.meEpoch, v.egressSeq, 0L, 0, digest, false);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        orders.applyReleaseV3(v, timestamp);
+        commit(v.journalSeq, v.egressSeq, digest);
+        return true;
+    }
+
+    /**
+     * MeEngineConfig 68, v3 only (D2 row 1 and 4.2): the FRESH record at journalSeq 1 binds the epoch (trust on first use),
+     * is applied and committed, then every FORWARDER/BRIDGE registration with a foreign sourceEpoch is revoked (10.2);
+     * later records must be valid BUMPs.
+     */
+    public boolean onMeEngineConfig(long egressSeq, long journalSeq, long meEpoch, long configVersion, long behaviorVersion,
+                                    long ledgerCapacity, int maxWireVersion, ConfigDecision decision, long timestamp,
+                                    LongConsumer revokedSession) {
+        if (!behaviorV3()) {
+            return false;
+        }
+        observeLogTime(timestamp);
+        final boolean values = configVersion >= 1 && behaviorVersion >= 2 && ledgerCapacity >= 1
+                && ledgerCapacity <= MAX_LEDGER_CAPACITY && maxWireVersion >= MIN_WIRE && maxWireVersion <= MAX_WIRE;
+        final long digest = configDigest(egressSeq, journalSeq, meEpoch, configVersion, behaviorVersion, ledgerCapacity,
+                maxWireVersion, decision);
+        // D2 row 1 with the 3.8 belt: the epoch must be the recorded genesisId (S2: meEpoch := genesisId), so a core
+        // re-genesised without its ME never binds the old ME's retained FRESH (4.4, review 2 NOTE-I)
+        if (feed.boundMeEpoch() == 0 && journalSeq == 1 && meEpoch > 0 && decision == ConfigDecision.FRESH && values
+                && meEpoch == coreConfig.recorded().genesisId) {
+            feed.bind(meEpoch);
+            feed.recordMeConfig(configVersion, behaviorVersion, ledgerCapacity, maxWireVersion);
+            commit(journalSeq, egressSeq, digest);
+            feed.countEpochRevoked(sessions.revokeForeignEpoch(meEpoch, revokedSession));
+            return true;
+        }
+        final int verdict = admit(68, journalSeq, meEpoch, egressSeq, 0L, 0, digest, decision == ConfigDecision.FRESH);
+        if (verdict != V_APPLY) {
+            return verdict == V_DUPLICATE;
+        }
+        // 4.2 (bound, s >= 2): only a BUMP of the record the ME journaled before, mirroring S2 rows 9, 11, 13, 14
+        if (!values || decision != ConfigDecision.BUMP || configVersion <= feed.meConfigVersion()
+                || behaviorVersion != feed.meBehaviorVersion() || ledgerCapacity != feed.meLedgerCapacity()
+                || maxWireVersion < feed.meMaxWireVersion()) {
+            latch(FeedHaltReason.SOURCE_SCHEMA, journalSeq, journalSeq, journalSeq, 0L, 0L, 0L, 0L);
+            return false;
+        }
+        feed.recordMeConfig(configVersion, behaviorVersion, ledgerCapacity, maxWireVersion);
+        commit(journalSeq, egressSeq, digest);
+        return true;
+    }
+
+    /**
+     * 5.4: a feed frame that passed the header, bounds and class gates but failed a value range, v3 only. Returns true
+     * when the frame latched (rows 1 and 2): a 62 batch stops there. {@code rawTradeId} is diagnostic only.
+     */
+    public boolean onFeedPoison(int templateId, long journalSeq, long meEpoch, long rawTradeId, long timestamp) {
+        if (!behaviorV3()) {
+            return false;
+        }
+        // no observeLogTime: a frame that failed its value ranges is decode poison, it leaves no trace but the latch (5.4)
+        final long bound = feed.boundMeEpoch();
+        if (bound == 0 && journalSeq == 1) {
+            latch(FeedHaltReason.SOURCE_SCHEMA, 1L, 1L, 0L, 0L, 0L, 0L, rawTradeId);
+            return true;
+        }
+        if (bound != 0 && meEpoch == bound && journalSeq == feed.lastAppliedJournalSeq() + 1) {
+            final long tradeId = templateId == 61 || templateId == 62 ? lastAppliedTradeId + 1 : 0L;
+            latch(FeedHaltReason.SOURCE_SCHEMA, journalSeq, journalSeq, journalSeq, tradeId, 0L, 0L, rawTradeId);
+            return true;
+        }
+        feed.countSourceSchema(); // a corrupt duplicate or gap entry does not stall the cursor
+        return false;
+    }
+
+    /**
+     * FeedHalt 66 (D3a), BRIDGE, v3 only. A GAP writes or replaces its {@code bridgeIdentity}'s lane-halt record (RC2 S10'
+     * 4R.1 rule 2); every other reason uses the latch slot as in S7.
+     */
+    public void applyFeedHalt(long sessionId, long correlationId, FeedHaltReason reason, long meEpochSeen,
+                              long expectedJournalSeq, long seenJournalSeq, long bridgeIdentity, long timestamp) {
+        if (!behaviorV3()) {
+            return;
+        }
+        observeLogTime(timestamp);
+        final long c = feed.lastAppliedJournalSeq();
+        final long bound = feed.boundMeEpoch();
+        final boolean invalid;
+        switch (reason) {
+            case GAP: invalid = !(expectedJournalSeq >= 1 && expectedJournalSeq < seenJournalSeq); break;
+            case EPOCH_MISMATCH: invalid = meEpochSeen == 0; break;
+            case SOURCE_SCHEMA: invalid = expectedJournalSeq < 1; break;
+            case SOURCE_UNBOUND:
+            case SETTLE_REFUSED: invalid = false; break;
+            default: invalid = true; break;
+        }
+        if (invalid) {
+            sink.onAdminAck(correlationId, 66, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
+            return;
+        }
+        if (reason == FeedHaltReason.SOURCE_UNBOUND || reason == FeedHaltReason.SETTLE_REFUSED) {
+            feed.countHaltDuplicate(); // binding and refusal are the core's judgment only
+            sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        final boolean stale = reason == FeedHaltReason.GAP ? c >= seenJournalSeq - 1
+                : reason == FeedHaltReason.EPOCH_MISMATCH ? bound == 0 || meEpochSeen == bound
+                : c >= expectedJournalSeq;
+        if (stale) {
+            feed.countHaltStale();
+            sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        if (reason == FeedHaltReason.GAP) {
+            // 4R.1 rule 2: a new or changed record is ACCEPTED, an identical one DUPLICATE; a ninth identity -> overflow
+            final int at = feed.recordGapHalt(bridgeIdentity, sessionId, expectedJournalSeq, seenJournalSeq, logPosition);
+            if (at == FeedState.HALT_DUPLICATE) {
+                feed.countHaltDuplicate();
+                sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+                return;
+            }
+            feed.countHaltApplied();
+            sink.onAdminAck(correlationId, 66, AdminResult.ACCEPTED, 0, 0L);
+            gapEffects(at, 0L);
+            return;
+        }
+        if (feed.latchReason() == reason || latchDecision(reason, 0L) != L_WRITE) {
+            if (feed.latchReason() != reason && latchDecision(reason, 0L) == L_SUPPRESS) {
+                feed.countLatchSuppressed();
+            }
+            feed.countHaltDuplicate();
+            sink.onAdminAck(correlationId, 66, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        feed.countHaltApplied();
+        sink.onAdminAck(correlationId, 66, AdminResult.ACCEPTED, 0, 0L);
+        final long expected = reason == FeedHaltReason.EPOCH_MISMATCH && expectedJournalSeq < 1 ? Math.max(1L, c + 1)
+                : expectedJournalSeq;
+        writeLatch(reason, expected, seenJournalSeq, 0L, 0L,
+                reason == FeedHaltReason.EPOCH_MISMATCH ? meEpochSeen : 0L, bridgeIdentity, 0L);
+    }
+
+    /**
+     * FeedLatchClear 76 (D3b, total), ADMIN, v3 only. {@code 76 {GAP, 0}} clears the whole lane-halt table and the overflow
+     * record and leaves the BRIDGE_HALT bit to the operator's OPEN (RC2 S10' 4R.1 rules 2 and 4).
+     */
+    public void applyFeedLatchClear(long correlationId, FeedHaltReason reason, long journalSeq, long timestamp) {
+        if (!behaviorV3()) {
+            return;
+        }
+        observeLogTime(timestamp);
+        if (reason == FeedHaltReason.EPOCH_MISMATCH || reason == FeedHaltReason.SOURCE_UNBOUND || reason == FeedHaltReason.NONE) {
+            sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L); // genesis only
+            return;
+        }
+        if (reason == FeedHaltReason.GAP) {
+            if (!feed.gapLatched()) {
+                sink.onAdminAck(correlationId, 76, AdminResult.DUPLICATE, 0, 0L);
+                return;
+            }
+            if (journalSeq != 0) {
+                sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L); // GAP skips nothing
+                return;
+            }
+            feed.clearGapTable();
+            feed.countLatchClear();
+            sink.onAdminAck(correlationId, 76, AdminResult.ACCEPTED, 0, 0L);
+            sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, journalSeq, 0L, logPosition);
+            sink.onFeedLatchCleared(reason, journalSeq, false);
+            return;
+        }
+        if (feed.latchReason() != reason) {
+            sink.onAdminAck(correlationId, 76, AdminResult.DUPLICATE, 0, 0L);
+            return;
+        }
+        final long skip = feed.latchSkipSeq();
+        final boolean clearOnly = journalSeq == 0 && skip == 0;
+        final boolean skipIt = skip != 0 && journalSeq == skip;
+        if (!clearOnly && !skipIt) {
+            sink.onAdminAck(correlationId, 76, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
+            return;
+        }
+        if (skipIt) {
+            // row 5: exactly the one entry the core refused or found poisoned at c + 1, and exactly one tradeId
+            final long tradeId = feed.latchTradeId();
+            feed.advanceCursorTo(journalSeq);
+            feed.recordDigest(journalSeq, 0L); // content unknown: a later copy of it cannot be byte-checked
+            if (tradeId != 0) {
+                lastAppliedTradeId = tradeId;
+            }
+            feed.setLastSkippedJournalSeq(journalSeq);
+        }
+        feed.zeroLatch();
+        feed.countLatchClear();
+        sink.onAdminAck(correlationId, 76, AdminResult.ACCEPTED, 0, 0L);
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, journalSeq, 0L, logPosition);
+        sink.onFeedLatchCleared(reason, journalSeq, false);
+        if (skipIt) {
+            // the skip moved the cursor: a GAP record it reached goes. NONGAP_AWAITING_OPEN is always held here (writeLatch
+            // added it, only clearAll removes it, and OPEN is refused while the slot is set), so this never opens the gate
+            // (review NOTE-7); it only keeps "no record at its reach" true.
+            reopen(feed.reopenAction(clearReachedRecords(journalSeq)), journalSeq);
+        }
+    }
+
+    /** D4 internal clear of one engine-owned bit (S8's ME_CAPACITY auto-clear). Only under v3. */
+    public void clearGateInternally(int marketId, GateReason reason) {
+        if (behaviorV3() && gate.clearReason(marketId, reason)) {
+            emitAdmission(marketId, false);
+        }
+    }
+
+    // ---- D1, the commit, the latch slot ----
+
+    /** D1 (and D2 rows 2-3 for a non-binding entry while unbound). Every refusal latches through {@link #latch}. */
+    private int admit(final int templateId, final long s, final long m, final long g, final long tradeId, final int marketId,
+                      final long digest, final boolean freshRecord) {
+        final long bound = feed.boundMeEpoch();
+        final long c = feed.lastAppliedJournalSeq();
+        if (s < 1 || m <= 0) {
+            latch(FeedHaltReason.SOURCE_SCHEMA, Math.max(1L, c + 1), s, 0L, 0L, 0L, 0L, tradeId); // D1 row 1, decode-grade
+            return V_REFUSED;
+        }
+        if (bound == 0) {
+            feed.countUnbound();
+            refuseFeed(tradeId, marketId, s, SettleRejectReason.FEED_UNBOUND, 1L);
+            if (s == 1) {
+                latch(FeedHaltReason.SOURCE_UNBOUND, 1L, 1L, 0L, 0L, 0L, 0L, tradeId); // D2 row 2: ME content, genesis only
+            } else {
+                latch(FeedHaltReason.GAP, 1L, s, 0L, 0L, 0L, 0L, tradeId); // D2 row 3: a hole at 1
+            }
+            return V_REFUSED;
+        }
+        if (m != bound) {
+            feed.countEpochMismatch();
+            refuseFeed(tradeId, marketId, s, SettleRejectReason.ME_EPOCH_MISMATCH, bound);
+            latch(FeedHaltReason.EPOCH_MISMATCH, Math.max(1L, c + 1), s, 0L, 0L, m, 0L, tradeId);
+            return V_REFUSED;
+        }
+        if (s <= c) {
+            // 3.8 (the duplicate belt): an entry at or below the cursor must byte-match what was applied there. The FRESH
+            // record is kept for the epoch's life, the last DIGEST_WINDOW entries in a ring; a 76-skipped entry is unknown.
+            final boolean held = s == 1 || feed.digestHeld(s);
+            final long applied = s == 1 ? feed.freshDigest() : held ? feed.digestAt(s) : 0L;
+            if (held && applied != 0 && applied != digest) {
+                feed.countDuplicateMismatch();
+                if (s == 1 && freshRecord) {
+                    // another FRESH under the bound epoch: the ME was re-genesised (or restored) reusing the epoch, genesis only
+                    // (belt review D-1: only a 68 FRESH; any other template labelled seq 1 is the SOURCE_SCHEMA row below)
+                    latch(FeedHaltReason.EPOCH_MISMATCH, Math.max(1L, c + 1), s, 0L, 0L, m, 0L, tradeId);
+                } else {
+                    // the source served other content at an applied seq (an in-epoch ME rewind, or a corrupt copy): loud,
+                    // skip 0 (nothing to skip: the cursor is past it), reach-cleared by the next exactly-next entry
+                    latch(FeedHaltReason.SOURCE_SCHEMA, c + 1, s, 0L, 0L, 0L, 0L, tradeId);
+                }
+                return V_REFUSED;
+            }
+            if (!held) {
+                feed.countDuplicateUnverified(); // older than the window: cannot be compared (counted, contract 3.8)
+            }
+            feed.countDuplicate(templateId);
+            if (s == feed.lastSkippedJournalSeq()) {
+                feed.countSkippedEntryRedelivered(); // FIX-G: a valid copy of an entry a 76 skipped
+            }
+            return V_DUPLICATE;
+        }
+        if (s > c + 1) {
+            feed.countGap();
+            refuseFeed(tradeId, marketId, s, SettleRejectReason.FEED_GAP, c + 1);
+            latch(FeedHaltReason.GAP, c + 1, s, 0L, 0L, 0L, 0L, tradeId);
+            return V_REFUSED;
+        }
+        if (g < consumePosition) {
+            feed.countEgressRegression(); // D1 row 6: the ME rewound inside its epoch (4.4); skip 0, never consumable
+            latch(FeedHaltReason.SOURCE_SCHEMA, c + 1, s, 0L, 0L, 0L, 0L, tradeId);
+            return V_REFUSED;
+        }
+        return V_APPLY;
+    }
+
+    /** ORIGIN SettleRejected for a v3 feed refusal: journalPosition = journalSeq (S1 4.1). */
+    private void refuseFeed(final long tradeId, final int marketId, final long s, final SettleRejectReason reason, final long detail) {
+        settleRejectCount++;
+        sink.onSettleRejected(tradeId, marketId, s, reason, detail);
+    }
+
+    /** 3.3: {@code c := s}, {@code P := max(P, g)}, the entry's digest (3.8), then the reach-clear. */
+    private void commit(final long s, final long g, final long digest) {
+        feed.advanceCursorTo(s);
+        feed.recordDigest(s, digest);
+        if (g > consumePosition) {
+            consumePosition = g;
+        }
+        reachClear();
+    }
+
+    /**
+     * 3.3 reach-clear, the only automatic exit; it never moves the cursor. RC2 S10' 4R: the slot (SOURCE_SCHEMA,
+     * SETTLE_REFUSED) clears and KEEPS its NONGAP_AWAITING_OPEN holder; every lane-halt record whose {@code c >= seen - 1}
+     * goes; when that empties the table and the holder set is empty, the BRIDGE_HALT bit (only it) is cleared (4R.1 rule 1).
+     */
+    private void reachClear() {
+        if (!feed.latched()) {
+            return;
+        }
+        final long c = feed.lastAppliedJournalSeq();
+        final FeedHaltReason reason = feed.latchReason();
+        final boolean reached;
+        switch (reason) {
+            case SOURCE_SCHEMA:
+            case SETTLE_REFUSED: reached = feed.latchSkipSeq() != 0 ? c >= feed.latchSkipSeq() : c >= feed.latchExpectedSeq(); break;
+            default: reached = false; break; // NONE, and the genesis-only EPOCH_MISMATCH / SOURCE_UNBOUND
+        }
+        if (reached) {
+            feed.zeroLatch();
+            feed.countLatchAutoClear();
+            sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, c, 0L, logPosition);
+            sink.onFeedLatchCleared(reason, 0L, true);
+            feed.releaseNonGapOnReach(); // keeps the holder (the operator's OPEN); only the ANY_REASON seam drops it
+        }
+        reopen(feed.reopenAction(clearReachedRecords(c)), c);
+    }
+
+    /** 4R.1 rule 2: remove the lane-halt records reached at {@code c}; true when that removed the GAP holder. */
+    private boolean clearReachedRecords(final long c) {
+        final boolean held = feed.holds(FeedState.HOLDER_GAP);
+        final int n = feed.reachClearRecords(c);
+        for (int i = 0; i < n; i++) {
+            feed.countLatchAutoClear();
+            sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, c, 0L, logPosition);
+            sink.onFeedLatchCleared(FeedHaltReason.GAP, 0L, true);
+        }
+        return n > 0 && held && !feed.holds(FeedState.HOLDER_GAP);
+    }
+
+    /**
+     * 4R.1 rules 1 and 5: clear the GLOBAL BRIDGE_HALT bit (never {@code clearAll}: ADMIN, GENESIS, ME_CAPACITY, ... stay).
+     * Idempotent: {@code clearReason} is false when the bit is not set, and then nothing is broadcast or counted.
+     * {@code assets_gate_auto_reopen_total} counts opens, not bit clears.
+     */
+    private void reopen(final int action, final long c) {
+        if (action == FeedState.REOPEN_NONE) {
+            return;
+        }
+        final boolean cleared = action == FeedState.REOPEN_ALL ? gate.clearAll(OrderEntryGate.GLOBAL)
+                : gate.clearReason(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
+        if (!cleared) {
+            return;
+        }
+        emitAdmission(OrderEntryGate.GLOBAL, false);
+        final boolean opened = gate.state(OrderEntryGate.GLOBAL) == GateState.OPEN;
+        if (opened) {
+            feed.countGateAutoReopen();
+        }
+        sink.onGateAutoReopen(c, opened, gate.reasons(OrderEntryGate.GLOBAL), feed.laneHaltCount());
+    }
+
+    /** Exit class of a latch reason (5.1): 1 auto, 2 admin, 3 genesis. */
+    private static int exitClass(final FeedHaltReason r) {
+        switch (r) {
+            case GAP: return 1;
+            case SOURCE_SCHEMA:
+            case SETTLE_REFUSED: return 2;
+            case EPOCH_MISMATCH:
+            case SOURCE_UNBOUND: return 3;
+            default: return 0;
+        }
+    }
+
+    /** 5.1 precedence of a new (non-GAP) latch against the one slot. */
+    private int latchDecision(final FeedHaltReason reason, final long skip) {
+        if (!feed.slotLatched()) {
+            return L_WRITE;
+        }
+        final int next = exitClass(reason);
+        final int current = exitClass(feed.latchReason());
+        if (next > current) {
+            return L_WRITE;
+        }
+        if (next == current && skip != 0 && feed.latchSkipSeq() == 0) {
+            return L_WRITE; // review NOTE-1: a skippable latch replaces a skip-0 one of its class
+        }
+        if (skip != 0 && feed.latchSkipSeq() == skip) {
+            return L_MERGE; // latchTradeId is L + 1 on both sides by construction: nothing changes
+        }
+        return L_SUPPRESS;
+    }
+
+    /**
+     * 5.1 / 5.2: raise, replace, merge or suppress a latch. RC2 S10' 4R: a GAP the core detected itself goes to the lane-halt
+     * table as the record of {@link FeedState#CORE_DETECTED_IDENTITY}; a later one merges into it ({@code seen = max}); an
+     * unchanged merge counts as suppressed.
+     */
+    private void latch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
+                       final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {
+        if (reason == FeedHaltReason.GAP) {
+            final int at = feed.recordCoreGap(expected, seen, logPosition);
+            if (at == FeedState.HALT_DUPLICATE) {
+                feed.countLatchSuppressed();
+            } else {
+                gapEffects(at, rawTradeId);
+            }
+            return;
+        }
+        switch (latchDecision(reason, skip)) {
+            case L_WRITE:
+                writeLatch(reason, expected, seen, skip, tradeId, meEpochSeen, bridgeIdentity, rawTradeId);
+                break;
+            case L_MERGE:
+                break;
+            default:
+                feed.countLatchSuppressed();
+                break;
+        }
+    }
+
+    /**
+     * 5.2 latching effects of a slot (non-GAP) latch: the fields, the NONGAP_AWAITING_OPEN holder (RC2 S10' 4R.1 rule 4), the
+     * BRIDGE_HALT bit, the FeedHaltApplied OrderFault, the node-local sink call.
+     */
+    private void writeLatch(final FeedHaltReason reason, final long expected, final long seen, final long skip, final long tradeId,
+                            final long meEpochSeen, final long bridgeIdentity, final long rawTradeId) {
+        feed.writeLatch(reason, expected, seen, skip, tradeId, meEpochSeen, bridgeIdentity, logPosition);
+        feed.holdAwaitingOpen();
+        suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, seen, expected, logPosition);
+        sink.onFeedLatch(reason, expected, seen, skip, rawTradeId);
+    }
+
+    /**
+     * 5.2 latching effects of a lane-halt record (index {@code at}) or the overflow record ({@link FeedState#HALT_OVERFLOW}):
+     * the BRIDGE_HALT bit (the holder was added by the table), the FeedHaltApplied OrderFault with the record's values, the
+     * node-local sink call.
+     */
+    private void gapEffects(final int at, final long rawTradeId) {
+        final boolean overflow = at == FeedState.HALT_OVERFLOW;
+        final long expected = overflow ? feed.overflowExpected() : feed.laneHaltExpected(at);
+        final long seen = overflow ? feed.overflowSeen() : feed.laneHaltSeen(at);
+        suspendGateInternally(OrderEntryGate.GLOBAL, GateReason.BRIDGE_HALT);
+        sink.onOrderFault(OrderFaultKind.FEED_HALT, 0L, 0L, 0, seen, expected, logPosition);
+        sink.onFeedLatch(FeedHaltReason.GAP, expected, seen, 0L, rawTradeId);
+    }
+
+    /** The AdmissionState of one gate with its reason set (all four emission sites go through here or pass it). */
+    private void emitAdmission(final int marketId, final boolean toOrigin) {
+        sink.onAdmissionState(marketId, gate.state(marketId), gate.reason(marketId), false, lastLogTime, logPosition, toOrigin,
+                gate.reasons(marketId));
+    }
+
+    // 3.8: the entry digest, over the decoded fields the core applies (a 62 entry and the same 61 digest alike)
+    private static final long K_TRADE = 0x61L;
+    private static final long K_TERMINAL = 0x63L;
+    private static final long K_OUTCOME = 0x64L;
+    private static final long K_RELEASE = 0x67L;
+    private static final long K_CONFIG = 0x68L;
+
+    // The digest definition is part of behaviour 3 (contract 3.8): pinned by DigestVectorTest. Behaviour 3 is in the
+    // production set from RC2 S8; the digest and every v3 rule freeze at the first v3 log outside a test rig (S8 D-S8-3,
+    // 3.10 item 5) and may change only under a new behaviour version from then on.
+
+    /** 3.8 digest of a 61 or of one 62 entry. */
+    public static long tradeDigest(long egressSeq, long journalSeq, long tradeId, int marketId, long takerLegId, long takerUserId,
+                                   long makerLegId, long makerUserId, long price, long quantity, boolean takerIsBuy,
+                                   long meTimestamp, long takerOmsOrderId, long makerOmsOrderId, long meEpoch) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(
+                digest(K_TRADE, egressSeq), journalSeq), tradeId), marketId), takerLegId), takerUserId), makerLegId), makerUserId),
+                price), quantity), takerIsBuy ? 1 : 0), meTimestamp), takerOmsOrderId), makerOmsOrderId), meEpoch);
+    }
+
+    /** 3.8 digest of a 63. */
+    public static long terminalDigest(long egressSeq, long journalSeq, long legId, long userId, int marketId, int statusCode,
+                                      int meRejectReason, long meTimestamp, long omsOrderId, long meEpoch) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(digest(K_TERMINAL, egressSeq),
+                journalSeq), legId), userId), marketId), statusCode), meRejectReason), meTimestamp), omsOrderId), meEpoch), 0);
+    }
+
+    /**
+     * 3.8 digest of a 64, widened by RC2 S8 3.10 item 2: the S7 fields, then orderType, orderSide, appliedPosition, status,
+     * timeInForce, expectedOldRemaining, ledgerSize, ledgerCapacity, behaviorVersion.
+     */
+    public static long outcomeDigest(final MeOutcomeView v) {
+        long h = digest(K_OUTCOME, v.egressSeq);
+        h = digest(h, v.journalSeq);
+        h = digest(h, v.commandIdHigh);
+        h = digest(h, v.commandIdLow);
+        h = digest(h, v.userId);
+        h = digest(h, v.omsOrderId);
+        h = digest(h, v.oldOrderId);
+        h = digest(h, v.price);
+        h = digest(h, v.quantity);
+        h = digest(h, v.budget);
+        h = digest(h, v.marketId);
+        h = digest(h, v.commandKind);
+        h = digest(h, v.result);
+        h = digest(h, v.orderId);
+        h = digest(h, v.reason);
+        h = digest(h, v.oldCancelled ? 1 : 0);
+        h = digest(h, v.meTimestamp);
+        h = digest(h, v.meEpoch);
+        h = digest(h, v.orderType);
+        h = digest(h, v.orderSide);
+        h = digest(h, v.appliedPosition);
+        h = digest(h, v.status);
+        h = digest(h, v.timeInForce);
+        h = digest(h, v.expectedOldRemaining);
+        h = digest(h, v.ledgerSize);
+        h = digest(h, v.ledgerCapacity);
+        return digest(h, v.behaviorVersion);
+    }
+
+    /**
+     * 3.8 digest of a 67, widened by RC2 S8 3.10 item 2: egressSeq, journalSeq, meEpoch, releaseSeq, ledgerSize,
+     * ledgerCapacity, tombstoneRanges, the entry count, then every entry (commandIdHigh, idLowFloor, scope, result, removed)
+     * in group order.
+     */
+    public static long releaseDigest(final MeReleaseView v) {
+        long h = digest(K_RELEASE, v.egressSeq);
+        h = digest(h, v.journalSeq);
+        h = digest(h, v.meEpoch);
+        h = digest(h, v.releaseSeq);
+        h = digest(h, v.ledgerSize);
+        h = digest(h, v.ledgerCapacity);
+        h = digest(h, v.tombstoneRanges);
+        h = digest(h, v.count);
+        for (int i = 0; i < v.count; i++) {
+            h = digest(h, v.commandIdHigh[i]);
+            h = digest(h, v.idLowFloor[i]);
+            h = digest(h, v.scope[i]);
+            h = digest(h, v.result[i]);
+            h = digest(h, v.removed[i]);
+        }
+        return h;
+    }
+
+    /** 3.8 digest of a 68. */
+    public static long configDigest(long egressSeq, long journalSeq, long meEpoch, long configVersion, long behaviorVersion,
+                                    long ledgerCapacity, int maxWireVersion, ConfigDecision decision) {
+        return digest(digest(digest(digest(digest(digest(digest(digest(digest(K_CONFIG, egressSeq), journalSeq),
+                meEpoch), configVersion), behaviorVersion), ledgerCapacity), maxWireVersion), decision.code()), 0);
+    }
+
+    /** One step of the deterministic 64-bit entry digest; never 0 (0 means "content unknown"). */
+    static long digest(final long h, final long v) {
+        long x = (h ^ 0x9E3779B97F4A7C15L) * 0xBF58476D1CE4E5B9L + v;
+        x = (x ^ (x >>> 30)) * 0xBF58476D1CE4E5B9L;
+        x = (x ^ (x >>> 27)) * 0x94D049BB133111EBL;
+        x ^= x >>> 31;
+        return x == 0 ? 1 : x;
+    }
+
+    /** Feed-virgin (7.1): nothing the RC1 feed rules did can have moved money or minted an ME command. */
+    private boolean feedVirgin() {
+        return lastAppliedTradeId == 0L && consumePosition == 0L && dispatchSeq == 0L;
+    }
+
+
+    /** OrderEntryGate (ADMIN, replicated): set one gate; DUPLICATE when unchanged; broadcast the new state. */
+    public void applyOrderEntryGate(long correlationId, int marketId, GateState state, GateReason reason, long timestamp) {
+        observeLogTime(timestamp);
+        if (!OrderEntryGate.validMarket(marketId) || state == null || reason == null) {
+            sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.UNKNOWN_MARKET.code(), 0L);
+            return;
+        }
+        if (behaviorV3()) {
+            applyOrderEntryGateV3(correlationId, marketId, state, reason);
+            return;
+        }
+        final boolean changed = gate.set(marketId, state, reason);
+        sink.onAdminAck(correlationId, 73, changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, 0, 0L);
+        if (changed) {
+            emitAdmission(marketId, false);
+        }
+    }
+
+    /** RC2 S7 D4 under v3: ADMIN sets only ADMIN-owned bits; OPEN clears every bit once the two refusals pass. */
+    private void applyOrderEntryGateV3(final long correlationId, final int marketId, final GateState state, final GateReason reason) {
+        final boolean changed;
+        if (state == GateState.SUSPENDED) {
+            if (!OrderEntryGate.adminOwned(reason)) {
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.INVALID.code(), 0L);
+                return;
+            }
+            changed = gate.addReason(marketId, reason);
+        } else {
+            final int bits = gate.reasons(marketId);
+            if ((bits & (1 << GateReason.BRIDGE_HALT.code())) != 0 && feed.latched()) {
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.FEED_HALTED.code(), 0L);
+                return;
+            }
+            if (marketId == OrderEntryGate.GLOBAL && (feed.boundMeEpoch() == 0 || feed.meBehaviorVersion() < 2)) {
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.ME_LANE_INACTIVE.code(), 0L);
+                return; // X13: GLOBAL stays closed until the ME epoch is bound
+            }
+            if (marketId == OrderEntryGate.GLOBAL && reason != GateReason.BRIDGE_HALT
+                    && (feed.holders() & FeedState.HOLDER_NONGAP_AWAITING_OPEN) != 0) {
+                // RC2 S17 W12 (G1): a halt holder (a non-GAP reach-clear, 76 {GAP, 0}, 76 {SOURCE_SCHEMA|SETTLE_REFUSED})
+                // is released only by an OPEN that names what it clears. Holder bits ride the snapshot and the OPEN's
+                // reason is a log entry, so the outcome is replicated and replay-safe.
+                sink.onAdminAck(correlationId, 73, AdminResult.REJECTED, CoreRejectReason.HALT_HOLDER_PENDING.code(), 0L);
+                return;
+            }
+            changed = gate.clearAll(marketId);
+            if (marketId == OrderEntryGate.GLOBAL) {
+                feed.clearHolders(); // RC2 S10' 4R.1 rule 4: ADMIN OPEN empties the holder set
+            }
+        }
+        sink.onAdminAck(correlationId, 73, changed ? AdminResult.ACCEPTED : AdminResult.DUPLICATE, 0, 0L);
+        if (changed) {
+            emitAdmission(marketId, false);
+        }
     }
 }

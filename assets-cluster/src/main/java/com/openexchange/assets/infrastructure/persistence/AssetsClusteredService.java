@@ -2,16 +2,17 @@
 package com.openexchange.assets.infrastructure.persistence;
 
 import com.openexchange.assets.application.engine.AssetsEngine;
-import com.openexchange.assets.application.projection.SettlementProjector;
 import com.openexchange.assets.infrastructure.publisher.AssetsEventPublisher;
 import com.openexchange.assets.infrastructure.generated.EgressChannelsDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.QueryFeedPositionDecoder;
 import com.openexchange.assets.infrastructure.generated.SubscribeDecoder;
 import com.openexchange.assets.infrastructure.publisher.SessionEgressQueue;
+import io.aeron.Aeron;
 import io.aeron.Counter;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
+import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
@@ -60,12 +61,47 @@ import java.util.concurrent.TimeUnit;
  */
 public final class AssetsClusteredService implements ClusteredService {
 
-    private final AssetsEngine engine = new AssetsEngine();
-    // The projector owns the feed-forward translation (Settle/TerminalRelease -> money mutation +
-    // consumePosition advance). It wraps the same engine instance for the life of the service:
-    // loadSnapshot restores INTO that instance, so the projector needs no re-wiring on recovery.
-    private final SettlementProjector projector = new SettlementProjector(engine);
-    private final AssetsSbeDemuxer demuxer = new AssetsSbeDemuxer(engine, projector);
+    // RCS S1: every replicated-state mutation goes through the applier (engine, projector, demuxer, envelope). RC1 S7:
+    // a CoreConfig cross-check failure stops this node (A-9 rule), through the same seam as the apply fence; failFast
+    // is read lazily, so a test's recorder swapped in later is the one that runs.
+    private final AssetsLogApplier applier = new AssetsLogApplier(() -> this.failFast.run());
+    // Read-only aliases of the applier's instances (declared after it: field order matters).
+    private final AssetsEngine engine = applier.engine();
+    private final AssetsSbeDemuxer demuxer = applier.demuxer();
+
+    {
+        // RC1 S3 (K6): the replicated registration decides; these are its leader-local transport effects.
+        applier.setTransportHooks(new AssetsSbeDemuxer.TransportHooks() {
+            public void onSessionRegistered(final long sessionId, final int channelMask, final boolean resumable) {
+                if (!isLeader || cluster == null) {
+                    return;
+                }
+                refreshSessionsIfNeeded();
+                final SessionEgressQueue queue = egressBySessionId.get(sessionId);
+                if (queue != null) {
+                    queue.subscribe(channelMask);
+                    if (resumable) {
+                        queue.markResumable();
+                    }
+                }
+            }
+
+            public void onSessionRejected(final long sessionId) {
+                if (!isLeader || cluster == null) {
+                    return;
+                }
+                // Through consensus, so followers observe the close deterministically via the log.
+                final ClientSession session = cluster.getClientSession(sessionId);
+                if (session != null && !session.isClosing()) {
+                    try {
+                        session.close();
+                    } catch (final RuntimeException ignored) {
+                        // already closing
+                    }
+                }
+            }
+        });
+    }
 
     private Cluster cluster;
     private IdleStrategy idleStrategy;
@@ -77,8 +113,44 @@ public final class AssetsClusteredService implements ClusteredService {
      * counter-allocated id desynced across switchovers and silently killed the flush chain. Rescheduling
      * the same id is idempotent, so at most one drain timer exists cluster-wide.
      */
-    private static final long EGRESS_DRAIN_TIMER_ID = 1_000_000_000_000L;
+    /**
+     * Timer ids are per LEADERSHIP TERM: {@code BASE + leadershipTermId} (RC1 S5). Aeron 1.53's consensus module counts,
+     * per correlationId, every TimerEvent a node consumes from the log while no timer with that id is pending
+     * ({@code onReplayTimerEvent}: followers do this for every expiry, the leader only during replay/catch-up) and
+     * silently swallows that many later {@code scheduleTimer} calls for the id ({@code onScheduleTimer}); the map is
+     * never pruned. A fixed id is therefore poisoned on a node that was a follower for a while: after it becomes
+     * leader its first re-arm is swallowed, {@code *Armed} stays true and the periodic timer is dead. A fresh id per
+     * term starts at count 0 on the new leader, the same id is safe within the term (the live leader never feeds the
+     * counter), and the map grows by one key per term, not per tick. Anything at or above a base is that timer kind.
+     */
+    private static final long EGRESS_DRAIN_TIMER_BASE = AssetsLogApplier.EGRESS_DRAIN_TIMER_BASE;
+    static final long SWEEP_TIMER_BASE = AssetsLogApplier.SWEEP_TIMER_BASE;
+    /** The ids term 0 would use; kept for the in-process service test. */
+    static final long EGRESS_DRAIN_TIMER_ID = EGRESS_DRAIN_TIMER_BASE;
+    static final long SWEEP_TIMER_ID = SWEEP_TIMER_BASE;
+    /** Current leadership term (from onNewLeadershipTermEvent, also seen during replay); -1 until known. */
+    private long leadershipTermId = -1L;
+
+    static boolean isSweepTimerId(final long correlationId) {
+        return AssetsLogApplier.isSweepTimerId(correlationId);
+    }
+
+    static boolean isDrainTimerId(final long correlationId) {
+        return AssetsLogApplier.isDrainTimerId(correlationId);
+    }
+
+    /** Terms are spaced by {@link #TIMER_ID_TERM_STRIDE} so consecutive terms never use adjacent ids (control runs). */
+    static final long TIMER_ID_TERM_STRIDE = AssetsLogApplier.TIMER_ID_TERM_STRIDE;
+
+    private long termTimerId(final long base) {
+        return base + Math.max(0L, leadershipTermId) * TIMER_ID_TERM_STRIDE;
+    }
     private static final long EGRESS_DRAIN_BACKSTOP_MS = 10;
+    /** RC1 S2 (K3-D): the ONE deadline sweep timer; constant id, re-armed every SWEEP_PERIOD_MS while the index is non-empty. */
+
+    static final long SWEEP_PERIOD_MS = 100;
+    private boolean sweepArmed;
+    private volatile long sweepTimerFires;
 
     // Per-session egress queues, plus a cached array so the money path iterates without allocating
     // (cluster.clientSessions() returns a JDK unmodifiable wrapper whose iterator() allocates).
@@ -104,8 +176,9 @@ public final class AssetsClusteredService implements ClusteredService {
     private boolean sessionsDirty = true;
     private boolean drainTimerArmed;
     private volatile long drainTimerFires;
-    private long egressStallCount;
     private volatile long resumableSessionsClosed;
+    /** Review FIX-2: every RC2 S8 3.13 discard close on this node (written on the service thread only). */
+    private volatile long discardClosesTotal;
 
     // Live egress instrumentation, published as Aeron counters so AeronStat (and therefore every bench
     // run) can read them without touching this process. Updated only from the drain timer, never from
@@ -125,7 +198,7 @@ public final class AssetsClusteredService implements ClusteredService {
      * set by a SetMoneyJournal command through the log.
      */
     public void setMoneyJournalSink(com.openexchange.assets.domain.MoneyJournalSink journalSink) {
-        engine.setMoneyJournalSink(journalSink);
+        applier.setMoneyJournalSink(journalSink);
     }
 
     /**
@@ -149,10 +222,37 @@ public final class AssetsClusteredService implements ClusteredService {
     private final com.openexchange.cluster.NodeReadiness readiness =
             new com.openexchange.cluster.NodeReadiness();
     private com.openexchange.cluster.NodeEndpoint nodeEndpoint;
-    // cluster-kit#15: the last role this duty cycle OBSERVED via cluster.role().
-    // Only feeds readiness in doBackgroundWork; isLeader and the rest of the
-    // role bookkeeping stay driven by the onRoleChange callback.
-    private Cluster.Role lastObservedRole;
+    private com.openexchange.cluster.ConsensusReadiness consensusReadiness;
+    // Per-message service-thread cost (apply vs drain), per-template cost and the last snapshot's
+    // size/timings, served as /metrics by the node endpoint. Plain writes on this thread only; see
+    // AssetsNodeMetrics for the publish/acquire visibility contract.
+    private final com.openexchange.assets.infrastructure.metrics.AssetsNodeMetrics nodeMetrics =
+            new com.openexchange.assets.infrastructure.metrics.AssetsNodeMetrics();
+    // Aeron can reenter doBackgroundWork via idle() before the callback returns.
+    // Its logPosition is already the new event's position at that point.
+    private int applicationCallbackDepth;
+    private boolean applicationCallbackFailed;
+
+    /**
+     * The fail-fast exit for an apply failure (RC1 S1, port of the ME's 23090c6 fence). The default is
+     * {@link Runtime#halt(int)}, NOT {@link System#exit(int)}: every caller runs on the cluster SERVICE
+     * thread, and this process's shutdown hooks (the Aeron teardown chain) await that very thread, so
+     * exit() from here deadlocks into a zombie (observed live on the ME, 2026-08-23: alive, HEALTHY,
+     * processing nothing, TERM-immune). halt() skips the hooks; skipping graceful teardown is correct
+     * because a node whose apply failed must not reach peers anyway, recovery is restart + replay.
+     * Callers log their evidence BEFORE invoking the seam. Package-private so tests swap a recorder in.
+     */
+    Runnable failFast = AssetsClusteredService::failFastHalt;
+
+    /** Production default of {@link #failFast}; static so the forked-JVM test runs the exact path. */
+    static void failFastHalt() {
+        Runtime.getRuntime().halt(1);
+    }
+
+    /** Wired before launch; the context owns the same-process consensus evidence. */
+    public void readinessConsensus(final io.aeron.cluster.ConsensusModule.Context context) {
+        consensusReadiness = new com.openexchange.cluster.ConsensusReadiness(context, readiness);
+    }
 
     // What makes this cluster snapshot itself with no admin gateway running.
     // The AE is the engine this was missing on: nothing ever triggered its
@@ -162,24 +262,155 @@ public final class AssetsClusteredService implements ClusteredService {
             com.openexchange.cluster.SnapshotCadence.fromEnv();
     // ...and what turns the snapshot into reclaimed disk on THIS node.
     private com.openexchange.cluster.SnapshotLogPruner logPruner;
+    // Lazily connected archive client used only to confirm the snapshot recording landed on disk
+    // before onTakeSnapshot returns (see awaitSnapshotRecorded). Cloned context: never shares lock
+    // state with the cluster's own archive client. Closed in onTerminate.
+    private AeronArchive snapshotArchive;
+    /** Bounded wait for a wedged snapshot publication (all chunks share one deadline). */
+    private static final long SNAPSHOT_OFFER_DEADLINE_MS = 30_000;
+    /** Bounded wait for the archive to ingest the published snapshot bytes. */
+    private static final long SNAPSHOT_RECORD_DEADLINE_MS = 10_000;
+
+    /**
+     * RC2 S17 W12 (R0 on the AE, the X-3(a) pattern of {@link #restoreFromImage} and the ME's haltPrincipalLess): the
+     * applier threw the kit's PrincipalLessSessionException (a principal-less SessionOpen, a frame from an id the
+     * registry does not hold, or a restored principal-less session). Print the CRITICAL line, close readiness in this
+     * callback, stop the process; the caller rethrows (test hooks may return, the production halt does not).
+     */
+    private void haltPrincipalLess(final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+        failApplicationCallback();
+        System.err.println(principalLess.getMessage());
+        failFast.run();
+    }
+
+    /**
+     * RC2 S17 W12 (R0): the sessions the container restored before onStart (Aeron's own snapshot) go through the kit
+     * gate at the log position every member shares. Package-private for AeSessionAuthorityTest.
+     */
+    void checkRestoredSessions(final Cluster cluster) {
+        try {
+            cluster.forEachClientSession(session -> com.openexchange.cluster.auth.PrincipalGate.requireClass(
+                    session.encodedPrincipal(), "restored session", session.id(), cluster.logPosition()));
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess);
+            throw principalLess;
+        }
+    }
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnStart(cluster, snapshotImage);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException halted) {
+            throw halted; // R0 already logged, fenced and ran failFast
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
+        if (consensusReadiness != null) { consensusReadiness.start(cluster.aeron()); }
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
-        engine.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
+        nodeMetrics.setRole(cluster.role().code());
+        applier.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
                 balanceFeed != null ? balanceFeed::onBalanceUpdate
                         : AssetsEventPublisher.LiveBalanceTap.NONE));
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
             seedBalanceFeedFromSnapshot();
         }
+        checkRestoredSessions(cluster);
         startNodeEndpoint();
         startDurability(cluster);
         // Started, not ready: the snapshot is loaded but the log replay may
-        // still be running. Readiness waits for the first live role change.
+        // still be running. Readiness waits for current consensus and application evidence.
         readiness.started();
+    }
+
+    /**
+     * What this node exposes about itself beyond liveness. Suppliers run on the endpoint thread and
+     * read plain longs or Aeron counters; nothing here can block the service thread. The histogram
+     * and snapshot series come from {@code nodeMetrics} itself.
+     */
+    private com.openexchange.assets.infrastructure.metrics.AssetsMetricsBody metricsBody() {
+        return new com.openexchange.assets.infrastructure.metrics.AssetsMetricsBody(nodeMetrics)
+                .gauge("assets_accounts",
+                        "Accounts in the ledger (never shrinks; a rejected command still creates its account)",
+                        () -> engine.accountCount())
+                .gauge("assets_last_applied_trade_id", "Settlement high-water (dense ME tradeId) applied by this ledger",
+                        engine::getLastAppliedTradeId)
+                .gauge("assets_consume_position", "ME settlement-journal egressSeq watermark this ledger has applied",
+                        engine::getConsumePosition)
+                .gauge("assets_journal_seq", "Money journal sequence (last entry written)", engine::getJournalSeq)
+                .gauge("assets_money_journal_enabled", "1 if the money journal is armed on this ledger, else 0",
+                        () -> engine.isMoneyJournalEnabled() ? 1 : 0)
+                .counter("assets_settle_faults_total",
+                        "Settle legs that could not draw fully from their order hold (MUST be alerted on)",
+                        engine::getSettleFaultCount)
+                .counter("assets_suppressed_feed_releases_total",
+                        "Feed TerminalReleases suppressed on OMS-managed holds", engine::getSuppressedFeedReleaseCount)
+                .counter("assets_exhausted_holds_reaped_total", "Fully drawn holds reaped from accounts",
+                        engine::getExhaustedHoldsReaped)
+                .counter("assets_drain_timer_fires_total",
+                        "Idle-path egress drain belt fires (leader only; a chain that stops advancing is match#25)",
+                        () -> drainTimerFires)
+                .counter("assets_resumable_sessions_closed_total",
+                        "Sessions closed at their egress queue ceiling instead of blocking the engine (every core session is resumable)",
+                        () -> resumableSessionsClosed)
+                // RC2 S10': assets_sessions{class} is the registered-session family (OrderEngineMetrics); this was its old name
+                .gauge("assets_egress_sessions", "Client sessions with an egress queue on this node", () -> egressQueues.length)
+                .gauge("assets_egress_pending_bytes", "Bytes queued for egress across sessions (-1 until the leader counters exist)",
+                        () -> egressPendingBytes == null ? -1 : egressPendingBytes.get())
+                .gauge("assets_egress_peak_pending_bytes", "Peak of assets_egress_pending_bytes (-1 until the leader counters exist)",
+                        () -> egressPeakPendingBytes == null ? -1 : egressPeakPendingBytes.get())
+                .counter("assets_egress_back_pressured_total",
+                        "Egress offers that hit back pressure (-1 until the leader counters exist)",
+                        () -> egressBackPressured == null ? -1 : egressBackPressured.get())
+                .gauge("assets_application_callback_failed",
+                        "1 once a cluster callback threw on this node (apply latched, /ready 503, process stopped), else 0",
+                        () -> applicationCallbackFailed ? 1 : 0)
+                .counter("assets_ingress_schema_rejects_total",
+                        "Ingress frames dropped for a schemaId/version outside this build's supported set (before any body decode)",
+                        demuxer::schemaRejectCount)
+                .counter("assets_ingress_decode_rejects_total",
+                        "Ingress frames dropped for frame/group bounds or an invalid enum/field byte (poison input, expected)",
+                        demuxer::decodeRejectCount)
+                .counter("assets_ingress_apply_errors_total",
+                        "Application faults after a decoded command entered the engine; nonzero fences this node until restart",
+                        demuxer::applyErrorCount)
+                .counter("assets_ingress_unknown_template_total",
+                        "Ingress frames whose templateId money-schema does not define", demuxer::unknownTemplateCount)
+                .counter("assets_ingress_unhandled_template_total",
+                        "Ingress frames whose v6 templateId this build does not serve yet (gateway ahead of the core)",
+                        demuxer::unhandledTemplateCount)
+                .counter("assets_settle_rejects_total",
+                        "Feed settles refused before any mutation (unknown market, bad amounts, overflow); MUST be alerted on",
+                        engine::getSettleRejectCount)
+                .counter("assets_egress_oversize_drops_total",
+                        "Egress frames larger than a session publication's max message length, lost for that session; should stay 0",
+                        this::egressOversizeDrops)
+                .counter("assets_ingress_unauthorised_total",
+                        "Ingress commands refused for session authority (class, user scope, registration); never a fence",
+                        demuxer::unauthorisedCount)
+                .gauge("assets_sessions_known", "Sessions in the replicated authority table", () -> engine.sessions().size())
+                .gauge("assets_order_entry_gate",
+                        "1 when the global order-entry gate is OPEN, else 0 (reason in the log and AdmissionState)",
+                        () -> engine.gate().state(com.openexchange.assets.application.engine.gate.OrderEntryGate.GLOBAL)
+                                == com.openexchange.assets.domain.GateState.OPEN ? 1 : 0)
+                .counter("assets_sweep_timer_fires_total",
+                        "Deadline sweep timer fires applied on this node (one log entry each; K3-D)", () -> sweepTimerFires)
+                .gauge("assets_deadline_index_size", "Entries in the derived deadline index (GTD, replace, requestId TTL)",
+                        () -> engine.deadlines().size())
+                .gauge("assets_last_log_time_ms", "Monotone log time last applied by this ledger (cluster epoch ms)",
+                        engine::getLastLogTime)
+                .include(com.openexchange.assets.infrastructure.metrics.OrderEngineMetrics.of(engine.metricsView(), this::egressDiscardCloses));
     }
 
     /**
@@ -246,24 +477,30 @@ public final class AssetsClusteredService implements ClusteredService {
             // Settlement Bridge's metrics port on the same box. cluster.memberId() is
             // -1 this early in onStart, so read the id the way AeronCluster does.
             // Empty env is treated as unset.
+            String nodeStr = System.getenv("CLUSTER_NODE");
+            if (nodeStr == null || nodeStr.isEmpty()) {
+                nodeStr = System.getProperty("node.id", "0");
+            }
+            int nodeId;
+            try {
+                nodeId = Integer.parseInt(nodeStr.trim());
+            } catch (NumberFormatException nfe) {
+                nodeId = 0;
+            }
+            nodeMetrics.setMemberId(nodeId);
+            // Env first (process manager), then the system property (in-process tests pick a free
+            // port without touching the environment), else the per-node default.
             final String env = System.getenv("ASSETS_NODE_PORT");
+            final String prop = System.getProperty("assets.node.port");
             final int port;
             if (env != null && !env.isEmpty()) {
                 port = Integer.parseInt(env);
+            } else if (prop != null && !prop.isEmpty()) {
+                port = Integer.parseInt(prop);
             } else {
-                String nodeStr = System.getenv("CLUSTER_NODE");
-                if (nodeStr == null || nodeStr.isEmpty()) {
-                    nodeStr = System.getProperty("node.id", "0");
-                }
-                int nodeId;
-                try {
-                    nodeId = Integer.parseInt(nodeStr.trim());
-                } catch (NumberFormatException nfe) {
-                    nodeId = 0;
-                }
                 port = 9700 + nodeId;
             }
-            nodeEndpoint = new com.openexchange.cluster.NodeEndpoint(readiness, null);
+            nodeEndpoint = new com.openexchange.cluster.NodeEndpoint(readiness, metricsBody()::render);
             nodeEndpoint.start(port);
         } catch (Exception e) {
             // A probe endpoint must never be the reason the ledger does not start.
@@ -279,22 +516,17 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     @Override
     public int doBackgroundWork(final long nowNs) {
-        readiness.tick();
-        // cluster-kit#15: feed readiness by POLLING the role, never by trusting
-        // onRoleChange alone. Aeron fires that callback only on role TRANSITIONS,
-        // so a node that boots straight into FOLLOWER and stays there never gets
-        // it: /ready answered "catching up" forever and SnapshotLogPruner never
-        // pruned on that node (observed live 2026-08-12). An enum compare per
-        // cycle is free; the callback keeps its other side effects (isLeader,
-        // cadence, drain timer) and readiness.roleChanged is idempotent.
-        final Cluster.Role observedRole = cluster.role();
-        if (observedRole != lastObservedRole) {
-            lastObservedRole = observedRole;
-            readiness.roleChanged(observedRole);
-            if (observedRole == Cluster.Role.LEADER || observedRole == Cluster.Role.FOLLOWER) {
-                System.out.println("READINESS: role " + observedRole
-                        + " observed via duty-cycle poll (cluster-kit#15)");
-            }
+        if (applicationCallbackDepth != 0 || applicationCallbackFailed) {
+            readiness.tick();
+            if (applicationCallbackFailed) { readiness.unavailable("application-callback-failed"); }
+            return 0; // Never publish a partially applied event as completed.
+        }
+        if (consensusReadiness == null) {
+            readiness.tick();
+            readiness.roleChanged(cluster.role());
+            readiness.unavailable("consensus-not-configured");
+        } else {
+            consensusReadiness.poll(cluster, nowNs);
         }
         // At most once a second, and only on the leader: is the cluster due a
         // snapshot? Everything past that gate is a long compare.
@@ -378,15 +610,52 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onSessionOpen(ClientSession session, long timestamp) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnSessionOpen(session, timestamp);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess);
+            throw principalLess;
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnSessionOpen(ClientSession session, long timestamp) {
+        if (session != null) {
+            // The principal the authenticator minted rides the SessionOpen log event: every member parses the
+            // same bytes into the same authority (K6). Null only in in-process unit tests.
+            applier.onSessionOpen(session.id(), cluster == null ? -1L : cluster.logPosition(), timestamp,
+                    session.encodedPrincipal());
+        }
         sessionsDirty = true;
         drainEgress();
         // Arm here as well as in onSessionMessage: a leader that has a session but has not yet been
         // asked anything should already have its idle-path belt running.
         armDrainTimerIfNeeded();
+        armSweepIfNeeded();
     }
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnSessionClose(session, timestamp, closeReason);
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        applier.onSessionClose(session.id(), cluster == null ? -1L : cluster.logPosition(), timestamp, closeReason);
         egressBySessionId.remove(session.id());
         sessionsDirty = true;
         drainEgress();
@@ -395,39 +664,140 @@ public final class AssetsClusteredService implements ClusteredService {
     @Override
     public void onSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
                                  int offset, int length, Header header) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnSessionMessage(session, timestamp, buffer, offset, length, header);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess);
+            throw principalLess;
+        } catch (RuntimeException | Error failure) {
+            // The demuxer already classified this: decode poison never gets here (dropped + counted), so
+            // anything that does is an APPLICATION FAULT after a possible mutation. Close readiness in
+            // THIS callback, log the evidence (hooks will not run), stop the process, and rethrow so
+            // Aeron's own accounting sees it too. The 'latch and continue' this replaces left a node
+            // applying with /ready 503 and its snapshot cadence stopped. Recovery is restart + replay.
+            failApplicationCallback();
+            System.err.println("FATAL command application failure: logPosition=" + header.position()
+                    + " sessionId=" + (session == null ? -1 : session.id())
+                    + " templateId=" + peekTemplateId(buffer, offset, length)
+                    + " type=" + failure.getClass().getName() + " message=" + failure.getMessage());
+            failFast.run();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void ensureApplicationHealthy() {
+        if (applicationCallbackFailed) {
+            throw new IllegalStateException("Application callback already failed; restart required");
+        }
+    }
+
+    /** Latch AND close readiness now, not on the next background tick. */
+    private void failApplicationCallback() {
+        applicationCallbackFailed = true;
+        readiness.unavailable("application-callback-failed");
+    }
+
+    private int peekTemplateId(DirectBuffer buffer, int offset, int length) {
+        return length >= MessageHeaderDecoder.ENCODED_LENGTH && offset >= 0
+                && length <= buffer.capacity() - offset
+                ? peekHeaderDecoder.wrap(buffer, offset).templateId() : -1;
+    }
+
+    private void applyOnSessionMessage(ClientSession session, long timestamp, DirectBuffer buffer,
+                                 int offset, int length, Header header) {
         // Subscribe is a TRANSPORT concern, not money state: it changes who receives egress, never what
         // the ledger does. It is handled here and deliberately never reaches the engine, so the engine
         // stays a pure deterministic state machine and the subscription never enters a snapshot.
-        if (!applyIfSubscribe(session, buffer, offset, length)) {
-            // Peeked, never consumed: a QueryFeedPosition marks its sender as resumable and still
-            // flows to the engine, which answers it with a FeedPositionReport.
-            markIfFeedConsumer(session, buffer, offset, length);
+        // Service-thread cost, apply and drain timed separately (RC0 measurement input). Diagnostic
+        // nanoTime only: nothing here feeds replicated state. Sampled per ASSETS_APPLY_SAMPLE_SHIFT
+        // (default: every message).
+        boolean sampled = false;
+        int templateId = -1;
+        long dispatchStartNs = 0L;
+        long dispatchEndNs = 0L;
+        if (session != null && !applier.holdsSession(session.id())) {
+            // RC2 S17 W12 (R0, ingress frame): a container session with no registry row. Every SessionOpen the
+            // registry applied has a class (the applier's kit gate), so this is a divergence between the container's
+            // sessions and the replicated table: halt, never serve. A null session (an id the container does not
+            // hold) keeps RCS S1 RF-1: dispatched with no authority.
+            com.openexchange.cluster.auth.PrincipalGate.requireClass(null, "ingress frame", session.id(),
+                    header.position());
+        }
+        if (applier.isTransportSubscribe(buffer, offset, length)) {
+            subscribeTransport(session, buffer, offset, length);
+        } else {
             // The origin context: while the engine applies this command, request-scoped egress goes to
             // THIS session (and, for a query, so does every emission — see isQueryIngress). Cleared in
             // a finally so a throwing apply cannot leak one command's origin onto the next.
             originSession = session;
             originIsQuery = isQueryIngress(buffer, offset, length);
+            sampled = nodeMetrics.shouldSample();
+            if (sampled) {
+                templateId = length >= MessageHeaderDecoder.ENCODED_LENGTH
+                        ? peekHeaderDecoder.wrap(buffer, offset).templateId() : -1;
+                dispatchStartNs = System.nanoTime();
+            }
             try {
                 // Deterministic on every replica: decode -> domain command -> engine mutation. The apply
                 // only queues its egress; the offers happen in the drain below, off the apply's critical
                 // section.
-                demuxer.dispatch(buffer, offset, length, timestamp);
+                applier.onSessionMessage(session == null ? -1L : session.id(), header.position(), timestamp,
+                        buffer, offset, length);
             } finally {
                 originSession = null;
                 originIsQuery = false;
             }
+            if (sampled) {
+                dispatchEndNs = System.nanoTime();
+            }
         }
         drainEgress();
+        if (sampled) {
+            nodeMetrics.recordMessage(templateId, dispatchEndNs - dispatchStartNs,
+                    System.nanoTime() - dispatchEndNs, header.position());
+        }
         armDrainTimerIfNeeded();
+        armSweepIfNeeded();
     }
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
-        // Holds have no TTL yet (auto-expiry is a later phase); the only timer is the egress drain belt.
-        if (correlationId == EGRESS_DRAIN_TIMER_ID) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnTimerEvent(correlationId, timestamp);
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnTimerEvent(long correlationId, long timestamp) {
+        final int kind = AssetsLogApplier.timerKind(correlationId);
+        final long logPosition = cluster == null ? -1L : cluster.logPosition();
+        if (kind == AssetsLogApplier.TIMER_SWEEP) {
+            // Replicated: a TimerEvent is a log entry, so every member pops the same entries at the same
+            // log time; only the leader re-arms, and only while something is left to sweep.
+            sweepArmed = false;
+            sweepTimerFires++;
+            applier.onTimerEvent(correlationId, logPosition, timestamp);
+            drainEgress();
+            armSweepIfNeeded();
+            return;
+        }
+        applier.onTimerEvent(correlationId, logPosition, timestamp);
+        if (kind == AssetsLogApplier.TIMER_DRAIN) {
             drainTimerArmed = false;
             drainTimerFires++;
+            final long drainStartNs = System.nanoTime();
             drainEgress();
+            nodeMetrics.recordTimerDrain(System.nanoTime() - drainStartNs);
             updateEgressCounters();
             reportEgressPressure(timestamp);
             armDrainTimerIfNeeded();
@@ -436,28 +806,163 @@ public final class AssetsClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnTakeSnapshot(snapshotPublication);
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
+        final long startNs = System.nanoTime();
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        final int length = BalanceSnapshotCodec.serialize(engine, buffer);
+        final int length = applier.serialize(buffer);
+        final long serializedNs = System.nanoTime();
+
+        // Chunked, like the matching engine's A-2 fix: a single offer() throws
+        // IllegalArgumentException the moment the payload exceeds the publication's
+        // maxMessageLength (snapshot term / 8: 8 MiB at the 64m default, 128 KiB on a 1m term).
+        // Every member snapshots at the same log position, so an oversize single offer fenced ALL
+        // nodes at once and the log was never pruned again. Splitting into maxMessageLength-sized
+        // messages keeps every offer legal; a payload that fits is still one message, byte-identical
+        // to the historical path. The receiver (loadSnapshot) reassembles by raw concatenation.
+        final int chunks = offerSnapshotChunked(snapshotPublication, buffer, length, idleStrategy);
+        final long offeredNs = System.nanoTime();
+
+        // Do not return until the archive has the bytes on disk: a node killed between the offer
+        // and the archive flush would prune a snapshot the recording log already points at and
+        // fail recovery with "unknown recording id" (matching engine forensic, 2026-07-02).
+        awaitSnapshotRecorded(snapshotPublication);
+        final long recordedNs = System.nanoTime();
+
+        System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " bytes=" + length
+                + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
+                + " serializeMs=" + ((serializedNs - startNs) / 1_000_000)
+                + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
+                + " recordMs=" + ((recordedNs - offeredNs) / 1_000_000)
+                + " logPosition=" + cluster.logPosition());
+        nodeMetrics.stampSnapshot(System.currentTimeMillis(), length, chunks, serializedNs - startNs,
+                offeredNs - serializedNs, recordedNs - offeredNs, cluster.logPosition());
+
+        // The baseline for the next snapshot, on EVERY member and whoever asked for this one.
+        snapshotCadence.snapshotTaken(cluster.logPosition(), System.nanoTime());
+    }
+
+    /**
+     * Offer a serialized snapshot as one or more Aeron messages, each no larger than the
+     * publication's {@code maxMessageLength}. Package-private and static so the multi-chunk
+     * transport path is unit-testable against a real Aeron publication
+     * ({@code SnapshotChunkingTransportTest}). One overall deadline covers every chunk, so a wedged
+     * publication fails loudly instead of parking the service thread forever (the old loop retried
+     * every negative result with no bound). Chunk count is a node-local I/O detail: each member splits
+     * with its own {@code maxMessageLength} and the receiver concatenates, so there is deliberately
+     * no cross-node framing.
+     *
+     * @return the number of messages offered
+     */
+    static int offerSnapshotChunked(final ExclusivePublication snapshotPublication,
+                                    final DirectBuffer buffer, final int length,
+                                    final IdleStrategy idleStrategy) {
+        final int maxLen = snapshotPublication.maxMessageLength();
+        final long deadlineMs = System.currentTimeMillis() + SNAPSHOT_OFFER_DEADLINE_MS;
+        int sent = 0;
+        int chunks = 0;
+        long attempts = 0;
         idleStrategy.reset();
-        while (true) {
-            final long result = snapshotPublication.offer(buffer, 0, length);
-            if (result > 0) {
-                // The baseline for the next snapshot, on EVERY member and whoever
-                // asked for this one.
-                snapshotCadence.snapshotTaken(cluster.logPosition(), System.nanoTime());
-                return;
+        while (sent < length) {
+            final int chunk = Math.min(maxLen, length - sent);
+            long result;
+            while ((result = snapshotPublication.offer(buffer, sent, chunk)) < 0) {
+                if (result == ExclusivePublication.CLOSED
+                        || result == ExclusivePublication.MAX_POSITION_EXCEEDED) {
+                    throw new IllegalStateException("failed to offer assets snapshot: result=" + result
+                            + " sent=" + sent + "/" + length + " bytes");
+                }
+                attempts++;
+                if (System.currentTimeMillis() > deadlineMs) {
+                    throw new IllegalStateException("assets snapshot offer stuck after "
+                            + SNAPSHOT_OFFER_DEADLINE_MS + "ms: lastResult=" + result
+                            + " attempts=" + attempts + " sent=" + sent + "/" + length + " bytes");
+                }
+                idleStrategy.idle();
             }
-            if (result == ExclusivePublication.CLOSED
-                    || result == ExclusivePublication.MAX_POSITION_EXCEEDED) {
-                throw new IllegalStateException("failed to offer assets snapshot: " + result);
+            sent += chunk;
+            chunks++;
+        }
+        return chunks;
+    }
+
+    /**
+     * Block until the Archive's recording of the snapshot publication has ingested every byte we
+     * offered ({@code recordingPosition >= publication.position()}), or fail after a bounded wait.
+     */
+    private void awaitSnapshotRecorded(final ExclusivePublication snapshotPublication) {
+        final long writtenPosition = snapshotPublication.position();
+        if (writtenPosition <= 0) {
+            return;
+        }
+        if (snapshotArchive == null) {
+            snapshotArchive = AeronArchive.connect(cluster.context().archiveContext().clone());
+        }
+        final String channel = snapshotPublication.channel();
+        final int streamId = snapshotPublication.streamId();
+        final int sessionId = snapshotPublication.sessionId();
+        final long deadlineMs = System.currentTimeMillis() + SNAPSHOT_RECORD_DEADLINE_MS;
+
+        long recordingId;
+        idleStrategy.reset();
+        while ((recordingId = snapshotArchive.findLastMatchingRecording(0L, channel, streamId, sessionId))
+                == Aeron.NULL_VALUE) {
+            if (System.currentTimeMillis() > deadlineMs) {
+                throw new IllegalStateException("assets snapshot recording not registered within "
+                        + SNAPSHOT_RECORD_DEADLINE_MS + "ms (channel=" + channel + " stream=" + streamId
+                        + " session=" + sessionId + ")");
+            }
+            idleStrategy.idle();
+        }
+        long observedPosition;
+        while ((observedPosition = snapshotArchive.getRecordingPosition(recordingId)) < writtenPosition) {
+            if (System.currentTimeMillis() > deadlineMs) {
+                throw new IllegalStateException("assets snapshot archive ingestion stalled: recordingId="
+                        + recordingId + " written=" + writtenPosition + " recorded=" + observedPosition);
             }
             idleStrategy.idle();
         }
     }
 
     @Override
+    public void onNewLeadershipTermEvent(long leadershipTermId, long logPosition, long timestamp, long termBaseLogPosition,
+                                         int leaderMemberId, int logSessionId, TimeUnit timeUnit, int appVersion) {
+        // Seen live and during replay (in log order): the latest term names the timer ids this node arms as leader.
+        this.leadershipTermId = leadershipTermId;
+        // Never fenced at the base: a latched applier refuses every entry, so a term event on a stopped node stays silent.
+        if (!applier.failed()) {
+            applier.onNewLeadershipTermEvent(leadershipTermId, logPosition, timestamp, timeUnit);
+        }
+    }
+
+    @Override
     public void onRoleChange(Cluster.Role newRole) {
+        ensureApplicationHealthy();
+        applicationCallbackDepth++;
+        try {
+            applyOnRoleChange(newRole);
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnRoleChange(Cluster.Role newRole) {
         this.isLeader = newRole == Cluster.Role.LEADER;
+        nodeMetrics.setRole(newRole.code());
         // The feed publishes only on the leader; a GAIN also queues a full-store sweep, which is the
         // feed's natural baseline for consumers across the failover (the store itself is current on
         // every node because the live tap runs during apply everywhere).
@@ -478,18 +983,41 @@ public final class AssetsClusteredService implements ClusteredService {
         // Always re-arm from scratch. Only the leader really schedules (a follower's scheduleTimer is a
         // no-op), and a timer does not survive a snapshot recover-into-leader, so clearing the flag
         // guarantees the next onSessionMessage arms exactly one fresh belt. This is match#26's fix:
-        // missing it leaves a leader whose idle-path drain never fires.
+        // missing it leaves a leader whose idle-path drain never fires. The deadline sweep follows the
+        // same rule (K3-D): clear here, re-arm from the next legal callback while the index is non-empty.
         drainTimerArmed = false;
+        sweepArmed = false;
     }
 
     @Override
     public void onTerminate(Cluster cluster) {
+        applicationCallbackDepth++;
+        try {
+            applyOnTerminate(cluster);
+        } catch (RuntimeException | Error failure) {
+            failApplicationCallback();
+            throw failure;
+        } finally {
+            applicationCallbackDepth--;
+        }
+    }
+
+    private void applyOnTerminate(Cluster cluster) {
         readiness.stopping();
+        if (consensusReadiness != null) { consensusReadiness.close(); }
         if (logPruner != null) {
             logPruner.stop();
         }
         if (nodeEndpoint != null) {
             nodeEndpoint.stop();
+        }
+        if (snapshotArchive != null) {
+            try {
+                snapshotArchive.close();
+            } catch (final RuntimeException ignored) {
+                // shutting down
+            }
+            snapshotArchive = null;
         }
         closeQuietly(egressPendingBytes);
         closeQuietly(egressBackPressured);
@@ -509,26 +1037,84 @@ public final class AssetsClusteredService implements ClusteredService {
     private void loadSnapshot(Image snapshotImage) {
         final ExpandableArrayBuffer collector = new ExpandableArrayBuffer();
         final MutableInteger length = new MutableInteger(0);
-        // A snapshot is one logical message (possibly fragmented); reassemble it, then decode.
+        // The snapshot is one OR MORE Aeron messages (chunked on the way out to stay under
+        // maxMessageLength). FragmentAssembler reassembles each message from its MTU fragments; the
+        // messages are then ACCUMULATED, in arrival order, into one contiguous payload that is decoded
+        // once. A single ExclusivePublication wrote them, so the concatenation is byte-identical to
+        // BalanceSnapshotCodec.serialize's output. Decoding the first message alone (the old
+        // behaviour) would silently restore a truncated ledger the moment a snapshot spans two chunks.
         final FragmentHandler handler = (buffer, offset, len, header) -> {
-            collector.putBytes(0, buffer, offset, len);
-            length.value = len;
+            collector.putBytes(length.value, buffer, offset, len);
+            length.value += len;
         };
         final io.aeron.FragmentAssembler assembler = new io.aeron.FragmentAssembler(handler);
         idleStrategy.reset();
+        int polls = 0;
         while (true) {
-            final int fragments = snapshotImage.poll(assembler, 1);
-            if (length.value > 0) {
+            final int fragments = snapshotImage.poll(assembler, 64);
+            polls++;
+            if (snapshotImage.isEndOfStream()) {
+                // Drain anything the image delivered together with end-of-stream.
+                while (snapshotImage.poll(assembler, 64) > 0) {
+                    polls++;
+                }
                 break;
             }
-            if (snapshotImage.isEndOfStream()) {
-                break;
+            if (fragments == 0 && snapshotImage.isClosed()) {
+                // Same guard as Aeron's own ClusteredServiceAgent.loadState: an image that went away
+                // without end-of-stream would otherwise park the service thread here forever.
+                throw new IllegalStateException("assets snapshot image closed before end-of-stream: "
+                        + length.value + " byte(s) received at position " + snapshotImage.position());
             }
             idleStrategy.idle(fragments);
         }
-        if (length.value > 0) {
-            BalanceSnapshotCodec.deserialize(collector, 0, length.value, engine);
+        System.out.println("[SNAPSHOT] reassembled " + length.value + " byte(s) in " + polls
+                + " poll(s) from image position " + snapshotImage.position());
+        restoreFromImage(collector, length.value);
+    }
+
+    /**
+     * Restore from a reassembled snapshot image: open the kit envelope (magic, version, length, CRC32C),
+     * decode the v4 payload, require it to end exactly where the envelope says, then verify the ledger
+     * invariants. Any refusal is logged with its reason and stops the node through {@link #failFast}: a
+     * node must not run on a snapshot it could not verify (hardening B1.2 step 5). A bare payload is
+     * refused like any other corruption; there is no legacy pass-through (clean genesis).
+     */
+    void restoreFromImage(final DirectBuffer image, final int imageLength) {
+        try {
+            // Empty image, envelope, decode, framing and invariants are all checked by the applier.
+            try {
+                applier.restore(image, imageLength);
+            } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+                haltPrincipalLess(principalLess); // a restored session row without a principal (section 9)
+                throw principalLess;
+            }
+            final BalanceSnapshotCodec.Decoded decoded = applier.lastRestored();
+            System.out.println("[SNAPSHOT] restored orders=" + engine.orders().orders().size() + " accounts=" + decoded.accountCount
+                    + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
+                    + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq
+                    + " lastLogTime=" + decoded.lastLogTime + " sections=" + decoded.sectionCount
+                    + " deadlines=" + engine.deadlines().size() + " enveloped=true verified=true");
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            throw principalLess;
+        } catch (final RuntimeException refused) {
+            failApplicationCallback();
+            System.err.println("FATAL snapshot refused: " + refused.getMessage()
+                    + " (imageLength=" + imageLength + "); this node will not serve an unverified ledger");
+            failFast.run();
+            throw refused;
         }
+    }
+
+    /** The snapshot image as offered: the v4 payload written at the envelope's payload offset, then sealed. */
+    static int encodeSnapshot(final AssetsEngine engine, final MutableDirectBuffer buffer,
+                              final com.openexchange.cluster.SnapshotEnvelope envelope) {
+        return AssetsLogApplier.encode(engine, buffer, envelope);
+    }
+
+    /** Exposed for tests / diagnostics: deadline sweep timer fires on this node. */
+    public long sweepTimerFires() {
+        return sweepTimerFires;
     }
 
     /**
@@ -638,19 +1224,12 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     /**
-     * Handle a Subscribe message if that is what this is.
-     *
-     * @return true when the message was a Subscribe and must NOT be dispatched to the engine
+     * The transport effect of a well-formed Subscribe ({@link AssetsLogApplier#isTransportSubscribe} said so): decode
+     * the channel mask and, on the leader, narrow this session's broadcast streams. Never the engine, never a
+     * snapshot. A short or foreign-version Subscribe is not classified as one: it goes to the applier, whose demuxer
+     * drops and counts it without reading stale bytes past the frame.
      */
-    private boolean applyIfSubscribe(ClientSession session, DirectBuffer buffer, int offset, int length) {
-        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
-            return false;
-        }
-        peekHeaderDecoder.wrap(buffer, offset);
-        if (peekHeaderDecoder.templateId() != SubscribeDecoder.TEMPLATE_ID
-                || peekHeaderDecoder.schemaId() != SubscribeDecoder.SCHEMA_ID) {
-            return false;
-        }
+    private void subscribeTransport(ClientSession session, DirectBuffer buffer, int offset, int length) {
         subscribeDecoder.wrapAndApplyHeader(buffer, offset, peekHeaderDecoder);
         final EgressChannelsDecoder channels = subscribeDecoder.channels();
         int mask = 0;
@@ -665,88 +1244,31 @@ public final class AssetsClusteredService implements ClusteredService {
                 queue.subscribe(mask);
             }
         }
-        return true;
-    }
-
-    /**
-     * Mark the session's queue resumable if this message is a QueryFeedPosition.
-     *
-     * <p>QueryFeedPosition is the first step of a consumer's RESUME protocol: the bridge sends it at
-     * every epoch start and rebuilds its skip-filter from the FeedPositionReport answer, so a sender
-     * has proven it can lose this session and resynchronise. That proof is what licenses
-     * {@link #appendAfterFreeingSpace} to close the session instead of blocking the engine when its
-     * queue hits the ceiling. The mark is a transport concern like Subscribe — leader-local, never
-     * snapshotted — but unlike Subscribe the message itself is FOR the engine, which answers it, so it
-     * is peeked here and still dispatched.</p>
-     */
-    private void markIfFeedConsumer(ClientSession session, DirectBuffer buffer, int offset, int length) {
-        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
-            return;
-        }
-        peekHeaderDecoder.wrap(buffer, offset);
-        if (peekHeaderDecoder.templateId() != QueryFeedPositionDecoder.TEMPLATE_ID
-                || peekHeaderDecoder.schemaId() != QueryFeedPositionDecoder.SCHEMA_ID) {
-            return;
-        }
-        if (isLeader && cluster != null) {
-            refreshSessionsIfNeeded();
-            final SessionEgressQueue queue = egressBySessionId.get(session.id());
-            if (queue != null) {
-                queue.markResumable();
-            }
-        }
     }
 
     /**
      * The queue hit its growth ceiling: this session's consumer has been unable to keep up for a long
-     * time, and what happens next depends on whether that consumer can survive losing its session.
-     *
-     * <p><b>Resumable consumer (it sent QueryFeedPosition): close the session, keep the engine.</b>
-     * A consumer with a resume protocol — the bridge: {@code SessionClosedException} -> epoch restart
-     * -> QueryFeedPosition/FeedPositionReport -> skip-filter, with AE idempotency underneath — loses
-     * NOTHING when its session dies: it replays from positions. Blocking the whole engine for it
-     * would trade cluster availability for a guarantee it does not need — and that trade can
-     * livelock: an engine parked here rejects ingress, so a consumer that is itself waiting on this
-     * engine can never drain the very queue the engine is blocked on. {@link ClientSession#close()}
-     * goes through the consensus module, so followers observe the close deterministically via the
-     * log.</p>
-     *
-     * <p><b>Everything else: block on that one session until it frees space,</b> exactly as the old
-     * inline path blocked — money egress to a consumer without a resume protocol (OMS, load
-     * generators) is never shed. Only that session's producer stalls, and only in this far-edge case;
-     * the other sessions keep their queued frames.</p>
+     * time. Every core session owns a resume protocol (RegisterSession requires {@code resumable=true};
+     * the C++ gateway resyncs through the log, the forwarder through RequestPendingDispatch, the bridge
+     * through QueryFeedPosition), so the session is CLOSED and the engine keeps flowing. Blocking the whole
+     * engine on one consumer traded cluster availability for a guarantee no remaining client needs, and
+     * it could livelock (an engine parked here rejects ingress, so a consumer waiting on this engine can
+     * never drain the queue the engine is blocked on). {@link ClientSession#close()} goes through the
+     * consensus module, so followers observe the close deterministically via the log.
      */
     private void appendAfterFreeingSpace(SessionEgressQueue queue, MutableDirectBuffer buffer,
                                          int offset, int length) {
-        if (queue.isResumable()) {
-            resumableSessionsClosed++;
-            System.err.println("CRITICAL: assets egress queue full for RESUMABLE session=" + queue.sessionId()
-                    + " via=" + queue.session().responseChannel()
-                    + " (pending=" + queue.pendingBytes() + "B, backPressured=" + queue.backPressureCount()
-                    + ") — closing the session instead of blocking the engine; the consumer resyncs on reconnect");
-            queue.reset();
-            try {
-                queue.session().close();
-            } catch (final RuntimeException ignored) {
-                // already closing: the queue is empty either way and later drains discard on CLOSED
-            }
-            return; // engine keeps flowing; the un-queued frame is safe — resync replays from positions
-        }
-        final long n = ++egressStallCount;
-        if (n == 1 || n % 1000 == 0) {
-            System.err.println("CRITICAL: assets egress queue full for session=" + queue.sessionId()
-                    + " via=" + queue.session().responseChannel()
-                    + " (pending=" + queue.pendingBytes() + "B, backPressured="
-                    + queue.backPressureCount() + ", stalls=" + n
-                    + ") — blocking the engine until the consumer drains; nothing is dropped");
-        }
-        idleStrategy.reset();
-        while (!queue.append(buffer, offset, length)) {
-            if (queue.drain() > 0) {
-                idleStrategy.reset();
-            } else {
-                idleStrategy.idle();
-            }
+        resumableSessionsClosed++;
+        System.err.println("CRITICAL: assets egress queue full for session=" + queue.sessionId()
+                + " via=" + queue.session().responseChannel()
+                + " (pending=" + queue.pendingBytes() + "B, backPressured=" + queue.backPressureCount()
+                + ", resumable=" + queue.isResumable()
+                + ") — closing the session instead of blocking the engine; the consumer resyncs on reconnect");
+        queue.reset();
+        try {
+            queue.session().close();
+        } catch (final RuntimeException ignored) {
+            // already closing: the queue is empty either way and later drains discard on CLOSED
         }
     }
 
@@ -783,7 +1305,7 @@ public final class AssetsClusteredService implements ClusteredService {
         for (final ClientSession session : sessions) {
             SessionEgressQueue queue = egressBySessionId.get(session.id());
             if (queue == null || queue.session() != session) {
-                queue = new SessionEgressQueue(session);
+                queue = new SessionEgressQueue(session, this::countDiscardClose);
                 egressBySessionId.put(session.id(), queue);
             }
             rebuilt[i++] = queue;
@@ -810,6 +1332,25 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     /**
+     * Arm the deadline sweep (K3-D): one timer, constant id, {@value #SWEEP_PERIOD_MS} ms ahead, leader
+     * only, only while the index is non-empty, and only from a callback where scheduling is legal (the
+     * same rule as the drain belt). Rescheduling the same id is idempotent, so at most one sweep exists
+     * cluster-wide; a sweep armed before a snapshot may also be replayed by the consensus module after a
+     * restore, which is harmless because the sweep itself is idempotent (one-shot pops).
+     */
+    private void armSweepIfNeeded() {
+        if (sweepArmed || !isLeader || cluster == null || engine.deadlines().isEmpty()) {
+            return;
+        }
+        final long deadline = cluster.time() + cluster.timeUnit().convert(SWEEP_PERIOD_MS, TimeUnit.MILLISECONDS);
+        idleStrategy.reset();
+        while (!cluster.scheduleTimer(termTimerId(SWEEP_TIMER_BASE), deadline)) {
+            idleStrategy.idle();
+        }
+        sweepArmed = true;
+    }
+
+    /**
      * Arm the idle-path drain belt. Leader only, and only from a callback where scheduling a timer is
      * legal (Aeron allows it from onSessionMessage / onTimerEvent / onSessionOpen / onSessionClose).
      */
@@ -820,15 +1361,48 @@ public final class AssetsClusteredService implements ClusteredService {
         final long deadline = cluster.time()
                 + cluster.timeUnit().convert(EGRESS_DRAIN_BACKSTOP_MS, TimeUnit.MILLISECONDS);
         idleStrategy.reset();
-        while (!cluster.scheduleTimer(EGRESS_DRAIN_TIMER_ID, deadline)) {
+        while (!cluster.scheduleTimer(termTimerId(EGRESS_DRAIN_TIMER_BASE), deadline)) {
             idleStrategy.idle();
         }
         drainTimerArmed = true;
     }
 
+    /**
+     * RC2 S8 3.13 with review FIX-2: a monotone service-level total. Each queue reports its discard close here at the
+     * moment it closes the session, so the count survives the queue's retirement at onSessionClose (a sum over the live
+     * queues fell back to 0 within a duty cycle) and never decreases.
+     */
+    private long egressDiscardCloses() {
+        return discardClosesTotal;
+    }
+
+    private void countDiscardClose() {
+        discardClosesTotal++;
+    }
+
+    /** Sum over live session queues (a closed session's drops leave with its queue). */
+    private long egressOversizeDrops() {
+        long total = 0L;
+        final SessionEgressQueue[] queues = egressQueues;
+        for (int i = 0; i < queues.length; i++) {
+            total += queues[i].oversizeDrops();
+        }
+        return total;
+    }
+
     /** Exposed for tests / diagnostics. */
     public AssetsEngine engine() {
         return engine;
+    }
+
+    /** Exposed for tests / diagnostics: the ingress fence counters live on the demuxer. */
+    public AssetsSbeDemuxer demuxer() {
+        return demuxer;
+    }
+
+    /** The log applier this service wraps (RCS S1); package-private for tests and later RCS slices. */
+    AssetsLogApplier applier() {
+        return applier;
     }
 
     /**

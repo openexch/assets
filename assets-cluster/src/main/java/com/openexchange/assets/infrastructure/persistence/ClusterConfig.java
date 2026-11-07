@@ -169,6 +169,7 @@ public final class ClusterConfig {
                 .clusterDir(new File(baseDir, CLUSTER_SUB_DIR))
                 .archiveContext(aeronArchiveContext.clone())
                 .serviceCount(1 + additionalServices.length)
+                .acceptStandbySnapshots(false)
                 .replicationChannel("aeron:udp?endpoint=" + hostname + ":0")
                 .snapshotChannel(snapshotChannel)
                 .idleStrategySupplier(org.agrona.concurrent.BusySpinIdleStrategy::new)
@@ -176,6 +177,20 @@ public final class ClusterConfig {
                 .wheelTickResolutionNs(1_000_000)
                 .ticksPerWheel(1024)
                 .maxConcurrentSessions(50);
+        // RC1 S3 (K6): every session authenticates against the node-local key table (-Dassets.auth.keys /
+        // ASSETS_AUTH_KEYS); the minted principal rides the SessionOpen log event to every member. An unset table
+        // rejects every session, loudly, by design. RC2 S6: the one kit copy of the authenticator with the AE
+        // policy (classes 1..7, users=* or an id list; a malformed table fails the boot), and a fail-closed window
+        // for Aeron's shared backup session id (-1) that outlives the session timeout (review DEFECT-1).
+        consensusModuleContext.authenticatorSupplier(() -> new com.openexchange.cluster.auth.ClusterAuthenticator(
+                com.openexchange.cluster.auth.AuthKeyTable.fromEnvironment(com.openexchange.assets.auth.AssetsAuth.POLICY),
+                com.openexchange.cluster.auth.ClusterAuthenticator.DEFAULT_MAX_PENDING,
+                () -> com.openexchange.cluster.auth.ClusterAuthenticator.backupWindowMsFor(
+                        consensusModuleContext.sessionTimeoutNs())));
+
+        if (clusteredService instanceof AssetsClusteredService engineService) {
+            engineService.readinessConsensus(consensusModuleContext);
+        }
 
         final List<ClusteredServiceContainer.Context> serviceContexts = new ArrayList<>();
 
@@ -257,6 +272,11 @@ public final class ClusterConfig {
         this.archiveContext.archiveDir(new File(baseDir, ARCHIVE_SUB_DIR));
         this.consensusModuleContext.clusterDir(new File(baseDir, CLUSTER_SUB_DIR));
         this.clusteredServiceContexts.forEach((ctx) -> ctx.clusterDir(new File(baseDir, CLUSTER_SUB_DIR)));
+    }
+
+    /** RCS S1: refuses boot on any STANDBY_SNAPSHOT state; see {@link StandbySnapshotBootGuard}. */
+    public void enforceBootGuards() {
+        StandbySnapshotBootGuard.enforce(consensusModuleContext);
     }
 
     public MediaDriver.Context mediaDriverContext() {

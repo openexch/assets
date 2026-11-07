@@ -1,0 +1,16 @@
+# S5 contract 3.3 C13 (R-C13a): an IOC BUY LIMIT is acked with its whole quantity resting: the ACK sets
+# CANCEL_PENDING and mints one CANCEL; the ME fills 0.5 on the leg before it cancels (PARTIALLY_FILLED), then
+# the terminal CANCELLED releases the residual 150 USD; the record is gone and nothing is pending.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=250.0
+DEPOSIT u=2 asset=1 amt=3.0
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=2.0 rid=1
+MEOUTCOME order=1 kind=0 attempt=0 result=0 leg=101
+CREATE u=1 market=1 side=0 type=0 px=100.0 qty=2.0 tif=1 rid=2
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=102
+PENDINGDISPATCH corr=1
+METRADE id=1 market=1 taker=2 maker=1 px=100.0 qty=0.5 takerBuy=1
+METERMINAL order=2 leg=102 status=3
+ORDERSNAP u=0 corr=2
+PENDINGDISPATCH corr=3

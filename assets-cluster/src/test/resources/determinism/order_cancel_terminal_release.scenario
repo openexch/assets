@@ -1,0 +1,21 @@
+# S5 contract 3.2 (R-C7a, R-C7b): after a half fill, user 1 cancels (one CANCEL dispatch); the ME terminal
+# CANCELLED on the current leg releases the residual hold exactly once; a replay of that terminal is stale
+# (the record is gone). User 2's cancel is settled by the CANCEL outcome APPLIED instead (3.3); the journal
+# terminal that follows it is stale too.
+CLOCK 1700000000000
+GATE market=0 open=1
+DEPOSIT u=1 asset=0 amt=250.0
+DEPOSIT u=2 asset=1 amt=3.0
+CREATE u=1 market=1 side=0 type=0 px=100.0 qty=2.0 rid=1
+CREATE u=2 market=1 side=1 type=0 px=100.0 qty=2.0 rid=2
+MEOUTCOME order=1 kind=0 attempt=0 result=0 leg=101
+MEOUTCOME order=2 kind=0 attempt=0 result=0 leg=102
+METRADE id=1 market=1 taker=2 maker=1 px=100.0 qty=0.5 takerBuy=0
+CANCEL u=1 order=1 rid=3
+METERMINAL order=1 leg=101 status=3
+METERMINAL order=1 leg=101 status=3
+CANCEL u=2 order=2 rid=4
+MEOUTCOME order=2 kind=1 attempt=1 result=0 leg=102
+METERMINAL order=2 leg=102 status=3
+ORDERSNAP u=0 corr=1
+PENDINGDISPATCH corr=2

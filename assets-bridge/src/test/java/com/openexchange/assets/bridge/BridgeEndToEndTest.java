@@ -75,6 +75,16 @@ import static org.junit.Assert.assertTrue;
  */
 public class BridgeEndToEndTest {
 
+    /** RC1 S3: the AE authenticates every session; the bridge presents the BRIDGE key, the test's own client the TOOL key. */
+    private static final String TEST_TOOL_SECRET = "22".repeat(32);
+    private static final String TEST_BRIDGE_SECRET = "33".repeat(32);
+    // RC2 S6 (A16): any-user scope is the explicit users=*.
+    private static final String TEST_KEYS = "2:TOOL:" + TEST_TOOL_SECRET + "::users=*;3:BRIDGE:" + TEST_BRIDGE_SECRET + "::users=*";
+
+    static {
+        System.setProperty(com.openexchange.assets.auth.CoreCredentials.PROPERTY, "3:BRIDGE:" + TEST_BRIDGE_SECRET);
+    }
+
     private static final int AE_PORT_BASE = 19400;
     private static final int JOURNAL_CONTROL_PORT = 18930;
     private static final long BUYER = 200L;
@@ -133,6 +143,7 @@ public class BridgeEndToEndTest {
             }
             final Holder holder = new Holder();
             this.cluster = AeronCluster.connect(new AeronCluster.Context()
+                    .credentialsSupplier(new com.openexchange.assets.auth.CoreCredentials(com.openexchange.assets.infrastructure.generated.SessionClass.TOOL, 2, java.util.HexFormat.of().parseHex(TEST_TOOL_SECRET)).supplier())
                     .aeronDirectoryName(aeronDir)
                     .ingressChannel("aeron:udp?term-length=4m|mtu=8192")
                     .ingressEndpoints("0=localhost:" + (AE_PORT_BASE + 2))
@@ -187,7 +198,7 @@ public class BridgeEndToEndTest {
 
         void deposit(long userId, int assetId, long amount) {
             depositEnc.wrapAndApplyHeader(buf, 0, headerEnc)
-                    .correlationId(0).userId(userId).assetId(assetId).amount(amount);
+                    .correlationId(0).userId(userId).assetId(assetId).amount(amount).requestIdHigh(0).requestIdLow(0);
             offer(MessageHeaderEncoder.ENCODED_LENGTH + depositEnc.encodedLength());
         }
 
@@ -258,6 +269,7 @@ public class BridgeEndToEndTest {
         IoUtil.delete(tmp, true);
 
         // Real single-node AE cluster (embedded driver, backoff idle) — ClusterBootSmokeTest pattern.
+        System.setProperty(com.openexchange.assets.auth.AssetsAuth.POLICY.keysProperty(), TEST_KEYS);
         final ClusterConfig cfg = ClusterConfig.create(0, List.of("localhost"), AE_PORT_BASE,
                 new AssetsClusteredService());
         cfg.baseDir(new File(tmp, "node0"));

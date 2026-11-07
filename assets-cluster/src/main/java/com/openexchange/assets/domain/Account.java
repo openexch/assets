@@ -91,7 +91,7 @@ public final class Account {
      * no-overflow invariant holds: {@code available + locked <= MAX} implies
      * {@code MAX - available >= locked}, so the subtraction stays non-negative.</p>
      */
-    private long headroom(int assetId) {
+    public long headroom(int assetId) {
         return Long.MAX_VALUE - bal[2 * assetId] - bal[2 * assetId + 1];
     }
 
