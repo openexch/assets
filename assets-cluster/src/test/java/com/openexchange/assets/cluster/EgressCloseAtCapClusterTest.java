@@ -56,6 +56,8 @@ public class EgressCloseAtCapClusterTest {
 
     private static final int PORT_BASE = 19500; // disjoint from boot smoke (19300) and cadence (19400)
     private static final long USER = 5151L;
+    /** Deposits in flight ahead of the healthy session's view; their egress stays far below the cap. */
+    private static final int FLOOD_WINDOW = 256;
 
     /** Captures the last observed available balance, batch or single (v5 coalescing). */
     private static final class BalanceEgress implements EgressListener {
@@ -158,13 +160,22 @@ public class EgressCloseAtCapClusterTest {
             // Pump: every deposit's egress fans out to BOTH sessions' queues. The healthy session
             // drains; the wedged one absorbs ~32KB in its response publication, then its queue grows
             // to the 64KB cap, where the engine must CLOSE it rather than block.
+            // The cap applies to EVERY session, so the flood is windowed: at most FLOOD_WINDOW deposits
+            // are ahead of what the healthy session has observed (USER's available balance counts the
+            // applied deposits it has seen). An open-loop flood leaves tens of thousands of deposits
+            // queued in ingress when the wedged session closes, and their egress then overflows the
+            // healthy session's 64KB queue too, closing it as well.
+            final long unit = FixedPoint.fromDouble(1.0);
             final long floodDeadline = System.currentTimeMillis() + 60_000;
             int sent = 0;
             while (service.resumableSessionsClosed() == 0) {
                 assertTrue("cap not reached before the deadline (deposits sent=" + sent + ")",
                         System.currentTimeMillis() < floodDeadline);
-                offer(healthy, encodeDeposit(USER, Asset.USD.id(), FixedPoint.fromDouble(1.0)));
-                sent++;
+                final long seen = Math.max(0L, healthyEgress.lastAvail.get()) / unit;
+                if (sent - seen < FLOOD_WINDOW) {
+                    offer(healthy, encodeDeposit(USER, Asset.USD.id(), unit));
+                    sent++;
+                }
                 healthy.pollEgress();
             }
 
@@ -178,6 +189,9 @@ public class EgressCloseAtCapClusterTest {
             boolean terminal = false;
             final long terminalDeadline = System.currentTimeMillis() + 20_000;
             while (!terminal && System.currentTimeMillis() < terminalDeadline) {
+                // Deposits offered during the flood are still being applied, and every session's queue
+                // is capped. The healthy consumer must keep draining or it is closed at its cap too.
+                healthy.pollEgress();
                 try {
                     wedged.pollEgress();
                     terminal = wedged.isClosed();
