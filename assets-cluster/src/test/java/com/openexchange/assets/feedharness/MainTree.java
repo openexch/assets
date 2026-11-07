@@ -20,8 +20,19 @@ import java.util.TreeMap;
  */
 public final class MainTree {
 
-    /** The core the harness is graded against (cluster-tools {@code money_schema_ref}). */
+    /**
+     * The core the harness is graded against (cluster-tools {@code money_schema_ref}): provenance. A runtime branch
+     * commit, so it need not be in this clone's history (a squash merge never puts it on main; CI clones shallow).
+     */
     public static final String MONEY_SCHEMA_REF = "0a7c4ee743b4a861c3dd8fad8ebfcf7592616cd0";
+
+    /**
+     * The guard: {@link #id} of {@link #MONEY_SCHEMA_REF}'s {@code src/main} trees. A function of file paths and blob
+     * contents only, so it survives a squash merge and needs no history. Bumped together with the ref; the
+     * lock-pinned harness (harness-eb559a7, feed_harness_sha256 85f2c1d7...) carries it as {@code main_tree_ref_id}.
+     */
+    public static final String MONEY_SCHEMA_MAIN_TREE_ID =
+            "f654f920ab32085815aab0e34187125daa7b52151e65beed7175f4490546da4b";
 
     private MainTree() {
     }
@@ -87,6 +98,18 @@ public final class MainTree {
             }
         }
         return out;
+    }
+
+    /** True when {@code ref} names a commit present in this clone (a shallow or squash-merged clone may lack it). */
+    public static boolean hasCommit(final Path root, final String ref) throws IOException {
+        final Process p = new ProcessBuilder("git", "-C", root.toString(), "cat-file", "-e", ref + "^{commit}")
+                .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+        try {
+            return p.waitFor() == 0;
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(e);
+        }
     }
 
     public static String git(final Path root, final String stdin, final String... args) throws IOException {

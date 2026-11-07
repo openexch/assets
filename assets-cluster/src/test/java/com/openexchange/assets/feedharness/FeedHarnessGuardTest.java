@@ -23,7 +23,7 @@ import static org.junit.Assert.assertTrue;
 /**
  * RC2 S9h 11.6 (R1) and 9.2 (review FIX-6): the harness stays out of every runtime path. No production source imports
  * the harness; the production classes and jar carry no harness class; the pump imports no archive client; the build's
- * production code equals {@code money_schema_ref}'s (b05b8e8) file for file; and a built harness jar names the pins its
+ * production code equals {@code money_schema_ref}'s file for file (by tree id); and a built harness jar names the pins its
  * consumers check.
  */
 public class FeedHarnessGuardTest {
@@ -107,14 +107,38 @@ public class FeedHarnessGuardTest {
         assertTrue("and uses no T1 journal host", !text.contains("T1Journal"));
     }
 
-    /** FIX-6: this build's production code is b05b8e8's, file for file (the empty {@code src/main} diff). */
+    /**
+     * FIX-6: this build's production code is {@code money_schema_ref}'s, file for file. Compared by the pinned tree id,
+     * not by the commit: the commit is on a runtime branch, which a squash merge and a shallow CI clone do not carry.
+     */
     @Test
     public void theMainTreeEqualsTheMoneySchemaRef() throws Exception {
         final Map<String, String> work = MainTree.workingTree(root());
+        assertTrue("non-vacuous: the working tree has main files", work.size() > 100);
+        final String id = MainTree.id(work);
+        if (!MainTree.MONEY_SCHEMA_MAIN_TREE_ID.equals(id)) {
+            final String detail = MainTree.hasCommit(root(), MainTree.MONEY_SCHEMA_REF)
+                    ? "differing paths " + MainTree.diff(work, MainTree.atRef(root(), MainTree.MONEY_SCHEMA_REF))
+                    : "(" + MainTree.MONEY_SCHEMA_REF + " is not in this clone: git fetch origin "
+                            + MainTree.MONEY_SCHEMA_REF + " to list the paths)";
+            throw new AssertionError("src/main differs from " + MainTree.MONEY_SCHEMA_REF + ": tree id " + id
+                    + ", pinned " + MainTree.MONEY_SCHEMA_MAIN_TREE_ID + "; " + detail
+                    + ". A production change needs a money_schema_ref bump (both pins) first.");
+        }
+    }
+
+    /**
+     * The two pins name the same tree. Needs the commit: skipped (reported) in a clone without it, e.g. a shallow
+     * checkout; the feed-harness job (full history) gates its jar on
+     * {@code src/main} equal to the ref's ({@code main_tree_equals_ref}).
+     */
+    @Test
+    public void thePinnedTreeIdIsTheMoneySchemaRefsTree() throws Exception {
+        org.junit.Assume.assumeTrue(MainTree.MONEY_SCHEMA_REF + " is not in this clone (shallow or squash-merged)",
+                MainTree.hasCommit(root(), MainTree.MONEY_SCHEMA_REF));
         final Map<String, String> ref = MainTree.atRef(root(), MainTree.MONEY_SCHEMA_REF);
         assertTrue("non-vacuous: the ref has main files", ref.size() > 100);
-        assertEquals("src/main differs from " + MainTree.MONEY_SCHEMA_REF, List.of(), MainTree.diff(work, ref));
-        assertEquals(MainTree.id(ref), MainTree.id(work));
+        assertEquals(MainTree.MONEY_SCHEMA_MAIN_TREE_ID, MainTree.id(ref));
     }
 
     /** The harness jar (when the feed-harness profile built it) names the pins of 2.3 and 9.2. */
