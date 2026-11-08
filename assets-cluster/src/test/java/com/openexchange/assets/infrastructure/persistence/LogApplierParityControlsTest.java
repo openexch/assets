@@ -74,7 +74,7 @@ public class LogApplierParityControlsTest {
     }
 
     @Test
-    public void aDroppedCloseIsSeenAtTheFirstFrameAfterIt() {
+    public void aDroppedCloseIsSeenAtTheCloseItself() {
         final List<LogStep> log = LogApplierParityTest.parityLog(SEED);
         final int tailClose = log.size() - 2;
         assertEquals(Kind.CLOSE, log.get(tailClose).kind());
@@ -83,7 +83,8 @@ public class LogApplierParityControlsTest {
         final ApplierArm reference = new ApplierArm();
         final ApplierArm noClose = new ApplierArm();
         final int first = firstDivergence(log, reference, noClose, (i, s) -> i == tailClose ? null : s);
-        assertEquals("comparator blind to a missing SessionClose", tailClose + 1, first);
+        // RCS S4 RF-3: a close of a known session stamps its frame end, so P differs at the dropped close itself
+        assertEquals("comparator blind to a missing SessionClose", tailClose, first);
         assertTrue("section 9 keeps the session the close should have dropped",
                 noClose.engine().sessions().sessionIds().contains(TAIL_SESSION));
         assertFalse(reference.engine().sessions().sessionIds().contains(TAIL_SESSION));

@@ -14,9 +14,7 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -101,14 +99,12 @@ public class LogApplierParityTest {
         final List<Arm> restored = new ArrayList<>();
         final List<Probe> restoredProbes = new ArrayList<>();
 
-        // The skip-open control's expected first divergence: the first message from a session whose OPEN it never saw.
-        final Set<Long> opened = new HashSet<>();
+        // The skip-open control's expected first divergence: since RCS S4 RF-3 a SessionOpen stamps its frame end, so
+        // the arm that never saw the first OPEN differs in P at that OPEN itself (before RF-3: at the first message
+        // from a session whose OPEN it never saw).
         int expectedSkipMismatch = -1;
         for (int i = 0; i < log.size() && expectedSkipMismatch < 0; i++) {
-            final LogStep s = log.get(i);
-            if (s.kind() == Kind.OPEN) {
-                opened.add(s.sessionId());
-            } else if (s.kind() == Kind.MESSAGE && opened.contains(s.sessionId())) {
+            if (log.get(i).kind() == Kind.OPEN) {
                 expectedSkipMismatch = i;
             }
         }

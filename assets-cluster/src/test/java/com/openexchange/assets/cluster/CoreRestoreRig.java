@@ -398,15 +398,26 @@ final class CoreRestoreRig {
         final List<String> lines = new CopyOnWriteArrayList<>();
         final List<Long> at = new CopyOnWriteArrayList<>();
         private final String marker;
+        /** RCS S4 W3: a second marker (null: none), so one tee can record two line families. */
+        private final String also;
 
         Tee(final PrintStream target, final String marker) {
+            this(target, marker, null);
+        }
+
+        Tee(final PrintStream target, final String marker, final String also) {
             super(target, true);
             this.marker = marker;
+            this.also = also;
+        }
+
+        private boolean marked(final String x) {
+            return x.contains(marker) || (also != null && x.contains(also));
         }
 
         @Override
         public void println(final String x) {
-            if (x != null && x.contains(marker)) {
+            if (x != null && marked(x)) {
                 lines.add(x);
                 at.add(System.nanoTime());
             }
@@ -416,7 +427,7 @@ final class CoreRestoreRig {
         @Override
         public void println(final Object x) {
             final String s = String.valueOf(x);
-            if (s.contains(marker)) {
+            if (marked(s)) {
                 lines.add(s);
                 at.add(System.nanoTime());
             }

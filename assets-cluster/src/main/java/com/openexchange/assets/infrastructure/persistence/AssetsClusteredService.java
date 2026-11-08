@@ -107,6 +107,45 @@ public final class AssetsClusteredService implements ClusteredService {
     private IdleStrategy idleStrategy;
     private boolean isLeader;
 
+    // ---------------------------------------------------------------- RCS S4 (stub mode, restore paths, floor)
+    /** The 3.5 settings, parsed once at construction (the boot guard parsed and refused the same table earlier). */
+    private final RcsSettings rcsSettings;
+    /** Node-local (3.1): decides what THIS node's onTakeSnapshot writes; never reaches the applier (rule 12.1). */
+    private final RcsMode rcsMode;
+    private final RcsCounters rcsCounters = new RcsCounters();
+    private final com.openexchange.cluster.shadow.ShadowCounters shadowCounters =
+            new com.openexchange.cluster.shadow.ShadowCounters();
+    /** Deep verdicts for the life of this process, shared by the restore and the housekeeping (S3 6.4). */
+    private final com.openexchange.cluster.shadow.ShadowVerdicts shadowVerdicts =
+            new com.openexchange.cluster.shadow.ShadowVerdicts();
+    /** Set by a SKIP restore; cleared by the first callback whose frame end is past P_s (6.4, MF-1). */
+    private com.openexchange.cluster.log.SkipWindow skipWindow;
+    /** The event sink the service runs with (the tail swaps a counting sink in and back, review F3). */
+    private AssetsEventPublisher livePublisher;
+    /** RCS S4 test seams (review F8); production: none. */
+    ShadowRestore.Faults shadowFaults = ShadowRestore.Faults.NONE;
+    /** RCS S4 11.6 runtime-net control only: a watermark other than the floor (must trip watermarkIs). */
+    java.util.function.LongSupplier prunerWatermarkOverride;
+    /**
+     * RCS S4 11.2 test seam (review FIX-5): sees every frame the publisher emits on THIS member, before the leader
+     * gate of {@link #enqueueEgress}, so a test can compare a restarted follower's event stream with the leader's for
+     * the same frames. Null in production (one volatile read per emitted frame, no allocation).
+     */
+    volatile AssetsEventPublisher.Egress egressTap;
+    private volatile MemberShadowHousekeeping shadowHousekeeping;
+    /** The engine's recorded genesis nonce as this thread last saw it, for the housekeeping thread (0 before ADOPT). */
+    private volatile long publishedGenesisId;
+
+    /** Production: the settings come from this process's environment ({@code RCS_MODE} and the 3.5 table). */
+    public AssetsClusteredService() {
+        this(RcsSettings.fromEnv());
+    }
+
+    public AssetsClusteredService(final RcsSettings settings) {
+        this.rcsSettings = java.util.Objects.requireNonNull(settings, "settings");
+        this.rcsMode = settings.mode();
+    }
+
     /**
      * Idle-path drain timer. A CONSTANT id, recognised by value in {@link #onTimerEvent}, so every node
      * identifies it deterministically after any recover/replay. This is the match#25/#26 lesson: a
@@ -143,6 +182,9 @@ public final class AssetsClusteredService implements ClusteredService {
     static final long TIMER_ID_TERM_STRIDE = AssetsLogApplier.TIMER_ID_TERM_STRIDE;
 
     private long termTimerId(final long base) {
+        if (shadowFaults.timerIdsFromTermZero) {
+            return base; // RCS S4 11.10 negative control only (the K3 shape): the term-0 id whatever the term
+        }
         return base + Math.max(0L, leadershipTermId) * TIMER_ID_TERM_STRIDE;
     }
     private static final long EGRESS_DRAIN_BACKSTOP_MS = 10;
@@ -150,6 +192,8 @@ public final class AssetsClusteredService implements ClusteredService {
 
     static final long SWEEP_PERIOD_MS = 100;
     private boolean sweepArmed;
+    /** The id the last sweep arm passed to {@code scheduleTimer}, or -1 (observability for 11.10, D5). */
+    private volatile long lastArmedSweepTimerId = -1;
     private volatile long sweepTimerFires;
 
     // Per-session egress queues, plus a cached array so the money path iterates without allocating
@@ -261,7 +305,7 @@ public final class AssetsClusteredService implements ClusteredService {
     private final com.openexchange.cluster.SnapshotCadence snapshotCadence =
             com.openexchange.cluster.SnapshotCadence.fromEnv();
     // ...and what turns the snapshot into reclaimed disk on THIS node.
-    private com.openexchange.cluster.SnapshotLogPruner logPruner;
+    private volatile com.openexchange.cluster.SnapshotLogPruner logPruner;
     // Lazily connected archive client used only to confirm the snapshot recording landed on disk
     // before onTakeSnapshot returns (see awaitSnapshotRecorded). Cloned context: never shares lock
     // state with the cluster's own archive client. Closed in onTerminate.
@@ -319,14 +363,16 @@ public final class AssetsClusteredService implements ClusteredService {
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
         nodeMetrics.setRole(cluster.role().code());
-        applier.setEventSink(new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
+        livePublisher = new AssetsEventPublisher(this::enqueueEgress, () -> originIsQuery,
                 balanceFeed != null ? balanceFeed::onBalanceUpdate
-                        : AssetsEventPublisher.LiveBalanceTap.NONE));
+                        : AssetsEventPublisher.LiveBalanceTap.NONE);
+        applier.setEventSink(livePublisher);
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
             seedBalanceFeedFromSnapshot();
         }
         checkRestoredSessions(cluster);
+        publishedGenesisId = new AssetsShadowIdentity(engine).genesisId();
         startNodeEndpoint();
         startDurability(cluster);
         // Started, not ready: the snapshot is loaded but the log replay may
@@ -410,7 +456,84 @@ public final class AssetsClusteredService implements ClusteredService {
                         () -> engine.deadlines().size())
                 .gauge("assets_last_log_time_ms", "Monotone log time last applied by this ledger (cluster epoch ms)",
                         engine::getLastLogTime)
-                .include(com.openexchange.assets.infrastructure.metrics.OrderEngineMetrics.of(engine.metricsView(), this::egressDiscardCloses));
+                .include(com.openexchange.assets.infrastructure.metrics.OrderEngineMetrics.of(engine.metricsView(), this::egressDiscardCloses))
+                .include(this::rcsMetrics);
+    }
+
+    /** RCS S4 section 13: the stub-mode, restore, skip-window, tail and floor counters (plain longs). */
+    private void rcsMetrics(final com.openexchange.assets.infrastructure.metrics.AssetsMetricsBody body) {
+        body.gauge("rcs_mode", "RCS_MODE of this node: 0 off, 1 shadow (node-local; never reaches the engine)",
+                () -> rcsMode == RcsMode.SHADOW ? 1 : 0);
+        for (final RcsCounters.C c : RcsCounters.C.values()) {
+            final boolean gauge = c == RcsCounters.C.RESTORE_PATH || c == RcsCounters.C.RESTORE_CANDIDATES_SCANNED
+                    || c == RcsCounters.C.TAIL_MS || c == RcsCounters.C.JOURNAL_TAIL_SEQ;
+            final java.util.function.LongSupplier v = () -> rcsCounters.get(c);
+            if (gauge) {
+                body.gauge(c.metricName(), "RCS S4 " + c.metricName(), v);
+            } else {
+                body.counter(c.metricName(), "RCS S4 " + c.metricName(), v);
+            }
+        }
+        final RcsCounters.Refusal[] refusals = RcsCounters.Refusal.values();
+        final String[] refusalNames = new String[refusals.length];
+        final java.util.function.LongSupplier[] refusalValues = new java.util.function.LongSupplier[refusals.length];
+        for (int i = 0; i < refusals.length; i++) {
+            final RcsCounters.Refusal r = refusals[i];
+            refusalNames[i] = r.name();
+            refusalValues[i] = () -> rcsCounters.refused(r);
+        }
+        body.labelledGauge("rcs_restore_candidates_refused_total", "Restore candidates refused before the engine, by"
+                + " reason (cumulative)", "reason", refusalNames, refusalValues);
+        final RcsCounters.ConflictAt[] at = RcsCounters.ConflictAt.values();
+        final String[] atNames = new String[at.length];
+        final java.util.function.LongSupplier[] atValues = new java.util.function.LongSupplier[at.length];
+        for (int i = 0; i < at.length; i++) {
+            final RcsCounters.ConflictAt a = at[i];
+            atNames[i] = a.name();
+            atValues[i] = () -> rcsCounters.conflicts(a);
+        }
+        body.labelledGauge("rcs_restore_conflict_total", "Shadow CONFLICTs met by a restore rule (cumulative; CRITICAL)",
+                "path", atNames, atValues);
+        final com.openexchange.cluster.log.FrameKind[] kinds = RcsCounters.DROPPABLE;
+        final String[] kindNames = new String[kinds.length];
+        final java.util.function.LongSupplier[] kindValues = new java.util.function.LongSupplier[kinds.length];
+        for (int i = 0; i < kinds.length; i++) {
+            final com.openexchange.cluster.log.FrameKind k = kinds[i];
+            kindNames[i] = k.name();
+            kindValues[i] = () -> rcsCounters.dropped(k);
+        }
+        body.labelledGauge("rcs_skip_dropped_total", "Frames a SKIP window kept from the applier, by kind (cumulative)",
+                "kind", kindNames, kindValues);
+        for (final com.openexchange.cluster.shadow.ShadowHousekeeping.Counter c
+                : com.openexchange.cluster.shadow.ShadowHousekeeping.Counter.values()) {
+            body.gauge(c.metricName(), "RCS S4 floor/retention/housekeeping (-1 while the floor is not wired)",
+                    () -> {
+                        final MemberShadowHousekeeping hk = shadowHousekeeping;
+                        return hk == null ? -1 : hk.counters().get(c);
+                    });
+        }
+        final com.openexchange.cluster.shadow.ShadowEntry.State[] states =
+                com.openexchange.cluster.shadow.ShadowEntry.State.values();
+        final String[] stateNames = new String[states.length];
+        final java.util.function.LongSupplier[] stateValues = new java.util.function.LongSupplier[states.length];
+        for (int i = 0; i < states.length; i++) {
+            final com.openexchange.cluster.shadow.ShadowEntry.State st = states[i];
+            stateNames[i] = st.name();
+            stateValues[i] = () -> {
+                final MemberShadowHousekeeping hk = shadowHousekeeping;
+                return hk == null ? 0 : hk.counters().skippedNonUsable(st);
+            };
+        }
+        body.labelledGauge("shadow_retention_skipped_non_usable", "Shadow copies retention never purges, by state"
+                + " (cumulative over passes)", "state", stateNames, stateValues);
+        body.counter("pruner_wakes_by_shadow_total", "Purge passes run because a shadow requested one (MF-8)", () -> {
+            final com.openexchange.cluster.SnapshotLogPruner p = logPruner;
+            return p == null ? 0 : p.wakesByShadow();
+        });
+        for (final com.openexchange.cluster.shadow.ShadowCounters.Counter c
+                : com.openexchange.cluster.shadow.ShadowCounters.Counter.values()) {
+            body.gauge(c.metricName(), "RCS S3 shadow catalog/loader counter on this node", () -> shadowCounters.get(c));
+        }
     }
 
     /**
@@ -448,6 +571,39 @@ public final class AssetsClusteredService implements ClusteredService {
                                 com.openexchange.cluster.ClusterMemberPositions.from(
                                         cluster.aeron(), cluster.context()),
                                 () -> isLeader);
+                if (rcsSettings.floorEnabled()) {
+                    // RCS S4 9.1-9.3 (MF-4, MF-8, D2): the floor is wired in BOTH modes. Its precondition reads the
+                    // newest group's payload kind: a FULL image answers P_cm (today's pruning, unchanged); a stub
+                    // (shadow mode, the MF-1 skip-window snapshot of an off node, or a mode switch) is purged only
+                    // behind a restorable local shadow. The housekeeping runs on the pruner thread.
+                    shadowHousekeeping = new MemberShadowHousekeeping(cluster.context().clusterDir(),
+                            cluster.context().archiveContext().clone(), clusterId, rcsSettings, rcsCounters,
+                            shadowCounters, shadowVerdicts,
+                            new com.openexchange.cluster.shadow.ShadowHousekeeping.Counters(),
+                            () -> publishedGenesisId, cluster.context().errorHandler());
+                    final com.openexchange.cluster.shadow.ShadowFloor floor = shadowHousekeeping.floor();
+                    logPruner.watermark(prunerWatermarkOverride != null ? prunerWatermarkOverride : floor)
+                            .wake(floor::purgeRequested)
+                            .onWake(shadowHousekeeping);
+                    // the runtime second net of 4.1: a pruner that purges behind anything else is refused
+                    if (!logPruner.watermarkIs(floor)) {
+                        logPruner = null;
+                        failApplicationCallback();
+                        System.err.println("FATAL RCS: pruner watermark is not the ShadowFloor (RCS_MODE="
+                                + rcsMode.text() + ", MF-4)");
+                        failFast.run();
+                        return;
+                    }
+                    System.out.println("[PRUNE] RCS_MODE=" + rcsMode.text() + ": purge bounded by the ShadowFloor"
+                            + " (full newest group: P_cm; stub: margin=" + rcsSettings.floorMargin().text()
+                            + "), woken by new VERIFIED shadows");
+                } else if (rcsMode == RcsMode.SHADOW) {
+                    System.err.println("[PRUNE] CRITICAL: RCS_MODE=shadow with SHADOW_FLOOR_ENABLED=false (test-only "
+                            + "override): this node purges below its stub with no shadow floor");
+                } else {
+                    System.err.println("[PRUNE] CRITICAL: SHADOW_FLOOR_ENABLED=false (test-only override): this node"
+                            + " purges to its newest snapshot even when that snapshot is a stub");
+                }
                 logPruner.start();
             } else {
                 System.out.println("[PRUNE] disabled by SNAPSHOT_PRUNE_ENABLED=false — "
@@ -527,6 +683,9 @@ public final class AssetsClusteredService implements ClusteredService {
             readiness.unavailable("consensus-not-configured");
         } else {
             consensusReadiness.poll(cluster, nowNs);
+        }
+        if (publishedGenesisId == 0 && shadowHousekeeping != null) {
+            publishedGenesisId = new AssetsShadowIdentity(engine).genesisId(); // ADOPT seen: the floor may arm
         }
         // At most once a second, and only on the leader: is the cluster due a
         // snapshot? Everything past that gate is a long compare.
@@ -626,11 +785,11 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnSessionOpen(ClientSession session, long timestamp) {
-        if (session != null) {
+        final long frameEnd = cluster == null ? -1L : cluster.logPosition();
+        if (session != null && !skipped(com.openexchange.cluster.log.FrameKind.SESSION_OPEN, frameEnd)) {
             // The principal the authenticator minted rides the SessionOpen log event: every member parses the
             // same bytes into the same authority (K6). Null only in in-process unit tests.
-            applier.onSessionOpen(session.id(), cluster == null ? -1L : cluster.logPosition(), timestamp,
-                    session.encodedPrincipal());
+            applier.onSessionOpen(session.id(), rf3(frameEnd), timestamp, session.encodedPrincipal());
         }
         sessionsDirty = true;
         drainEgress();
@@ -655,7 +814,10 @@ public final class AssetsClusteredService implements ClusteredService {
     }
 
     private void applyOnSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
-        applier.onSessionClose(session.id(), cluster == null ? -1L : cluster.logPosition(), timestamp, closeReason);
+        final long frameEnd = cluster == null ? -1L : cluster.logPosition();
+        if (!skipped(com.openexchange.cluster.log.FrameKind.SESSION_CLOSE, frameEnd)) {
+            applier.onSessionClose(session.id(), rf3(frameEnd), timestamp, closeReason);
+        }
         egressBySessionId.remove(session.id());
         sessionsDirty = true;
         drainEgress();
@@ -689,6 +851,59 @@ public final class AssetsClusteredService implements ClusteredService {
         }
     }
 
+    /**
+     * RCS S4 6.4 (MF-1): the SKIP window in front of the applier. True when {@code kind} at {@code frameEnd} is a frame
+     * the restored engine already holds (an engine-mutating frame with {@code end <= P_s}): the caller skips the
+     * applier and keeps the transport effects. The first callback of any kind whose frame end is past P_s clears the
+     * window (counted once). The positions are the ones RF-3 stamps: {@code header.position()} or the live
+     * {@code cluster.logPosition()}.
+     */
+    private boolean skipped(final com.openexchange.cluster.log.FrameKind kind, final long frameEnd) {
+        final com.openexchange.cluster.log.SkipWindow w = skipWindow;
+        if (w == null) {
+            return false;
+        }
+        if (w.drops(kind, frameEnd)) {
+            rcsCounters.drop(kind);
+            return true;
+        }
+        if (frameEnd > w.skipThrough()) {
+            skipWindow = null;
+            rcsCounters.increment(RcsCounters.C.SKIP_WINDOW_CLOSED_TOTAL);
+            System.out.println("[RCS] skip window (.., " + w.skipThrough() + "] closed at " + kind + "@" + frameEnd
+                    + ": dropped messages=" + rcsCounters.dropped(com.openexchange.cluster.log.FrameKind.SESSION_MESSAGE) + " timers="
+                    + rcsCounters.dropped(com.openexchange.cluster.log.FrameKind.TIMER_EVENT) + " opens=" + rcsCounters.dropped(com.openexchange.cluster.log.FrameKind.SESSION_OPEN)
+                    + " closes=" + rcsCounters.dropped(com.openexchange.cluster.log.FrameKind.SESSION_CLOSE));
+        }
+        return false;
+    }
+
+    /**
+     * Whether this node is inside a SKIP window: while true {@code onTakeSnapshot} writes a stub whatever the mode, and
+     * no shadow producer may serialize (hard rule 12.6; S5 and S8 consult it).
+     */
+    boolean skipWindowActive() {
+        return skipWindow != null;
+    }
+
+    /**
+     * The position an open, close or timer entry is stamped with: the frame end (RF-3). The 11.10 negative control
+     * ({@code rf3StampOff}) hands a stale position instead (the previous open/close/timer frame end, 0 at first), the
+     * shape of the base, where such events carried an older frame's position. The service never reads the engine here
+     * (ApplierOwnershipGuardTest).
+     */
+    private long rf3(final long frameEnd) {
+        if (!shadowFaults.rf3StampOff) {
+            return frameEnd;
+        }
+        final long stale = rf3PreviousFrameEnd;
+        rf3PreviousFrameEnd = frameEnd;
+        return stale;
+    }
+
+    /** RCS S4 11.10 negative control state only. */
+    private long rf3PreviousFrameEnd;
+
     private void ensureApplicationHealthy() {
         if (applicationCallbackFailed) {
             throw new IllegalStateException("Application callback already failed; restart required");
@@ -719,6 +934,17 @@ public final class AssetsClusteredService implements ClusteredService {
         int templateId = -1;
         long dispatchStartNs = 0L;
         long dispatchEndNs = 0L;
+        if (skipped(com.openexchange.cluster.log.FrameKind.SESSION_MESSAGE, header.position())) {
+            // RCS S4 6.4 SKIP window: the engine already holds this frame (end <= P_s). Transport effects only; the
+            // registry is at P_s, so the R0 ingress check below would compare it with an older container state.
+            if (applier.isTransportSubscribe(buffer, offset, length)) {
+                subscribeTransport(session, buffer, offset, length);
+            }
+            drainEgress();
+            armDrainTimerIfNeeded();
+            armSweepIfNeeded();
+            return;
+        }
         if (session != null && !applier.holdsSession(session.id())) {
             // RC2 S17 W12 (R0, ingress frame): a container session with no registry row. Every SessionOpen the
             // registry applied has a class (the applier's kit gate), so this is a divergence between the container's
@@ -781,17 +1007,22 @@ public final class AssetsClusteredService implements ClusteredService {
     private void applyOnTimerEvent(long correlationId, long timestamp) {
         final int kind = AssetsLogApplier.timerKind(correlationId);
         final long logPosition = cluster == null ? -1L : cluster.logPosition();
+        final boolean drop = skipped(com.openexchange.cluster.log.FrameKind.TIMER_EVENT, logPosition);
         if (kind == AssetsLogApplier.TIMER_SWEEP) {
             // Replicated: a TimerEvent is a log entry, so every member pops the same entries at the same
             // log time; only the leader re-arms, and only while something is left to sweep.
             sweepArmed = false;
-            sweepTimerFires++;
-            applier.onTimerEvent(correlationId, logPosition, timestamp);
+            if (!drop) {
+                sweepTimerFires++;
+                applier.onTimerEvent(correlationId, rf3(logPosition), timestamp);
+            }
             drainEgress();
             armSweepIfNeeded();
             return;
         }
-        applier.onTimerEvent(correlationId, logPosition, timestamp);
+        if (!drop) {
+            applier.onTimerEvent(correlationId, logPosition, timestamp);
+        }
         if (kind == AssetsLogApplier.TIMER_DRAIN) {
             drainTimerArmed = false;
             drainTimerFires++;
@@ -816,12 +1047,37 @@ public final class AssetsClusteredService implements ClusteredService {
         } finally {
             applicationCallbackDepth--;
         }
+        if (shadowFaults.afterTakeSnapshot != null) {
+            shadowFaults.afterTakeSnapshot.run(); // RCS S4 11.13 Q9 drill seam only (Faults.NONE leaves it null)
+        }
     }
 
     private void applyOnTakeSnapshot(ExclusivePublication snapshotPublication) {
         final long startNs = System.nanoTime();
+        final long actionPosition = cluster.logPosition();
+        skipped(com.openexchange.cluster.log.FrameKind.CLUSTER_ACTION, actionPosition); // closes a window past P_s
+        // RCS S4 11.4 negative control only: windowClauseOff ignores the window (the 3.3 window clause off)
+        final boolean inWindow = skipWindow != null && !shadowFaults.windowClauseOff;
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer();
-        final int length = applier.serialize(buffer);
+        final boolean stub = (rcsMode == RcsMode.SHADOW && leadershipTermId >= 0) || inWindow;
+        if (rcsMode == RcsMode.SHADOW && !stub) {
+            // a FULL-path restore keeps leadershipTermId = -1 until the next term event (pre-existing hole N2, 6.5);
+            // a stub cannot carry an unknown term (rule S6), and a full image is always a valid restore (D3: counted)
+            rcsCounters.increment(RcsCounters.C.SNAPSHOT_FULL_TERM_UNKNOWN_TOTAL);
+            System.err.println("[SNAPSHOT] CRITICAL: RCS_MODE=shadow but this node's leadershipTermId is unknown (-1, "
+                    + "the full-path hole N2): writing a FULL image at " + actionPosition + " instead of a stub");
+        }
+        final int length;
+        if (stub) {
+            // RCS S4 3.2/3.3: the stub names where the state lives; every field is log-derived (rule 12.11)
+            final long hintPs = shadowCounters.get(com.openexchange.cluster.shadow.ShadowCounters.Counter
+                    .NEWEST_VERIFIED_POSITION);
+            length = new com.openexchange.cluster.shadow.ShadowStub(AssetsLogApplier.ENGINE_ID_ASSETS,
+                    cluster.context().clusterId(), new AssetsShadowIdentity(engine).genesisId(), leadershipTermId,
+                    actionPosition, hintPs >= 0 ? hintPs : -1L, -1L).encodeEnveloped(ShadowRestore.envelope(), buffer);
+        } else {
+            length = applier.serialize(buffer);
+        }
         final long serializedNs = System.nanoTime();
 
         // Chunked, like the matching engine's A-2 fix: a single offer() throws
@@ -837,15 +1093,28 @@ public final class AssetsClusteredService implements ClusteredService {
         // Do not return until the archive has the bytes on disk: a node killed between the offer
         // and the archive flush would prune a snapshot the recording log already points at and
         // fail recovery with "unknown recording id" (matching engine forensic, 2026-07-02).
-        awaitSnapshotRecorded(snapshotPublication);
-        final long recordedNs = System.nanoTime();
+        // RCS S4 3.4 (M Q9): skipped for a stub. Aeron's own agent awaits the recording right after this callback
+        // returns (CSA:1004-1006, 1021-1038: RecordingPos up to the publication position, plus a stop check), which
+        // covers the same forensic; the full path keeps this wait unchanged.
+        if (stub) {
+            rcsCounters.increment(RcsCounters.C.AWAIT_RECORDED_SKIPPED_TOTAL);
+        } else {
+            awaitSnapshotRecorded(snapshotPublication);
+        }
+        final long recordedNs = stub ? offeredNs : System.nanoTime();
+        rcsCounters.increment(stub ? RcsCounters.C.SNAPSHOT_STUB_TOTAL : RcsCounters.C.SNAPSHOT_FULL_TOTAL);
+        if (inWindow) {
+            rcsCounters.increment(RcsCounters.C.SNAPSHOT_IN_SKIP_WINDOW_TOTAL);
+        }
+        publishedGenesisId = new AssetsShadowIdentity(engine).genesisId();
 
         System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " bytes=" + length
                 + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
                 + " serializeMs=" + ((serializedNs - startNs) / 1_000_000)
                 + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
                 + " recordMs=" + ((recordedNs - offeredNs) / 1_000_000)
-                + " logPosition=" + cluster.logPosition());
+                + " logPosition=" + cluster.logPosition() + " kind=" + (stub ? "stub" : "full")
+                + (inWindow ? " inSkipWindow=true" : ""));
         nodeMetrics.stampSnapshot(System.currentTimeMillis(), length, chunks, serializedNs - startNs,
                 offeredNs - serializedNs, recordedNs - offeredNs, cluster.logPosition());
 
@@ -940,6 +1209,7 @@ public final class AssetsClusteredService implements ClusteredService {
                                          int leaderMemberId, int logSessionId, TimeUnit timeUnit, int appVersion) {
         // Seen live and during replay (in log order): the latest term names the timer ids this node arms as leader.
         this.leadershipTermId = leadershipTermId;
+        skipped(com.openexchange.cluster.log.FrameKind.NEW_LEADERSHIP_TERM, logPosition); // never dropped; closes a SKIP window past P_s
         // Never fenced at the base: a latched applier refuses every entry, so a term event on a stopped node stays silent.
         if (!applier.failed()) {
             applier.onNewLeadershipTermEvent(leadershipTermId, logPosition, timestamp, timeUnit);
@@ -1007,6 +1277,10 @@ public final class AssetsClusteredService implements ClusteredService {
         if (consensusReadiness != null) { consensusReadiness.close(); }
         if (logPruner != null) {
             logPruner.stop();
+        }
+        final MemberShadowHousekeeping hk = shadowHousekeeping;
+        if (hk != null) {
+            hk.close(); // releases this archive's one purge owner (C9)
         }
         if (nodeEndpoint != null) {
             nodeEndpoint.stop();
@@ -1082,6 +1356,16 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     void restoreFromImage(final DirectBuffer image, final int imageLength) {
         try {
+            // RCS S4 3.3: the envelope first (magic, version, length, CRC32C), then the first payload long decides.
+            if (imageLength <= 0) {
+                throw new IllegalStateException("assets snapshot image is empty");
+            }
+            final ShadowRestore.Peek peek = ShadowRestore.peek(image, imageLength);
+            if (peek.stub()) {
+                restoreFromStub(image, peek.payloadOffset(), peek.payloadLength());
+                return;
+            }
+            peek.requireFullImage();
             // Empty image, envelope, decode, framing and invariants are all checked by the applier.
             try {
                 applier.restore(image, imageLength);
@@ -1089,14 +1373,22 @@ public final class AssetsClusteredService implements ClusteredService {
                 haltPrincipalLess(principalLess); // a restored session row without a principal (section 9)
                 throw principalLess;
             }
+            // RF-3 (5.1): until the first replayed frame the engine's position is the image's, P_cm
+            applier.stampLogPosition(cluster == null ? 0L : cluster.logPosition());
+            rcsCounters.set(RcsCounters.C.RESTORE_PATH, RcsCounters.PATH_FULL);
             final BalanceSnapshotCodec.Decoded decoded = applier.lastRestored();
             System.out.println("[SNAPSHOT] restored orders=" + engine.orders().orders().size() + " accounts=" + decoded.accountCount
                     + " holds=" + decoded.holdCount + " lastAppliedTradeId=" + decoded.lastAppliedTradeId
                     + " consumePosition=" + decoded.consumePosition + " journalSeq=" + decoded.journalSeq
                     + " lastLogTime=" + decoded.lastLogTime + " sections=" + decoded.sectionCount
-                    + " deadlines=" + engine.deadlines().size() + " enveloped=true verified=true");
+                    + " deadlines=" + engine.deadlines().size() + " enveloped=true verified=true path=FULL");
         } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
             throw principalLess;
+        } catch (final ShadowRestore.Halt halt) {
+            failApplicationCallback();
+            System.err.println(halt.getMessage());
+            failFast.run();
+            throw halt;
         } catch (final RuntimeException refused) {
             failApplicationCallback();
             System.err.println("FATAL snapshot refused: " + refused.getMessage()
@@ -1104,6 +1396,40 @@ public final class AssetsClusteredService implements ClusteredService {
             failFast.run();
             throw refused;
         }
+    }
+
+    /**
+     * RCS S4 sections 3.3 and 6-8: the image is a stub; restore this node from its own shadows and log (EQUAL, SKIP,
+     * TAIL, virtual genesis) or halt. Inside {@code onStart}, before the service acks.
+     */
+    private void restoreFromStub(final DirectBuffer image, final int payloadOffset, final int payloadLength) {
+        if (cluster == null) {
+            throw new ShadowRestore.Halt("FATAL RCS: a stub image needs the cluster context (onStart)");
+        }
+        final com.openexchange.cluster.shadow.ShadowStub stub = ShadowRestore.decodeStub(image, payloadOffset,
+                payloadLength, cluster.context().clusterId(), cluster.logPosition());
+        System.out.println("[SNAPSHOT] stub P_cm=" + stub.logPosition() + " term=" + stub.leadershipTermId()
+                + " genesisId=" + stub.genesisId() + " hintPs=" + stub.hintPs() + " (RCS_MODE=" + rcsMode.text() + ")");
+        final ShadowRestore restore = new ShadowRestore(
+                new ShadowRestore.Inputs(cluster.context().clusterDir(), cluster.context().archiveContext(),
+                        cluster.context().clusterId(), cluster.logPosition()),
+                applier, rcsSettings, rcsCounters, shadowCounters, shadowVerdicts, shadowFaults,
+                term -> this.leadershipTermId = term, livePublisher != null ? livePublisher
+                        : NoopAssetsEventSink.INSTANCE,
+                text -> {
+                    failApplicationCallback();
+                    System.err.println(text);
+                    failFast.run();
+                });
+        final ShadowRestore.Outcome outcome;
+        try {
+            outcome = restore.run(stub);
+        } catch (final com.openexchange.cluster.auth.PrincipalLessSessionException principalLess) {
+            haltPrincipalLess(principalLess); // a restored or tail-replayed session without a principal
+            throw principalLess;
+        }
+        this.leadershipTermId = outcome.leadershipTermId();
+        this.skipWindow = outcome.window();
     }
 
     /** The snapshot image as offered: the v4 payload written at the envelope's payload offset, then sealed. */
@@ -1160,6 +1486,14 @@ public final class AssetsClusteredService implements ClusteredService {
      */
     private void enqueueEgress(MutableDirectBuffer buffer, int offset, int length, int channel,
                                AssetsEventPublisher.Routing routing) {
+        final AssetsEventPublisher.Egress tap = egressTap;
+        if (tap != null) {
+            tap.emit(buffer, offset, length, channel, routing);
+        }
+        // RCS S4 review F3 / D8: this leader gate is why a TAIL cannot grow the egress queues. The tail runs inside
+        // onStart, where isLeader is cluster.role() before any election (a FOLLOWER), so every frame the tail applies
+        // returns here before a queue is touched; the 11.2 heap/queue control was dropped for that reason and the
+        // gate is pinned by EgressLeaderGateTest instead.
         if (!isLeader || cluster == null) {
             return; // followers replicate state but do not emit client egress
         }
@@ -1347,6 +1681,7 @@ public final class AssetsClusteredService implements ClusteredService {
         while (!cluster.scheduleTimer(termTimerId(SWEEP_TIMER_BASE), deadline)) {
             idleStrategy.idle();
         }
+        lastArmedSweepTimerId = termTimerId(SWEEP_TIMER_BASE);
         sweepArmed = true;
     }
 

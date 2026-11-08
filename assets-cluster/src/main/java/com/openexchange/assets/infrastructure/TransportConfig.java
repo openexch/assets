@@ -107,7 +107,8 @@ public final class TransportConfig {
         return sb.toString();
     }
 
-    private static String envOrProp(final String envName, final String propName, final String defaultValue) {
+    /** Env first (non-empty), then the system property, else {@code defaultValue}; RCS S4 settings read through it too. */
+    public static String envOrProp(final String envName, final String propName, final String defaultValue) {
         final String env = System.getenv(envName);
         if (env != null && !env.isEmpty()) {
             return env;

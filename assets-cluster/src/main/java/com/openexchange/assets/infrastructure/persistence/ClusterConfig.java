@@ -274,7 +274,12 @@ public final class ClusterConfig {
         this.clusteredServiceContexts.forEach((ctx) -> ctx.clusterDir(new File(baseDir, CLUSTER_SUB_DIR)));
     }
 
-    /** RCS S1: refuses boot on any STANDBY_SNAPSHOT state; see {@link StandbySnapshotBootGuard}. */
+    /**
+     * RCS S1: refuses boot on any STANDBY_SNAPSHOT state; see {@link StandbySnapshotBootGuard}. The RCS S4 guard
+     * ({@link StubModeBootGuard}, the 3.5 settings and MF-4) runs earlier, in {@code AeronCluster.run} before the
+     * service is constructed, because the service is built from the settings it parses; both run before any Aeron
+     * component.
+     */
     public void enforceBootGuards() {
         StandbySnapshotBootGuard.enforce(consensusModuleContext);
     }
