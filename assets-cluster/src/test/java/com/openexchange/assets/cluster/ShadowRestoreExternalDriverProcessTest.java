@@ -305,7 +305,11 @@ public class ShadowRestoreExternalDriverProcessTest {
         // more journal entries in (P_s, P_cm] than the production 16 MiB ring holds (a deposit entry is 64 ring bytes)
         final int deposits = (16 * 1024 * 1024) / 64 + 20_000;
         final long d0 = System.nanoTime();
-        c.deposits(deposits);
+        try {
+            c.deposits(deposits);
+        } catch (final AssertionError e) {
+            throw new AssertionError(e.getMessage() + "; engine log tail:" + tail(node.log()), e);
+        }
         System.out.println("[11.14-ext] " + deposits + " deposits in " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - d0)
                 + " ms");
         final long pCm = node.snapshot();
@@ -553,6 +557,9 @@ public class ShadowRestoreExternalDriverProcessTest {
     }
 
     /** ADMIN and TOOL sessions of the test JVM on the external driver. */
+    /** Deposits a test client keeps unacked; far below what fills the engine's 16 MiB per-session egress queue. */
+    private static final long DEPOSITS_IN_FLIGHT = 8192;
+
     private final class Clients implements AutoCloseable {
         final Session admin;
         final Session tool;
@@ -611,15 +618,23 @@ public class ShadowRestoreExternalDriverProcessTest {
                 lastCorr = corr++;
                 CoreRestoreRig.offer(tool, enc.buf, enc.deposit(lastCorr, 1 + (i % 5), CoreRestoreRig.usd(),
                         ShadowClusterRig.ONE), all);
-                if ((i & 1023) == 0) {
-                    for (final Session s : all) {
-                        s.poll();
-                    }
+                // a bounded in-flight window: the engine closes a non-resumable session whose 16 MiB egress queue
+                // fills (by design), so an unpaced flood loses every later ack when egress drains slowly (small
+                // socket buffers on CI runners). Polling inside await refreshes lastDepositAckCorr.
+                if (lastCorr - tool.in.lastDepositAckCorr > DEPOSITS_IN_FLIGHT) {
+                    awaitDepositAck(lastCorr - DEPOSITS_IN_FLIGHT, 60_000);
                 }
             }
-            final long target = lastCorr;
-            CoreRestoreRig.await(all, () -> tool.in.lastDepositAckCorr >= target, System.currentTimeMillis() + 300_000,
-                    "deposit ack " + target);
+            awaitDepositAck(lastCorr, 300_000);
+        }
+
+        private void awaitDepositAck(final long target, final long timeoutMs) {
+            try {
+                CoreRestoreRig.await(all, () -> tool.in.lastDepositAckCorr >= target,
+                        System.currentTimeMillis() + timeoutMs, "deposit ack " + target);
+            } catch (final AssertionError e) {
+                throw new AssertionError(e.getMessage() + " (last acked " + tool.in.lastDepositAckCorr + ")", e);
+            }
         }
 
         @Override
