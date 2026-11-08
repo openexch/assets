@@ -72,7 +72,11 @@ public final class AeronCluster {
         final String hosts = getClusterAddresses();
 
         final List<String> hostAddresses = List.of(hosts.split(","));
-        final AssetsClusteredService assetsService = new AssetsClusteredService();
+        // RCS S4 4.1 G-S1 (D1): the 3.5 settings are parsed under the boot guard FIRST, so a bad value is refused with
+        // the "ASSETS BOOT GUARD: " prefix and exit 1 before the service, the journal runtime or any Aeron component
+        // exists. The service takes the parsed settings; it never re-reads the environment.
+        final RcsSettings rcsSettings = StubModeBootGuard.enforce();
+        final AssetsClusteredService assetsService = new AssetsClusteredService(rcsSettings);
 
         // Money journal: the ring is wired onto the engine NOW so the service thread can journal from
         // the first command, replayed or live. Whether it DOES is the cluster's replicated setting,

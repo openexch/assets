@@ -497,7 +497,10 @@ public class AssetsReplayParityTest {
         if (mismatch == null) {
             throw new AssertionError("comparator blind: arm R without the GATEWAY_SESSION open compared equal");
         }
-        assertEquals("first mismatch at GATEWAY_SESSION's Register frame (" + mismatch + ")", register, mismatch.index());
+        // RCS S4 RF-3: a SessionOpen stamps its frame end, so arm R differs in P at the dropped OPEN itself, before the
+        // Register frame that showed it before RF-3
+        assertTrue("the Register frame follows the open", register > openIndex);
+        assertEquals("first mismatch at GATEWAY_SESSION's dropped OPEN (" + mismatch + ")", openIndex, mismatch.index());
     }
 
     @Test

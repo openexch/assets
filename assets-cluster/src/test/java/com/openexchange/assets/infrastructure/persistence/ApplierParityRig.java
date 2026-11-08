@@ -72,11 +72,17 @@ final class ApplierParityRig {
         final Map<Long, StubSession> container;
         long time = CoreFrameStory.T0;
         /**
-         * Deliberately NOT the entry's position: open, close and timer bodies must ignore the position they are handed
-         * in S1 (rule 1.3), and a constant here makes a body that stamps it diverge from the frame-id arm at once.
+         * RCS S4 W0 (contract 5.4, review N6): the position the cluster serves to the callback in flight, set from the
+         * step before every callback ({@link ServiceArm#apply}). In S1 this was a constant 42 on purpose, because open,
+         * close and timer bodies had to IGNORE the position; with RF-3 they stamp it, so a constant would make the
+         * service arm diverge from the frame-id arm on every such step. 42 stays the default for the rigs that call the
+         * service directly and never set it ({@code AeSessionAuthorityTest} asserts it in its halt line).
          */
-        final long logPosition = 42;
+        long logPosition = 42;
         int scheduled;
+        /** RCS S4 W0 instrumentation: how often the service asked for the position, and the last value it was served. */
+        long positionReads;
+        long lastPositionRead = -1;
 
         StubCluster(final Role role, final Map<Long, StubSession> container) {
             this.role = role;
@@ -84,7 +90,11 @@ final class ApplierParityRig {
         }
 
         public Role role() { return role; }
-        public long logPosition() { return logPosition; }
+        public long logPosition() {
+            positionReads++;
+            lastPositionRead = logPosition;
+            return logPosition;
+        }
         public int memberId() { return 1; }
         public Aeron aeron() { throw new UnsupportedOperationException(); }
         public ClusteredServiceContainer.Context context() { throw new UnsupportedOperationException(); }
@@ -169,6 +179,8 @@ final class ApplierParityRig {
 
         public void apply(final SessionedLog.LogStep s) {
             cluster.time = s.timestamp();
+            // every callback kind sees its own frame end: Aeron sets logPosition before invoking the service
+            cluster.logPosition = s.logPosition();
             switch (s.kind()) {
                 case OPEN -> {
                     if (container.containsKey(s.sessionId())) {

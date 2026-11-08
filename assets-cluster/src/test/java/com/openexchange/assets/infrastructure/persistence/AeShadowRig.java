@@ -164,8 +164,13 @@ final class AeShadowRig {
         final ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(1 << 20);
 
         Arm() {
+            this(AssetsReplayParityTest.APP_VERSION);
+        }
+
+        /** RCS S4 W0: a member's real log carries the cluster's own app version; the scaffold replays it under that. */
+        Arm(final int appVersion) {
             applier.setEventSink(sink);
-            container = new ReplayContainer(engine(applier), AssetsReplayParityTest.APP_VERSION,
+            container = new ReplayContainer(engine(applier), appVersion,
                     AppVersionValidator.SEMANTIC_VERSIONING_VALIDATOR, ShadowTriggerListener.NONE);
         }
 

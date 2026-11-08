@@ -30,9 +30,12 @@ import java.util.concurrent.TimeUnit;
  *   <li>The applier knows nothing about shadows, stubs or skip windows; callers gate calls in front of it.</li>
  * </ol>
  *
- * <p><b>Position rule (kept from a9a865d).</b> Only a non-Subscribe session message stamps
- * {@code engine.setLogPosition(logPosition)}. Open, close, timer and term events receive their frame's position too,
- * but ignore it until RCS S4 (RF-3) changes the bodies; the signatures do not change then.</p>
+ * <p><b>Position rule (RCS S4 RF-3, section 5).</b> Every entry that reaches the engine stamps
+ * {@code engine.setLogPosition(logPosition)} with its frame end BEFORE it touches the engine: a non-Subscribe session
+ * message, a sweep TimerEvent (before the sweep), a SessionOpen (before the registry), a SessionClose of a KNOWN id (an
+ * unknown close stays a full no-op, stamp included: S2 conformance R5). A well-formed Subscribe and the term event do
+ * not stamp. After a restore the owner calls {@link #stampLogPosition} with the image's position, so events emitted
+ * before the first replayed frame carry it.</p>
  *
  * <p><b>Refusals.</b> The applier never calls a fail-fast, never logs a FATAL line, never fences and never touches
  * readiness. Any exception out of an entry latches the instance ({@link #failed()}): every later entry throws
@@ -155,7 +158,7 @@ public final class AssetsLogApplier implements ShadowEngine {
      * SessionOpen: parse the principal into the session's authority. A clashing id is refused: the container never
      * delivers one (it throws before calling the service), so a caller that does has lost track of its sessions.
      *
-     * @param logPosition the entry's frame-end position; ignored until RCS S4 (RF-3)
+     * @param logPosition the entry's frame-end position; stamped before the registry is touched (RF-3)
      */
     @Override
     public void onSessionOpen(final long clusterSessionId, final long logPosition, final long timestamp,
@@ -169,6 +172,7 @@ public final class AssetsLogApplier implements ShadowEngine {
             // owner decides what a refusal means (the live service fail-fasts; a reader or a shadow stops).
             com.openexchange.cluster.auth.PrincipalGate.requireClass(encodedPrincipal, "session open",
                     clusterSessionId, logPosition);
+            engine.setLogPosition(logPosition);
             engine.sessions().open(clusterSessionId, encodedPrincipal);
         } catch (final RuntimeException | Error failure) {
             failed = true;
@@ -177,16 +181,19 @@ public final class AssetsLogApplier implements ShadowEngine {
     }
 
     /**
-     * SessionClose: drop the session's authority (an unknown id is a no-op).
+     * SessionClose: drop the session's authority (an unknown id is a full no-op, the position stamp included).
      *
-     * @param logPosition the entry's frame-end position; ignored until RCS S4 (RF-3)
+     * @param logPosition the entry's frame-end position; stamped only when the id is known (RF-3, S2 R5)
      */
     @Override
     public void onSessionClose(final long clusterSessionId, final long logPosition, final long timestamp,
                                final CloseReason closeReason) {
         enter();
         try {
-            engine.sessions().close(clusterSessionId);
+            if (engine.sessions().get(clusterSessionId) != null) {
+                engine.setLogPosition(logPosition);
+                engine.sessions().close(clusterSessionId);
+            }
         } catch (final RuntimeException | Error failure) {
             failed = true;
             throw failure;
@@ -221,7 +228,8 @@ public final class AssetsLogApplier implements ShadowEngine {
     /**
      * A TimerEvent: the deadline sweep is replicated state; the drain belt and any other id change nothing here.
      *
-     * @param logPosition the entry's frame-end position; ignored until RCS S4 (RF-3)
+     * @param logPosition the entry's frame-end position; stamped before the sweep (RF-3); the drain belt and any other
+     *                    id touch nothing here and do not stamp
      * @return {@link #timerKind(long)} of the id
      */
     @Override
@@ -230,6 +238,7 @@ public final class AssetsLogApplier implements ShadowEngine {
         try {
             final int kind = timerKind(correlationId);
             if (kind == TIMER_SWEEP) {
+                engine.setLogPosition(logPosition);
                 engine.sweep(timestamp);
             }
             return kind;
@@ -304,6 +313,17 @@ public final class AssetsLogApplier implements ShadowEngine {
     /** The decode summary of the last successful {@link #restore}; null until one succeeds. */
     public BalanceSnapshotCodec.Decoded lastRestored() {
         return lastRestored;
+    }
+
+    /**
+     * RCS S4 5.1: after a restore (full image or shadow), the engine's position is the image's log position until the
+     * first replayed frame: {@code P_cm} on the full path and EQUAL, {@code P_s} on SKIP and TAIL (before the tail),
+     * 0 for a virtual genesis. Not an entry: it does not end the pristine state and mutates nothing replicated (the
+     * position is not in the snapshot payload). The owner supplies a log-derived value, never a clock.
+     */
+    void stampLogPosition(final long imagePosition) {
+        ensureNotFailed();
+        engine.setLogPosition(imagePosition);
     }
 
     /** True once an entry threw; every later entry refuses. */
