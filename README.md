@@ -56,7 +56,7 @@ With the dependencies already in `~/.m2`, the Makefile targets work without `-s`
 
 `integration` and `nightly` launch clusters. On a machine that also runs a live engine, pin them to spare cores, for example `taskset -c 20-23 make integration`.
 
-The feed harness jar used by cluster-tools' compatibility tests is built with `mvn -s .mvn-settings.xml -pl assets-cluster -am -Pfeed-harness -DskipTests package` and published by `.github/workflows/feed-harness.yml` as the release asset `harness-<sha>/assets-feed-harness.jar`.
+The feed harness jar used by cluster-tools' compatibility tests is built with `mvn -s .mvn-settings.xml -pl assets-cluster -am -Pfeed-harness -DskipTests package` and published on demand by `.github/workflows/feed-harness.yml` (run it by hand on the commit to publish) as the asset `assets-feed-harness-<sha>.jar` of the single `feed-harness` prerelease.
 
 ## Configuration
 
