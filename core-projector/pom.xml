@@ -12,6 +12,11 @@
 
     <artifactId>core-projector</artifactId>
     <packaging>jar</packaging>
+    <properties>
+        <!-- Overridden by the build with the short git sha. See the shade plugin's
+             Build-Sha manifest entry for why this is never guessed. -->
+        <buildSha>unknown</buildSha>
+    </properties>
     <name>Core Money Projector</name>
     <description>Standalone agent: live-follows the core money journal (Aeron Archive recording) and
         idempotently projects every money movement into Postgres, resumable from the PG high-water</description>
@@ -88,6 +93,11 @@
                                          repeating the flags on the command line. -->
                                     <manifestEntries>
                                         <Add-Opens>java.base/jdk.internal.misc java.base/sun.nio.ch java.base/java.nio</Add-Opens>
+                                        <!-- Stamped so a deployed projector names the exact
+                                             binary it runs. The default is the literal
+                                             "unknown" rather than a guess, so a build without
+                                             provenance says so instead of implying it. -->
+                                        <Build-Sha>${buildSha}</Build-Sha>
                                     </manifestEntries>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>

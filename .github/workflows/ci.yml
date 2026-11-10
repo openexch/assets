@@ -134,11 +134,12 @@ jobs:
       # has to change.
       ARTIFACT: core-cluster
       # Published under that prefix, as <name>/target/<name>.jar. The engine jar is
-      # what the box deploys. The bridge joins it because it is a production component
-      # of the money path that until now had no published build at all, and the load
-      # generator because a published benchmark has to be re-runnable from the
-      # artifacts it was measured on.
-      JARS: core-cluster core-bridge core-loadgen
+      # what the box deploys (members and the replica run it). The projector is the
+      # only writer of the PostgreSQL history and deploys from the same prefix as the
+      # engine it projects, so a core roll fetches both by one ref. The bridge jar stays:
+      # its `dump` CLI is the money check's core dump. The load generator because a
+      # published benchmark has to be re-runnable from the artifacts it was measured on.
+      JARS: core-cluster core-projector core-bridge core-loadgen
     steps:
       - uses: actions/checkout@v7
 
