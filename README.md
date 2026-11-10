@@ -85,6 +85,28 @@ The main engine settings:
 
 Ports are `CLUSTER_PORT_BASE + node id * CLUSTER_PORT_STRIDE + offset`, with offsets 1 archive control, 2 client ingress, 3 member, 4 log, 5 catchup transfer. With the defaults, clients connect to port 9302.
 
+### Replica
+
+`java -jar assets.jar replica` (or `ASSETS_ROLE=replica`) starts a fourth process that is not a member: it follows the cluster through Aeron `ClusterBackup`, applies the log into its own engine and writes the shadow images members restore from. Behaviour, trust after a restart, fences and readiness are in cluster-kit's `docs/replica.md`. Every setting is parsed and range-checked at boot; a bad value exits 1 with an `ASSETS REPLICA BOOT GUARD:` line before anything starts. The cluster settings above (`CLUSTER_ADDRESSES`, `CLUSTER_PORT_BASE`, `CLUSTER_PORT_STRIDE`, `TRANSPORT_*`) apply as well.
+
+| variable | default | meaning |
+|---|---|---|
+| `CLUSTER_REPLICA_SLOT` | `3` | port slot; must not collide with a member on the same host |
+| `CLUSTER_REPLICA_ADDRESS` | `localhost` (only when every member is local) | address the members reach the replica on |
+| `BASE_DIR` | `./ae-replica<slot>` | the replica's archive: log copy and shadows. Keep it on disk |
+| `ASSETS_NODE_PORT` | `9700 + slot` | `/health`, `/ready`, `/metrics` |
+| `REPLICA_BACKUP_SOURCE` | `FOLLOWER` | `FOLLOWER`, `LEADER` or `ANY`; `FOLLOWER` needs two or more members |
+| `REPLICA_BACKUP_QUERY_INTERVAL_MS` | `60000` | how often the backup queries a member |
+| `REPLICA_BACKUP_COOLDOWN_MS` | `12000` | wait after a backup reset |
+| `REPLICA_VERIFY_WAIT_MS` | `180000` | stall bound for an unverified replica; at least 2 x query interval + cooldown |
+| `REPLICA_ALIGNED_WAIT_MS` | `90000` | how long an ALIGNED trigger waits for a busy writer before it fences |
+| `REPLICA_READY_MAX_LAG_BYTES` | `67108864` | recorded minus applied allowed for `/ready` |
+| `REPLICA_READY_SHADOW_AGE_MS` | `1800000` | newest shadow age allowed for `/ready`; `0` disables |
+| `REPLICA_READY_TIME_LAG_MS` | `3000` | wall clock minus cluster time of the last applied frame; `0` disables |
+| `REPLICA_SHADOW_BUFFER_MB` | `512` | serialize buffer; an image larger than this fences |
+
+The remaining `REPLICA_*` settings (backup timeouts, catch-up buffers, driver MTU and term length, stream ids) are listed with their ranges in `assets-cluster/src/main/java/com/openexchange/assets/replica/ReplicaSettings.java`. After a normal restart the replica reports 503 `unverified continuation` until it has compared its state with the next member snapshot, about one member snapshot interval.
+
 HTTP endpoints: each engine member serves `/health`, `/ready` and `/metrics` on its probe port. The bridge serves `/health` and `/metrics` on `BRIDGE_METRICS_PORT` (default 9600), the projector on `PROJECTOR_METRICS_PORT` (default 9601).
 
 ## Releases

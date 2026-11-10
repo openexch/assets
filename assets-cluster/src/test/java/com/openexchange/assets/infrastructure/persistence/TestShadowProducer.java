@@ -166,6 +166,50 @@ public final class TestShadowProducer {
         return write("GENUINE", who, log, p, p, null);
     }
 
+    /**
+     * The trailer-less recording a {@code kill -9} mid-write leaves: genuine header and
+     * payload chunks of {@code S(p)} from {@code who} at {@code producerSeq}, no trailer, no cleanup purge.
+     */
+    public Written produceCrashed(final Who who, final RecordedLog log, final long p, final long producerSeq) {
+        final Arm content = new Arm(appVersionOf(log)).genesis();
+        log.replay(-1, p, content.container);
+        requireAt(content, p, "content");
+        final ShadowImageBuffer image = AeShadowRig.image(content, capacity);
+        final ShadowWriter w = com.openexchange.cluster.shadow.CrashedShadowWriters.crashingBeforeTrailer(aeron, archive,
+                new ShadowProducer(clusterId, who.kind(), who.id()), new AeShadowRig.ApplierSelfCheck(),
+                AeShadowRig.SHADOW_TERM, producerSeq);
+        final ShadowWriter.WriteResult r = w.write(image, ShadowHeader.ENGINE_ASSETS, ShadowKind.ALIGNED,
+                content.container.cursor(), AeShadowRig.identityOf(content.applier));
+        return new Written("CRASHED_BEFORE_TRAILER", r, p, p, content.container.cursor().clusterTime(),
+                content.applier.engine().getLastLogTime(), r.recordingId(), image.payloadLength(),
+                AeShadowRig.identityOf(content.applier).genesisId());
+    }
+
+    /**
+     * For the two-restores control: a sealed, digest-valid shadow of {@code who} whose payload is NOT an engine
+     * image (the envelope refuses it), under the genuine identity and cursor of {@code S(p)}. Written without the
+     * self-check ({@code ShadowSelfCheck.UNCHECKED_TEST_ONLY}, which needs {@code -Doxs.shadow.unchecked=true}): the
+     * loader accepts it, {@code restore} throws.
+     */
+    public Written produceUndecodable(final Who who, final RecordedLog log, final long p) {
+        final Arm content = new Arm(appVersionOf(log)).genesis();
+        log.replay(-1, p, content.container);
+        requireAt(content, p, "content");
+        final ShadowImageBuffer image = AeShadowRig.image(content, capacity);
+        final int n = image.payloadLength();
+        for (int i = 0; i < n; i++) {
+            image.payloadView().putByte(i, (byte)(0xA5 ^ i));
+        }
+        final ShadowWriter w = new ShadowWriter(aeron, archive, new ShadowProducer(clusterId, who.kind(), who.id()),
+                com.openexchange.cluster.shadow.ShadowSelfCheck.UNCHECKED_TEST_ONLY, AeShadowRig.SHADOW_TERM,
+                SystemNanoClock.INSTANCE, TIMEOUT_NS, TIMEOUT_NS, TIMEOUT_NS, 1, -1, counters);
+        final ShadowWriter.WriteResult r = w.write(image, ShadowHeader.ENGINE_ASSETS, ShadowKind.ALIGNED,
+                content.container.cursor(), AeShadowRig.identityOf(content.applier));
+        return new Written("UNDECODABLE", r, p, p, content.container.cursor().clusterTime(),
+                content.applier.engine().getLastLogTime(), r.recordingId(), n,
+                AeShadowRig.identityOf(content.applier).genesisId());
+    }
+
     /** Backward shift: content {@code S(y)} under a header {@code P_s = x} ({@code x < y}). */
     public Written produceBackwardShift(final Who who, final RecordedLog log, final long x, final long y) {
         if (y <= x) {

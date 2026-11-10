@@ -221,4 +221,16 @@ public final class ServiceProbe {
         f.tailFrameObserver = observer;
         service.shadowFaults = f;
     }
+
+    /** The node's snapshot cadence (the standby counters and the byte baseline). */
+    public static com.openexchange.cluster.SnapshotCadence cadence(final AssetsClusteredService service) {
+        return (com.openexchange.cluster.SnapshotCadence)field(service, "snapshotCadence");
+    }
+
+    /** {@code assets_backup_queries_denied_total} of this node (0 without ClusterConfig's table). */
+    public static long backupQueriesDenied(final AssetsClusteredService service) {
+        final Object table = field(service, "sessionAuthorisation");
+        return table == null ? 0 : ((com.openexchange.cluster.auth.ClassAuthorisationService)table)
+                .deniedCount(com.openexchange.cluster.auth.ClassAuthorisationService.BACKUP_QUERY);
+    }
 }

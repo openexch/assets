@@ -2,6 +2,7 @@
 package com.openexchange.assets.auth;
 
 import com.openexchange.cluster.auth.AuthPolicy;
+import com.openexchange.cluster.auth.ClassAuthorisationService;
 import com.openexchange.cluster.auth.ClusterSessionClass;
 
 /**
@@ -20,6 +21,20 @@ public final class AssetsAuth {
             ClusterSessionClass.GATEWAY, ClusterSessionClass.FORWARDER, ClusterSessionClass.BRIDGE,
             ClusterSessionClass.ADMIN, ClusterSessionClass.TOOL, ClusterSessionClass.TREASURY,
             ClusterSessionClass.REPLICA);
+
+    /**
+     * The consensus-module authorisation table: REPLICA
+     * may send BackupQuery; every other (class, action), HeartbeatRequest, StandbySnapshot and AdminRequest included,
+     * is denied. Without it Aeron's default allows BackupQuery, HeartbeatRequest and StandbySnapshot for any
+     * authenticated class (ABS:39-48). A new instance per call: {@code ClusterConfig} installs ONE and exports its
+     * denial counters.
+     */
+    public static ClassAuthorisationService authorisationService() {
+        return ClassAuthorisationService.builder()
+                .allow(ClusterSessionClass.REPLICA, ClassAuthorisationService.CLUSTER_PROTOCOL_ID,
+                        ClassAuthorisationService.BACKUP_QUERY)
+                .build();
+    }
 
     private AssetsAuth() {
     }

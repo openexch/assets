@@ -30,6 +30,8 @@ public final class TestAuth {
     private static final String SECRET_GATEWAY = "55".repeat(32);
     private static final String SECRET_FORWARDER = "66".repeat(32);
     private static final String SECRET_TREASURY_ANY = "77".repeat(32);
+    /** The replica's key (class REPLICA = 7, BackupQuery only). */
+    private static final String SECRET_REPLICA = "88".repeat(32);
 
     /** keyId:class:secret:identity:users=... (RC2 S6, A16: any-user scope is the explicit users=*) */
     public static final String KEYS = String.join(";",
@@ -39,7 +41,8 @@ public final class TestAuth {
             "4:TREASURY:" + SECRET_TREASURY_7 + ":4:users=7",
             "5:GATEWAY:" + SECRET_GATEWAY + "::users=*",
             "6:FORWARDER:" + SECRET_FORWARDER + "::users=*",
-            "7:TREASURY:" + SECRET_TREASURY_ANY + "::users=*");
+            "7:TREASURY:" + SECRET_TREASURY_ANY + "::users=*",
+            "8:REPLICA:" + SECRET_REPLICA + "::users=*");
 
     private TestAuth() {
     }
@@ -76,6 +79,7 @@ public final class TestAuth {
             case GATEWAY: return new CoreCredentials(sessionClass, 5, HexFormat.of().parseHex(SECRET_GATEWAY));
             case FORWARDER: return new CoreCredentials(sessionClass, 6, HexFormat.of().parseHex(SECRET_FORWARDER));
             case TREASURY: return new CoreCredentials(sessionClass, 7, HexFormat.of().parseHex(SECRET_TREASURY_ANY));
+            case REPLICA: return new CoreCredentials(sessionClass, 8, HexFormat.of().parseHex(SECRET_REPLICA));
             default: throw new IllegalArgumentException("no test key for " + sessionClass);
         }
     }
