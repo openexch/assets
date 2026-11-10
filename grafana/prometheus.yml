@@ -1,5 +1,5 @@
-# Prometheus scrape config for the Assets Engine nodes (RC2 S8 3.10 item 3, D-S8-9).
-# Each AE node serves /metrics on ASSETS_NODE_PORT, else 9700 + nodeId (AssetsClusteredService.startNodeEndpoint).
+# Prometheus scrape config for the core nodes.
+# Each core node serves /metrics on CORE_NODE_PORT, else 9700 + nodeId (CoreClusteredService.startNodeEndpoint).
 # Loopback-only by design: run Prometheus on the same box or tunnel; never expose these ports publicly.
 global:
   scrape_interval: 5s
@@ -8,7 +8,7 @@ rule_files:
   - alerts.yml
 
 scrape_configs:
-  - job_name: assets-nodes           # cluster-kit NodeEndpoint: /metrics, /health, /ready
+  - job_name: core-nodes           # cluster-kit NodeEndpoint: /metrics, /health, /ready
     metrics_path: /metrics
     static_configs:
       - targets: ['localhost:9700', 'localhost:9701', 'localhost:9702']

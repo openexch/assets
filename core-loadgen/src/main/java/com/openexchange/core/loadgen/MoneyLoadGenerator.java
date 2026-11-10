@@ -1,0 +1,1168 @@
+package com.openexchange.core.loadgen;
+
+import com.match.infrastructure.generated.CreateOrderEncoder;
+import com.match.infrastructure.generated.OrderSide;
+import com.match.infrastructure.generated.OrderStatusBatchDecoder;
+import com.match.infrastructure.generated.OrderType;
+import com.match.infrastructure.generated.TradeExecutionBatchDecoder;
+import com.openexchange.core.domain.FixedPoint;
+import io.aeron.Publication;
+import io.aeron.cluster.client.AeronCluster;
+import io.aeron.cluster.client.EgressListener;
+import io.aeron.cluster.codecs.EventCode;
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
+import io.aeron.logbuffer.Header;
+import org.HdrHistogram.Histogram;
+import org.HdrHistogram.SingleWriterRecorder;
+import org.agrona.DirectBuffer;
+import org.agrona.ExpandableDirectByteBuffer;
+import org.agrona.collections.Long2LongHashMap;
+import org.agrona.collections.Long2ObjectHashMap;
+
+import java.io.PrintStream;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Benchmark driver for the full money-critical hot path, with no OMS in the loop:
+ *
+ *   core Hold -> HoldAck -> ME CreateOrder(omsOrderId) -> trade -> settlement journal
+ *     -> bridge -> core Settle -> (feed terminal releases residual hold)
+ *
+ * The generator performs the OMS's synchronous fail-closed hold gate itself: no order is
+ * sent to the matching engine before its fund lock is acknowledged by the core.
+ * The Hold's orderId and the ME order's omsOrderId are the SAME value - that is the key
+ * the settlement feed uses to draw down and release the hold.
+ *
+ * Measurement rules (see BENCH methodology):
+ *  - Single clock: every latency is recorded on this process's clock. The order->settled
+ *    interval joins ME TradeExecution egress (tradeId, taker/makerOmsOrderId) to core
+ *    SettlementApplied egress (tradeId), both observed here.
+ *  - Coordinated-omission safe: each order's t0 is its SCHEDULED send slot on the fixed
+ *    rate timeline. The schedule is never reset when the generator falls behind, so delay
+ *    caused by a slow system lands in the tail percentiles instead of being hidden.
+ *  - Histograms only record inside the measurement window (after warmup); counters always run.
+ *
+ * Single-threaded by design: one duty thread owns both AeronCluster sessions (they are not
+ * thread-safe), which is also what makes the single-clock rule trivially true.
+ */
+public final class MoneyLoadGenerator implements AutoCloseable {
+
+    // ---- fixed-point (8dp) ----
+    private static final double FP_SCALE = 1e8;
+    private static long fp(final double v) { return Math.round(v * FP_SCALE); }
+
+    // ---- market/scenario constants (mirrors match-loadtest AGGRESSIVE, bias configurable) ----
+    private static final int MARKET_ID = 1;              // BTC-USD
+    private static final int ASSET_USD = 0;
+    private static final int ASSET_BTC = 1;
+    private static final double MID_PRICE = 120_000.0;
+    /**
+     * Market-BUY budget price: must clear the WORST possible crossing (asks go up to
+     * mid*(1+0.01) in this scenario). The hold equals the budget, and the engine caps the
+     * fill cost at the budget, so budget >= worst ask price makes a settle shortfall
+     * impossible. Dry-run 2026-07-24 proved budget==mid faults ~13% of trades (core's D5
+     * shortfall hardening absorbed them - conservation held - but a benchmark run must be
+     * fault-free to be publishable).
+     */
+    private static final double MARKET_BUY_BUDGET_PRICE = MID_PRICE * 1.02;
+
+    private static final long PREFUND_CORR_BASE = 1L << 62;
+    private static final int OFFER_RETRIES = 10;
+
+    /** Egress channel names as in the {@code EgressChannels} bit set (money-schema.xml). */
+    private static final List<String> CHANNEL_NAMES = List.of("acks", "balances", "settlements", "snapshots");
+
+    // ---- config ----
+    private final int rate;
+    private final int durationSec;          // measurement window, EXCLUDES warmup (unlike match-loadtest)
+    private final int warmupSec;
+    private final int users;
+    private final int window;               // max in-flight lifecycles (hold-sent .. first-status)
+    private final double bidBias;           // 0.5 = no net USD->BTC drift (long-run safe)
+    private final double limitRatio;
+    private final int sampleShift;          // order->settled lifecycle sampling: 1 in 2^shift
+    private final Path outDir;
+    private final int genId;        // cok-uretici kosumda kimlik: id uzayi, RNG ve kullanici araligi ayrilir
+    /** Substrate mode: hold + release against the core alone, no ME, no journal, no bridge. */
+    private final boolean coreOnly;
+    /** Once per second, print one interval-only ILOG line per latency track. */
+    private final boolean intervalLog;
+    private final boolean prefund;
+    private final long prefundUsdFp;
+    private final long prefundBtcFp;
+    /** Core egress channels to subscribe to after connect; null = flag absent: no Subscribe sent, full broadcast. */
+    private final Set<String> subscribeChannels;
+
+    // ---- transport ----
+    /** Embedded media driver; null when {@code --aeron-dir} attaches to an external one. */
+    private final MediaDriver driver;
+    private final AeronCluster me;
+    private final AeronCluster coreCluster;
+    /**
+     * Balance-feed side-channel measurement tap ({@code --balance-feed <channel>}): a plain Aeron
+     * subscription on the same media driver, counting frames and entries — the consumer half of the
+     * Core's conflated latest-value feed. Counters only, by design: the feed's contract is "latest
+     * value, intermediates may conflate away", so a latency track would measure the conflation
+     * window, not the transport. Null when the flag is absent (default: off).
+     */
+    private final io.aeron.Aeron feedAeron;
+    private final io.aeron.Subscription feedSub;
+    private final io.aeron.FragmentAssembler feedHandler;
+    private final com.openexchange.core.infrastructure.generated.BalanceUpdateDecoder feedUpdateDec =
+            new com.openexchange.core.infrastructure.generated.BalanceUpdateDecoder();
+    private final com.openexchange.core.infrastructure.generated.BalanceUpdateBatchDecoder feedBatchDec =
+            new com.openexchange.core.infrastructure.generated.BalanceUpdateBatchDecoder();
+    private long feedFrames, feedEntries;
+
+    // ---- SBE (ME side imported, core side fully qualified to avoid header-codec name clash) ----
+    private final com.match.infrastructure.generated.MessageHeaderEncoder meHeaderEnc =
+            new com.match.infrastructure.generated.MessageHeaderEncoder();
+    private final com.match.infrastructure.generated.MessageHeaderDecoder meHeaderDec =
+            new com.match.infrastructure.generated.MessageHeaderDecoder();
+    private final CreateOrderEncoder createOrderEnc = new CreateOrderEncoder();
+    private final OrderStatusBatchDecoder statusBatchDec = new OrderStatusBatchDecoder();
+    private final TradeExecutionBatchDecoder tradeBatchDec = new TradeExecutionBatchDecoder();
+
+    private final com.openexchange.core.infrastructure.generated.MessageHeaderEncoder coreHeaderEnc =
+            new com.openexchange.core.infrastructure.generated.MessageHeaderEncoder();
+    private final com.openexchange.core.infrastructure.generated.MessageHeaderDecoder coreHeaderDec =
+            new com.openexchange.core.infrastructure.generated.MessageHeaderDecoder();
+    private final com.openexchange.core.infrastructure.generated.HoldEncoder holdEnc =
+            new com.openexchange.core.infrastructure.generated.HoldEncoder();
+    private final com.openexchange.core.infrastructure.generated.ReleaseEncoder releaseEnc =
+            new com.openexchange.core.infrastructure.generated.ReleaseEncoder();
+    private final com.openexchange.core.infrastructure.generated.DepositEncoder depositEnc =
+            new com.openexchange.core.infrastructure.generated.DepositEncoder();
+    private final com.openexchange.core.infrastructure.generated.SubscribeEncoder subscribeEnc =
+            new com.openexchange.core.infrastructure.generated.SubscribeEncoder();
+    private final com.openexchange.core.infrastructure.generated.HoldAckDecoder holdAckDec =
+            new com.openexchange.core.infrastructure.generated.HoldAckDecoder();
+    private final com.openexchange.core.infrastructure.generated.HoldAckBatchDecoder holdAckBatchDec =
+            new com.openexchange.core.infrastructure.generated.HoldAckBatchDecoder();
+    private final com.openexchange.core.infrastructure.generated.HoldRejectDecoder holdRejectDec =
+            new com.openexchange.core.infrastructure.generated.HoldRejectDecoder();
+    private final com.openexchange.core.infrastructure.generated.DepositAckDecoder depositAckDec =
+            new com.openexchange.core.infrastructure.generated.DepositAckDecoder();
+    private final com.openexchange.core.infrastructure.generated.SettlementAppliedDecoder settleDec =
+            new com.openexchange.core.infrastructure.generated.SettlementAppliedDecoder();
+    private final com.openexchange.core.infrastructure.generated.SettlementAppliedBatchDecoder settleBatchDec =
+            new com.openexchange.core.infrastructure.generated.SettlementAppliedBatchDecoder();
+    private final com.openexchange.core.infrastructure.generated.SettleFaultDecoder settleFaultDec =
+            new com.openexchange.core.infrastructure.generated.SettleFaultDecoder();
+
+    private final ExpandableDirectByteBuffer meBuffer = new ExpandableDirectByteBuffer(256);
+    private final ExpandableDirectByteBuffer coreBuffer = new ExpandableDirectByteBuffer(256);
+
+    // ---- lifecycle tracking (duty thread only) ----
+    private static final class Pending {
+        /** nanoTime at which the ME CreateOrder was actually offered — isolates the ME leg. */
+        long orderSentNs;
+        long omsOrderId;
+        long scheduledNs;
+        long userId;
+        boolean isBid;
+        boolean isLimit;
+        long priceFp;
+        long qtyFp;
+        long totalPriceFp;
+        long holdAmountFp;
+        int holdAssetId;
+        boolean orderSent;
+        boolean sampled;
+    }
+
+    private final ArrayDeque<Pending> pool = new ArrayDeque<>();
+    /** hold-sent (awaiting HoldAck) OR order-sent (awaiting first status). Bounded by {@link #window}. */
+    private final Long2ObjectHashMap<Pending> pending = new Long2ObjectHashMap<>();
+    /** sampled orders awaiting their first settle: omsOrderId -> scheduledNs. */
+    private final Long2LongHashMap sampledOrders = new Long2LongHashMap(-1);
+    /** tradeId -> first-seen-on-ME-egress ns. Removed when its settle is observed. */
+    private final Long2LongHashMap tradeSeenNs = new Long2LongHashMap(-1);
+    /**
+     * tradeId -> SettlementApplied-seen ns for settles that arrived BEFORE the ME egress
+     * trade observation. Dry-run finding: the settlement path (journal -> bridge -> core,
+     * ~1.5ms) is usually FASTER than the ME market-data egress batch flush (~20ms), so the
+     * settle routinely wins the race; the join must work in both directions.
+     */
+    private final Long2LongHashMap settleSeenNs = new Long2LongHashMap(-1);
+    /** tradeId -> scheduledNs of a SAMPLED parent order (taker preferred). */
+    private final Long2LongHashMap tradeToSampledOrder = new Long2LongHashMap(-1);
+    private static final int TRADE_MAP_CAP = 4_000_000;
+
+    // ---- latency tracks (ns) ----
+    /**
+     * The duty thread is the ONLY writer (recordValue, wait-free); the interval-log thread and the
+     * final report are the only readers, serialized by the synchronized flip methods. Cumulative
+     * keeps the newHist() bounds/digits, so the final report and hgrm output are unchanged.
+     */
+    private static final class Track {
+        final String name;
+        private final SingleWriterRecorder recorder = new SingleWriterRecorder(3);
+        private final Histogram cumulative = newHist();
+        private Histogram recycled;
+
+        Track(final String name) { this.name = name; }
+
+        void recordValue(final long v) { recorder.recordValue(v); }
+
+        /** Fold the interval since the last flip into cumulative; recycled IS that interval. */
+        private void flip() {
+            recycled = recorder.getIntervalHistogram(recycled);
+            cumulative.add(recycled);
+        }
+
+        synchronized Histogram cumulative() {
+            flip();
+            return cumulative;
+        }
+
+        synchronized void printIntervalLine(final PrintStream out, final String stampPrefix) {
+            flip();
+            out.printf(Locale.ROOT, "%strack=%s n=%d p50_ms=%.2f p99_ms=%.2f max_ms=%.2f%n",
+                    stampPrefix, name, recycled.getTotalCount(),
+                    recycled.getValueAtPercentile(50) / 1e6,
+                    recycled.getValueAtPercentile(99) / 1e6,
+                    recycled.getMaxValue() / 1e6);
+        }
+    }
+
+    private final Track holdAckHist = new Track("hold-ack");
+    private final Track orderAckHist = new Track("order-ack");
+    private final Track tradeToSettledHist = new Track("trade-to-settled");   // trade observed first (settle lag)
+    /**
+     * ME order OFFER -> first ME status. Deliberately NOT charged from the scheduled slot: this is the
+     * matching engine's own round trip with the hold leg and any schedule backlog removed, which is the
+     * only way to tell a fixed structural cost from queueing. The coordinated-omission-safe lifecycle
+     * histogram above stays the headline number; this one is the diagnostic.
+     */
+    private final Track meLegHist = new Track("me-leg");
+    private final Track settleLeadHist = new Track("settle-lead");            // settle observed first (its lead)
+    private final Track orderToSettledHist = new Track("order-to-settled");
+    /** ILOG emission order; names match the hgrm file names. */
+    private final Track[] tracks = {
+            holdAckHist, orderAckHist, meLegHist, tradeToSettledHist, settleLeadHist, orderToSettledHist };
+    private static Histogram newHist() { return new Histogram(TimeUnit.MINUTES.toNanos(2), 3); }
+    private static final DateTimeFormatter ILOG_TS =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
+
+    // ---- counters ----
+    private long holdsSent, holdAcks, holdRejects, ordersSent, orderSendFailures,
+            firstStatuses, tradesSeen, settlesSeen, settleFaults, depositAcks,
+            meBackpressure, coreBackpressure, tradeMapSkips, settleLedJoins, tradeLedJoins,
+            scheduleBacklogMax, releasesSent;
+
+    private long measureStartNs;
+    private boolean measuring;
+    private final Random rand; // seed per generator: reproducible AND distinct streams
+
+    /**
+     * omsOrderId base: epoch-millis shifted so CONSECUTIVE RUNS against the same (not
+     * re-genesis'd) clusters can never collide ids - a collision merges this run's holds
+     * with a previous run's leftovers (dry-run 2: 34k hold rejects + garbage SettleFaults).
+     * ~2^20 ids per ms of headroom; stays far below 2^63.
+     */
+    private final long userBase;
+    private final long orderIdBase;
+
+    private MoneyLoadGenerator(final String[] args) {
+        this.rate = intArg(args, "--rate", 10_000);
+        this.durationSec = intArg(args, "--duration", 60);
+        this.warmupSec = intArg(args, "--warmup", 30);
+        this.users = intArg(args, "--users", 16);
+        this.window = intArg(args, "--window", 8192);
+        this.bidBias = doubleArg(args, "--bid-bias", 0.5);
+        this.limitRatio = doubleArg(args, "--limit-ratio", 0.40);
+        this.sampleShift = intArg(args, "--sample-shift", 6); // 1/64 lifecycle sampling
+        this.outDir = Path.of(strArg(args, "--out", "results"));
+        this.genId = intArg(args, "--gen-id", 0);
+        this.userBase = (long) this.genId * this.users;
+        this.rand = new Random(42 + this.genId);
+        this.orderIdBase = (System.currentTimeMillis() + this.genId) << 20;
+        this.coreOnly = hasFlag(args, "--core-only");
+        this.intervalLog = hasFlag(args, "--interval-log");
+        this.prefund = !hasFlag(args, "--no-prefund");
+        this.prefundUsdFp = fp(doubleArg(args, "--prefund-usd", 50_000_000_000.0)); // $50B/user
+        this.prefundBtcFp = fp(doubleArg(args, "--prefund-btc", 10_000_000.0));     // 10M BTC/user
+        this.subscribeChannels = parseChannels(args); // fail-fast: before any resource is launched
+
+        final List<String> meHosts = List.of(strArg(args, "--me-hosts", "127.0.0.1").split(","));
+        final List<String> coreHosts = List.of(strArg(args, "--core-hosts", "127.0.0.1").split(","));
+        final int mePortBase = intArg(args, "--me-port-base", 9000);
+        final int corePortBase = intArg(args, "--core-port-base", 9300);
+        // Probe toward the cluster we actually talk to. In --core-only there is no ME, and probing
+        // toward its default 127.0.0.1 would resolve the advertised egress address to loopback:
+        // the core leader would then publish egress into its own container and the run would sit at
+        // zero acks with nothing in any log (the match#151 class of bug).
+        final String egressHost = resolveEgressHost(strArg(args, "--egress-host", null),
+                coreOnly ? coreHosts.get(0) : meHosts.get(0));
+
+        // --aeron-dir: attach to an EXTERNAL media driver (e.g. a pinned busy-spin aeronmd)
+        // instead of launching an embedded SHARED-mode one, so client-side driver noise stays
+        // out of the measurement. The external driver's lifecycle is not ours: driver stays
+        // null and close() only closes what this process started.
+        final String externalAeronDir = strArg(args, "--aeron-dir", null);
+        this.driver = externalAeronDir != null ? null : MediaDriver.launch(new MediaDriver.Context()
+                .aeronDirectoryName("/dev/shm/aeron-moneyload-" + ProcessHandle.current().pid())
+                .threadingMode(ThreadingMode.SHARED)
+                .dirDeleteOnStart(true)
+                .dirDeleteOnShutdown(true)
+                .errorHandler(t -> t.printStackTrace(System.err)));
+        final String aeronDir = driver != null ? driver.aeronDirectoryName() : externalAeronDir;
+
+        System.out.printf("connecting %sAE %s (base %d), egressHost=%s%n",
+                coreOnly ? "" : "ME " + meHosts + " (base " + mePortBase + ") / ",
+                coreHosts, corePortBase, egressHost);
+
+        // core-only never connects to the ME at all: an idle-but-connected cluster client still
+        // costs a session, a poll and a keep-alive, and the point of this mode is to measure the
+        // Core substrate with nothing else in the picture.
+        AeronCluster meClient = null;
+        AeronCluster coreClient = null;
+        io.aeron.Aeron feedClient = null;
+        io.aeron.Subscription feedSubscription = null;
+        try {
+            meClient = coreOnly ? null : connect(aeronDir, ingressEndpoints(meHosts, mePortBase), egressHost, new MeEgress());
+            coreClient = connect(aeronDir, ingressEndpoints(coreHosts, corePortBase), egressHost, new CoreEgress());
+            if (subscribeChannels != null) {
+                sendSubscribe(coreClient);
+                System.out.println("Core egress narrowed to: " + String.join(",", subscribeChannels));
+            }
+            // Balance-feed side-channel tap: a plain subscription through the same driver. Off by
+            // default; the channel must match the core nodes' BALANCE_FEED_CHANNEL.
+            final String feedChannel = strArg(args, "--balance-feed", null);
+            if (feedChannel != null) {
+                // Default mirrors InfrastructureConstants.BALANCE_FEED_STREAM_ID (the loadgen does
+                // not depend on core-cluster, same as it hardcodes the 9300 port base).
+                final int feedStream = intArg(args, "--balance-feed-stream", 4201);
+                feedClient = io.aeron.Aeron.connect(
+                        new io.aeron.Aeron.Context().aeronDirectoryName(aeronDir));
+                feedSubscription = feedClient.addSubscription(feedChannel, feedStream);
+                System.out.println("balance-feed tap subscribed: " + feedChannel
+                        + " stream " + feedStream);
+            } else if (hasFlag(args, "--balance-feed")) {
+                throw new IllegalArgumentException("--balance-feed requires a channel URI value");
+            }
+        } catch (final RuntimeException e) {
+            // The embedded media driver's threads are NOT daemons. A failed connect used to leave
+            // them running with the constructor half-done, so close() never ran and the JVM never
+            // exited: the process sat there forever and an automated run hung instead of failing in
+            // the 10s connect timeout. Tear the driver down and let the exception surface.
+            org.agrona.CloseHelper.quietClose(feedSubscription);
+            org.agrona.CloseHelper.quietClose(feedClient);
+            org.agrona.CloseHelper.quietClose(coreClient);
+            org.agrona.CloseHelper.quietClose(meClient);
+            org.agrona.CloseHelper.quietClose(driver);
+            throw e;
+        }
+        this.me = meClient;
+        this.coreCluster = coreClient;
+        this.feedAeron = feedClient;
+        this.feedSub = feedSubscription;
+        this.feedHandler = feedSub == null ? null : new io.aeron.FragmentAssembler(this::onFeedFrame);
+    }
+
+    /** Count one balance-feed frame and its entries (single BalanceUpdate or BalanceUpdateBatch). */
+    private void onFeedFrame(final DirectBuffer buffer, final int offset, final int length,
+                             final Header header) {
+        if (length < coreHeaderDec.encodedLength()) {
+            return;
+        }
+        coreHeaderDec.wrap(buffer, offset);
+        final int body = offset + coreHeaderDec.encodedLength();
+        if (coreHeaderDec.templateId() == feedUpdateDec.sbeTemplateId()) {
+            feedFrames++;
+            feedEntries++;
+        } else if (coreHeaderDec.templateId() == feedBatchDec.sbeTemplateId()) {
+            feedFrames++;
+            feedBatchDec.wrap(buffer, body, coreHeaderDec.blockLength(), coreHeaderDec.version());
+            feedEntries += feedBatchDec.updates().count();
+        }
+    }
+
+    /** {@code i=host:port} CSV; port = base + i*100 + 2 (client-facing offset, both clusters). */
+    static String ingressEndpoints(final List<String> hosts, final int portBase) {
+        final StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < hosts.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(i).append('=').append(hosts.get(i).trim()).append(':')
+                    .append(com.openexchange.cluster.ClusterPorts.port(
+                            i, portBase, com.openexchange.cluster.ClusterPorts.CLIENT_FACING_OFFSET));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The egress endpoint must be reachable from the cluster leader (match#151 class of bug:
+     * an iface-name guess silently falls back to loopback on cloud hosts). Resolution order:
+     * explicit arg/env, then the OS's routed source address toward the first ME host, then loopback.
+     */
+    static String resolveEgressHost(final String explicit, final String firstMeHost) {
+        if (explicit != null && !explicit.isBlank()) return explicit;
+        final String env = System.getenv("EGRESS_HOST");
+        if (env != null && !env.isBlank()) return env;
+        try (DatagramSocket probe = new DatagramSocket()) {
+            probe.connect(new InetSocketAddress(InetAddress.getByName(firstMeHost), 9)); // discard port
+            final InetAddress local = probe.getLocalAddress();
+            if (local != null && !local.isAnyLocalAddress()) return local.getHostAddress();
+        } catch (final Exception ignore) {
+            // fall through
+        }
+        return "127.0.0.1";
+    }
+
+    private static AeronCluster connect(final String aeronDir, final String ingressEndpoints,
+                                        final String egressHost, final EgressListener listener) {
+        return AeronCluster.connect(new AeronCluster.Context()
+                // Both clusters may authenticate; the core requires it. One TOOL credential
+                // (CORE_AUTH_CREDENTIAL / -Dcore.auth.credential) is presented to every connect; a
+                // cluster without an authenticator ignores it.
+                .credentialsSupplier(credentialsOrNone())
+                .messageTimeoutNs(TimeUnit.SECONDS.toNanos(10))
+                .aeronDirectoryName(aeronDir)
+                .ingressChannel("aeron:udp?term-length=16m|mtu=8k")
+                .ingressEndpoints(ingressEndpoints)
+                .egressChannel("aeron:udp?endpoint=" + egressHost + ":0")
+                .egressListener(listener)
+                .errorHandler(t -> t.printStackTrace(System.err)));
+    }
+
+    /**
+     * Narrow the core session's egress to the channels named in {@code --subscribe}, mirroring the
+     * bridge's CoreFeedClient. A session that never subscribes is broadcast EVERY channel
+     * (deliberate back-compat), so by default each generator session also pays for the
+     * BalanceUpdate firehose it decodes and discards. Transport state on the leader, never
+     * snapshotted; one message per connect is enough.
+     *
+     * <p>Fail fast on a terminal offer result or timeout instead of continuing: silently running
+     * unsubscribed would put the firehose cost back into the measurement, which is exactly what
+     * the flag exists to remove. Constructor context only — never reached from an egress
+     * callback, so polling between retries is safe here (unlike {@link #offerWithRetry}).</p>
+     */
+    private void sendSubscribe(final AeronCluster cluster) {
+        subscribeEnc.wrapAndApplyHeader(coreBuffer, 0, coreHeaderEnc)
+                .correlationId(0L)
+                .channels().clear()
+                .acks(subscribeChannels.contains("acks"))
+                .balances(subscribeChannels.contains("balances"))
+                .settlements(subscribeChannels.contains("settlements"))
+                .snapshots(subscribeChannels.contains("snapshots"));
+        final int len = coreHeaderEnc.encodedLength() + subscribeEnc.encodedLength();
+        final long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
+            final long result = cluster.offer(coreBuffer, 0, len);
+            if (result > 0) return;
+            if (result == Publication.CLOSED || result == Publication.NOT_CONNECTED
+                    || result == Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("Subscribe offer failed terminally: " + result);
+            }
+            if (System.nanoTime() > deadlineNs) {
+                throw new IllegalStateException("Subscribe not accepted within 10s (ingress backpressure)");
+            }
+            cluster.pollEgress();
+            Thread.onSpinWait();
+        }
+    }
+
+    // ------------------------------------------------------------------ pre-fund
+
+    private void prefundUsers() {
+        System.out.printf("pre-funding %d users (USD %.0f, BTC %.0f each)...%n",
+                users, prefundUsdFp / FP_SCALE, prefundBtcFp / FP_SCALE);
+        final int expected = users * 2;
+        for (int u = 0; u < users; u++) {
+            final long uid = userBase + u;
+            sendDeposit(PREFUND_CORR_BASE + uid * 2L, uid, ASSET_USD, prefundUsdFp);
+            sendDeposit(PREFUND_CORR_BASE + uid * 2L + 1, uid, ASSET_BTC, prefundBtcFp);
+        }
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (depositAcks < expected) {
+            pollBoth();
+            if (System.nanoTime() > deadline) {
+                throw new IllegalStateException("pre-fund incomplete: " + depositAcks + "/" + expected
+                        + " DepositAcks in 30s");
+            }
+        }
+        System.out.println("pre-fund complete: " + depositAcks + " deposits acked");
+    }
+
+    private void sendDeposit(final long corrId, final long userId, final int assetId, final long amountFp) {
+        depositEnc.wrapAndApplyHeader(coreBuffer, 0, coreHeaderEnc)
+                .correlationId(corrId).userId(userId).assetId(assetId).amount(amountFp).requestIdHigh(0).requestIdLow(0);
+        final int len = coreHeaderEnc.encodedLength() + depositEnc.encodedLength();
+        offerWithRetry(coreCluster, coreBuffer, len, true);
+    }
+
+    // ------------------------------------------------------------------ hot loop
+
+    private void run() {
+        if (prefund) prefundUsers();
+
+        final long nanosPerOrder = 1_000_000_000L / rate;
+        final long startNs = System.nanoTime();
+        this.measureStartNs = startNs + TimeUnit.SECONDS.toNanos(warmupSec);
+        final long sendEndNs = measureStartNs + TimeUnit.SECONDS.toNanos(durationSec);
+        long nextScheduledNs = startNs;
+        long lastKeepAliveNs = startNs;
+        long orderSeq = 0;
+
+        System.out.printf("running: %d orders/s, warmup %ds, measured window %ds, window %d, users %d%n",
+                rate, warmupSec, durationSec, window, users);
+
+        // One shared stamp per tick, stamped at the interval's END. Warmup ticks print n=0
+        // (histograms only record inside the window) - a useful GC-ramp timebase.
+        Thread intervalLogger = null;
+        if (intervalLog) {
+            intervalLogger = new Thread(() -> {
+                while (true) {
+                    try { Thread.sleep(1_000); } catch (final InterruptedException e) { return; }
+                    final long epochMs = System.currentTimeMillis();
+                    final String stamp = "ILOG epoch_ms=" + epochMs
+                            + " ts=" + ILOG_TS.format(Instant.ofEpochMilli(epochMs)) + " ";
+                    for (final Track t : tracks) t.printIntervalLine(System.out, stamp);
+                }
+            }, "interval-log");
+            intervalLogger.setDaemon(true);
+            intervalLogger.start();
+        }
+
+        while (true) {
+            final long now = System.nanoTime();
+
+            if (!measuring && now >= measureStartNs) {
+                measuring = true;
+                System.out.println("warmup done, measurement window open");
+            }
+
+            if (now >= sendEndNs) break;
+
+            // Send exactly on the fixed timeline. The schedule NEVER resets to `now`:
+            // if we are behind (window full / backpressure), orders go out late and their
+            // latency is charged from the slot they SHOULD have occupied (CO-safe).
+            if (now >= nextScheduledNs) {
+                final long backlog = (now - nextScheduledNs) / nanosPerOrder;
+                if (backlog > scheduleBacklogMax) scheduleBacklogMax = backlog;
+                if (pending.size() < window) {
+                    ++orderSeq;
+                    startLifecycle(orderIdBase + orderSeq, orderSeq, nextScheduledNs);
+                    nextScheduledNs += nanosPerOrder;
+                }
+                // window full: keep polling; the slot stays owed and is sent as soon as
+                // capacity frees, still stamped with its original scheduled time.
+            }
+
+            pollBoth();
+
+            if (now - lastKeepAliveNs > 250_000_000L) {
+                lastKeepAliveNs = now;
+                if (me != null) try { me.sendKeepAlive(); } catch (final Exception ignore) { }
+                try { coreCluster.sendKeepAlive(); } catch (final Exception ignore) { }
+            }
+        }
+
+        drain();
+        if (intervalLogger != null) {
+            // Stop the reporter BEFORE the final report so ILOG lines never interleave it.
+            intervalLogger.interrupt();
+            try { intervalLogger.join(); } catch (final InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+        report(startNs);
+    }
+
+    private void startLifecycle(final long omsOrderId, final long seq, final long scheduledNs) {
+        final Pending p = pool.isEmpty() ? new Pending() : pool.pop();
+        p.omsOrderId = omsOrderId;
+        p.scheduledNs = scheduledNs;
+        p.userId = userBase + (seq % users);
+        p.isLimit = rand.nextDouble() < limitRatio;
+        p.isBid = rand.nextDouble() < bidBias;
+        p.orderSent = false;
+        p.sampled = (seq & ((1L << sampleShift) - 1)) == 0;
+
+        final double spread = 0.002 + rand.nextDouble() * 0.008;
+        final double price = p.isBid ? MID_PRICE * (1.0 - spread) : MID_PRICE * (1.0 + spread);
+        final double qty = 0.1 + rand.nextDouble() * 1.9;
+        final double tickPrice = Math.rint(price); // $1 tick, engine rejects off-tick
+
+        p.priceFp = p.isLimit ? fp(tickPrice) : 0L;
+        p.qtyFp = fp(qty);
+        // LIMIT: compute the notional with the core's OWN FixedPoint.multiply (truncating),
+        // NOT double math - the settle draws exactly multiply(price, qty) per fill
+        // (CoreEngine quote leg), and a double-rounded hold is 1 unit short ~13% of the
+        // time (dry-run 3: 8026 deterministic SettleFaults, all uncovered=0).
+        // Truncation sums safely across partial fills (floor(a)+floor(b) <= floor(a+b)).
+        p.totalPriceFp = p.isLimit ? FixedPoint.multiply(p.priceFp, p.qtyFp)
+                : (p.isBid ? fp(MARKET_BUY_BUDGET_PRICE * qty) : 0L);
+        if (p.isBid) {
+            p.holdAssetId = ASSET_USD;
+            p.holdAmountFp = p.totalPriceFp;
+        } else {
+            p.holdAssetId = ASSET_BTC;
+            p.holdAmountFp = p.qtyFp;
+        }
+
+        // Hold.orderId == ME omsOrderId == correlationId (one id, three roles).
+        holdEnc.wrapAndApplyHeader(coreBuffer, 0, coreHeaderEnc)
+                .correlationId(p.omsOrderId)
+                .orderId(p.omsOrderId)
+                .userId(p.userId)
+                .assetId(p.holdAssetId)
+                .amount(p.holdAmountFp)
+                .omsManagedRelease(com.openexchange.core.infrastructure.generated.BoolFlag.FALSE);
+        final int len = coreHeaderEnc.encodedLength() + holdEnc.encodedLength();
+        if (offerWithRetry(coreCluster, coreBuffer, len, true)) {
+            holdsSent++;
+            pending.put(p.omsOrderId, p);
+        } else {
+            pool.push(p); // could not even queue the hold; slot abandoned
+        }
+    }
+
+    /**
+     * HoldAck arrived: the gate opens, the ME order goes out (same duty thread). {@code nowNs} is
+     * captured ONCE at frame arrival — for a v5 HoldAckBatch every entry in the frame shares it,
+     * mirroring how the ME-side batch decoding treats a frame's arrival as its entries' t1.
+     */
+    private void onHoldAck(final long corrId, final long nowNs) {
+        final Pending p = pending.get(corrId);
+        if (p == null || p.orderSent) return;
+        holdAcks++;
+        if (measuring) holdAckHist.recordValue(clamp(nowNs - p.scheduledNs));
+        if (coreOnly) {
+            // core-only: the HoldAck IS the measurement. Release the hold straight away so the
+            // engine's hold map stays bounded and the run ends with clean conservation, then
+            // close the lifecycle. No ME, no journal, no bridge in the loop.
+            releaseEnc.wrapAndApplyHeader(coreBuffer, 0, coreHeaderEnc)
+                    .orderId(p.omsOrderId).userId(p.userId).amount(-1L);
+            if (offerWithRetry(coreCluster, coreBuffer, coreHeaderEnc.encodedLength() + releaseEnc.encodedLength(), true)) {
+                releasesSent++;
+            }
+            pending.remove(corrId);
+            pool.push(p);
+            return;
+        }
+        sendMeOrder(p);
+    }
+
+    private void onHoldReject(final long corrId) {
+        final Pending p = pending.remove(corrId);
+        if (p == null) {
+            // Not ours. Core egress is broadcast to every session, so a second generator's rejects
+            // land here too; counting them made two independent runs report the SAME reject total
+            // (observed: 4,255,423 on both sides of a 2-generator run). onHoldAck already guards
+            // this way, the reject path did not.
+            return;
+        }
+        holdRejects++;
+        pool.push(p);
+    }
+
+    private void sendMeOrder(final Pending p) {
+        createOrderEnc.wrapAndApplyHeader(meBuffer, 0, meHeaderEnc);
+        createOrderEnc.userId(p.userId);
+        // match order-schema v8 removed the separate totalPrice field: the MARKET-BUY spend budget
+        // now rides in `price` (LIMIT still carries its limit price; MARKET-SELL leaves it 0). The
+        // internal p.totalPriceFp still sizes the core hold above (hold = notional); only the wire
+        // moved. The value the ME reads for a market buy is byte-identical to the old totalPrice.
+        createOrderEnc.price(p.isLimit ? p.priceFp : (p.isBid ? p.totalPriceFp : 0L));
+        createOrderEnc.quantity(p.qtyFp);
+        createOrderEnc.marketId(MARKET_ID);
+        createOrderEnc.orderType(p.isLimit ? OrderType.LIMIT : OrderType.MARKET);
+        createOrderEnc.orderSide(p.isBid ? OrderSide.BID : OrderSide.ASK);
+        createOrderEnc.omsOrderId(p.omsOrderId);
+        final int len = meHeaderEnc.encodedLength() + createOrderEnc.encodedLength();
+
+        if (offerWithRetry(me, meBuffer, len, false)) {
+            ordersSent++;
+            p.orderSent = true;
+            p.orderSentNs = System.nanoTime();
+            // Lifecycle sampling is armed at SEND time: market orders trade at the engine
+            // before their first status reaches us (egress batching), so arming at
+            // first-status missed nearly all taker lifecycles (dry-run n=2).
+            if (p.sampled) sampledOrders.put(p.omsOrderId, p.scheduledNs);
+        } else {
+            // The hold is placed but the order will never exist: release it so the run
+            // ends with clean conservation instead of a leaked lock.
+            orderSendFailures++;
+            releaseEnc.wrapAndApplyHeader(coreBuffer, 0, coreHeaderEnc)
+                    .orderId(p.omsOrderId).userId(p.userId).amount(-1L);
+            offerWithRetry(coreCluster, coreBuffer, coreHeaderEnc.encodedLength() + releaseEnc.encodedLength(), true);
+            pending.remove(p.omsOrderId);
+            pool.push(p);
+        }
+    }
+
+    /** First ME status for the order: ack latency, lifecycle slot freed. */
+    private void onFirstStatus(final long omsOrderId) {
+        final Pending p = pending.get(omsOrderId);
+        if (p == null || !p.orderSent) return;
+        firstStatuses++;
+        if (measuring) {
+            final long now = System.nanoTime();
+            orderAckHist.recordValue(clamp(now - p.scheduledNs));
+            meLegHist.recordValue(clamp(now - p.orderSentNs));
+        }
+        pending.remove(omsOrderId);
+        pool.push(p);
+    }
+
+    private void onTrade(final long tradeId, final long takerOmsOrderId, final long makerOmsOrderId) {
+        final long now = System.nanoTime();
+        // Bidirectional join. If the settle already arrived (usual case: journal->bridge->core
+        // beats the ME egress batch flush), close the pair now and record the settle's LEAD.
+        final long settleAt = settleSeenNs.remove(tradeId);
+        if (settleAt != -1) {
+            tradesSeen++;
+            settleLedJoins++; // pair closed here; the SETTLE had led
+            if (measuring) settleLeadHist.recordValue(clamp(now - settleAt));
+        } else if (tradeSeenNs.get(tradeId) == -1) {
+            tradesSeen++;
+            if (tradeSeenNs.size() < TRADE_MAP_CAP) tradeSeenNs.put(tradeId, now); else tradeMapSkips++;
+        } else {
+            return; // duplicate observation of an already-mapped trade
+        }
+        // A sampled order's lifecycle closes at its FIRST fill's settle; remove so the
+        // sampled map only holds not-yet-filled sampled orders (bounded).
+        long sampledScheduled = sampledOrders.remove(takerOmsOrderId);
+        if (sampledScheduled == -1) sampledScheduled = sampledOrders.remove(makerOmsOrderId);
+        if (sampledScheduled != -1) {
+            if (settleAt != -1) {
+                // settle already observed: lifecycle closes here
+                if (measuring) orderToSettledHist.recordValue(clamp(now - sampledScheduled));
+            } else if (tradeToSampledOrder.size() < TRADE_MAP_CAP) {
+                tradeToSampledOrder.put(tradeId, sampledScheduled);
+            }
+        }
+    }
+
+    /** {@code nowNs}: frame-arrival time, shared by every entry of a batch frame (see onHoldAck). */
+    private void onSettlementApplied(final long tradeId, final long nowNs) {
+        settlesSeen++;
+        final long seen = tradeSeenNs.remove(tradeId);
+        if (seen != -1) {
+            tradeLedJoins++; // pair closed here; the TRADE observation had led
+            if (measuring) tradeToSettledHist.recordValue(clamp(nowNs - seen));
+        } else if (settleSeenNs.size() < TRADE_MAP_CAP) {
+            settleSeenNs.put(tradeId, nowNs); // settle first; trade observation will close it
+        }
+        final long scheduled = tradeToSampledOrder.remove(tradeId);
+        if (scheduled != -1 && measuring) orderToSettledHist.recordValue(clamp(nowNs - scheduled));
+    }
+
+    // ------------------------------------------------------------------ egress adapters
+
+    private final class MeEgress implements EgressListener {
+        @Override
+        public void onMessage(final long clusterSessionId, final long timestamp,
+                              final DirectBuffer buffer, final int offset, final int length,
+                              final Header header) {
+            meHeaderDec.wrap(buffer, offset);
+            final int templateId = meHeaderDec.templateId();
+            final int actingBlockLength = meHeaderDec.blockLength();
+            final int actingVersion = meHeaderDec.version();
+            final int body = offset + meHeaderDec.encodedLength();
+            switch (templateId) {
+                // match order-schema v8 removed the single OrderStatusUpdate (id 5): the ME only
+                // ever emits OrderStatusBatch, so the first status arrives here (same omsOrderId).
+                case OrderStatusBatchDecoder.TEMPLATE_ID -> {
+                    statusBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                    for (final OrderStatusBatchDecoder.OrdersDecoder o : statusBatchDec.orders()) {
+                        onFirstStatus(o.omsOrderId());
+                    }
+                }
+                // TradeExecution singles (id 4) are deliberately IGNORED: the same trades also
+                // arrive on the reliable TradeExecutionBatch stream (dry-run showed exactly 2x
+                // observations), and consuming one stream keeps the tradeId join dedupe-free.
+                case TradeExecutionBatchDecoder.TEMPLATE_ID -> {
+                    tradeBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                    for (final TradeExecutionBatchDecoder.TradesDecoder t : tradeBatchDec.trades()) {
+                        onTrade(t.tradeId(), t.takerOmsOrderId(), t.makerOmsOrderId());
+                    }
+                }
+                default -> { } // book updates, heartbeats: not our concern
+            }
+        }
+
+        // Log-only overrides: during failover drills these lines are the client-side timestamp of the
+        // redirect, the wall-clock counterpart of the server's election log.
+        @Override
+        public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
+                                final int leaderMemberId, final String ingressEndpoints) {
+            System.out.printf("%s [ME] NEW LEADER member=%d term=%d session=%d endpoints=%s%n",
+                    ILOG_TS.format(Instant.now()), leaderMemberId, leadershipTermId,
+                    clusterSessionId, ingressEndpoints);
+        }
+
+        @Override
+        public void onSessionEvent(final long correlationId, final long clusterSessionId,
+                                   final long leadershipTermId, final int leaderMemberId,
+                                   final EventCode code, final String detail) {
+            System.out.printf("%s [ME] SESSION EVENT code=%s member=%d term=%d session=%d detail=%s%n",
+                    ILOG_TS.format(Instant.now()), code, leaderMemberId, leadershipTermId,
+                    clusterSessionId, detail);
+        }
+    }
+
+    private final class CoreEgress implements EgressListener {
+        @Override
+        public void onMessage(final long clusterSessionId, final long timestamp,
+                              final DirectBuffer buffer, final int offset, final int length,
+                              final Header header) {
+            // Single t1 per frame: every entry decoded out of this frame (batch or single) is stamped
+            // with the frame's arrival, exactly as the ME-side batch handling treats its frames.
+            final long nowNs = System.nanoTime();
+            coreHeaderDec.wrap(buffer, offset);
+            final int templateId = coreHeaderDec.templateId();
+            final int actingBlockLength = coreHeaderDec.blockLength();
+            final int actingVersion = coreHeaderDec.version();
+            final int body = offset + coreHeaderDec.encodedLength();
+            if (templateId == holdAckDec.sbeTemplateId()) {
+                holdAckDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                onHoldAck(holdAckDec.correlationId(), nowNs);
+            } else if (templateId == holdAckBatchDec.sbeTemplateId()) {
+                // v5 coalesced acks: identical per-entry semantics, one shared t1.
+                holdAckBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                for (final com.openexchange.core.infrastructure.generated.HoldAckBatchDecoder.AcksDecoder a
+                        : holdAckBatchDec.acks()) {
+                    onHoldAck(a.correlationId(), nowNs);
+                }
+            } else if (templateId == holdRejectDec.sbeTemplateId()) {
+                holdRejectDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                if (holdRejects < 5) {
+                    System.err.printf("HOLD REJECT: orderId=%d userId=%d asset=%d amount=%d reason=%s%n",
+                            holdRejectDec.orderId(), holdRejectDec.userId(), holdRejectDec.assetId(),
+                            holdRejectDec.amount(), holdRejectDec.reason());
+                }
+                onHoldReject(holdRejectDec.correlationId());
+            } else if (templateId == settleDec.sbeTemplateId()) {
+                settleDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                onSettlementApplied(settleDec.tradeId(), nowNs);
+            } else if (templateId == settleBatchDec.sbeTemplateId()) {
+                // v5 coalesced settlement acks: identical join/counter semantics, one shared t1.
+                settleBatchDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                for (final com.openexchange.core.infrastructure.generated.SettlementAppliedBatchDecoder.SettlementsDecoder s
+                        : settleBatchDec.settlements()) {
+                    onSettlementApplied(s.tradeId(), nowNs);
+                }
+            } else if (templateId == settleFaultDec.sbeTemplateId()) {
+                settleFaultDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                settleFaults++;
+                if (settleFaults <= 5) {
+                    System.err.printf("SETTLE FAULT: tradeId=%d orderId=%d userId=%d "
+                                    + "drawnFromAvailable=%d uncovered=%d "
+                                    + "(pre-fund/hold sizing bug - run is INVALID)%n",
+                            settleFaultDec.tradeId(), settleFaultDec.orderId(),
+                            settleFaultDec.userId(), settleFaultDec.drawnFromAvailable(),
+                            settleFaultDec.uncovered());
+                }
+            } else if (templateId == depositAckDec.sbeTemplateId()) {
+                depositAckDec.wrap(buffer, body, actingBlockLength, actingVersion);
+                if (depositAckDec.correlationId() >= PREFUND_CORR_BASE) depositAcks++;
+            }
+            // BalanceUpdate / BalanceUpdateBatch and snapshots: high-volume, ignored by design —
+            // identical semantics to before v5 (--subscribe acks,settlements stops them at the
+            // source instead).
+        }
+
+        // Log-only overrides: same purpose as MeEgress — client-side wall-clock stamps for drills.
+        @Override
+        public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
+                                final int leaderMemberId, final String ingressEndpoints) {
+            System.out.printf("%s [CORE] NEW LEADER member=%d term=%d session=%d endpoints=%s%n",
+                    ILOG_TS.format(Instant.now()), leaderMemberId, leadershipTermId,
+                    clusterSessionId, ingressEndpoints);
+        }
+
+        @Override
+        public void onSessionEvent(final long correlationId, final long clusterSessionId,
+                                   final long leadershipTermId, final int leaderMemberId,
+                                   final EventCode code, final String detail) {
+            System.out.printf("%s [CORE] SESSION EVENT code=%s member=%d term=%d session=%d detail=%s%n",
+                    ILOG_TS.format(Instant.now()), code, leaderMemberId, leadershipTermId,
+                    clusterSessionId, detail);
+        }
+    }
+
+    // ------------------------------------------------------------------ plumbing
+
+    private void pollBoth() {
+        if (me != null) me.pollEgress();
+        coreCluster.pollEgress();
+        if (feedSub != null) feedSub.poll(feedHandler, 64);
+    }
+
+    /**
+     * Offer with bounded spin retries. Deliberately does NOT poll egress between retries:
+     * this method is reached from inside egress callbacks (HoldAck -> order send), and a
+     * reentrant pollEgress on the same AeronCluster from within its own callback is unsafe.
+     * The main loop is the only place egress is drained.
+     */
+    private boolean offerWithRetry(final AeronCluster cluster, final DirectBuffer buffer,
+                                   final int length, final boolean isCore) {
+        for (int retry = 0; retry < OFFER_RETRIES; retry++) {
+            final long result = cluster.offer(buffer, 0, length);
+            if (result > 0) return true;
+            if (result == Publication.CLOSED || result == Publication.NOT_CONNECTED) return false;
+            if (isCore) coreBackpressure++; else meBackpressure++;
+            Thread.onSpinWait();
+        }
+        return false;
+    }
+
+    /** Post-send drain: give in-flight trades time to settle before the final report. */
+    private void drain() {
+        System.out.println(coreOnly
+                ? "send window closed, draining in-flight hold acks..."
+                : "send window closed, draining in-flight settles...");
+        final long grace = TimeUnit.SECONDS.toNanos(30);
+        final long start = System.nanoTime();
+        long lastProgress = -1;
+        long lastChangeNs = start;
+        while (System.nanoTime() - start < grace) {
+            pollBoth();
+            final long progress = coreOnly ? holdAcks : settlesSeen;
+            if (progress != lastProgress) {
+                lastProgress = progress;
+                lastChangeNs = System.nanoTime();
+            } else if (System.nanoTime() - lastChangeNs > TimeUnit.SECONDS.toNanos(5)) {
+                break; // stable for 5s: pipeline is dry
+            }
+        }
+    }
+
+    private static long clamp(final long ns) { return Math.max(0, Math.min(ns, TimeUnit.MINUTES.toNanos(2) - 1)); }
+
+    /**
+     * Core substrate report. The headline is deliberately ACKED round trips per second, not offers:
+     * an offer only reaches the local driver's shared memory, while a HoldAck means the command was
+     * replicated, committed, applied and answered. Publishing the offer rate as throughput is the
+     * mistake this whole mode exists to avoid.
+     */
+    private void reportCoreOnly(final PrintStream out, final double elapsedSec) {
+        final long committedCommands = holdAcks + releasesSent;
+        out.println("==== core substrate report (hold + release, no ME / journal / bridge) ====");
+        out.printf("elapsed %.1fs (warmup %ds excluded from histograms)%n", elapsedSec, warmupSec);
+        out.printf("holds sent %d | ACKED %d | rejects %d | releases sent %d%n",
+                holdsSent, holdAcks, holdRejects, releasesSent);
+        out.printf("core backpressure %d | max schedule backlog %d | pending at exit %d%n",
+                coreBackpressure, scheduleBacklogMax, pending.size());
+        out.printf("ACKED ROUND TRIPS  %.0f/s   (hold -> quorum commit -> apply -> egress)%n",
+                holdAcks / elapsedSec);
+        out.printf("COMMITTED COMMANDS %.0f/s   (holds + releases through the log)%n",
+                committedCommands / elapsedSec);
+        printFeedLine(out);
+        printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
+        try {
+            Files.createDirectories(outDir);
+            writeHgrm("core-hold-ack", holdAckHist);
+            out.println("hgrm files written to " + outDir.toAbsolutePath());
+        } catch (final Exception e) {
+            out.println("WARN: could not write hgrm files: " + e);
+        }
+    }
+
+    private void report(final long startNs) {
+        final double elapsedSec = (System.nanoTime() - startNs) / 1e9;
+        final PrintStream out = System.out;
+        out.println();
+        if (coreOnly) {
+            reportCoreOnly(out, elapsedSec);
+            return;
+        }
+        out.println("==== money-path load report ====");
+        out.printf("elapsed %.1fs (warmup %ds excluded from histograms)%n", elapsedSec, warmupSec);
+        out.printf("holds sent %d | acks %d | rejects %d | orders sent %d | send-failures %d%n",
+                holdsSent, holdAcks, holdRejects, ordersSent, orderSendFailures);
+        out.printf("first-statuses %d | trades seen %d | settles seen %d | SETTLE FAULTS %d%n",
+                firstStatuses, tradesSeen, settlesSeen, settleFaults);
+        out.printf("backpressure me/core %d/%d | trade-map skips %d | max schedule backlog %d%n",
+                meBackpressure, coreBackpressure, tradeMapSkips, scheduleBacklogMax);
+        out.printf("join direction: settle-led %d / trade-led %d (settle-led = settlement path "
+                        + "beat the ME egress batch flush)%n", settleLedJoins, tradeLedJoins);
+        out.printf("unpaired at exit: trades %d / settles %d | pending lifecycles: %d%n",
+                tradeSeenNs.size(), settleSeenNs.size(), pending.size());
+        printFeedLine(out);
+        printHist(out, "hold->holdAck (from scheduled send)", holdAckHist);
+        printHist(out, "order lifecycle start->first ME status", orderAckHist);
+        printHist(out, "  of which ME leg: order offer->first status", meLegHist);
+        printHist(out, "trade obs->settled (trade-led pairs)", tradeToSettledHist);
+        printHist(out, "settle lead over trade obs (settle-led)", settleLeadHist);
+        printHist(out, "scheduled send->settled (sampled 1/" + (1 << sampleShift) + ")", orderToSettledHist);
+        if (settleFaults > 0) {
+            out.println("!! RUN INVALID: settle faults observed - fix pre-fund/hold sizing before publishing");
+        }
+        try {
+            Files.createDirectories(outDir);
+            writeHgrm("hold-ack", holdAckHist);
+            writeHgrm("order-ack", orderAckHist);
+            writeHgrm("me-leg", meLegHist);
+            writeHgrm("trade-to-settled", tradeToSettledHist);
+            writeHgrm("settle-lead", settleLeadHist);
+            writeHgrm("order-to-settled", orderToSettledHist);
+            out.println("hgrm files written to " + outDir.toAbsolutePath());
+        } catch (final Exception e) {
+            out.println("WARN: could not write hgrm files: " + e);
+        }
+    }
+
+    /**
+     * Balance-feed tap counters, printed only when {@code --balance-feed} was given. Entries may be
+     * FEWER than the balance mutations the run caused: the feed conflates to latest-value per
+     * (user, asset) by contract — a big gap between entries and mutations under load is the feature
+     * working, not loss.
+     */
+    private void printFeedLine(final PrintStream out) {
+        if (feedSub != null) {
+            out.printf("balance-feed seen n=%d frames=%d (conflated latest-value side-channel)%n",
+                    feedEntries, feedFrames);
+        }
+    }
+
+    private static void printHist(final PrintStream out, final String name, final Track t) {
+        final Histogram h = t.cumulative();
+        if (h.getTotalCount() == 0) {
+            out.printf("%-45s  (no samples)%n", name);
+            return;
+        }
+        out.printf("%-45s n=%-9d p50=%s p90=%s p99=%s p99.9=%s p99.99=%s max=%s%n",
+                name, h.getTotalCount(),
+                us(h.getValueAtPercentile(50)), us(h.getValueAtPercentile(90)),
+                us(h.getValueAtPercentile(99)), us(h.getValueAtPercentile(99.9)),
+                us(h.getValueAtPercentile(99.99)), us(h.getMaxValue()));
+    }
+
+    private static String us(final long ns) {
+        return ns < 1_000_000 ? String.format("%.1fus", ns / 1e3) : String.format("%.2fms", ns / 1e6);
+    }
+
+    private void writeHgrm(final String name, final Track t) throws Exception {
+        try (PrintStream ps = new PrintStream(Files.newOutputStream(outDir.resolve(name + ".hgrm")))) {
+            t.cumulative().outputPercentileDistribution(ps, 1000.0); // report in microseconds
+        }
+    }
+
+    @Override
+    public void close() {
+        org.agrona.CloseHelper.quietClose(feedSub);
+        org.agrona.CloseHelper.quietClose(feedAeron);
+        org.agrona.CloseHelper.quietClose(me);
+        org.agrona.CloseHelper.quietClose(coreCluster);
+        org.agrona.CloseHelper.quietClose(driver);
+    }
+
+    // ------------------------------------------------------------------ args
+
+    private static String strArg(final String[] args, final String key, final String def) {
+        for (int i = 0; i < args.length - 1; i++) if (args[i].equals(key)) return args[i + 1];
+        return def;
+    }
+
+    private static int intArg(final String[] args, final String key, final int def) {
+        final String v = strArg(args, key, null);
+        return v == null ? def : Integer.parseInt(v);
+    }
+
+    private static double doubleArg(final String[] args, final String key, final double def) {
+        final String v = strArg(args, key, null);
+        return v == null ? def : Double.parseDouble(v);
+    }
+
+    private static boolean hasFlag(final String[] args, final String key) {
+        for (final String a : args) if (a.equals(key)) return true;
+        return false;
+    }
+
+    /**
+     * {@code --subscribe} CSV -> channel-name set; null when the flag is absent (no Subscribe is
+     * sent and the session receives every egress channel — exactly the pre-flag behaviour).
+     * Unknown or missing names fail fast: a typo that silently fell back to the full firehose
+     * would invalidate the very measurement the flag exists to protect.
+     */
+    private static Set<String> parseChannels(final String[] args) {
+        final String csv = strArg(args, "--subscribe", null);
+        if (csv == null) {
+            if (hasFlag(args, "--subscribe")) {
+                throw new IllegalArgumentException("--subscribe requires a value: comma-separated"
+                        + " channels of " + String.join(", ", CHANNEL_NAMES));
+            }
+            return null;
+        }
+        final Set<String> channels = new LinkedHashSet<>();
+        for (final String raw : csv.split(",")) {
+            final String name = raw.trim().toLowerCase(Locale.ROOT);
+            if (!CHANNEL_NAMES.contains(name)) {
+                throw new IllegalArgumentException("--subscribe: unknown channel '" + raw.trim()
+                        + "', valid: " + String.join(", ", CHANNEL_NAMES));
+            }
+            channels.add(name);
+        }
+        return channels;
+    }
+
+    public static void main(final String[] args) {
+        com.openexchange.core.config.RetiredSettings.refuseRetired("core-loadgen.jar", args);
+        if (hasFlag(args, "--help")) {
+            System.out.println("""
+                MoneyLoadGenerator - full money-path benchmark driver (no OMS)
+                  --rate N            orders/s on the fixed timeline (default 10000)
+                  --duration S        measured window seconds, EXCLUDES warmup (default 60)
+                  --warmup S          warmup seconds before the window opens (default 30)
+                  --users N           distinct userIds 0..N-1 (default 16)
+                  --window N          max in-flight lifecycles (default 8192)
+                  --bid-bias F        P(bid) (default 0.5 = no net balance drift)
+                  --limit-ratio F     P(limit) vs market (default 0.40)
+                  --sample-shift N    order->settled sampling 1/2^N (default 6)
+                  --me-hosts CSV      matching-engine node hosts (default 127.0.0.1)
+                  --core-hosts CSV    core node hosts (default 127.0.0.1)
+                  --me-port-base N    default 9000
+                  --core-port-base N  default 9300
+                  --egress-host H     advertised egress address (default: routed source addr)
+                  --aeron-dir DIR     attach to an EXTERNAL media driver at DIR instead of
+                                      launching an embedded one (default: embedded driver
+                                      in /dev/shm/aeron-moneyload-<pid>)
+                  --subscribe CSV     subscribe the core session to only these egress channels:
+                                      acks, balances, settlements, snapshots (case-insensitive).
+                                      Default: no Subscribe is sent and the core broadcasts every
+                                      channel to this session. "acks,settlements" keeps every
+                                      loadgen counter live (BalanceUpdate is ignored by design)
+                  --balance-feed URI  also subscribe to the core's conflated balance-feed
+                                      side-channel at this Aeron channel (must match the nodes'
+                                      BALANCE_FEED_CHANNEL); counts frames+entries and reports
+                                      a "balance-feed seen n=..." line (default: off)
+                  --balance-feed-stream N  feed stream id (default 4201)
+                  --out DIR           hgrm output dir (default results)
+                  --gen-id N          generator identity for multi-generator runs (default 0):
+                                      separates order-id space, RNG stream and user range
+                  --interval-log      once per second, print one ILOG line per latency track:
+                                      that second's n/p50/p99/max in ms (default off)
+                  --core-only         core substrate mode: hold + release only, NO ME/journal/bridge.
+                                      Reports ACKED round trips/s (committed), not offers.
+                  --no-prefund        skip the deposit phase
+                  --prefund-usd F     USD per user (default 5e10)
+                  --prefund-btc F     BTC per user (default 1e7)""");
+            return;
+        }
+        try (MoneyLoadGenerator gen = new MoneyLoadGenerator(args)) {
+            gen.run();
+        }
+    }
+
+    private static io.aeron.security.CredentialsSupplier credentialsOrNone() {
+        final com.openexchange.core.auth.CoreCredentials c = com.openexchange.core.auth.CoreCredentials.fromEnvironment();
+        return c == null ? new io.aeron.security.NullCredentialsSupplier() : c.supplier();
+    }
+}

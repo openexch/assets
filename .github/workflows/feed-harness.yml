@@ -1,9 +1,9 @@
 name: Feed harness
 
-# Builds the test-scope feed harness jar (assets-cluster -Pfeed-harness: the Java reference translator,
+# Builds the test-scope feed harness jar (core-cluster -Pfeed-harness: the Java reference translator,
 # serve, story and the journal fixtures) and publishes it as an asset of ONE fixed prerelease, tagged
 # feed-harness:
-#   releases/download/feed-harness/assets-feed-harness-<sha>.jar (+ .sha256)
+#   releases/download/feed-harness/core-feed-harness-<sha>.jar (+ .sha256)
 # cluster-tools pins that jar by sha256 (dependencies.lock feed_harness_*; scripts/fetch-deps.sh --harness).
 # The jar is never in a release manifest and never deployed to a box.
 #
@@ -14,7 +14,7 @@ name: Feed harness
 #   - the jar is built twice (the second after clean) and must hash the same (reproducible);
 #   - its META-INF/feed-harness.properties must say main_tree_equals_ref=true (src/main equals the
 #     money_schema_ref that cluster-tools pins; a production change needs a money_schema_ref bump first)
-#     and assets_worktree_dirty=false;
+#     and core_worktree_dirty=false;
 #   - plain `java -jar ... version` and `random` must run with no JVM flag;
 #   - an asset that already exists for this commit must hold the same bytes (a pin names its bytes).
 
@@ -47,10 +47,10 @@ jobs:
       - name: Build the harness jar (twice, the second after clean)
         run: |
           set -euo pipefail
-          mvn -B -s .mvn-settings.xml -pl assets-cluster -am -Pfeed-harness -DskipTests package
-          sha256sum assets-cluster/target/assets-feed-harness.jar | cut -d' ' -f1 > "$RUNNER_TEMP/first.sha256"
-          mvn -B -s .mvn-settings.xml -pl assets-cluster -am -Pfeed-harness -DskipTests clean package
-          sha256sum assets-cluster/target/assets-feed-harness.jar | cut -d' ' -f1 > "$RUNNER_TEMP/second.sha256"
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am -Pfeed-harness -DskipTests package
+          sha256sum core-cluster/target/core-feed-harness.jar | cut -d' ' -f1 > "$RUNNER_TEMP/first.sha256"
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am -Pfeed-harness -DskipTests clean package
+          sha256sum core-cluster/target/core-feed-harness.jar | cut -d' ' -f1 > "$RUNNER_TEMP/second.sha256"
           if ! cmp -s "$RUNNER_TEMP/first.sha256" "$RUNNER_TEMP/second.sha256"; then
             echo "::error::the harness jar is not reproducible: $(cat "$RUNNER_TEMP/first.sha256") vs $(cat "$RUNNER_TEMP/second.sha256")"
             exit 1
@@ -61,23 +61,23 @@ jobs:
       - name: Check the build properties and plain java -jar
         run: |
           set -euo pipefail
-          JAR=assets-cluster/target/assets-feed-harness.jar
+          JAR=core-cluster/target/core-feed-harness.jar
           java -jar "$JAR" version | tee props.txt
           grep -qx 'main_tree_equals_ref=true' props.txt || { echo "::error::src/main differs from money_schema_ref"; exit 1; }
-          grep -qx 'assets_worktree_dirty=false' props.txt || { echo "::error::built from a dirty tree"; exit 1; }
-          grep -qx "assets_commit=${GITHUB_SHA}" props.txt || { echo "::error::the jar names another commit"; exit 1; }
+          grep -qx 'core_worktree_dirty=false' props.txt || { echo "::error::built from a dirty tree"; exit 1; }
+          grep -qx "core_commit=${GITHUB_SHA}" props.txt || { echo "::error::the jar names another commit"; exit 1; }
           mkdir -p smoke && java -jar "$JAR" random 1 1000 smoke && (cd smoke && sha256sum -c SHA256SUMS)
 
-      - name: Publish assets-feed-harness-${{ github.sha }}.jar
+      - name: Publish core-feed-harness-${{ github.sha }}.jar
         run: |
           set -euo pipefail
           TAG=feed-harness
-          NAME="assets-feed-harness-${GITHUB_SHA}.jar"
-          cp assets-cluster/target/assets-feed-harness.jar "$NAME"
+          NAME="core-feed-harness-${GITHUB_SHA}.jar"
+          cp core-cluster/target/core-feed-harness.jar "$NAME"
           sha256sum "$NAME" > "$NAME.sha256"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "Feed harness (test artifact)" \
-              --notes "Test-scope feed harness jars, one per published assets commit (assets-feed-harness-<sha>.jar). Pinned by sha256 in cluster-tools. Not a release, never deployed."
+              --notes "Test-scope feed harness jars, one per published core commit (core-feed-harness-<sha>.jar). Pinned by sha256 in cluster-tools. Not a release, never deployed."
           fi
           if gh release download "$TAG" -p "$NAME.sha256" -O published.sha256 2>/dev/null; then
             echo "$NAME exists: a commit is published once (the pin names its bytes)"

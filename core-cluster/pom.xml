@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.openexchange.core</groupId>
+        <artifactId>core</artifactId>
+        <version>0.1.0-runtime.20260928.r02d.g571248f</version>
+    </parent>
+
+    <artifactId>core-cluster</artifactId>
+    <packaging>jar</packaging>
+    <name>Core Cluster</name>
+    <description>Core (OMS + ledger core): domain money model, deterministic engine, Aeron cluster service</description>
+
+    <properties>
+        <!-- Overridden by the build with the short git sha. See the shade plugin's
+             Build-Sha manifest entry for why this is never guessed. -->
+        <buildSha>unknown</buildSha>
+    </properties>
+
+    <dependencies>
+        <!-- Internal: shared kernel (value objects + SBE codecs) -->
+        <dependency>
+            <groupId>com.openexchange.core</groupId>
+            <artifactId>core-common</artifactId>
+        </dependency>
+
+        <!-- Shared with the matching engine: snapshot bundles, staging archive,
+             watermark-bounded housekeeping. -->
+        <dependency>
+            <groupId>com.openexchange</groupId>
+            <artifactId>cluster-kit</artifactId>
+        </dependency>
+
+        <!-- Aeron (full: cluster node + archive + consensus module) -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-all</artifactId>
+        </dependency>
+
+        <!-- LMAX Disruptor for lock-free egress publishing -->
+        <dependency>
+            <groupId>com.lmax</groupId>
+            <artifactId>disruptor</artifactId>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Match-common at the schema 4 build, TEST scope only, for the feed harness
+             (reference translator, CoreApplyRunner, T1 tools). The version is explicit (not the root pin, which stays the
+             frozen bridge's schema 3 match.version), and nothing transitive comes with it: the generated codecs need
+             only agrona, which this module already pins. The version string alone is not trusted: the harness and its
+             tests check the schema XML sha256 inside the jar (rule H1). -->
+        <dependency>
+            <groupId>com.match</groupId>
+            <artifactId>match-common</artifactId>
+            <version>${match.journal.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+            </plugin>
+            <!-- Uber JAR for cluster nodes -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <finalName>core-cluster</finalName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.openexchange.core.Main</mainClass>
+                                    <manifestEntries>
+                                        <!-- Stamped so a bundle can name the binary that
+                                             produced it. A snapshot serialized by one build
+                                             may not deserialize in another, so without this
+                                             an archived bundle is decorative. Pass the short
+                                             git sha as the buildSha property; the default is
+                                             deliberately the literal "unknown" rather than a
+                                             guess, so a bundle without provenance says so
+                                             instead of implying it. -->
+                                        <Build-Sha>${buildSha}</Build-Sha>
+                                    </manifestEntries>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- The PR gate: everything except the long replica process tests (several minutes each: re-genesis matrix,
+             alignment trust after a restart, bootstrap, partial copies, housekeeping, backup window, readiness flap,
+             self-check). CI's nightly job and the release tag build run them; a plain `mvn verify` runs everything.
+             An explicit -Dtest overrides these excludes. -->
+        <profile>
+            <id>fast</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <excludes>
+                                <exclude>**/ReplicaAlignmentTrustTest.java</exclude>
+                                <exclude>**/ReplicaReGenesisMatrixTest.java</exclude>
+                                <exclude>**/ReplicaBootstrapTest.java</exclude>
+                                <exclude>**/ReplicaPartialCopyTest.java</exclude>
+                                <exclude>**/ReplicaHousekeepingTest.java</exclude>
+                                <exclude>**/ReplicaBackupWindowTest.java</exclude>
+                                <exclude>**/ReplicaReadyDoesNotFlapTest.java</exclude>
+                                <exclude>**/ReplicaSelfCheckTest.java</exclude>
+                                <exclude>**/*$*</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!-- The feed harness jar (test scope, never a runtime artifact). `mvn -pl core-cluster -am
+             -Pfeed-harness -DskipTests package` builds target/core-feed-harness.jar: main + test classes, the test
+             classpath, Main-Class FeedHarnessMain and META-INF/feed-harness.properties. The jar is written by the
+             test-scope FeedHarnessJarBuilder (sorted entries, the commit time on every entry, no build-time values),
+             so its sha256 is a function of the tree it was built from. -->
+        <profile>
+            <id>feed-harness</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>feed-harness-jar</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>java</executable>
+                                    <classpathScope>test</classpathScope>
+                                    <arguments>
+                                        <argument>-classpath</argument>
+                                        <classpath/>
+                                        <argument>com.openexchange.core.feedharness.FeedHarnessJarBuilder</argument>
+                                        <argument>${project.build.directory}/core-feed-harness.jar</argument>
+                                        <argument>${project.basedir}/..</argument>
+                                        <argument>${match.journal.version}</argument>
+                                        <argument>${aeron.version}</argument>
+                                        <argument>${sbe.version}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

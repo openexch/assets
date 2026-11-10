@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-  # RC1 S8: the heavy harness (100k cluster restore = RC1-A05, 1M sizing, 30k-line splice) runs nightly.
+  # The heavy harness (100k cluster restore, 1M sizing, 30k-line splice, long replica tests) runs nightly.
   schedule:
     - cron: '17 2 * * *'
 
@@ -37,21 +37,23 @@ jobs:
           cache: maven
 
       # com.match:match-common (the ME settlement-journal SBE classes) resolves from
-      # GitHub Packages at the version pinned in pom.xml — no more checking out match
+      # GitHub Packages at the version pinned in pom.xml: no more checking out match
       # at floating main and installing a mutable "1.0" into ~/.m2.
 
-      # verify runs the full gate: unit tests, the determinism corpus, and
-      # ClusterBootSmokeTest (boots a real in-process single-node AE cluster).
+      # verify runs the gate: unit tests, the determinism corpus, and
+      # ClusterBootSmokeTest (boots a real in-process single-node core cluster).
+      # Pull requests and main pushes use -Pfast, which leaves out the long replica
+      # process tests (about 45 minutes); the nightly job and a release tag run them.
       - name: Build and test
-        run: mvn -B -s .mvn-settings.xml clean verify
+        run: mvn -B -s .mvn-settings.xml clean verify ${{ startsWith(github.ref, 'refs/tags/') && ' ' || '-Pfast' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # RC1 S8 nightly harness (harness B9): flagged tests that are too slow for the PR gate. Only on the schedule.
+  # Nightly harness: flagged tests that are too slow for the PR gate. Only on the schedule.
   nightly-harness:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: read
@@ -65,10 +67,10 @@ jobs:
           java-version: 21
           cache: maven
 
-      - name: Nightly harness (100k restore, 1M sizing, large splice)
+      - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests)
         run: >-
-          mvn -B -s .mvn-settings.xml -pl assets-cluster -am test
-          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest'
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
         env:
@@ -123,20 +125,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # deploys the assets wire modules (assets-common, assets-cluster) to GitHub Packages
+      packages: write # deploys the core wire modules (core-common, core-cluster) to GitHub Packages
       id-token: write # OIDC: no long-lived AWS keys in this repo
     env:
       BUCKET: openexch-build-artifacts-675715936685
       # The prefix builds are addressed by. The box asks for a named file inside it,
       # so more files under the same prefix is additive: nothing that reads it today
       # has to change.
-      ARTIFACT: assets-cluster
+      ARTIFACT: core-cluster
       # Published under that prefix, as <name>/target/<name>.jar. The engine jar is
       # what the box deploys. The bridge joins it because it is a production component
       # of the money path that until now had no published build at all, and the load
       # generator because a published benchmark has to be re-runnable from the
       # artifacts it was measured on.
-      JARS: assets-cluster assets-bridge assets-loadgen
+      JARS: core-cluster core-bridge core-loadgen
     steps:
       - uses: actions/checkout@v7
 
@@ -340,13 +342,13 @@ jobs:
         run: echo "published s3://${BUCKET}/${DEST}"
 
       # ---- cross-repo wire artifacts ----
-      # oms consumes com.openexchange.assets:assets-common (compile) and assets-cluster
-      # (test-scoped, for its embedded-AE integration test). Same discipline as
-      # match-common: every main push deploys an IMMUTABLE 0.1.0.<utcstamp>.g<sha> to
-      # GitHub Packages, replacing oms's checkout-at-floating-main + a SNAPSHOT that
-      # lived in no registry at all. After the S3 steps so a Packages failure cannot
-      # block the box artifact; still fails the job loudly.
-      - name: Deploy assets wire modules to GitHub Packages
+      # com.openexchange.core:core-common and core-cluster for the consumers that
+      # build against the core wire. Same discipline as match-common: every main push
+      # deploys an IMMUTABLE 0.1.0.<utcstamp>.g<sha> to GitHub Packages. No consumer
+      # bump PR is opened from here: oms is frozen legacy and keeps its pinned
+      # com.openexchange.assets artifact. After the S3 steps so a Packages failure
+      # cannot block the box artifact; still fails the job loudly.
+      - name: Deploy core wire modules to GitHub Packages
         id: wire
         env:
           GITHUB_ACTOR: ${{ github.actor }}
@@ -356,77 +358,9 @@ jobs:
           V="0.1.0.$(date -u +%Y%m%d%H%M%S).g${GITHUB_SHA::7}"
           mvn -B -q org.codehaus.mojo:versions-maven-plugin:2.16.2:set \
             -DnewVersion="$V" -DgenerateBackupPoms=false
-          # ".," so the parent pom deploys too; assets-common rides in via -am for
-          # assets-cluster, but naming it keeps the intent explicit.
-          mvn -B -s .mvn-settings.xml deploy -pl .,assets-common,assets-cluster -am -DskipTests \
-            -DaltDeploymentRepository=github::https://maven.pkg.github.com/openexch/assets
+          # ".," so the parent pom deploys too; core-common rides in via -am for
+          # core-cluster, but naming it keeps the intent explicit.
+          mvn -B -s .mvn-settings.xml deploy -pl .,core-common,core-cluster -am -DskipTests \
+            -DaltDeploymentRepository=github::https://maven.pkg.github.com/openexch/core
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "published com.openexchange.assets:{assets-common,assets-cluster}:$V"
-
-      # Same consumer-bump machinery as match's: API commits (GitHub signs them),
-      # token-gated, loud skip without the secret, never fails the publish.
-      - name: Open consumer bump PR (oms)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.CONSUMER_BUMP_TOKEN }}
-          V: ${{ steps.wire.outputs.version }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "CONSUMER_BUMP_TOKEN not set; skipping the oms bump PR (pin goes stale until it exists)."
-            exit 0
-          fi
-          BRANCH="bump/assets-wire"
-          BASE=$(gh api "repos/openexch/oms/git/ref/heads/main" --jq .object.sha)
-          # Create the branch, or force it back onto main if a previous bump is
-          # still open. Force is safe here precisely because nothing but this job
-          # writes this branch, and whatever it carried was an older version of
-          # the very pin about to be rewritten.
-          if gh api "repos/openexch/oms/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/openexch/oms/git/refs/heads/${BRANCH}" \
-              -f sha="$BASE" -F force=true >/dev/null
-          else
-            gh api -X POST "repos/openexch/oms/git/refs" \
-              -f ref="refs/heads/${BRANCH}" -f sha="$BASE" >/dev/null
-          fi
-          CONTENT=$(gh api "repos/openexch/oms/contents/pom.xml?ref=${BRANCH}" --jq .content | base64 -d)
-          NEW=$(printf '%s' "$CONTENT" \
-            | sed -E "s|(<assets.version>)[^<]+(</assets.version>)|\1${V}\2|")
-          if [ "$CONTENT" = "$NEW" ]; then
-            echo "oms: no <assets.version> property found; skipping"; exit 0
-          fi
-          SHA=$(gh api "repos/openexch/oms/contents/pom.xml?ref=${BRANCH}" --jq .sha)
-          gh api -X PUT "repos/openexch/oms/contents/pom.xml" \
-            -f message="build: assets wire ${V}" \
-            -f content="$(printf '%s' "$NEW" | base64 -w0)" \
-            -f sha="$SHA" -f branch="$BRANCH" >/dev/null
-          # One lock file per producer, so this bump and match's never touch the
-          # same lines and stay independently mergeable. oms's e2e fails if this
-          # write is skipped while the pom pin moved, so a partial bump is loud
-          # rather than a green build of a combination nobody ships.
-          LPATH="producers/assets.lock"
-          LSHA=$(gh api "repos/openexch/oms/contents/${LPATH}?ref=${BRANCH}" --jq .sha 2>/dev/null || true)
-          if [ -n "$LSHA" ]; then
-            LOCK=$(gh api "repos/openexch/oms/contents/${LPATH}?ref=${BRANCH}" --jq .content | base64 -d \
-              | sed -E "s|^[0-9a-f]{7,40}$|${GITHUB_SHA}|")
-            gh api -X PUT "repos/openexch/oms/contents/${LPATH}" \
-              -f message="build: ${LPATH} assets=${GITHUB_SHA::7}" \
-              -f content="$(printf '%s' "$LOCK" | base64 -w0)" \
-              -f sha="$LSHA" -f branch="$BRANCH" >/dev/null
-          else
-            echo "oms: ${LPATH} missing; pom pin moved without the lock (e2e will fail loudly)"
-          fi
-          # Reuse the open PR when there is one: retitle it to the version it now
-          # carries (a stale title is a lie about what would merge) instead of
-          # stacking another PR behind it.
-          BODY="Automated wire-artifact bump from openexch/assets@${GITHUB_SHA::7}. CI green = the new wire decodes. This PR is REUSED by every assets main push: its branch is reset onto oms's main and re-stamped, so it always shows the current pin and never has to be rebased. Commits are unsigned BY DESIGN — signing keys never leave the operator's vault, so automation cannot sign. Where the base branch requires signatures: re-sign locally, then merge (the operator tooling squashes this PR into one signed commit and force-pushes; auto-merge finishes the rest)."
-          PR=$(gh pr list --repo openexch/oms --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$PR" ]; then
-            gh pr edit "$PR" --repo openexch/oms --title "build: assets wire ${V}" --body "$BODY"
-            echo "oms: refreshed existing bump PR #${PR} to ${V}"
-          else
-            gh pr create --repo openexch/oms --base main --head "$BRANCH" \
-              --title "build: assets wire ${V}" --body "$BODY"
-          fi
-          gh pr merge --repo openexch/oms --auto --squash "$BRANCH" \
-            || echo "oms: auto-merge unavailable; PR stays open for a human"
+          echo "published com.openexchange.core:{core-common,core-cluster}:$V"
