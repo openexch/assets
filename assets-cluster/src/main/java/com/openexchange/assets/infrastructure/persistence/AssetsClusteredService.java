@@ -293,6 +293,15 @@ public final class AssetsClusteredService implements ClusteredService {
         Runtime.getRuntime().halt(1);
     }
 
+    // The consensus module's authorisation table, the instance ClusterConfig installed; null when the
+    // service runs without ClusterConfig (in-process tests), then the denial gauge reads 0.
+    private volatile com.openexchange.cluster.auth.ClassAuthorisationService sessionAuthorisation;
+
+    /** Wired before launch by ClusterConfig with the instance its authorisation supplier returns. */
+    public void sessionAuthorisation(final com.openexchange.cluster.auth.ClassAuthorisationService authorisation) {
+        this.sessionAuthorisation = authorisation;
+    }
+
     /** Wired before launch; the context owns the same-process consensus evidence. */
     public void readinessConsensus(final io.aeron.cluster.ConsensusModule.Context context) {
         consensusReadiness = new com.openexchange.cluster.ConsensusReadiness(context, readiness);
@@ -445,6 +454,25 @@ public final class AssetsClusteredService implements ClusteredService {
                 .counter("assets_ingress_unauthorised_total",
                         "Ingress commands refused for session authority (class, user scope, registration); never a fence",
                         demuxer::unauthorisedCount)
+                .counter("assets_backup_queries_denied_total",
+                        "BackupQuery requests denied by the class table on this node: only REPLICA may query",
+                        () -> { final var z = sessionAuthorisation; return z == null ? 0L
+                                : z.deniedCount(com.openexchange.cluster.auth.ClassAuthorisationService.BACKUP_QUERY); })
+                .gauge("assets_standby_interval_minutes",
+                        "SNAPSHOT_STANDBY_INTERVAL_MINUTES of this node's cadence (0 = no standby schedule)",
+                        () -> java.util.concurrent.TimeUnit.NANOSECONDS.toMinutes(snapshotCadence.standbyIntervalNs()))
+                .counter("assets_standby_requests_total",
+                        "STANDBY_SNAPSHOT toggles this node made while leading (flags-1 actions; no member snapshots)",
+                        snapshotCadence::standbyRequestCount)
+                .counter("assets_standby_toggle_deferred_total",
+                        "Due standby requests that found the toggle held (a SNAPSHOT or an operator); retried next evaluation",
+                        snapshotCadence::standbyDeferredCount)
+                .counter("assets_standby_toggle_lost_total",
+                        "Standby requests that can never be appended (INACTIVE toggle, stale, or leadership lost)",
+                        snapshotCadence::standbyLostCount)
+                .counter("assets_standby_toggle_ambiguous_total",
+                        "Standby requests completed while another action was toggled in the same evaluation",
+                        snapshotCadence::standbyAmbiguousCount)
                 .gauge("assets_sessions_known", "Sessions in the replicated authority table", () -> engine.sessions().size())
                 .gauge("assets_order_entry_gate",
                         "1 when the global order-entry gate is OPEN, else 0 (reason in the log and AdmissionState)",
@@ -1213,6 +1241,17 @@ public final class AssetsClusteredService implements ClusteredService {
         // Never fenced at the base: a latched applier refuses every entry, so a term event on a stopped node stays silent.
         if (!applier.failed()) {
             applier.onNewLeadershipTermEvent(leadershipTermId, logPosition, timestamp, timeUnit);
+            // The log never goes idle while there is a leader. The new leader arms its
+            // drain belt at its own term's first log entry instead of waiting for the next ingress message, so a
+            // quiet cluster's cluster time keeps ticking every EGRESS_DRAIN_BACKSTOP_MS after an election (the
+            // replica's time-lag readiness reads it). Aeron refuses scheduleTimer inside onRoleChange
+            // (CSA:748-760, :1243-1249); this log callback is the first legal one after the gain, and the term id is
+            // already this term's. A follower (and any node replaying) is not leader: a no-op. Same id, same site.
+            armDrainTimerIfNeeded();
+            // Money path, same shape: the deadline sweep is re-armed here too, so GTD and
+            // deadline expiry never wait for the next ingress after a failover. A no-op while the index is empty, on
+            // a follower, or when already armed. Same id (termTimerId(SWEEP_TIMER_BASE)), same site: no new timer.
+            armSweepIfNeeded();
         }
     }
 
@@ -1252,7 +1291,8 @@ public final class AssetsClusteredService implements ClusteredService {
         }
         // Always re-arm from scratch. Only the leader really schedules (a follower's scheduleTimer is a
         // no-op), and a timer does not survive a snapshot recover-into-leader, so clearing the flag
-        // guarantees the next onSessionMessage arms exactly one fresh belt. This is match#26's fix:
+        // guarantees the next legal callback arms exactly one fresh belt: the new term's NewLeadershipTermEvent
+        // (scheduling is refused inside onRoleChange itself), else the next onSessionMessage. This is match#26's fix:
         // missing it leaves a leader whose idle-path drain never fires. The deadline sweep follows the
         // same rule (K3-D): clear here, re-arm from the next legal callback while the index is non-empty.
         drainTimerArmed = false;

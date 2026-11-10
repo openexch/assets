@@ -26,6 +26,6 @@ public class KitAuthenticatorInstalledTest {
         assertTrue("installed: " + a.getClass().getName(), a instanceof ClusterAuthenticator);
         final ClusterAuthenticator kit = (ClusterAuthenticator) a;
         assertSame(AssetsAuth.POLICY, kit.keys().policy());
-        assertEquals("the test table's seven keys", 7, kit.keys().size());
+        assertEquals("the test table's eight keys (the replica added the REPLICA key)", 8, kit.keys().size());
     }
 }

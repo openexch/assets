@@ -251,23 +251,9 @@ public final class AeronCluster {
         return new File(baseDir);
     }
 
-    /**
-     * True if {@code path} is (or is nested under) a well-known ephemeral/tmpfs mount ({@code /tmp} or
-     * {@code /dev/shm}). Matches on path-segment boundaries, so a sibling like {@code /tmpfoo} does
-     * <b>not</b> false-positive against {@code /tmp}. Pure and static so it is unit-testable without
-     * booting a node. Relative paths always return {@code false} (nothing to warn about until they are
-     * resolved against a cwd: callers should pass an absolute path, e.g. {@code File#getAbsolutePath()}).
-     */
+    /** {@link StatePaths#looksEphemeral}: the tmpfs startup warning's predicate (kept here for its callers). */
     static boolean pathLooksEphemeral(final String path) {
-        if (null == path || path.isEmpty()) {
-            return false;
-        }
-        String normalized = path;
-        while (normalized.length() > 1 && normalized.endsWith("/")) {
-            normalized = normalized.substring(0, normalized.length() - 1);
-        }
-        return "/tmp".equals(normalized) || normalized.startsWith("/tmp/")
-                || "/dev/shm".equals(normalized) || normalized.startsWith("/dev/shm/");
+        return StatePaths.looksEphemeral(path);
     }
 
     private static String getClusterAddresses() {

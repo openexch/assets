@@ -187,9 +187,16 @@ public final class ClusterConfig {
                 com.openexchange.cluster.auth.ClusterAuthenticator.DEFAULT_MAX_PENDING,
                 () -> com.openexchange.cluster.auth.ClusterAuthenticator.backupWindowMsFor(
                         consensusModuleContext.sessionTimeoutNs())));
+        // Only REPLICA may BackupQuery; HeartbeatRequest and StandbySnapshot are denied
+        // for every class. ONE instance: Aeron calls the supplier once per consensus module and the service exports
+        // this instance's denial counters (assets_backup_queries_denied_total).
+        final com.openexchange.cluster.auth.ClassAuthorisationService authorisation =
+                com.openexchange.assets.auth.AssetsAuth.authorisationService();
+        consensusModuleContext.authorisationServiceSupplier(() -> authorisation);
 
         if (clusteredService instanceof AssetsClusteredService engineService) {
             engineService.readinessConsensus(consensusModuleContext);
+            engineService.sessionAuthorisation(authorisation);
         }
 
         final List<ClusteredServiceContainer.Context> serviceContexts = new ArrayList<>();

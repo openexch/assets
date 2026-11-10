@@ -86,6 +86,8 @@ final class ShadowClusterRig implements AutoCloseable {
         java.util.function.Consumer<AssetsClusteredService> beforeLaunch;
         /** RCS S4 W4: runs after the driver, archive and consensus module launched, before the container (AC:208-212). */
         java.util.function.Consumer<Member> beforeContainer;
+        /** Runs after ClusterConfig.create and before the launch (wraps the authenticator supplier). */
+        java.util.function.Consumer<Member> afterConfig;
         final List<String> halts = new CopyOnWriteArrayList<>();
         private Aeron producerAeron;
         private AeronArchive producerArchive;
@@ -244,6 +246,9 @@ final class ShadowClusterRig implements AutoCloseable {
         // so each member's archive gets its own id (production runs one member per process). Stable across restarts
         // of the same member, so a restart re-registers the same id.
         m.cfg.archiveContext().archiveId(archiveIdBase + m.id);
+        if (m.afterConfig != null) {
+            m.afterConfig.accept(m);
+        }
         m.driver = ClusteredMediaDriver.launch(
                 m.cfg.mediaDriverContext().dirDeleteOnStart(true).dirDeleteOnShutdown(true).mtuLength(8192),
                 m.cfg.archiveContext(), m.cfg.consensusModuleContext());
@@ -373,6 +378,15 @@ final class ShadowClusterRig implements AutoCloseable {
 
     // ---------------------------------------------------------------------------------------------- clients
 
+    /**
+     * The clients' new-leader timeout, {@code Aeron.NULL_VALUE} (the default) for Aeron's
+     * 2 x the members' leader heartbeat timeout. With this rig's 1 s heartbeat timeout that is 2 s, shorter than an
+     * election after a leader kill here (heartbeat timeout plus election, measured 2 038..2 320 ms), so a client whose
+     * egress image closed at the kill can time out before the NewLeaderEvent. A test that needs its sessions to survive
+     * an election sets it longer.
+     */
+    long clientNewLeaderTimeoutNs = io.aeron.Aeron.NULL_VALUE;
+
     String ingressEndpoints() {
         final StringBuilder sb = new StringBuilder();
         for (final Member m : members) {
@@ -411,7 +425,8 @@ final class ShadowClusterRig implements AutoCloseable {
                         .ingressChannel(INGRESS_CHANNEL)
                         .aeronDirectoryName(host.driverDir)
                         .ingressEndpoints(ingressEndpoints())
-                        .messageTimeoutNs(TimeUnit.SECONDS.toNanos(5)));
+                        .messageTimeoutNs(TimeUnit.SECONDS.toNanos(5))
+                        .newLeaderTimeoutNs(clientNewLeaderTimeoutNs));
                 final Client c = new Client(new Session(client, in), in);
                 clients.add(c);
                 return c;
@@ -460,19 +475,27 @@ final class ShadowClusterRig implements AutoCloseable {
         return archive(m).getStartPosition(rec);
     }
 
+    /** The nonce {@link #adopt} ADOPTs: {@link #GENESIS} unless a re-genesis test sets another. */
+    long adoptGenesis = GENESIS;
+
     /** ADMIN CoreConfig version 1: the ADOPT of the genesis nonce (RCS S3 A7); the producer of 11.0 needs it. */
     void adopt(final Client admin) {
         final UnsafeBuffer buf = new UnsafeBuffer(new byte[4096]);
-        admin.offer(buf, encodeAdopt(buf));
+        admin.offer(buf, encodeAdopt(buf, adoptGenesis));
         await(() -> admin.in.count(f -> f.startsWith("ADMINACK ref=70 result=ADOPTED")) > 0, OP_TIMEOUT_MS,
                 () -> "the CoreConfig ADOPT must be acked ADOPTED; frames " + admin.in.frames);
     }
 
     /** RCS S4 W4: the ADOPT frame of {@link #adopt} (also offered by the external-driver test's own client). */
     static int encodeAdopt(final UnsafeBuffer buf) {
+        return encodeAdopt(buf, GENESIS);
+    }
+
+    /** The ADOPT of another genesis nonce, for a re-genesised rig. */
+    static int encodeAdopt(final UnsafeBuffer buf, final long genesis) {
         final MessageHeaderEncoder header = new MessageHeaderEncoder();
         final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(buf, 0, header).correlationId(0x71L)
-                .configVersion(1).behaviorVersion(1).genesisId(GENESIS);
+                .configVersion(1).behaviorVersion(1).genesisId(genesis);
         final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(Market.ALL.length);
         for (final Market d : Market.ALL) {
             m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id())
