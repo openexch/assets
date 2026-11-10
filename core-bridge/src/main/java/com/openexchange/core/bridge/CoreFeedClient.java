@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: Apache-2.0
+package com.openexchange.core.bridge;
+
+import com.openexchange.core.infrastructure.generated.FeedPositionReportDecoder;
+import com.openexchange.core.infrastructure.generated.MessageHeaderDecoder;
+import com.openexchange.core.infrastructure.generated.MessageHeaderEncoder;
+import com.openexchange.core.infrastructure.generated.QueryFeedPositionEncoder;
+import com.openexchange.core.infrastructure.generated.SettlementAppliedBatchDecoder;
+import com.openexchange.core.infrastructure.generated.SettlementAppliedDecoder;
+import io.aeron.Publication;
+import io.aeron.cluster.client.AeronCluster;
+import io.aeron.cluster.client.EgressListener;
+import io.aeron.logbuffer.Header;
+import org.agrona.CloseHelper;
+import org.agrona.DirectBuffer;
+import org.agrona.concurrent.BackoffIdleStrategy;
+import org.agrona.concurrent.IdleStrategy;
+import org.agrona.concurrent.UnsafeBuffer;
+
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.LongConsumer;
+
+/**
+ * The bridge's core session: offers translated Settle/TerminalRelease commands as
+ * cluster ingress (BLOCKING — the journal is lossless, so the bridge waits, never drops)
+ * and answers the resume protocol (QueryFeedPosition -> FeedPositionReport).
+ *
+ * Session death surfaces as {@link SessionClosedException}: the bridge's response is always
+ * the same — tear down the epoch, reconnect, re-query, rebuild the filter. Statelessness
+ * keeps every failure mode boring.
+ */
+final class CoreFeedClient implements AutoCloseable, EgressListener {
+
+    static final class SessionClosedException extends RuntimeException {
+        SessionClosedException(final String msg) {
+            super(msg);
+        }
+    }
+
+    record FeedPosition(long consumePosition, long lastAppliedTradeId) {
+    }
+
+    private static final long KEEPALIVE_INTERVAL_MS = 1_000;
+
+    private final AeronCluster cluster;
+    private final IdleStrategy idle = new BackoffIdleStrategy();
+
+    private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
+    private final FeedPositionReportDecoder feedPositionDecoder = new FeedPositionReportDecoder();
+    private final SettlementAppliedDecoder settlementAppliedDecoder = new SettlementAppliedDecoder();
+    private final SettlementAppliedBatchDecoder settlementAppliedBatchDecoder = new SettlementAppliedBatchDecoder();
+    private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
+    private final QueryFeedPositionEncoder queryEncoder = new QueryFeedPositionEncoder();
+    private final com.openexchange.core.infrastructure.generated.RegisterSessionEncoder registerEncoder =
+            new com.openexchange.core.infrastructure.generated.RegisterSessionEncoder();
+    private final org.agrona.concurrent.UnsafeBuffer subscribeBuffer =
+            new org.agrona.concurrent.UnsafeBuffer(new byte[64]);
+    private final UnsafeBuffer queryBuffer = new UnsafeBuffer(new byte[64]);
+
+    private long lastKeepAliveMs;
+    /** Set by onNewLeader (fires on this thread, inside pollEgress), consumed by duty(). */
+    private boolean pendingRedeclare;
+    private long awaitedCorrelationId;
+    private FeedPosition capturedPosition;
+    /** Settlement-ack observer (tradeId); invoked on the polling thread — the bridge agent's. */
+    private LongConsumer onSettlementApplied;
+
+    private CoreFeedClient(final AeronCluster cluster) {
+        this.cluster = cluster;
+    }
+
+    /** Late-bound listener holder: the CoreFeedClient instance cannot exist before connect(). */
+    private static final class DelegatingListener implements EgressListener {
+        volatile EgressListener delegate;
+
+        @Override
+        public void onMessage(final long clusterSessionId, final long timestamp,
+                              final DirectBuffer buffer, final int offset, final int length, final Header header) {
+            final EgressListener d = delegate;
+            if (d != null) {
+                d.onMessage(clusterSessionId, timestamp, buffer, offset, length, header);
+            }
+        }
+    }
+
+    static CoreFeedClient connect(final BridgeConfig config, final String aeronDirectoryName) {
+        final DelegatingListener holder = new DelegatingListener();
+        final AeronCluster cluster = AeronCluster.connect(new AeronCluster.Context()
+                // The core authenticates every session. The bridge presents its BRIDGE key
+                // (CORE_AUTH_CREDENTIAL / -Dcore.auth.credential); without one the connect is rejected.
+                .credentialsSupplier(requireCredentials().supplier())
+                .aeronDirectoryName(aeronDirectoryName)
+                // mtu MUST match the core cluster ingress (TransportConfig.mtuLength(), default 8192)
+                // and every other core client (see MoneyLoadGenerator's 8k). At the default 1408 a full
+                // v5 SettleBatch (~4.4KB, 64 trades) fragments and the cluster ingress never takes the
+                // fragmented frame, so the bridge's keepalives — sharing this publication — cannot land
+                // either and the session times out (-4). Single trades and terminals stay under 1408,
+                // so this only bites on backlog catch-up: the exact outage-recovery path (2026-09-02).
+                .ingressChannel("aeron:udp?term-length=4m|mtu=8192")
+                .ingressEndpoints(ingressEndpoints(config.coreClusterAddresses, config.corePortBase))
+                .egressChannel("aeron:udp?endpoint=" + config.coreEgressEndpoint + "|term-length=4m")
+                .egressListener(holder));
+        final CoreFeedClient client = new CoreFeedClient(cluster);
+        holder.delegate = client;
+        client.subscribeToWhatWeActuallyRead();
+        return client;
+    }
+
+    /**
+     * Narrow this session's egress to what the bridge actually consumes.
+     *
+     * <p>The bridge reads SettlementApplied (its settle acknowledgement) and FeedPositionReport (its
+     * resume point), and discards everything else — see {@link #onMessage}. Until subscriptions existed
+     * it still received the full BalanceUpdate firehose, roughly five frames per settle that it decoded
+     * and threw away. Under load that made this session, not the load generator, the one whose egress
+     * queue backed up to its ceiling and stalled the engine.</p>
+     *
+     * <p>Sent on every connect, including reconnects after an epoch restart: the subscription is
+     * transport state on the leader and is deliberately not snapshotted, so it must be re-declared
+     * rather than assumed. Losing it only costs traffic, never correctness.</p>
+     */
+    private void subscribeToWhatWeActuallyRead() {
+        offerBlocking(subscribeBuffer, encodeRegisterSession());
+    }
+
+    private static com.openexchange.core.auth.CoreCredentials requireCredentials() {
+        final com.openexchange.core.auth.CoreCredentials c = com.openexchange.core.auth.CoreCredentials.fromEnvironment();
+        if (c == null) {
+            throw new IllegalStateException("Core credentials missing: set " + com.openexchange.core.auth.CoreCredentials.ENV
+                    + " (or -D" + com.openexchange.core.auth.CoreCredentials.PROPERTY + ") to keyId:BRIDGE:secretHex");
+        }
+        if (c.sessionClass() != com.openexchange.core.infrastructure.generated.SessionClass.BRIDGE) {
+            throw new IllegalStateException("the bridge must present a BRIDGE credential, got " + c.sessionClass());
+        }
+        return c;
+    }
+
+    /**
+     * RegisterSession: one replicated declaration replaces the Subscribe narrowing and the
+     * QueryFeedPosition resumable side effect. Class BRIDGE (asserted, checked against the principal),
+     * resumable (this client owns a resume protocol), channels acks + settlements (what the bridge reads).
+     */
+    private int encodeRegisterSession() {
+        registerEncoder.wrapAndApplyHeader(subscribeBuffer, 0, headerEncoder)
+                .correlationId(0L)
+                .sessionClass(com.openexchange.core.infrastructure.generated.SessionClass.BRIDGE)
+                .readerKind((short) 0)
+                .resumable(com.openexchange.core.infrastructure.generated.BoolFlag.TRUE)
+                .identity(0L)
+                .sourceEpoch(0L);
+        registerEncoder.channels().clear().acks(true).settlements(true);
+        return MessageHeaderEncoder.ENCODED_LENGTH + registerEncoder.encodedLength();
+    }
+
+    /**
+     * A leader change the session SURVIVES still loses every piece of transport state this client
+     * declared, because both declarations live on the leader and are deliberately never snapshotted:
+     * the Subscribe narrowing (without it the new leader feeds this session the full BalanceUpdate
+     * firehose again) and the resumable mark from QueryFeedPosition (without it the new leader blocks
+     * on this session's full queue instead of closing it). Re-declare both as soon as {@link #duty()}
+     * gets the chance; until the offers land the flag stays up and every duty retries.
+     */
+    @Override
+    public void onNewLeader(final long clusterSessionId, final long leadershipTermId,
+                            final int leaderMemberId, final String ingressEndpoints) {
+        System.out.println("[BRIDGE] core new leader member=" + leaderMemberId + " term=" + leadershipTermId
+                + ": re-declaring the session registration (egress mask + resumable mark)");
+        pendingRedeclare = true;
+    }
+
+    /** @return true when both transport-state frames were accepted by the new leader. */
+    private boolean redeclareTransportState() {
+        // Re-sending RegisterSession is idempotent (DUPLICATE on the replicated side); the new leader
+        // re-applies the egress mask and the resumable mark from it.
+        return tryOffer(subscribeBuffer, encodeRegisterSession());
+    }
+
+    /** One non-blocking offer attempt; terminal codes throw exactly like {@link #offerOnce}. */
+    private boolean tryOffer(final DirectBuffer buffer, final int length) {
+        final long result = cluster.offer(buffer, 0, length);
+        if (result == Publication.CLOSED || result == Publication.MAX_POSITION_EXCEEDED) {
+            throw new SessionClosedException("Core ingress offer failed terminally: " + result);
+        }
+        return result > 0;
+    }
+
+    /** Cluster ingress endpoint list using the core ClusterConfig port math (client port = base + n*100 + 2). */
+    static String ingressEndpoints(final List<String> addresses, final int portBase) {
+        final StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < addresses.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(i).append('=').append(addresses.get(i).trim()).append(':')
+                    .append(com.openexchange.cluster.ClusterPorts.port(
+                            i, portBase, com.openexchange.cluster.ClusterPorts.CLIENT_FACING_OFFSET));
+        }
+        return sb.toString();
+    }
+
+    /** Registers the SettlementApplied observer (called back with the tradeId; agent thread). */
+    void onSettlementApplied(final LongConsumer callback) {
+        this.onSettlementApplied = callback;
+    }
+
+    @Override
+    public void onMessage(final long clusterSessionId, final long timestamp,
+                          final DirectBuffer buffer, final int offset, final int length, final Header header) {
+        headerDecoder.wrap(buffer, offset);
+        if (headerDecoder.templateId() == FeedPositionReportDecoder.TEMPLATE_ID) {
+            feedPositionDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+            if (feedPositionDecoder.correlationId() == awaitedCorrelationId) {
+                capturedPosition = new FeedPosition(
+                        feedPositionDecoder.consumePosition(), feedPositionDecoder.lastAppliedTradeId());
+            }
+        } else if (headerDecoder.templateId() == SettlementAppliedDecoder.TEMPLATE_ID) {
+            final LongConsumer callback = onSettlementApplied;
+            if (callback != null) {
+                settlementAppliedDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                callback.accept(settlementAppliedDecoder.tradeId());
+            }
+        } else if (headerDecoder.templateId() == SettlementAppliedBatchDecoder.TEMPLATE_ID) {
+            // v5: the core coalesces consecutive settlement acks into one frame; each entry is one ack.
+            final LongConsumer callback = onSettlementApplied;
+            if (callback != null) {
+                settlementAppliedBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                for (final SettlementAppliedBatchDecoder.SettlementsDecoder s
+                        : settlementAppliedBatchDecoder.settlements()) {
+                    callback.accept(s.tradeId());
+                }
+            }
+        }
+        // All other egress (acks, balance updates, snapshots) is for other consumers; ignore.
+    }
+
+    /** The resume protocol: ask the core how far it has consumed; retries within the deadline. */
+    FeedPosition queryFeedPosition(final long timeoutMs) {
+        awaitedCorrelationId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+        capturedPosition = null;
+        queryEncoder.wrapAndApplyHeader(queryBuffer, 0, headerEncoder).correlationId(awaitedCorrelationId);
+        final int length = MessageHeaderEncoder.ENCODED_LENGTH + queryEncoder.encodedLength();
+
+        final long deadline = System.currentTimeMillis() + timeoutMs;
+        long nextSendMs = 0;
+        while (capturedPosition == null) {
+            final long nowMs = System.currentTimeMillis();
+            if (nowMs > deadline) {
+                throw new SessionClosedException("FeedPositionReport not received within " + timeoutMs + "ms");
+            }
+            if (nowMs >= nextSendMs) {
+                offerOnce(queryBuffer, length); // re-send is safe: read-only query
+                nextSendMs = nowMs + 500;
+            }
+            duty();
+            idle.idle();
+        }
+        idle.reset();
+        return capturedPosition;
+    }
+
+    /** Blocking offer: waits out backpressure forever; session death throws (epoch restart). */
+    void offerBlocking(final DirectBuffer buffer, final int length) {
+        while (true) {
+            final long result = cluster.offer(buffer, 0, length);
+            if (result > 0) {
+                idle.reset();
+                return;
+            }
+            if (result == Publication.CLOSED || result == Publication.NOT_CONNECTED
+                    || result == Publication.MAX_POSITION_EXCEEDED) {
+                throw new SessionClosedException("Core ingress offer failed terminally: " + result);
+            }
+            duty();
+            idle.idle();
+        }
+    }
+
+    private void offerOnce(final DirectBuffer buffer, final int length) {
+        final long result = cluster.offer(buffer, 0, length);
+        if (result == Publication.CLOSED || result == Publication.MAX_POSITION_EXCEEDED) {
+            throw new SessionClosedException("Core ingress offer failed terminally: " + result);
+        }
+    }
+
+    /** Keep the session healthy: consume egress + protocol keep-alive. Call often from any wait loop. */
+    void duty() {
+        // pollEgress caps at 10 fragments per call; a single call per idle loop was a trickle that can
+        // never catch up with a leader-side backlog — drain until empty.
+        while (cluster.pollEgress() > 0) {
+        }
+        if (pendingRedeclare) {
+            pendingRedeclare = !redeclareTransportState();
+        }
+        final long nowMs = System.currentTimeMillis();
+        if (nowMs - lastKeepAliveMs >= KEEPALIVE_INTERVAL_MS) {
+            cluster.sendKeepAlive();
+            lastKeepAliveMs = nowMs;
+        }
+    }
+
+    @Override
+    public void close() {
+        CloseHelper.quietClose(cluster);
+    }
+}

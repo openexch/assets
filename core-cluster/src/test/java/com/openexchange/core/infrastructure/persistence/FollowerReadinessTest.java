@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: Apache-2.0
+package com.openexchange.core.infrastructure.persistence;
+
+import com.openexchange.cluster.NodeReadiness;
+import io.aeron.Aeron;
+import io.aeron.DirectBufferVector;
+import io.aeron.cluster.service.ClientSession;
+import io.aeron.cluster.service.Cluster;
+import io.aeron.cluster.service.ClusteredServiceContainer;
+import io.aeron.logbuffer.BufferClaim;
+import org.agrona.DirectBuffer;
+import org.agrona.concurrent.IdleStrategy;
+import org.junit.Test;
+
+import java.lang.reflect.Field;
+import java.util.Collection;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+/** Initial FOLLOWER needs real consensus/application evidence even without a role callback. */
+public class FollowerReadinessTest {
+
+    @Test
+    public void bootTimeFollowerBecomesReadyWithoutOnRoleChange() throws Exception {
+        final CoreClusteredService service = new CoreClusteredService();
+        final StubCluster cluster = new StubCluster(Cluster.Role.FOLLOWER);
+        inject(service, "cluster", cluster);
+        final NodeReadiness readiness = readinessOf(service);
+        readiness.started();
+        try (ConsensusFixture fixture = new ConsensusFixture()) {
+            inject(service, "consensusReadiness", new com.openexchange.cluster.ConsensusReadiness(
+                    fixture.context, readiness, time -> new com.openexchange.cluster.ConsensusReadiness.LeaderCheckpoint(
+                        fixture.context.leadershipTermIdCounter().get(), 999, fixture.context.commitPositionCounter().get(), time)));
+            long now = System.nanoTime();
+            service.doBackgroundWork(now);
+            assertFalse("role alone must not hide lag", readiness.ready());
+            cluster.applied = 100;
+            service.doBackgroundWork(now + 20_000_000);
+            assertTrue("caught up initial FOLLOWER without callback: " + readiness.describe(), readiness.ready());
+            fixture.context.electionStateCounter().set(io.aeron.cluster.ElectionState.CANVASS.code());
+            service.doBackgroundWork(now + 40_000_000);
+            assertFalse("consensus election wins over stale service role", readiness.ready());
+        }
+    }
+
+    @Test
+    public void candidateObservationMustNotReportReady() throws Exception {
+        final CoreClusteredService service = new CoreClusteredService();
+        inject(service, "cluster", new StubCluster(Cluster.Role.CANDIDATE));
+        final NodeReadiness readiness = readinessOf(service);
+        readiness.started();
+
+        service.doBackgroundWork(System.nanoTime());
+
+        assertFalse("an election in flight must never report ready; was: "
+                + readiness.describe(), readiness.ready());
+    }
+
+    private static final class ConsensusFixture implements AutoCloseable {
+        final java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("follower-readiness-");
+        final org.agrona.concurrent.status.CountersManager counters = new org.agrona.concurrent.status.CountersManager(
+                new org.agrona.concurrent.UnsafeBuffer(java.nio.ByteBuffer.allocateDirect(8192)),
+                new org.agrona.concurrent.UnsafeBuffer(java.nio.ByteBuffer.allocateDirect(2048)));
+        final io.aeron.cluster.service.ClusterMarkFile mark = new io.aeron.cluster.service.ClusterMarkFile(
+                dir.resolve(io.aeron.cluster.service.ClusterMarkFile.FILENAME).toFile(),
+                io.aeron.cluster.codecs.mark.ClusterComponentType.CONSENSUS_MODULE,
+                io.aeron.cluster.service.ClusterMarkFile.ERROR_BUFFER_MIN_LENGTH,
+                System::currentTimeMillis, 0, 4096);
+        final io.aeron.cluster.ConsensusModule.Context context = new io.aeron.cluster.ConsensusModule.Context()
+                .clusterMarkFile(mark).clusterClock(new io.aeron.cluster.MillisecondClusterClock())
+                .commitPositionCounter(counter(100)).leadershipTermIdCounter(counter(7))
+                .electionCounter(counter(2))
+                .electionStateCounter(counter(io.aeron.cluster.ElectionState.CLOSED.code()))
+                .moduleStateCounter(counter(io.aeron.cluster.ConsensusModule.State.ACTIVE.code()))
+                .clusterNodeRoleCounter(counter(Cluster.Role.FOLLOWER.code()));
+        ConsensusFixture() throws Exception { mark.updateActivityTimestamp(System.currentTimeMillis()); }
+        private io.aeron.Counter counter(long value) {
+            int id = counters.allocate("readiness test"); counters.setCounterRegistrationId(id, 100 + id);
+            var c = new io.aeron.Counter(counters, id); c.set(value); return c;
+        }
+        public void close() throws Exception {
+            mark.close();
+            try (var paths = java.nio.file.Files.walk(dir)) {
+                for (var p : paths.sorted(java.util.Comparator.reverseOrder()).toList()) { java.nio.file.Files.delete(p); }
+            }
+        }
+    }
+
+    @Test
+    public void idleInsideUnfinishedCallbackCannotPublishAppliedPosition() throws Exception {
+        final CoreClusteredService service = new CoreClusteredService();
+        final StubCluster cluster = new StubCluster(Cluster.Role.LEADER);
+        cluster.applied = 100; // Aeron sets logPosition before invoking the callback.
+        inject(service, "cluster", cluster);
+        final NodeReadiness readiness = readinessOf(service); readiness.started();
+        try (ConsensusFixture fixture = new ConsensusFixture()) {
+            fixture.context.clusterNodeRoleCounter().set(Cluster.Role.LEADER.code());
+            inject(service, "consensusReadiness", new com.openexchange.cluster.ConsensusReadiness(
+                    fixture.context, readiness, time -> new com.openexchange.cluster.ConsensusReadiness.LeaderCheckpoint(
+                        fixture.context.leadershipTermIdCounter().get(), 999, fixture.context.commitPositionCounter().get(), time)));
+            final int[] reentries = {0};
+            cluster.onIdle = () -> {
+                reentries[0]++;
+                service.doBackgroundWork(System.nanoTime());
+                assertFalse("unfinished callback was advertised as applied: " + readiness.describe(), readiness.ready());
+            };
+            inject(service, "isLeader", true);
+            inject(service, "idleStrategy", cluster.idleStrategy());
+            service.onSessionOpen(null, 0);
+            assertTrue("actual idle reentry is required", reentries[0] > 0);
+            service.doBackgroundWork(System.nanoTime() + 20_000_000);
+            assertTrue("completed callback may establish evidence: " + readiness.describe(), readiness.ready());
+        }
+    }
+
+    // ==================== helpers ====================
+
+    private static NodeReadiness readinessOf(final CoreClusteredService service) throws Exception {
+        final Field f = CoreClusteredService.class.getDeclaredField("readiness");
+        f.setAccessible(true);
+        return (NodeReadiness) f.get(service);
+    }
+
+    private static void inject(final CoreClusteredService service, final String field,
+                               final Object value) throws Exception {
+        final Field f = CoreClusteredService.class.getDeclaredField(field);
+        f.setAccessible(true);
+        f.set(service, value);
+    }
+
+    /**
+     * Everything a boot-time member's duty cycle touches: {@code role()} and
+     * {@code logPosition()}. The rest is unreachable from doBackgroundWork and
+     * throws so any new dependency fails loudly here instead of passing vacuously.
+     */
+    private static final class StubCluster implements Cluster {
+        private final Role role;
+        private long applied;
+        private Runnable onIdle;
+        private int schedules;
+
+        StubCluster(final Role role) {
+            this.role = role;
+        }
+
+        public Role role() {
+            return role;
+        }
+
+        public long logPosition() {
+            return applied;
+        }
+
+        public int memberId() {
+            return 1;
+        }
+
+        public Aeron aeron() {
+            throw new UnsupportedOperationException();
+        }
+
+        public ClusteredServiceContainer.Context context() {
+            throw new UnsupportedOperationException();
+        }
+
+        public ClientSession getClientSession(final long clusterSessionId) {
+            throw new UnsupportedOperationException();
+        }
+
+        public Collection<ClientSession> clientSessions() {
+            return java.util.List.of();
+        }
+
+        public void forEachClientSession(final Consumer<? super ClientSession> action) {
+            throw new UnsupportedOperationException();
+        }
+
+        public boolean closeClientSession(final long clusterSessionId) {
+            throw new UnsupportedOperationException();
+        }
+
+        public long time() {
+            return 0;
+        }
+
+        public TimeUnit timeUnit() {
+            return TimeUnit.MILLISECONDS;
+        }
+
+        public boolean scheduleTimer(final long correlationId, final long deadline) {
+            return ++schedules > 1;
+        }
+
+        public boolean cancelTimer(final long correlationId) {
+            throw new UnsupportedOperationException();
+        }
+
+        public long offer(final DirectBuffer buffer, final int offset, final int length) {
+            throw new UnsupportedOperationException();
+        }
+
+        public long offer(final DirectBufferVector[] vectors) {
+            throw new UnsupportedOperationException();
+        }
+
+        public long tryClaim(final int length, final BufferClaim bufferClaim) {
+            throw new UnsupportedOperationException();
+        }
+
+        public IdleStrategy idleStrategy() {
+            return new IdleStrategy() {
+                public void idle() { onIdle.run(); }
+                public void idle(int workCount) { if (workCount <= 0) idle(); }
+                public void reset() { }
+                public String alias() { return "reentrant-test"; }
+            };
+        }
+    }
+}

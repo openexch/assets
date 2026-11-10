@@ -4,14 +4,14 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.openexchange.assets</groupId>
-    <artifactId>assets</artifactId>
+    <groupId>com.openexchange.core</groupId>
+    <artifactId>core</artifactId>
     <version>0.1.0-runtime.20260928.r02d.g571248f</version>
     <packaging>pom</packaging>
 
-    <name>Assets Engine Parent</name>
+    <name>Core Parent</name>
     <description>Authoritative money ledger (balances, holds, settlement) on an Aeron Cluster</description>
-    <url>https://github.com/openexch/assets</url>
+    <url>https://github.com/openexch/core</url>
 
     <licenses>
         <license>
@@ -22,11 +22,11 @@
     </licenses>
 
     <modules>
-        <module>assets-common</module>
-        <module>assets-cluster</module>
-        <module>assets-bridge</module>
-        <module>assets-projector</module>
-        <module>assets-loadgen</module>
+        <module>core-common</module>
+        <module>core-cluster</module>
+        <module>core-bridge</module>
+        <module>core-projector</module>
+        <module>core-loadgen</module>
     </modules>
 
     <properties>
@@ -36,7 +36,7 @@
         <!-- cluster-kit, Aeron and Agrona are pinned identical to the match engine so the two
              Aeron clusters share a substrate and one aeronmd can drive both. SBE is pinned
              independently of match. -->
-        <cluster-kit.version>0.1.15-runtime.20261110.replica.g29e9754</cluster-kit.version>
+        <cluster-kit.version>0.1.16-runtime.20261110.core.g949d861</cluster-kit.version>
         <aeron.version>1.53.1</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <sbe.version>1.40.1</sbe.version>
@@ -45,17 +45,17 @@
         <postgresql.version>42.7.13</postgresql.version>
         <hikari.version>7.1.0</hikari.version>
         <slf4j.version>2.0.18</slf4j.version>
-        <!-- match repo (settlement-journal codecs consumed by assets-bridge): an IMMUTABLE
+        <!-- match repo (settlement-journal codecs consumed by core-bridge): an IMMUTABLE
              1.0.<utcstamp>.g<sha> from GitHub Packages, deployed by match CI on every main push.
              The trailing g<sha> names the exact match commit these wire bytes came from.
              Bumped by match CI's consumer-bump PR (or by hand: pick any published version). -->
         <match.version>1.0.20261109190743.g1239a8d</match.version>
-        <!-- RC2 S9h (D-S9h-1): the ME journal schema 4 codecs (match 421226c) for the TEST-scope feed harness of
-             assets-cluster only. Separate from match.version on purpose: the frozen assets-bridge keeps schema 3. -->
+        <!-- The ME journal schema 4 codecs (match 421226c) for the TEST-scope feed harness of
+             core-cluster only. Separate from match.version on purpose: the frozen core-bridge keeps schema 3. -->
         <match.journal.version>1.0.20261106224552.g2b242ed</match.journal.version>
-        <!-- Benchmark loadgen histograms (assets-loadgen only; not in any engine hot path). -->
+        <!-- Benchmark loadgen histograms (core-loadgen only; not in any engine hot path). -->
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
-        <!-- RC2 S10' review FIX-3: reproducible jars (maven-jar / shade entry times), so the pinned AE jar sha comes from a
+        <!-- Reproducible jars (maven-jar / shade entry times), so the pinned core jar sha comes from a
              plain `package` of the committed tree. The Maven convention: a literal ISO-8601 instant, bumped at release. -->
         <project.build.outputTimestamp>2026-11-01T00:00:00Z</project.build.outputTimestamp>
         <!-- Default so surefire's ${argLine} resolves even before jacoco's prepare-agent sets it. -->
@@ -66,14 +66,14 @@
         <dependencies>
             <!-- Internal modules -->
             <dependency>
-                <groupId>com.openexchange.assets</groupId>
-                <artifactId>assets-common</artifactId>
+                <groupId>com.openexchange.core</groupId>
+                <artifactId>core-common</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
             <!-- Cross-repo: match engine's shared kernel (settlement-journal SBE codecs, schema id=3),
                  the same way order-management depends on com.match:match-common for its own cluster
-                 wire codecs. assets-bridge is the only assets module that pulls this in. -->
+                 wire codecs. core-bridge is the only core module that pulls this in. -->
             <dependency>
                 <groupId>com.match</groupId>
                 <artifactId>match-common</artifactId>
@@ -142,7 +142,7 @@
                 <version>${slf4j.version}</version>
             </dependency>
 
-            <!-- Benchmark histograms (assets-loadgen) -->
+            <!-- Benchmark histograms (core-loadgen) -->
             <dependency>
                 <groupId>org.hdrhistogram</groupId>
                 <artifactId>HdrHistogram</artifactId>

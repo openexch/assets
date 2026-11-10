@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: Apache-2.0
+package com.openexchange.core.bridge;
+
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
+import org.agrona.CloseHelper;
+import org.agrona.concurrent.ShutdownSignalBarrier;
+
+import java.io.IOException;
+
+/**
+ * Settlement bridge entry point: ME settlement journal -> core ingress.
+ *
+ * Runs a lightweight embedded media driver (own /dev/shm dir, SHARED threading — the bridge
+ * is backoff-idle by nature, it must never busy-spin on the shared box) and the single
+ * {@link BridgeAgent} thread. Stateless: safe to kill and restart at any time; a duplicate
+ * instance is safe too (the core dedupes), just wasteful.
+ */
+public final class BridgeMain {
+
+    public static void main(final String[] args) {
+        // First, for every subcommand: a deployment written for the retired names refuses before any setting is read.
+        com.openexchange.core.config.RetiredSettings.refuseRetired("core-bridge.jar");
+        // Read-only ledger snapshot for the money-check guardrail: `java -jar core-bridge.jar dump`.
+        // Kept in this one entry point so the shade jar stays single-main; CoreDump owns its own
+        // media driver and exits when done (0 = JSON printed, 3 = snapshot timeout).
+        if (args.length > 0 && "dump".equals(args[0])) {
+            System.exit(CoreDump.run(java.util.Arrays.copyOfRange(args, 1, args.length)));
+            return;
+        }
+        // Arm/disarm the money journal: `java -jar core-bridge.jar set-money-journal on|off`. The
+        // one WRITE tool here, and the only way to change that setting — it is replicated state, so it
+        // travels through the log rather than through a node's environment.
+        if (args.length > 0 && "set-money-journal".equals(args[0])) {
+            System.exit(CoreSetMoneyJournal.run(java.util.Arrays.copyOfRange(args, 1, args.length)));
+            return;
+        }
+
+        final BridgeConfig config = BridgeConfig.fromEnv();
+        final BridgeState state = new BridgeState();
+
+        final MediaDriver driver = MediaDriver.launch(new MediaDriver.Context()
+                .aeronDirectoryName("/dev/shm/aeron-bridge-" + ProcessHandle.current().pid())
+                .threadingMode(ThreadingMode.SHARED)
+                .dirDeleteOnStart(true)
+                .dirDeleteOnShutdown(true));
+
+        final BridgeAgent agent = new BridgeAgent(config, driver.aeronDirectoryName(), state);
+        final Thread thread = new Thread(agent, "settlement-bridge");
+        thread.setDaemon(false);
+        thread.start();
+
+        final BridgeMetricsServer metricsServer = new BridgeMetricsServer(state);
+        try {
+            metricsServer.start(config.metricsPort);
+        } catch (IOException e) {
+            throw new RuntimeException("failed to start bridge metrics server on port " + config.metricsPort, e);
+        }
+
+        final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            agent.stop();
+            try {
+                thread.join(5_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            metricsServer.stop();
+            CloseHelper.quietClose(driver);
+        }, "bridge-shutdown"));
+        barrier.await();
+    }
+
+    private BridgeMain() {
+    }
+}
