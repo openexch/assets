@@ -157,8 +157,19 @@ final class ReplicaRig implements AutoCloseable {
         }
     }
 
+    /** A member's image key: the member and the SNAPSHOT action position it serialized at. */
+    record MemberPosition(int memberId, long logPosition) {
+    }
+
     final ShadowClusterRig rig;
+    /** The LAST image per member (the single-snapshot tests read it). */
     final Map<Integer, byte[]> imageAtSnapshot = new ConcurrentHashMap<>();
+    /** Every member image by (member, action position), captured on the service thread in {@code onTakeSnapshot}. */
+    final Map<MemberPosition, byte[]> imageAt = new ConcurrentHashMap<>();
+    /** Test seam (a control): keep only the newest image per member, the shape before the per-position map. */
+    volatile boolean keepOnlyLastImagePerMember;
+    /** Every {@code host.hold} reason (the oracle mismatch hold; the process stays up). */
+    final List<String> holds = new CopyOnWriteArrayList<>();
     final Map<Integer, Long> snapshotsTaken = new ConcurrentHashMap<>();
     final List<String> fatals = new CopyOnWriteArrayList<>();
     final List<String> aeronErrors = new CopyOnWriteArrayList<>();
@@ -197,9 +208,24 @@ final class ReplicaRig implements AutoCloseable {
     /** The member's image at each {@code onTakeSnapshot}, captured on its service thread (state at P_cm). */
     void hook(final Member m) {
         ServiceProbe.afterTakeSnapshot(m.service, () -> {
-            imageAtSnapshot.put(m.id, ServiceProbe.image(m.service));
+            final byte[] image = ServiceProbe.image(m.service);
+            final long position = ServiceProbe.logPosition(m.service);
+            imageAtSnapshot.put(m.id, image);
+            if (keepOnlyLastImagePerMember) {
+                imageAt.keySet().removeIf(k -> k.memberId() == m.id);
+            }
+            imageAt.put(new MemberPosition(m.id, position), image);
             snapshotsTaken.merge(m.id, 1L, Long::sum);
         });
+    }
+
+    /** Member {@code memberId}'s image at {@code p}, or {@code no member image captured at <P> for member <id>}. */
+    byte[] memberImage(final int memberId, final long p) {
+        final byte[] image = imageAt.get(new MemberPosition(memberId, p));
+        if (image == null) {
+            throw new AssertionError("no member image captured at " + p + " for member " + memberId);
+        }
+        return image;
     }
 
     /**
@@ -232,8 +258,16 @@ final class ReplicaRig implements AutoCloseable {
         orders(users, 2 * users);
     }
 
-    /** {@code n} GATEWAY GTD limit orders over users {@code 1..users}, every one answered. */
+    /** {@code n} GATEWAY GTD limit orders over users {@code 1..users} expiring in a day, every one answered. */
     void orders(final int users, final int n) {
+        orders(users, n, expiresAt);
+    }
+
+    /**
+     * {@code n} GATEWAY GTD limit orders over users {@code 1..users} expiring at {@code expiresAtMs} (a near expiry
+     * makes the deadline sweep fire: TimerEvent frames in the log), every one answered.
+     */
+    void orders(final int users, final int n, final long expiresAtMs) {
         final List<Session> all = rig.sessions();
         final int target = gw.in.acks + gw.in.rejects + n;
         for (int i = 0; i < n; i++) {
@@ -242,7 +276,7 @@ final class ReplicaRig implements AutoCloseable {
             final int market = CoreRestoreRig.marketOf(user);
             CoreRestoreRig.offer(gw.session, enc.buf, enc.limit(nextOrder, user, nextOrder, market, buy,
                     CoreRestoreRig.priceOf(market, buy, (int)(nextOrder % 7)), ShadowClusterRig.ONE / 10,
-                    TimeInForce.GTD, expiresAt), all);
+                    TimeInForce.GTD, expiresAtMs), all);
             nextOrder++;
         }
         rig.await(() -> gw.in.acks + gw.in.rejects >= target, 120_000, "every GTD create must be answered");
@@ -255,6 +289,67 @@ final class ReplicaRig implements AutoCloseable {
     void reconnectTool() throws InterruptedException {
         rig.forget(tool);
         tool = rig.connect(SessionClass.TOOL, clientHost);
+    }
+
+    /**
+     * A RegisterSession from {@code c} asserting {@code asserted}: returns the AdminAck line
+     * ({@code ADMINACK ref=80 result=<r> reason=<reason>}) the registry decided on apply (so it is in the log).
+     */
+    String register(final Client c, final SessionClass asserted, final boolean resumable) {
+        final long before = c.in.count(f -> f.startsWith("ADMINACK ref=80"));
+        final UnsafeBuffer buf = new UnsafeBuffer(new byte[128]);
+        final int len = TestAuth.encodeRegisterSession(buf, 0x8E7L, asserted, resumable, true, false, false, false, false,
+                false, false);
+        c.offer(buf, len);
+        rig.await(() -> c.in.count(f -> f.startsWith("ADMINACK ref=80")) > before, 30_000,
+                () -> "no AdminAck for a " + asserted + " RegisterSession: " + c.in.frames);
+        final List<String> acks = c.in.frames.stream().filter(f -> f.startsWith("ADMINACK ref=80")).toList();
+        return acks.get(acks.size() - 1);
+    }
+
+    /**
+     * The two registrations the registry refuses: a GATEWAY session asserting BRIDGE ({@code UNAUTHORIZED_CLASS})
+     * and a BRIDGE session registering non-resumable ({@code NOT_RESUMABLE}); both sessions stay open.
+     */
+    void rejectedRegistrations() throws InterruptedException {
+        final Client wrongClass = rig.connect(SessionClass.GATEWAY, clientHost);
+        final String a = register(wrongClass, SessionClass.BRIDGE, true);
+        if (!a.contains("result=REJECTED reason=UNAUTHORIZED_CLASS")) {
+            throw new AssertionError("a GATEWAY session asserting BRIDGE was not refused UNAUTHORIZED_CLASS: " + a);
+        }
+        final Client notResumable = rig.connect(SessionClass.BRIDGE, clientHost);
+        final String b = register(notResumable, SessionClass.BRIDGE, false);
+        if (!b.contains("result=REJECTED reason=NOT_RESUMABLE")) {
+            throw new AssertionError("a non-resumable BRIDGE registration was not refused NOT_RESUMABLE: " + b);
+        }
+        System.out.println("[rig] rejected registrations: " + a + "; " + b);
+    }
+
+    /** A CoreConfig switch to {@code version} (config and behaviour) through the ADMIN session, ACCEPTED. */
+    void configSwitch(final long version) {
+        final UnsafeBuffer buf = new UnsafeBuffer(new byte[4096]);
+        final long before = admin.in.count(f -> f.startsWith("ADMINACK ref=70 result=ACCEPTED"));
+        admin.offer(buf, Encoders.coreConfig(buf, 0x7C0L + version, version, rig.adoptGenesis));
+        rig.await(() -> admin.in.count(f -> f.startsWith("ADMINACK ref=70 result=ACCEPTED")) > before, 30_000,
+                () -> "the CoreConfig switch to version " + version + " must be ACCEPTED: " + admin.in.frames);
+    }
+
+    /**
+     * Every client moved to sessions through {@code host} (the old ones closed): a member a test is about to kill
+     * must not carry the clients' media driver. GATEWAY and BRIDGE register again.
+     */
+    void moveClientsTo(final Member host) throws InterruptedException {
+        for (final Client c : List.of(admin, tool, gw, bridge)) {
+            rig.forget(c);
+        }
+        clientHost = host;
+        admin = rig.connect(SessionClass.ADMIN, host);
+        tool = rig.connect(SessionClass.TOOL, host);
+        gw = rig.connect(SessionClass.GATEWAY, host);
+        bridge = rig.connect(SessionClass.BRIDGE, host);
+        final List<Session> all = rig.sessions();
+        CoreRestoreRig.register(gw.session, SessionClass.GATEWAY, false, false, all);
+        CoreRestoreRig.register(bridge.session, SessionClass.BRIDGE, true, false, all);
     }
 
     /** Light traffic: deposits plus orders. */
@@ -311,6 +406,7 @@ final class ReplicaRig implements AutoCloseable {
             throw new IllegalStateException("a replica is running (one replica per core cluster)");
         }
         fatals.clear();
+        holds.clear();
         binding = engine;
         replica = ReplicaProcess.launch(cfg, engine, new ReplicaProcess.Host() {
             @Override
@@ -327,6 +423,12 @@ final class ReplicaRig implements AutoCloseable {
             @Override
             public void awaitExternalDriver(final String aeronDir, final long timeoutMs) {
                 throw new IllegalStateException("the in-JVM rig runs EMBEDDED");
+            }
+
+            @Override
+            public void hold(final String reason) {
+                holds.add(reason);
+                System.err.println("[REPLICA-TEST] host.hold: " + reason);
             }
         }, null);
         return replica;
@@ -713,6 +815,157 @@ final class ReplicaRig implements AutoCloseable {
                     + ", stopped at " + archive.getStopPosition(recordingId) + " on stream " + streamId);
             return recordingId;
         }
+    }
+
+    /** Member {@code m}'s valid service snapshot recording at {@code position}, or -1. */
+    long snapshotRecording(final Member m, final long position) {
+        for (final long[] e : rig.snapshots(m)) {
+            if (e[0] == position) {
+                return e[1];
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * A forged member snapshot, made in place in member {@code m}'s archive segment: one byte of the v4 payload (the
+     * low byte of the last applied trade id, payload offset 8: same length, decodes, the genesis field untouched)
+     * flipped and the envelope's CRC trailer re-sealed ({@code reseal} false: a TORN copy, the CRC no longer matches).
+     * The two rewritten ranges (the image's first bytes, its last bytes) are each found once, contiguous, in the
+     * recording's segment file (a data frame never splits them in this rig: its MTU is far above both ranges).
+     * Returns the forged image (what the backup will retrieve).
+     */
+    byte[] forgeMemberSnapshot(final Member m, final long position, final boolean reseal) {
+        final long recordingId = snapshotRecording(m, position);
+        if (recordingId < 0) {
+            throw new AssertionError("forge: member " + m.id + " has no service snapshot at " + position);
+        }
+        final byte[] image = memberImage(m.id, position);
+        final int target = com.openexchange.cluster.SnapshotEnvelope.payloadOffset() + 8;
+        final UnsafeBuffer forged = new UnsafeBuffer(Arrays.copyOf(image, image.length));
+        forged.putByte(target, (byte)(forged.getByte(target) ^ 0x01));
+        if (reseal) {
+            new com.openexchange.cluster.SnapshotEnvelope().seal(forged, image.length
+                    - com.openexchange.cluster.SnapshotEnvelope.envelopedLength(0));
+        }
+        final byte[] out = new byte[image.length];
+        forged.getBytes(0, out);
+        final int head = target + 8;
+        final int tail = 24;
+        final File[] segments = m.archiveDir().listFiles((d, n) -> n.startsWith(recordingId + "-") && n.endsWith(".rec"));
+        if (segments == null || segments.length == 0) {
+            throw new AssertionError("forge: no segment file of recording " + recordingId + " in " + m.archiveDir());
+        }
+        java.util.Arrays.sort(segments);
+        final long[] headAt = {-1, -1};
+        final long[] tailAt = {-1, -1};
+        final byte[] headNeedle = Arrays.copyOf(image, head);
+        final byte[] tailNeedle = Arrays.copyOfRange(image, image.length - tail, image.length);
+        for (int si = 0; si < segments.length; si++) {
+            final byte[] all;
+            try {
+                all = java.nio.file.Files.readAllBytes(segments[si].toPath());
+            } catch (final IOException e) {
+                throw new UncheckedIOException(e);
+            }
+            final int h = indexOf(all, headNeedle);
+            if (h >= 0 && headAt[0] < 0) {
+                headAt[0] = si;
+                headAt[1] = h;
+            }
+            final int t = indexOf(all, tailNeedle);
+            if (t >= 0) {
+                tailAt[0] = si;
+                tailAt[1] = t;
+            }
+        }
+        if (headAt[0] < 0 || tailAt[0] < 0) {
+            throw new AssertionError("forge: member " + m.id + " recording " + recordingId + " at " + position
+                    + ": head found " + (headAt[0] >= 0) + ", tail found " + (tailAt[0] >= 0) + " (a frame split them)");
+        }
+        write(segments[(int)headAt[0]], headAt[1], out, 0, head);
+        if (reseal) {
+            write(segments[(int)tailAt[0]], tailAt[1], out, image.length - tail, tail);
+        }
+        System.out.println("[rig] forged member " + m.id + " snapshot rec=" + recordingId + " at " + position + ": byte "
+                + target + " flipped, " + (reseal ? "CRC trailer re-sealed" : "CRC NOT re-sealed (a torn copy)")
+                + " (head at " + segments[(int)headAt[0]].getName() + ":" + headAt[1] + ", tail at "
+                + segments[(int)tailAt[0]].getName() + ":" + tailAt[1] + ")");
+        return out;
+    }
+
+    private static void write(final File file, final long at, final byte[] bytes, final int from, final int length) {
+        try (RandomAccessFile f = new RandomAccessFile(file, "rw")) {
+            f.seek(at);
+            f.write(bytes, from, length);
+            f.getFD().sync();
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static int indexOf(final byte[] hay, final byte[] needle) {
+        outer:
+        for (int i = 0; i + needle.length <= hay.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (hay[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /**
+     * The member service snapshot copy the backup of replica {@code name} retrieved at {@code position}: every message
+     * after Aeron's END marker (Aeron writes END before the service's own payload) of the recording its RecordingLog
+     * names (service id 0), concatenated as the kit reads them; null when no such entry or recording exists.
+     */
+    byte[] retrievedCopy(final String name, final long position) {
+        long rec = -1;
+        final File clusterDir = new File(replicaBase(name), "cluster");
+        try (io.aeron.cluster.RecordingLog log = new io.aeron.cluster.RecordingLog(clusterDir, false)) {
+            for (final io.aeron.cluster.RecordingLog.Entry e : log.entries()) {
+                if (e.type == io.aeron.cluster.RecordingLog.ENTRY_TYPE_SNAPSHOT && e.isValid && e.serviceId == 0
+                        && e.logPosition == position) {
+                    rec = e.recordingId;
+                }
+            }
+        }
+        if (rec < 0 || !inReplicaArchive(rec)) {
+            return null;
+        }
+        final long[] d = {-1, -1};
+        replicaArchive().listRecording(rec, (a, b, c, ts0, ts1, start, stop, h, i, j, k, l, sid, n, o, q) -> {
+            d[0] = start;
+            d[1] = stop;
+        });
+        final java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        final boolean[] ended = {false};
+        final io.aeron.cluster.codecs.MessageHeaderDecoder hd = new io.aeron.cluster.codecs.MessageHeaderDecoder();
+        final io.aeron.cluster.codecs.SnapshotMarkerDecoder md = new io.aeron.cluster.codecs.SnapshotMarkerDecoder();
+        new com.openexchange.cluster.shadow.ShadowReplay(replica.aeron(), replicaArchive(), SystemNanoClock.INSTANCE)
+                .readAll(rec, d[0], d[1], (buffer, offset, length, header) -> {
+                    if (!ended[0]) {
+                        if (length >= io.aeron.cluster.codecs.MessageHeaderDecoder.ENCODED_LENGTH) {
+                            hd.wrap(buffer, offset);
+                            if (hd.schemaId() == io.aeron.cluster.codecs.MessageHeaderDecoder.SCHEMA_ID
+                                    && hd.templateId() == io.aeron.cluster.codecs.SnapshotMarkerDecoder.TEMPLATE_ID) {
+                                md.wrap(buffer, offset + io.aeron.cluster.codecs.MessageHeaderDecoder.ENCODED_LENGTH,
+                                        hd.blockLength(), hd.version());
+                                ended[0] = md.mark() == io.aeron.cluster.codecs.SnapshotMark.END;
+                            }
+                        }
+                        return;
+                    }
+                    {
+                        final byte[] b = new byte[length];
+                        buffer.getBytes(offset, b);
+                        out.writeBytes(b);
+                    }
+                }, System.nanoTime() + TimeUnit.SECONDS.toNanos(30));
+        return out.toByteArray();
     }
 
     @Override

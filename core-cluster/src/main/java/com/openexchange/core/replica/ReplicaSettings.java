@@ -9,6 +9,7 @@ import com.openexchange.cluster.ClusterPorts;
 import com.openexchange.cluster.EngineLifecycle;
 import com.openexchange.cluster.auth.ClusterCredentials;
 import com.openexchange.cluster.auth.ClusterSessionClass;
+import com.openexchange.cluster.replica.MismatchDump;
 import com.openexchange.cluster.replica.ReplicaConfig;
 import com.openexchange.cluster.replica.ReplicaContexts;
 import io.aeron.CommonContext;
@@ -39,7 +40,10 @@ import java.util.Objects;
  * <p>Boot guards beyond the ranges: {@code REPLICA_BACKUP_SOURCE=FOLLOWER} with one member (the backup
  * agent would spin on a one-element publication group); {@code CLUSTER_REPLICA_ADDRESS} defaults to {@code localhost}
  * only when every member is local; the credential must claim class REPLICA; a replica port on a member's
- * host must not be one of that member's ports, and no replica port may exceed 65535.</p>
+ * host must not be one of that member's ports, and no replica port may exceed 65535; when
+ * {@code REPLICA_MEMBER_CADENCE_MS} is set, {@code REPLICA_READY_SHADOW_AGE_MS} must cover it plus
+ * {@code REPLICA_VERIFY_WAIT_MS} (a dropped ALIGNED suspends STANDBY until the next equal compare); the mismatch dump
+ * dir ({@code REPLICA_MISMATCH_DIR}) must be writable at boot.</p>
  */
 public final class ReplicaSettings {
 
@@ -104,6 +108,16 @@ public final class ReplicaSettings {
         REPLICA_BOOTSTRAP_WAIT_MS("replica.bootstrap.wait.ms"),
         /** The bound of an ALIGNED compare's wait for the retrieved member snapshot. */
         REPLICA_VERIFY_WAIT_MS("replica.verify.wait.ms"),
+        /** How long an oracle mismatch holds before exit 1; 0 holds until the operator stops the process. */
+        REPLICA_MISMATCH_HOLD_MS("replica.mismatch.hold.ms"),
+        /** Where an oracle mismatch dumps both images and its report (default {@code BASE_DIR/mismatch}). */
+        REPLICA_MISMATCH_DIR("replica.mismatch.dir"),
+        /** The cap per dumped image file in MiB; 0 writes the report only. */
+        REPLICA_MISMATCH_DUMP_MAX_MB("replica.mismatch.dump.max.mb"),
+        /** How long a history fence waits for the purge of its suspect shadows before exit 1. */
+        REPLICA_FENCE_PURGE_WAIT_MS("replica.fence.purge.wait.ms"),
+        /** The members' snapshot cadence, for the readiness shadow age cross-check; 0 = not checked. */
+        REPLICA_MEMBER_CADENCE_MS("replica.member.cadence.ms"),
         /** The cluster log stream the backup records L on (Aeron's 100, the members'). */
         REPLICA_LOG_STREAM_ID("replica.log.stream.id"),
         /** The members' snapshot streams, comma separated (Aeron's 106,107). */
@@ -159,6 +173,7 @@ public final class ReplicaSettings {
     private String replicaAddress;
     private String aeronDir;
     private File baseDir;
+    private File mismatchDir;
     private String catchupRcvbuf;
     private String catchupSndbuf;
     private String catchupRcvWnd;
@@ -175,6 +190,7 @@ public final class ReplicaSettings {
     public static ReplicaSettings enforce() {
         try {
             final ReplicaSettings s = parse(ENVIRONMENT);
+            s.requireMismatchDirWritable();
             System.out.println("[REPLICA-BOOT-GUARD] ok " + s);
             return s;
         } catch (final Refused refused) {
@@ -192,6 +208,27 @@ public final class ReplicaSettings {
             throw new Refused(bad.getMessage(), bad);
         }
         return s;
+    }
+
+    /**
+     * The boot check of {@code REPLICA_MISMATCH_DIR}: created and a probe file written and removed, so a mismatch
+     * dump never meets a missing or read-only dir at the worst moment. Separate from {@link #parse} (which has no side
+     * effect on the file system); {@link #enforce} runs it before any Aeron component. The check is the kit's
+     * ({@link MismatchDump#requireWritable}); this adds the {@value #PREFIX} prefix.
+     *
+     * @throws Refused {@code REPLICA_MISMATCH_DIR is not writable: <path>}
+     */
+    public void requireMismatchDirWritable() {
+        try {
+            MismatchDump.requireWritable(config.mismatchDir());
+        } catch (final IllegalArgumentException notWritable) {
+            throw new Refused(notWritable.getMessage(), notWritable.getCause());
+        }
+    }
+
+    /** {@code REPLICA_MISMATCH_DIR} as the kit resolves it ({@code BASE_DIR/mismatch} when unset). */
+    public File mismatchDir() {
+        return config.mismatchDir();
     }
 
     // ------------------------------------------------------------------------------------------------ the table
@@ -296,6 +333,22 @@ public final class ReplicaSettings {
         if (cycle != null) {
             throw new IllegalArgumentException(cycle);
         }
+        // the live oracle's settings: the kit's refusal texts, one source for both layers
+        checked(Key.REPLICA_MISMATCH_HOLD_MS, ReplicaConfig.DEFAULT_MISMATCH_HOLD_MS,
+                ReplicaConfig::mismatchHoldRefusal);
+        final String md = raw(Key.REPLICA_MISMATCH_DIR);
+        mismatchDir = md != null ? new File(md) : null;
+        checked(Key.REPLICA_MISMATCH_DUMP_MAX_MB, ReplicaConfig.DEFAULT_MISMATCH_DUMP_MAX_MB,
+                ReplicaConfig::mismatchDumpMaxMbRefusal);
+        checked(Key.REPLICA_FENCE_PURGE_WAIT_MS, ReplicaConfig.DEFAULT_FENCE_PURGE_WAIT_MS,
+                ReplicaConfig::fencePurgeWaitRefusal);
+        final long cadence = checked(Key.REPLICA_MEMBER_CADENCE_MS, ReplicaConfig.DEFAULT_MEMBER_CADENCE_MS,
+                ReplicaConfig::memberCadenceRefusal);
+        final String age = ReplicaConfig.readyShadowAgeBelowCadence(numbers.get(Key.REPLICA_READY_SHADOW_AGE_MS),
+                cadence, verifyWait);
+        if (age != null) {
+            throw new IllegalArgumentException(age);
+        }
         final long logStream = integer(Key.REPLICA_LOG_STREAM_ID, ReplicaConfig.DEFAULT_LOG_STREAM_ID, 1,
                 Integer.MAX_VALUE);
         snapshotStreamIds = streamIds(Key.REPLICA_SNAPSHOT_STREAM_IDS, ReplicaConfig.DEFAULT_SNAPSHOT_STREAM_IDS,
@@ -364,6 +417,28 @@ public final class ReplicaSettings {
         }
         if (value < min || value > max) {
             throw new IllegalArgumentException(key.name() + "=" + value + " out of range [" + min + "," + max + "]");
+        }
+        numbers.put(key, value);
+        return value;
+    }
+
+    /** An integer whose range and refusal text are the kit's ({@code refusal} returns null when valid). */
+    private long checked(final Key key, final long defaultValue,
+                         final java.util.function.LongFunction<String> refusal) {
+        final String v = raw(key);
+        final long value;
+        if (v == null) {
+            value = defaultValue;
+        } else {
+            try {
+                value = Long.parseLong(v);
+            } catch (final NumberFormatException notANumber) {
+                throw new IllegalArgumentException(key.name() + "='" + v + "' is not an integer");
+            }
+        }
+        final String refused = refusal.apply(value);
+        if (refused != null) {
+            throw new IllegalArgumentException(refused);
         }
         numbers.put(key, value);
         return value;
@@ -597,6 +672,11 @@ public final class ReplicaSettings {
                 .attachBackoffMs(numeric(Key.REPLICA_ATTACH_BACKOFF_MS))
                 .bootstrapWaitMs(numeric(Key.REPLICA_BOOTSTRAP_WAIT_MS))
                 .verifyWaitMs(numeric(Key.REPLICA_VERIFY_WAIT_MS))
+                .mismatchHoldMs(numeric(Key.REPLICA_MISMATCH_HOLD_MS))
+                .mismatchDir(mismatchDir)
+                .mismatchDumpMaxMb(intOf(Key.REPLICA_MISMATCH_DUMP_MAX_MB))
+                .fencePurgeWaitMs(numeric(Key.REPLICA_FENCE_PURGE_WAIT_MS))
+                .memberCadenceMs(numeric(Key.REPLICA_MEMBER_CADENCE_MS))
                 .logStreamId(intOf(Key.REPLICA_LOG_STREAM_ID))
                 .snapshotStreamIds(snapshotStreamIds)
                 .shadowTermLength(shadowTermLength)

@@ -35,6 +35,11 @@ public final class ServiceProbe {
         }
     }
 
+    /** The service's {@code cluster.logPosition()}: in {@code onTakeSnapshot} the position of the SNAPSHOT action. */
+    public static long logPosition(final CoreClusteredService service) {
+        return ((io.aeron.cluster.service.Cluster)field(service, "cluster")).logPosition();
+    }
+
     /** {@code /ready} as the node endpoint computes it. */
     public static boolean ready(final CoreClusteredService service) {
         return ((NodeReadiness)field(service, "readiness")).ready();

@@ -36,7 +36,7 @@
         <!-- cluster-kit, Aeron and Agrona are pinned identical to the match engine so the two
              Aeron clusters share a substrate and one aeronmd can drive both. SBE is pinned
              independently of match. -->
-        <cluster-kit.version>0.1.16-runtime.20261110.core.g949d861</cluster-kit.version>
+        <cluster-kit.version>0.1.17-runtime.20261110.oracle.gfa30789</cluster-kit.version>
         <aeron.version>1.53.1</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <sbe.version>1.40.1</sbe.version>
@@ -60,6 +60,8 @@
         <project.build.outputTimestamp>2026-11-01T00:00:00Z</project.build.outputTimestamp>
         <!-- Default so surefire's ${argLine} resolves even before jacoco's prepare-agent sets it. -->
         <argLine></argLine>
+        <!-- The test JVM heap; the dev-box-only 1M equivalence variant raises it (make nightly-million). -->
+        <surefire.heap>2g</surefire.heap>
     </properties>
 
     <dependencyManagement>
@@ -196,7 +198,7 @@
                         <reuseForks>false</reuseForks>
                         <argLine>
                             ${argLine}
-                            -Xmx2g
+                            -Xmx${surefire.heap}
                             --add-opens java.base/jdk.internal.misc=ALL-UNNAMED
                             --add-opens java.base/java.nio=ALL-UNNAMED
                             --add-opens java.base/sun.nio.ch=ALL-UNNAMED

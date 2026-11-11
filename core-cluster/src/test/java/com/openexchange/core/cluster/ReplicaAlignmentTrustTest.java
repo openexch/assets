@@ -25,8 +25,9 @@ import static org.junit.Assert.assertTrue;
  *       members' DEFAULT cadence (5 min, {@code SnapshotCadence.DEFAULT_INTERVAL_MINUTES}) and the replica's default
  *       query interval (60 s), so the not-ready window after a restart is measured, not assumed.</li>
  *   <li>Re-genesis: every re-genesis row is in one matrix, {@code ReplicaReGenesisMatrixTest}.</li>
- *   <li>A mutated replica state (test seam: one session message dropped on the replica only) fences at the next
- *       ALIGNED compare.</li>
+ *   <li>A mutated replica state (test seam: one session message dropped on the replica only) latches an oracle
+ *       mismatch at the next ALIGNED compare: the replica holds ({@code fenced:oracle mismatch at <P>: ...}), it does
+ *       not exit, and writes no shadow at P.</li>
  * </ul>
  * <p>Control {@code ALIGN_COMPARE_OFF} (the rule before the alignment trust): every row fails with its named text.</p>
  */
@@ -261,7 +262,7 @@ public class ReplicaAlignmentTrustTest {
             awaitDropped(r, dropping);
             final long p2 = r.rig.snapshotAll();
             assertDivergenceFenced(r, p2);
-            System.out.println("[alignment] mutated: " + r.fatals.get(0));
+            System.out.println("[alignment] mutated: " + r.holds.get(0));
             r.stopReplica();
 
             r.windowGap();
@@ -296,14 +297,15 @@ public class ReplicaAlignmentTrustTest {
     }
 
     private static void assertDivergenceFenced(final ReplicaRig r, final long p) {
-        final String text = "FATAL replica: state at " + p + " differs from member snapshot (history mismatch or"
-                + " divergence); wipe BASE_DIR";
+        final String text = "oracle mismatch at " + p + ": ";
         try {
-            r.rig.await(() -> r.fatals.stream().anyMatch(f -> f.contains(text)), 120_000, "divergence");
+            r.rig.await(() -> r.holds.stream().anyMatch(f -> f.startsWith(text)), 120_000, "divergence");
         } catch (final AssertionError timeout) {
-            throw new AssertionError("divergence not fenced at the next ALIGNED (" + p + "): fatals " + r.fatals
-                    + " verified " + r.verified(ShadowKind.ALIGNED));
+            throw new AssertionError("divergence not fenced at the next ALIGNED (" + p + "): holds " + r.holds
+                    + " fatals " + r.fatals + " verified " + r.verified(ShadowKind.ALIGNED));
         }
+        assertTrue("a byte mismatch holds, it does not exit: " + r.fatals, r.fatals.isEmpty());
+        assertEquals("mismatch counted", 1, r.metric("shadow_oracle_mismatch_total"));
         final LogicalShadow s = r.scan() == null ? null : r.scan().atPosition(p);
         assertTrue("no shadow at the diverged position " + p, s == null);
     }

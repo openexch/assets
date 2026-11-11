@@ -6,8 +6,6 @@ import com.openexchange.core.cluster.CoreRestoreRig.Session;
 import com.openexchange.core.cluster.CoreRestoreRig.Tee;
 import com.openexchange.core.domain.Asset;
 import com.openexchange.core.domain.FixedPoint;
-import com.openexchange.core.domain.Market;
-import com.openexchange.core.infrastructure.generated.CoreConfigEncoder;
 import com.openexchange.core.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.core.infrastructure.generated.SessionClass;
 import com.openexchange.core.infrastructure.persistence.CoreClusteredService;
@@ -494,19 +492,7 @@ final class ShadowClusterRig implements AutoCloseable {
 
     /** The ADOPT of another genesis nonce, for a re-genesised rig. */
     static int encodeAdopt(final UnsafeBuffer buf, final long genesis) {
-        final MessageHeaderEncoder header = new MessageHeaderEncoder();
-        final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(buf, 0, header).correlationId(0x71L)
-                .configVersion(1).behaviorVersion(1).genesisId(genesis);
-        final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(Market.ALL.length);
-        for (final Market d : Market.ALL) {
-            m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id())
-                    .quoteAssetId(d.quoteAsset().id()).tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L).lotSize(0);
-        }
-        final CoreConfigEncoder.AssetsEncoder a = e.assetsCount(Asset.values().length);
-        for (final Asset d : Asset.values()) {
-            a.next().assetId(d.id()).code(d.name()).scale((short)8);
-        }
-        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
+        return CoreRestoreRig.Encoders.coreConfig(buf, 0x71L, 1, genesis);
     }
 
     /**

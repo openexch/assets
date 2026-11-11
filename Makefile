@@ -1,6 +1,6 @@
 # Core: build + determinism targets
 
-.PHONY: build build-java test determinism update-goldens integration nightly clean
+.PHONY: build build-java test determinism update-goldens integration nightly nightly-million clean
 
 build build-java:
 	mvn clean package -DskipTests
@@ -26,7 +26,15 @@ integration:
 # Nightly: the heavy harness behind flags (harness B9). The 100k cluster restore is the evidence
 # (restore + replay -> ready <= 30 s, corrupt CRC refused); the 1M sizing and the 30k-line strided splice are reports.
 nightly:
-	mvn -pl core-cluster -am test -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
+	mvn -pl core-cluster -am test -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
+	mvn -pl core-cluster -am test -Dtest='ShadowEquivalenceClusterTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.equivalence.100k=true
+
+# The shadow equivalence story with 1M open orders: a large box only (three members, the replica and their images
+# in one JVM do not fit a CI runner). MILLION_HEAP sets the test JVM heap. Run it alone: on a shared box wrap it in
+# the box's heavy-job lock and a CPU set.
+MILLION_HEAP ?= 16g
+nightly-million:
+	mvn -pl core-cluster -am test -Dtest='ShadowEquivalenceClusterTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.equivalence.million=true -Dsurefire.heap=$(MILLION_HEAP)
 
 clean:
 	mvn clean

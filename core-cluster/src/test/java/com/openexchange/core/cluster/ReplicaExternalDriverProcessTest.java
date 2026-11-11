@@ -58,10 +58,19 @@ import static org.junit.Assert.assertTrue;
  *       exit 1 within the client driver timeout (10 s) plus the fatal grace, stderr
  *       {@code media driver lost in EXTERNAL driver mode}.</li>
  * </ol>
+ *
+ * <p>The oracle mismatch hold on the external driver ({@link #aHeldReplicaStopsOnSigtermAndHaltsOnDriverLoss}, its own
+ * rig): every follower's service snapshot forged in place (one payload byte, the envelope re-sealed), the child holds
+ * ({@code /ready} 503 {@code recovery=fenced:oracle mismatch at <P>: ...}, {@code shadow_oracle_mismatch_total 1},
+ * alive); SIGTERM exits 143; a restart on the same dirs re-latches at the same P; kill -9 of the driver while held
+ * exits 1 within the client driver timeout plus the fatal grace, stderr naming the driver loss.</p>
  */
 public class ReplicaExternalDriverProcessTest {
 
     private static final int PORT_BASE = 33000; // members 33000/33100/33200, the replica at slot 3 (33300)
+    private static final int PORT_BASE_HOLD = 47400;
+    /** The smallest verify wait the rig's backup cycle allows (2 x 12 000 + the 12 000 cool-down). */
+    private static final long VERIFY_WAIT_MS = 36_000;
     private static final String CREDENTIAL = "8:REPLICA:" + "88".repeat(32);
     private static final long CLIENT_DRIVER_TIMEOUT_MS = 10_000; // Aeron's client default, Aeron.Context
     private static final long FATAL_GRACE_MS = 5_000; // EngineLifecycle.DEFAULT_FATAL_EXIT_GRACE_MS
@@ -196,17 +205,136 @@ public class ReplicaExternalDriverProcessTest {
         }
     }
 
+    @Test(timeout = 1_500_000)
+    public void aHeldReplicaStopsOnSigtermAndHaltsOnDriverLoss() throws Exception {
+        try (ReplicaRig r = new ReplicaRig(PORT_BASE_HOLD, "replica-external-driver-hold")) {
+            final Path base = r.rig.tmp.toPath();
+            final List<ReplicaChild> children = new ArrayList<>();
+            Driver driver = null;
+            try {
+                r.bootAll();
+                final Member leader = r.rig.awaitLeader(null);
+                final Member host = r.rig.followerOtherThan(leader, null);
+                r.story(host, 4);
+                driver = startDriver(base);
+                final Path state = base.resolve("replica-state");
+                final Runnable pump = () -> r.rig.pumpMs(100);
+                final int nodePort = ReplicaRig.freeTcp();
+                final Map<String, String> env = replicaEnv(driver, state, nodePort, "external", PORT_BASE_HOLD);
+                env.put("REPLICA_VERIFY_WAIT_MS", Long.toString(VERIFY_WAIT_MS));
+
+                // 1. forge -> hold -> SIGTERM -> 143
+                final ReplicaChild first = ReplicaChild.start(base, "hold-1", env, List.of("replica"));
+                children.add(first);
+                first.awaitLine("[REPLICA] bootstrap done: restore_path=GENESIS", 120_000, pump);
+                awaitReady(first, nodePort, 120_000, pump);
+                final long p0 = r.rig.snapshotAll();
+                try (Clients c = new Clients(driver)) {
+                    c.awaitShadow(p0, ShadowKind.ALIGNED, 90_000, first, nodePort, pump);
+                }
+                long p = -1;
+                for (int attempt = 1; attempt <= 3 && p < 0; attempt++) {
+                    r.windowGap();
+                    final long at = r.rig.snapshotAll();
+                    for (final Member m : r.rig.live()) {
+                        if (m.id != leader.id) {
+                            r.forgeMemberSnapshot(m, at, true);
+                        }
+                    }
+                    final long deadline = System.currentTimeMillis() + 120_000;
+                    while (System.currentTimeMillis() < deadline) {
+                        final String text = first.out() + first.err();
+                        if (text.contains("oracle mismatch at " + at + ": ")) {
+                            p = at;
+                            break;
+                        }
+                        if (metrics(nodePort).contains("shadow_align_verified_position " + at + "\n")) {
+                            System.out.println("[external-driver] forge attempt " + attempt + " at " + at
+                                    + " lost the race with the backup query");
+                            break;
+                        }
+                        assertTrue("the child exited at the forge" + first.tails(), first.process.isAlive());
+                        pump.run();
+                    }
+                }
+                assertTrue("the forgery never reached the child's backup before its query" + first.tails(), p > 0);
+                r.rig.pumpMs(5_000);
+                assertTrue("the process exited before the metrics were read" + first.tails(), first.process.isAlive());
+                final String[] ready = readyOf(nodePort);
+                assertEquals("/ready while held: " + ready[1], "503", ready[0]);
+                assertTrue("/ready names the mismatch: " + ready[1],
+                        ready[1].contains("recovery=fenced:oracle mismatch at " + p + ": "));
+                assertTrue("/metrics while held", metrics(nodePort).contains("shadow_oracle_mismatch_total 1\n"));
+                assertTrue("the hold is logged through the core logger" + first.tails(),
+                        (first.out() + first.err()).contains("CRITICAL replica HOLD: oracle mismatch at " + p));
+                first.process.destroy(); // SIGTERM
+                final int sigterm = first.awaitExit(30_000);
+                assertEquals("SIGTERM while held exits 143" + first.tails(), 143, sigterm);
+                System.out.println("GREEN external hold: held at " + p + " (" + ready[1].trim() + "), SIGTERM exit 143");
+
+                // 2. restart: re-latched at P; kill -9 of the driver while held -> exit 1, driver loss named
+                r.windowGap();
+                final ReplicaChild second = ReplicaChild.start(base, "hold-2", env, List.of("replica"));
+                children.add(second);
+                second.awaitLine("CRITICAL replica HOLD: oracle mismatch at " + p, 240_000, pump);
+                r.rig.pumpMs(2_000);
+                assertTrue("the restarted child exited instead of holding" + second.tails(), second.process.isAlive());
+                final long t0 = System.nanoTime();
+                driver.process.destroyForcibly(); // kill -9 of the media driver
+                final int killed = second.awaitExit(CLIENT_DRIVER_TIMEOUT_MS + FATAL_GRACE_MS + 30_000);
+                final long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+                assertEquals("a driver loss while held exits 1" + second.tails(), 1, killed);
+                assertTrue("within the client driver timeout plus the fatal grace: " + ms + " ms",
+                        ms < CLIENT_DRIVER_TIMEOUT_MS + FATAL_GRACE_MS + 3_000);
+                assertTrue("stderr names the driver loss" + second.tails(),
+                        second.err().contains("media driver lost in EXTERNAL driver mode"));
+                assertFalse("the exit is not blamed on the hold bound" + second.tails(),
+                        (second.out() + second.err()).contains("the oracle mismatch hold ended"));
+                System.out.println("GREEN external hold: re-latched at " + p + " after a restart; driver kill -9 while"
+                        + " held: exit 1 after " + ms + " ms; "
+                        + ReplicaChild.line(second.err(), "media driver lost in EXTERNAL driver mode"));
+            } finally {
+                for (final ReplicaChild c : children) {
+                    c.destroyForcibly();
+                }
+                if (driver != null) {
+                    driver.process.destroyForcibly();
+                    driver.process.waitFor(20, TimeUnit.SECONDS);
+                    deleteTree(driver.dir);
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------------------------------ helpers
+
+    /** {@code GET /ready}: {status, body}. */
+    private static String[] readyOf(final int port) throws IOException {
+        final HttpURLConnection c = (HttpURLConnection)URI.create("http://127.0.0.1:" + port + "/ready").toURL()
+                .openConnection();
+        c.setConnectTimeout(1_000);
+        c.setReadTimeout(2_000);
+        final int code = c.getResponseCode();
+        final java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        final String body = in == null ? "" : new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        c.disconnect();
+        return new String[] {Integer.toString(code), body};
+    }
 
     private static Map<String, String> replicaEnv(final Driver driver, final Path state, final int nodePort,
                                                   final String mode) {
+        return replicaEnv(driver, state, nodePort, mode, PORT_BASE);
+    }
+
+    private static Map<String, String> replicaEnv(final Driver driver, final Path state, final int nodePort,
+                                                  final String mode, final int portBase) {
         final Map<String, String> env = new HashMap<>();
         env.put("TRANSPORT_DRIVER_MODE", mode);
         env.put("AERON_DIR", driver.dir.toString());
         env.put("TRANSPORT_EXTERNAL_DRIVER_TIMEOUT_MS", "30000");
         env.put("TRANSPORT_IDLE_MODE", "backoff");
         env.put("CLUSTER_ADDRESSES", "localhost,localhost,localhost");
-        env.put("CLUSTER_PORT_BASE", Integer.toString(PORT_BASE));
+        env.put("CLUSTER_PORT_BASE", Integer.toString(portBase));
         env.put("CLUSTER_PORT_STRIDE", Integer.toString(ReplicaRig.STRIDE));
         env.put("CLUSTER_REPLICA_SLOT", Integer.toString(ReplicaRig.SLOT));
         env.put("CLUSTER_REPLICA_ADDRESS", "localhost");

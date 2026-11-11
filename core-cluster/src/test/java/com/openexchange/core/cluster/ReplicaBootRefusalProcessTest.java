@@ -117,4 +117,38 @@ public class ReplicaBootRefusalProcessTest {
         assertNothingLaunched(k);
         System.out.println("NC LOCAL_MEMBERS_NEED_NO_ADDRESS -> " + ReplicaChild.line(k.err(), NO_CREDENTIAL));
     }
+
+    /**
+     * An unwritable mismatch dump dir (a path under a regular file) is refused at boot with the guard prefix, exit 1,
+     * before any Aeron component. Control: the same settings with a writable dir pass that guard (and the child then
+     * starts, so it is stopped by the test).
+     */
+    @Test(timeout = 180_000)
+    public void anUnwritableMismatchDirExitsOneBeforeAnyAeronComponent() throws Exception {
+        final Path file = Files.createFile(dir().resolve("plain-file"));
+        final String bad = file.resolve("mismatch").toString();
+        final Map<String, String> env = replicaEnv("localhost,localhost,localhost", true);
+        env.put("CLUSTER_PORT_STRIDE", "100");
+        env.put("REPLICA_MISMATCH_DIR", bad);
+        final ReplicaChild c = ReplicaChild.start(dir(), "mismatch-dir", env, List.of("replica"));
+        final String text = "CORE REPLICA BOOT GUARD: REPLICA_MISMATCH_DIR is not writable: " + bad;
+        assertEquals("exit status" + c.tails(), 1, c.awaitExit(EXIT_MS));
+        assertTrue("stderr names the dir" + c.tails(), c.err().contains(text));
+        assertNothingLaunched(c);
+        System.out.println("GREEN mismatch dir: exit 1, " + ReplicaChild.line(c.err(), text));
+
+        // control: a writable dir passes the guard; the child goes on to launch (stopped here)
+        final Map<String, String> ok = new HashMap<>(env);
+        ok.put("REPLICA_MISMATCH_DIR", dir().resolve("writable-mismatch").toString());
+        ok.put("CORE_NODE_PORT", Integer.toString(ReplicaRig.freeTcp()));
+        final ReplicaChild k = ReplicaChild.start(dir(), "mismatch-dir-control", ok, List.of("replica"));
+        try {
+            k.awaitLine("[REPLICA] starting", EXIT_MS);
+            assertFalse("the dir text for a writable dir" + k.tails(), k.err().contains("REPLICA_MISMATCH_DIR is not"));
+            assertTrue("the writable dir was created at boot", Files.isDirectory(dir().resolve("writable-mismatch")));
+            System.out.println("NC WRITABLE_MISMATCH_DIR -> the child passed the guard and started");
+        } finally {
+            k.destroyForcibly();
+        }
+    }
 }

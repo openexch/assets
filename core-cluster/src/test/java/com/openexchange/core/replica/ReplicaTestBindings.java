@@ -123,6 +123,64 @@ public final class ReplicaTestBindings {
         }
     }
 
+    /** A delegate that drops every session open before the engine sees it (a replica-side divergence). */
+    public static final class SkipSessionOpenEngine implements ShadowEngine {
+        private final ShadowEngine delegate;
+
+        public SkipSessionOpenEngine(final ShadowEngine delegate) {
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+        }
+
+        @Override
+        public int engineId() {
+            return delegate.engineId();
+        }
+
+        @Override
+        public void genesis() {
+            delegate.genesis();
+        }
+
+        @Override
+        public void restore(final org.agrona.DirectBuffer image, final int length) {
+            delegate.restore(image, length);
+        }
+
+        @Override
+        public int serialize(final org.agrona.MutableDirectBuffer dst) {
+            return delegate.serialize(dst);
+        }
+
+        @Override
+        public void onSessionOpen(final long clusterSessionId, final long logPosition, final long timestamp,
+                                  final byte[] encodedPrincipal) {
+            // dropped
+        }
+
+        @Override
+        public void onSessionClose(final long clusterSessionId, final long logPosition, final long timestamp,
+                                   final io.aeron.cluster.codecs.CloseReason closeReason) {
+            delegate.onSessionClose(clusterSessionId, logPosition, timestamp, closeReason);
+        }
+
+        @Override
+        public boolean onSessionMessage(final long clusterSessionId, final long logPosition, final long timestamp,
+                                        final org.agrona.DirectBuffer buffer, final int offset, final int length) {
+            return delegate.onSessionMessage(clusterSessionId, logPosition, timestamp, buffer, offset, length);
+        }
+
+        @Override
+        public int onTimerEvent(final long correlationId, final long logPosition, final long timestamp) {
+            return delegate.onTimerEvent(correlationId, logPosition, timestamp);
+        }
+
+        @Override
+        public void onNewLeadershipTermEvent(final long leadershipTermId, final long logPosition,
+                                             final long timestamp, final java.util.concurrent.TimeUnit timeUnit) {
+            delegate.onNewLeadershipTermEvent(leadershipTermId, logPosition, timestamp, timeUnit);
+        }
+    }
+
     private static ReplicaEngine wrap(final ReplicaEngine binding, final ShadowSelfCheck check,
                                       final ShadowEngine engine) {
         Objects.requireNonNull(binding, "binding");
