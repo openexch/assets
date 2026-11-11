@@ -125,7 +125,17 @@ public final class ReplicaSettings {
         SHADOW_TERM_LENGTH("shadow.term.length"),
         SHADOW_WRITE_CONNECT_TIMEOUT_MS("shadow.write.connect.timeout.ms"),
         SHADOW_WRITE_OFFER_TIMEOUT_MS("shadow.write.offer.timeout.ms"),
-        SHADOW_WRITE_RECORD_TIMEOUT_MS("shadow.write.record.timeout.ms");
+        SHADOW_WRITE_RECORD_TIMEOUT_MS("shadow.write.record.timeout.ms"),
+        /** Replay-below-start refusals in a row before a re-bootstrap; 0 counts and never acts. */
+        SHADOW_REBOOTSTRAP_REPLAY_FAILURES("shadow.rebootstrap.replay.failures"),
+        /** Re-bootstraps allowed inside {@code SHADOW_REBOOTSTRAP_WINDOW_MS} (the loop guard). */
+        SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE("shadow.rebootstrap.max.consecutive"),
+        /** The loop guard's window. */
+        SHADOW_REBOOTSTRAP_WINDOW_MS("shadow.rebootstrap.window.ms"),
+        /** Moved-aside {@code cluster.rebootstrap-*} dirs kept. */
+        SHADOW_REBOOTSTRAP_KEEP("shadow.rebootstrap.keep"),
+        /** At most one {@code re-bootstrap not taken} line per interval. */
+        SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS("shadow.rebootstrap.not.taken.log.ms");
 
         private final String property;
 
@@ -359,6 +369,20 @@ public final class ReplicaSettings {
         integer(Key.SHADOW_WRITE_OFFER_TIMEOUT_MS, ReplicaConfig.DEFAULT_WRITE_OFFER_TIMEOUT_MS, 1000, 3_600_000L);
         integer(Key.SHADOW_WRITE_RECORD_TIMEOUT_MS, ReplicaConfig.DEFAULT_WRITE_RECORD_TIMEOUT_MS, 1000, 3_600_000L);
 
+        // re-bootstrap (members pruned past this replica's log): the kit's ranges and refusal texts
+        checked(Key.SHADOW_REBOOTSTRAP_REPLAY_FAILURES, ReplicaConfig.DEFAULT_REBOOTSTRAP_REPLAY_FAILURES,
+                ReplicaConfig::rebootstrapReplayFailuresRefusal);
+        checked(Key.SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE, ReplicaConfig.DEFAULT_REBOOTSTRAP_MAX_CONSECUTIVE,
+                ReplicaConfig::rebootstrapMaxConsecutiveRefusal);
+        checked(Key.SHADOW_REBOOTSTRAP_WINDOW_MS, ReplicaConfig.DEFAULT_REBOOTSTRAP_WINDOW_MS,
+                ReplicaConfig::rebootstrapWindowRefusal);
+        checked(Key.SHADOW_REBOOTSTRAP_KEEP, ReplicaConfig.DEFAULT_REBOOTSTRAP_KEEP,
+                ReplicaConfig::rebootstrapKeepRefusal);
+        checked(Key.SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS, ReplicaConfig.DEFAULT_REBOOTSTRAP_NOT_TAKEN_LOG_MS,
+                ReplicaConfig::rebootstrapNotTakenLogRefusal);
+
+        // the shared shadow keys and the SHADOW_PULL_* rows (the member table, the kit's one pull parser); the kit
+        // refuses a source list that names this replica's own archive endpoint
         shared = SnapshotModeSettings.parse(source);
         // the kit re-checks structure; a refusal there also carries this prefix
         config = configBuilder().build();
@@ -688,6 +712,12 @@ public final class ReplicaSettings {
                 .deepReadPaceMs(shared.deepReadPaceMs())
                 .scanPeriodMs(shared.scanPeriodMs())
                 .loadTimeoutMs(shared.loadTimeoutMs())
+                .pullSettings(shared.pullSettings())
+                .rebootstrapReplayFailures(intOf(Key.SHADOW_REBOOTSTRAP_REPLAY_FAILURES))
+                .rebootstrapMaxConsecutive(intOf(Key.SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE))
+                .rebootstrapWindowMs(numeric(Key.SHADOW_REBOOTSTRAP_WINDOW_MS))
+                .rebootstrapKeep(intOf(Key.SHADOW_REBOOTSTRAP_KEEP))
+                .rebootstrapNotTakenLogMs(numeric(Key.SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS))
                 .nodePort(nodePort());
     }
 
@@ -701,6 +731,18 @@ public final class ReplicaSettings {
         final List<String> lines = new ArrayList<>(ReplicaContexts.windowWarnings(config));
         lines.addAll(storageWarnings());
         return lines;
+    }
+
+    /**
+     * The puller's CRITICAL boot lines ({@code shadow puller disabled: ...}, a kinds widening), printed by the main
+     * next to {@link #warnings}.
+     */
+    List<String> pullWarnings() {
+        final List<String> out = new ArrayList<>();
+        for (final String line : shared.pullSettings().criticalLines()) {
+            out.add("CRITICAL " + line);
+        }
+        return out;
     }
 
     /** The BASE_DIR tmpfs warning only (the kit prints the window lines itself at launch). */

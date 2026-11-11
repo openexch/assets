@@ -118,14 +118,15 @@ public class ReplicaBackupWindowTest {
     }
 
     /** Open replays of {@code m}'s log (following live, never drained) until its archive refuses one. */
-    private static Hold fill(final ReplicaRig r, final Member m) {
+    static Hold fill(final ReplicaRig r, final Member m) {
         final AeronArchive a = r.rig.archive(m);
         final Subscription sink = r.rig.aeron(m).addSubscription("aeron:ipc", HOLD_STREAM);
         final long rec = r.rig.logRecordingId(m);
+        final long from = a.getStartPosition(rec); // the member's pruner may have purged the head of its log
         final Hold h = new Hold(m, sink);
         for (int i = 0; i < 32; i++) {
             try {
-                a.startReplay(rec, 0, AeronArchive.NULL_LENGTH, "aeron:ipc", HOLD_STREAM);
+                a.startReplay(rec, from, AeronArchive.NULL_LENGTH, "aeron:ipc", HOLD_STREAM);
                 h.held++;
             } catch (final ArchiveException refused) {
                 h.refusal = refused.getMessage();
@@ -134,6 +135,9 @@ public class ReplicaBackupWindowTest {
         }
         if (h.refusal == null) {
             throw new AssertionError("member " + m.id + " archive accepted " + h.held + " replays and never refused");
+        }
+        if (!h.refusal.contains("max concurrent replays")) {
+            throw new AssertionError("member " + m.id + " refused a held replay for another reason: " + h.refusal);
         }
         System.out.println("[window] member " + m.id + ": holding " + h.held + " replays (" + h.refusal + ")");
         return h;
@@ -157,7 +161,7 @@ public class ReplicaBackupWindowTest {
     }
 
     /** A backup response after {@code liftMs}, then L live again with a successful re-attach poll. */
-    private static void awaitReattach(final ReplicaRig r, final long liftMs) {
+    static void awaitReattach(final ReplicaRig r, final long liftMs) {
         final long responses0 = r.replica.events().responses();
         final long reattach0 = r.replica.follower().reattachTotal();
         final long rejected0 = r.replica.events().authRejected();

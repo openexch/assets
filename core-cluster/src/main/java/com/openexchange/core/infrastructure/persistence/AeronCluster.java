@@ -99,6 +99,10 @@ public final class AeronCluster {
         final ClusterConfig clusterConfig = ClusterConfig.create(nodeId, hostAddresses, hostAddresses, portBase,
                 coreService);
 
+        // guard row 3: a pull source list must never name this node's own archive (refused before any launch)
+        StubModeBootGuard.enforcePullSources(snapshotModeSettings,
+                StubModeBootGuard.endpointOf(clusterConfig.archiveContext().controlChannel()));
+
         final File resolvedBaseDir = getBaseDir(nodeId);
         clusterConfig.baseDir(resolvedBaseDir);
         if (pathLooksEphemeral(resolvedBaseDir.getAbsolutePath())) {

@@ -3,6 +3,7 @@ package com.openexchange.core.infrastructure.persistence;
 
 import com.openexchange.core.infrastructure.TransportConfig;
 import com.openexchange.cluster.shadow.ShadowFloor;
+import com.openexchange.cluster.shadow.ShadowPullSettings;
 
 import java.util.Objects;
 
@@ -28,7 +29,17 @@ public final class SnapshotModeSettings {
         SNAPSHOT_RESTORE_READY_BUDGET_MS("snapshot.restore.ready.budget.ms", "30000"),
         CONSENSUS_SNAPSHOT_MAX_BYTES("consensus.snapshot.max.bytes", "1048576"),
         SHADOW_LOAD_TIMEOUT_MS("shadow.load.timeout.ms", "60000"),
-        SHADOW_FLOOR_ENABLED("shadow.floor.enabled", "true");
+        SHADOW_FLOOR_ENABLED("shadow.floor.enabled", "true"),
+        SHADOW_ANCHOR_RULE("shadow.anchor.rule", "two-producers"),
+        SHADOW_PULL_SOURCES("shadow.pull.sources", ""),
+        SHADOW_PULL_PERIOD_MS("shadow.pull.period.ms", "5000"),
+        SHADOW_PULL_STARTUP_WAIT_MS("shadow.pull.startup.wait.ms", "60000"),
+        SHADOW_PULL_TIMEOUT_MS("shadow.pull.timeout.ms", "120000"),
+        SHADOW_PULL_RETRY_BACKOFF_MS("shadow.pull.retry.backoff.ms", "5000"),
+        SHADOW_PULL_MAX_INFLIGHT("shadow.pull.max.inflight", "1"),
+        SHADOW_PULL_KINDS("shadow.pull.kinds", "ALIGNED"),
+        SHADOW_PULL_REPLICATION_ENDPOINT("shadow.pull.replication.endpoint", ""),
+        SHADOW_PULL_RESPONSE_ENDPOINT("shadow.pull.response.endpoint", "");
 
         private final String property;
         private final String defaultText;
@@ -69,6 +80,9 @@ public final class SnapshotModeSettings {
     private final long consensusSnapshotMaxBytes;
     private final long loadTimeoutMs;
     private final boolean floorEnabled;
+    private final ShadowFloor.AnchorRule anchorRule;
+    private final java.util.function.Function<String, String> pullEnv;
+    private final ShadowPullSettings pullSettings;
 
     private SnapshotModeSettings(final Source source) {
         this.mode = SnapshotMode.parse(raw(source, Key.SNAPSHOT_MODE));
@@ -81,6 +95,10 @@ public final class SnapshotModeSettings {
         this.consensusSnapshotMaxBytes = range(source, Key.CONSENSUS_SNAPSHOT_MAX_BYTES, 4096, 1_073_741_824L);
         this.loadTimeoutMs = range(source, Key.SHADOW_LOAD_TIMEOUT_MS, 1000, 86_400_000L);
         this.floorEnabled = bool(source, Key.SHADOW_FLOOR_ENABLED);
+        this.anchorRule = ShadowFloor.AnchorRule.parse(raw(source, Key.SHADOW_ANCHOR_RULE));
+        // the puller rows: the kit's one parser (its ranges and refusal texts), read through this table's source
+        this.pullEnv = name -> raw(source, Key.valueOf(name));
+        this.pullSettings = ShadowPullSettings.parse(pullEnv, null);
     }
 
     /** The settings of this process. @throws IllegalArgumentException with the 3.5 text of the first bad setting */
@@ -173,6 +191,36 @@ public final class SnapshotModeSettings {
     /** {@code SHADOW_FLOOR_ENABLED}: a test-only override (4.1); false is refused by the boot guard in shadow mode. */
     public boolean floorEnabled() {
         return floorEnabled;
+    }
+
+    /** {@code SHADOW_ANCHOR_RULE}: what may anchor a purge below P_cm on a member (default two-producers). */
+    public ShadowFloor.AnchorRule anchorRule() {
+        return anchorRule;
+    }
+
+    /** The {@code SHADOW_PULL_*} rows (disabled when {@code SHADOW_PULL_SOURCES} is empty). */
+    public ShadowPullSettings pullSettings() {
+        return pullSettings;
+    }
+
+    /**
+     * The pull rows checked against this node's own archive control endpoint ({@code host:port}): a source list that
+     * names it is refused with the kit's text.
+     *
+     * @throws IllegalArgumentException {@code SHADOW_PULL_SOURCES lists this node's own archive endpoint <v>}
+     */
+    public ShadowPullSettings pullSettingsFor(final String ownArchiveEndpoint) {
+        return ShadowPullSettings.parse(pullEnv, ownArchiveEndpoint);
+    }
+
+    /** The CRITICAL lines a member prints at boot: the anchor rule's opt-out, the disabled puller, a kinds widening. */
+    public java.util.List<String> criticalLines() {
+        final java.util.List<String> out = new java.util.ArrayList<>();
+        if (anchorRule.criticalLine() != null) {
+            out.add(anchorRule.criticalLine());
+        }
+        out.addAll(pullSettings.criticalLines());
+        return out;
     }
 
     @Override

@@ -162,8 +162,6 @@ final class ReplicaRig implements AutoCloseable {
     }
 
     final ShadowClusterRig rig;
-    /** The LAST image per member (the single-snapshot tests read it). */
-    final Map<Integer, byte[]> imageAtSnapshot = new ConcurrentHashMap<>();
     /** Every member image by (member, action position), captured on the service thread in {@code onTakeSnapshot}. */
     final Map<MemberPosition, byte[]> imageAt = new ConcurrentHashMap<>();
     /** Test seam (a control): keep only the newest image per member, the shape before the per-position map. */
@@ -172,6 +170,8 @@ final class ReplicaRig implements AutoCloseable {
     final List<String> holds = new CopyOnWriteArrayList<>();
     final Map<Integer, Long> snapshotsTaken = new ConcurrentHashMap<>();
     final List<String> fatals = new CopyOnWriteArrayList<>();
+    /** Every {@code host.restart(code, reason)} as {@code <code> <reason>} (a decided re-bootstrap exits 3). */
+    final List<String> restarts = new CopyOnWriteArrayList<>();
     final List<String> aeronErrors = new CopyOnWriteArrayList<>();
     final Faults faults = new Faults();
     ReplicaProcess replica;
@@ -210,7 +210,6 @@ final class ReplicaRig implements AutoCloseable {
         ServiceProbe.afterTakeSnapshot(m.service, () -> {
             final byte[] image = ServiceProbe.image(m.service);
             final long position = ServiceProbe.logPosition(m.service);
-            imageAtSnapshot.put(m.id, image);
             if (keepOnlyLastImagePerMember) {
                 imageAt.keySet().removeIf(k -> k.memberId() == m.id);
             }
@@ -407,6 +406,7 @@ final class ReplicaRig implements AutoCloseable {
         }
         fatals.clear();
         holds.clear();
+        restarts.clear();
         binding = engine;
         replica = ReplicaProcess.launch(cfg, engine, new ReplicaProcess.Host() {
             @Override
@@ -423,6 +423,12 @@ final class ReplicaRig implements AutoCloseable {
             @Override
             public void awaitExternalDriver(final String aeronDir, final long timeoutMs) {
                 throw new IllegalStateException("the in-JVM rig runs EMBEDDED");
+            }
+
+            @Override
+            public void restart(final int code, final String reason) {
+                restarts.add(code + " " + reason);
+                System.err.println("[REPLICA-TEST] host.restart(" + code + "): " + reason);
             }
 
             @Override

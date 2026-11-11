@@ -129,6 +129,161 @@ public class SnapshotModeSettingsTest {
         }
     }
 
+    // ------------------------------------------------------------------------------- anchor rule and puller rows
+
+    private record PullRange(SnapshotModeSettings.Key key, long min, long max) {
+    }
+
+    private static final PullRange[] PULL_RANGES = {
+            new PullRange(SnapshotModeSettings.Key.SHADOW_PULL_PERIOD_MS, 500, 3_600_000L),
+            new PullRange(SnapshotModeSettings.Key.SHADOW_PULL_STARTUP_WAIT_MS, 1000, 86_400_000L),
+            new PullRange(SnapshotModeSettings.Key.SHADOW_PULL_TIMEOUT_MS, 1000, 86_400_000L),
+            new PullRange(SnapshotModeSettings.Key.SHADOW_PULL_RETRY_BACKOFF_MS, 100, 3_600_000L),
+    };
+
+    private static long readPull(final SnapshotModeSettings s, final SnapshotModeSettings.Key key) {
+        return switch (key) {
+            case SHADOW_PULL_PERIOD_MS -> s.pullSettings().periodMs();
+            case SHADOW_PULL_STARTUP_WAIT_MS -> s.pullSettings().startupWaitMs();
+            case SHADOW_PULL_TIMEOUT_MS -> s.pullSettings().timeoutMs();
+            case SHADOW_PULL_RETRY_BACKOFF_MS -> s.pullSettings().retryBackoffMs();
+            default -> throw new IllegalArgumentException(key.name());
+        };
+    }
+
+    @Test
+    public void pullSettingsAtTheirBoundariesInBothModes() {
+        int rows = 0;
+        for (final String mode : new String[] {"off", "shadow"}) {
+            for (final PullRange r : PULL_RANGES) {
+                final String name = r.key().name();
+                assertEquals(mode + " " + name + " min", r.min(), readPull(parse(mode, r.key(), Long.toString(r.min())),
+                        r.key()));
+                assertEquals(mode + " " + name + " max", r.max(), readPull(parse(mode, r.key(), Long.toString(r.max())),
+                        r.key()));
+                assertEquals(name + " must be " + r.min() + ".." + r.max() + " ms: " + (r.min() - 1),
+                        assertThrows(IllegalArgumentException.class,
+                                () -> parse(mode, r.key(), Long.toString(r.min() - 1))).getMessage());
+                assertEquals(name + " must be " + r.min() + ".." + r.max() + " ms: " + (r.max() + 1),
+                        assertThrows(IllegalArgumentException.class,
+                                () -> parse(mode, r.key(), Long.toString(r.max() + 1))).getMessage());
+                assertEquals(name + " is not an integer: 5s", assertThrows(IllegalArgumentException.class,
+                        () -> parse(mode, r.key(), "5s")).getMessage());
+                rows += 5;
+            }
+            final SnapshotModeSettings.Key inflight = SnapshotModeSettings.Key.SHADOW_PULL_MAX_INFLIGHT;
+            assertEquals(1, parse(mode, inflight, "1").pullSettings().maxInflight());
+            assertEquals(3, parse(mode, inflight, "3").pullSettings().maxInflight());
+            assertEquals("SHADOW_PULL_MAX_INFLIGHT must be 1..3: 0", assertThrows(IllegalArgumentException.class,
+                    () -> parse(mode, inflight, "0")).getMessage());
+            assertEquals("SHADOW_PULL_MAX_INFLIGHT must be 1..3: 4", assertThrows(IllegalArgumentException.class,
+                    () -> parse(mode, inflight, "4")).getMessage());
+            assertEquals("SHADOW_PULL_MAX_INFLIGHT is not an integer: two", assertThrows(IllegalArgumentException.class,
+                    () -> parse(mode, inflight, "two")).getMessage());
+            rows += 5;
+        }
+        System.out.println("GREEN pull settings: " + rows + " boundary rows");
+    }
+
+    @Test
+    public void pullDefaultsSourcesKindsAndEndpoints() {
+        final SnapshotModeSettings d = SnapshotModeSettings.defaults();
+        final com.openexchange.cluster.shadow.ShadowPullSettings p = d.pullSettings();
+        assertEquals(ShadowFloor.AnchorRule.TWO_PRODUCERS, d.anchorRule());
+        assertEquals(java.util.List.of(), p.sources());
+        assertEquals(false, p.enabled());
+        assertEquals(5000, p.periodMs());
+        assertEquals(60_000, p.startupWaitMs());
+        assertEquals(120_000, p.timeoutMs());
+        assertEquals(5000, p.retryBackoffMs());
+        assertEquals(1, p.maxInflight());
+        assertEquals(java.util.Set.of(com.openexchange.cluster.shadow.ShadowKind.ALIGNED), p.kinds());
+        assertEquals(null, p.replicationEndpoint());
+        assertEquals(null, p.responseEndpoint());
+        assertEquals("an empty source list is a CRITICAL line, never a refusal",
+                java.util.List.of(com.openexchange.cluster.shadow.ShadowPullSettings.DISABLED_LINE), d.criticalLines());
+
+        // sources: an ordered allowlist of host:port, never derived
+        final SnapshotModeSettings two = parse("shadow", SnapshotModeSettings.Key.SHADOW_PULL_SOURCES,
+                "10.0.0.2:9301, 10.0.0.3:9301");
+        assertEquals("[10.0.0.2:9301, 10.0.0.3:9301]", two.pullSettings().sources().toString());
+        assertTrue(two.pullSettings().enabled());
+        assertEquals(java.util.List.of(), two.criticalLines());
+        assertEquals("SHADOW_PULL_SOURCES entry '10.0.0.2' is not host:port", assertThrows(
+                IllegalArgumentException.class, () -> parse("off", SnapshotModeSettings.Key.SHADOW_PULL_SOURCES,
+                        "10.0.0.2")).getMessage());
+        assertEquals("SHADOW_PULL_SOURCES entry 'host:99999' is not host:port", assertThrows(
+                IllegalArgumentException.class, () -> parse("off", SnapshotModeSettings.Key.SHADOW_PULL_SOURCES,
+                        "host:99999")).getMessage());
+        // this node's own archive endpoint is a refusal, once the endpoint is known
+        assertEquals("SHADOW_PULL_SOURCES lists this node's own archive endpoint 10.0.0.2:9301", assertThrows(
+                IllegalArgumentException.class, () -> two.pullSettingsFor("10.0.0.2:9301")).getMessage());
+        assertEquals(2, two.pullSettingsFor("10.0.0.1:9301").sources().size());
+
+        // kinds: ALIGNED by default, a widening is allowed with a CRITICAL line, a typo is refused
+        final SnapshotModeSettings wide = parse("shadow", SnapshotModeSettings.Key.SHADOW_PULL_KINDS, "ALIGNED,STANDBY");
+        assertEquals(java.util.Set.of(com.openexchange.cluster.shadow.ShadowKind.ALIGNED,
+                com.openexchange.cluster.shadow.ShadowKind.STANDBY), wide.pullSettings().kinds());
+        assertTrue(wide.criticalLines().toString(), wide.criticalLines().contains(
+                "pulling single-producer kinds ALIGNED,STANDBY: a held source's suspects can be pulled"));
+        assertEquals("SHADOW_PULL_KINDS 'ALIGNED,FULL' (expected a comma list of ALIGNED|STANDBY|CADENCE|LOCAL)",
+                assertThrows(IllegalArgumentException.class, () -> parse("off", SnapshotModeSettings.Key.SHADOW_PULL_KINDS,
+                        "ALIGNED,FULL")).getMessage());
+
+        // both fixed endpoints (an isolated host): parsed into the settings the puller hands ReplicationParams
+        final Map<SnapshotModeSettings.Key, String> m = new HashMap<>();
+        m.put(SnapshotModeSettings.Key.SHADOW_PULL_REPLICATION_ENDPOINT, "10.0.0.1:9450");
+        m.put(SnapshotModeSettings.Key.SHADOW_PULL_RESPONSE_ENDPOINT, "10.0.0.1:9451");
+        final com.openexchange.cluster.shadow.ShadowPullSettings fixed = SnapshotModeSettings.with(m).pullSettings();
+        assertEquals("aeron:udp?endpoint=10.0.0.1:9450", fixed.replicationEndpoint().udpChannel());
+        assertEquals("aeron:udp?endpoint=10.0.0.1:9451", fixed.responseEndpoint().udpChannel());
+        assertEquals("SHADOW_PULL_REPLICATION_ENDPOINT 'nowhere' is not host:port", assertThrows(
+                IllegalArgumentException.class, () -> parse("off",
+                        SnapshotModeSettings.Key.SHADOW_PULL_REPLICATION_ENDPOINT, "nowhere")).getMessage());
+        assertEquals("SHADOW_PULL_RESPONSE_ENDPOINT 'nowhere:' is not host:port", assertThrows(
+                IllegalArgumentException.class, () -> parse("off",
+                        SnapshotModeSettings.Key.SHADOW_PULL_RESPONSE_ENDPOINT, "nowhere:")).getMessage());
+    }
+
+    @Test
+    public void anchorRuleRows() {
+        for (final String mode : new String[] {"off", "shadow"}) {
+            assertEquals(ShadowFloor.AnchorRule.TWO_PRODUCERS,
+                    parse(mode, SnapshotModeSettings.Key.SHADOW_ANCHOR_RULE, "two-producers").anchorRule());
+            final SnapshotModeSettings any = parse(mode, SnapshotModeSettings.Key.SHADOW_ANCHOR_RULE, "any-verified");
+            assertEquals(ShadowFloor.AnchorRule.ANY_VERIFIED, any.anchorRule());
+            assertTrue("any-verified is allowed with a CRITICAL line: " + any.criticalLines(),
+                    any.criticalLines().contains(ShadowFloor.AnchorRule.ANY_VERIFIED.criticalLine()));
+            assertEquals("SHADOW_ANCHOR_RULE 'one-producer' (expected two-producers|any-verified)",
+                    assertThrows(IllegalArgumentException.class, () -> parse(mode,
+                            SnapshotModeSettings.Key.SHADOW_ANCHOR_RULE, "one-producer")).getMessage());
+        }
+        // the margin keeps its default under the new rule
+        assertEquals(ShadowFloor.Margin.PREVIOUS_VERIFIED, SnapshotModeSettings.defaults().floorMargin());
+    }
+
+    @Test
+    public void bootGuardPullRows() {
+        // guard row 1 covers the pull rows: refused with the prefix and the kit's text
+        assertEquals("CORE BOOT GUARD: SHADOW_PULL_PERIOD_MS must be 500..3600000 ms: 499", assertThrows(
+                StandbySnapshotBootGuard.Refused.class, () -> StubModeBootGuard.enforce(
+                        source("shadow", "SHADOW_PULL_PERIOD_MS", "499", null), true)).getMessage());
+        assertEquals("CORE BOOT GUARD: SHADOW_ANCHOR_RULE 'x' (expected two-producers|any-verified)", assertThrows(
+                StandbySnapshotBootGuard.Refused.class, () -> StubModeBootGuard.enforce(
+                        source("off", "SHADOW_ANCHOR_RULE", "x", null), true)).getMessage());
+        // guard row 3: this node's own archive endpoint
+        final SnapshotModeSettings s = StubModeBootGuard.enforce(source("shadow", "SHADOW_PULL_SOURCES",
+                "localhost:9301,localhost:9401", null), true);
+        assertEquals("CORE BOOT GUARD: SHADOW_PULL_SOURCES lists this node's own archive endpoint localhost:9401",
+                assertThrows(StandbySnapshotBootGuard.Refused.class, () -> StubModeBootGuard.enforcePullSources(s,
+                        StubModeBootGuard.endpointOf("aeron:udp?endpoint=localhost:9401"))).getMessage());
+        StubModeBootGuard.enforcePullSources(s, StubModeBootGuard.endpointOf("aeron:udp?endpoint=localhost:9501"));
+        assertEquals("localhost:9401", StubModeBootGuard.endpointOf("aeron:udp?endpoint=localhost:9401|mtu=8192"));
+        // guard row 4: any-verified boots, with its CRITICAL line among the boot lines
+        assertEquals(ShadowFloor.AnchorRule.ANY_VERIFIED, StubModeBootGuard.enforce(source("shadow",
+                "SHADOW_ANCHOR_RULE", "any-verified", null), true).anchorRule());
+    }
+
     private static SnapshotModeSettings.Source source(final String mode, final String env, final String value,
                                              final String unused) {
         return (e, p) -> e.equals("SNAPSHOT_MODE") ? mode : e.equals(env) ? value : null;

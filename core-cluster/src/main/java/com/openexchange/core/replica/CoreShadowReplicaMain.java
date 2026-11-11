@@ -25,8 +25,9 @@ import java.util.Objects;
  * <p>Order (the {@code AeronCluster} discipline, AC:58-67): install the lifecycle, parse {@link ReplicaSettings} under
  * the {@value ReplicaSettings#PREFIX} guard BEFORE any Aeron component (the mismatch dump dir included), build the
  * binding, then {@code ReplicaProcess.launch} with the lifecycle's host and wait for the stop. A refused setting, a
- * failed launch or a fatal fault exits 1 through the lifecycle; a signal exits 143; there is no cluster termination
- * for a replica. An oracle mismatch (the members' snapshot at an ALIGNED position differs from the replica's image,
+ * failed launch or a fatal fault exits 1 through the lifecycle; a signal exits 143; a decided re-bootstrap (members
+ * pruned past this replica's log, a newer ALIGNED pulled and verified) exits 3 for the unit to restart; there is no
+ * cluster termination for a replica. An oracle mismatch (the members' snapshot at an ALIGNED position differs from the replica's image,
  * same genesis) holds instead of exiting: the process stays up with {@code /ready} 503 and its metrics served until
  * it is stopped (143), the external driver is lost (1) or {@code REPLICA_MISMATCH_HOLD_MS} elapses (1).</p>
  *
@@ -63,6 +64,9 @@ public final class CoreShadowReplicaMain {
         for (final String line : settings.storageWarnings()) {
             log.warn("%s", line);
         }
+        for (final String line : settings.pullWarnings()) {
+            log.error("%s", line);
+        }
         final Binding binding = new Binding(() -> lifecycle.fatal(EngineLifecycle.EXIT_FATAL, CORE_CONFIG_FAILED));
         log.info("Core replica R%d starting: members=%s driverMode=%s source=%s",
                 settings.slot(), settings.memberHosts(), settings.driverMode(), settings.sourceType());
@@ -92,6 +96,14 @@ public final class CoreShadowReplicaMain {
             @Override
             public void awaitExternalDriver(final String aeronDir, final long timeoutMs) {
                 lifecycle.awaitExternalDriver(aeronDir, timeoutMs);
+            }
+
+            @Override
+            public void restart(final int code, final String reason) {
+                // a decided re-bootstrap: the lifecycle closes the process (cluster/ moves aside after the backup and
+                // the archive closed) and exits with code (3); the unit restarts it
+                log.error("CRITICAL replica restart (exit %d): %s", code, reason);
+                lifecycle.restart(code, reason);
             }
 
             @Override

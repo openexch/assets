@@ -105,7 +105,15 @@ public final class CoreClusteredService implements ClusteredService {
 
     private Cluster cluster;
     private IdleStrategy idleStrategy;
-    private boolean isLeader;
+    /**
+     * The service's role, written on the service thread only ({@code onStart}, {@code onRoleChange}); volatile because
+     * the shadow puller's leader gate reads it from its own thread ({@link #leaderNow}).
+     */
+    private volatile boolean isLeader;
+    /** The consensus module context ClusterConfig wired (the members table names this node's archive endpoint). */
+    private volatile io.aeron.cluster.ConsensusModule.Context consensusContext;
+    /** The startup pull's puller (3b) while and after it ran, for the metrics; null when none ran. */
+    private volatile com.openexchange.cluster.shadow.ShadowPuller startupPuller;
 
     // ---------------------------------------------------------------- (stub mode, restore paths, floor)
     /** The 3.5 settings, parsed once at construction (the boot guard parsed and refused the same table earlier). */
@@ -305,6 +313,61 @@ public final class CoreClusteredService implements ClusteredService {
     /** Wired before launch; the context owns the same-process consensus evidence. */
     public void readinessConsensus(final io.aeron.cluster.ConsensusModule.Context context) {
         consensusReadiness = new com.openexchange.cluster.ConsensusReadiness(context, readiness);
+        consensusContext = context;
+    }
+
+    /**
+     * Test seam (the leader gate's negative control): the puller is handed a role that never reads LEADER. Production
+     * never sets it.
+     */
+    volatile boolean pullLeaderGateOff;
+
+    /** The shadow puller's leader gate: the service's role only (true while LEADER). */
+    boolean leaderNow() {
+        return isLeader && !pullLeaderGateOff;
+    }
+
+    /**
+     * This node's archive control endpoint {@code host:port}, read from the members table ClusterConfig gave the
+     * consensus module (node-local configuration, never replicated state); null when there is none.
+     */
+    private String ownArchiveEndpoint() {
+        final io.aeron.cluster.ConsensusModule.Context ctx = consensusContext;
+        if (ctx == null || ctx.clusterMembers() == null) {
+            return null;
+        }
+        final int memberId = ctx.clusterMemberId();
+        for (final io.aeron.cluster.ClusterMember m : io.aeron.cluster.ClusterMember.parse(ctx.clusterMembers())) {
+            if (m.id() == memberId) {
+                return m.archiveEndpoint();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The {@code SHADOW_PULL_*} rows for this node: checked against its own archive endpoint (a source list that names
+     * it is a refusal, the boot guard's row 3); disabled with a CRITICAL line when this node has no members table.
+     */
+    private com.openexchange.cluster.shadow.ShadowPullSettings pullSettings() {
+        final com.openexchange.cluster.shadow.ShadowPullSettings ps = snapshotModeSettings.pullSettings();
+        if (!ps.enabled()) {
+            return ps;
+        }
+        final String own = ownArchiveEndpoint();
+        if (own == null) {
+            System.err.println("[SHADOW-PULL] CRITICAL: no members table names this node's archive endpoint: the"
+                    + " puller stays disabled");
+            return com.openexchange.cluster.shadow.ShadowPullSettings.disabled();
+        }
+        return snapshotModeSettings.pullSettingsFor(own);
+    }
+
+    /** This node's host (the listing clients' response channel when no response endpoint is set). */
+    private String pullHost() {
+        final String own = ownArchiveEndpoint();
+        final int colon = own == null ? -1 : own.lastIndexOf(':');
+        return colon <= 0 ? "localhost" : own.substring(0, colon);
     }
 
     // What makes this cluster snapshot itself with no admin gateway running.
@@ -562,6 +625,67 @@ public final class CoreClusteredService implements ClusteredService {
                 : com.openexchange.cluster.shadow.ShadowCounters.Counter.values()) {
             body.gauge(c.metricName(), "Shadow catalog/loader counter on this node", () -> shadowCounters.get(c));
         }
+        pullMetrics(body);
+    }
+
+    /** The refusal reasons {@code shadow_pull_refused_total} is exported with (the puller's classes). */
+    static String[] pullRefusalReasons() {
+        final java.util.List<String> out = new java.util.ArrayList<>(java.util.List.of("GENERIC", "MAX_RECORDINGS",
+                "REPLICATION_CONNECTION_FAILURE", "STORAGE_SPACE", "INCOMPLETE", "TIMEOUT", "CORRUPT"));
+        for (final com.openexchange.cluster.shadow.ShadowEntry.State st
+                : com.openexchange.cluster.shadow.ShadowEntry.State.values()) {
+            if (!out.contains(st.name())) {
+                out.add(st.name());
+            }
+        }
+        return out.toArray(new String[0]);
+    }
+
+    /**
+     * The puller counters: the running puller's plus the startup pull's (3b). {@code shadow_pull_inflight} and
+     * {@code shadow_pull_purge_pending} are the running puller's only; every series is 0 while no puller ran.
+     */
+    long pullCounter(final com.openexchange.cluster.shadow.ShadowPuller.Counter c) {
+        final MemberShadowHousekeeping hk = shadowHousekeeping;
+        final com.openexchange.cluster.shadow.ShadowPuller running = hk == null ? null : hk.puller();
+        final com.openexchange.cluster.shadow.ShadowPuller startup = startupPuller;
+        final boolean gauge = c == com.openexchange.cluster.shadow.ShadowPuller.Counter.INFLIGHT
+                || c == com.openexchange.cluster.shadow.ShadowPuller.Counter.PURGE_PENDING;
+        return (running == null ? 0 : running.counters().get(c))
+                + (startup == null || gauge ? 0 : startup.counters().get(c));
+    }
+
+    /** {@code shadow_pull_refused_total{reason}}, running and startup pullers together. */
+    long pullRefused(final String reason) {
+        final MemberShadowHousekeeping hk = shadowHousekeeping;
+        final com.openexchange.cluster.shadow.ShadowPuller running = hk == null ? null : hk.puller();
+        final com.openexchange.cluster.shadow.ShadowPuller startup = startupPuller;
+        return (running == null ? 0 : running.counters().refused(reason))
+                + (startup == null ? 0 : startup.counters().refused(reason));
+    }
+
+    private void pullMetrics(final com.openexchange.core.infrastructure.metrics.CoreMetricsBody body) {
+        for (final com.openexchange.cluster.shadow.ShadowPuller.Counter c
+                : com.openexchange.cluster.shadow.ShadowPuller.Counter.values()) {
+            final boolean gauge = c == com.openexchange.cluster.shadow.ShadowPuller.Counter.INFLIGHT
+                    || c == com.openexchange.cluster.shadow.ShadowPuller.Counter.PURGE_PENDING;
+            if (gauge) {
+                body.gauge(c.metricName(), "Shadow puller: " + c.metricName(), () -> pullCounter(c));
+            } else {
+                body.counter(c.metricName(), "Shadow puller: " + c.metricName(), () -> pullCounter(c));
+            }
+        }
+        final String[] reasons = pullRefusalReasons();
+        final java.util.function.LongSupplier[] values = new java.util.function.LongSupplier[reasons.length];
+        for (int i = 0; i < reasons.length; i++) {
+            final String r = reasons[i];
+            values[i] = () -> pullRefused(r);
+        }
+        body.labelledGauge("shadow_pull_refused_total", "Shadow pulls refused, by class (cumulative; archive,"
+                + " INCOMPLETE and TIMEOUT are retried, content refusals never)", "reason", reasons, values);
+        body.gauge("shadow_anchor_rule_two_producers", "1 when SHADOW_ANCHOR_RULE=two-producers, 0 for any-verified",
+                () -> snapshotModeSettings.anchorRule()
+                        == com.openexchange.cluster.shadow.ShadowFloor.AnchorRule.TWO_PRODUCERS ? 1 : 0);
     }
 
     /**
@@ -608,7 +732,8 @@ public final class CoreClusteredService implements ClusteredService {
                             cluster.context().archiveContext().clone(), clusterId, snapshotModeSettings, snapshotModeCounters,
                             shadowCounters, shadowVerdicts,
                             new com.openexchange.cluster.shadow.ShadowHousekeeping.Counters(),
-                            () -> publishedGenesisId, cluster.context().errorHandler());
+                            () -> publishedGenesisId, cluster.context().errorHandler(), pullSettings(), pullHost(),
+                            this::leaderNow, "shadow-puller-core-" + cluster.memberId());
                     final com.openexchange.cluster.shadow.ShadowFloor floor = shadowHousekeeping.floor();
                     logPruner.watermark(prunerWatermarkOverride != null ? prunerWatermarkOverride : floor)
                             .wake(floor::purgeRequested)
@@ -1460,7 +1585,8 @@ public final class CoreClusteredService implements ClusteredService {
                     failApplicationCallback();
                     System.err.println(text);
                     failFast.run();
-                });
+                },
+                startupPull());
         final ShadowRestore.Outcome outcome;
         try {
             outcome = restore.run(stub);
@@ -1470,6 +1596,18 @@ public final class CoreClusteredService implements ClusteredService {
         }
         this.leadershipTermId = outcome.leadershipTermId();
         this.skipWindow = outcome.window();
+    }
+
+    /** The 3b inputs: the pull rows of this node, its host, its role and the readiness detail. */
+    private ShadowRestore.StartupPull startupPull() {
+        final com.openexchange.cluster.shadow.ShadowPullSettings ps;
+        try {
+            ps = pullSettings();
+        } catch (final IllegalArgumentException ownEndpoint) {
+            throw new ShadowRestore.Halt("FATAL shadow restore: " + ownEndpoint.getMessage(), ownEndpoint);
+        }
+        return new ShadowRestore.StartupPull(ps, pullHost(), this::leaderNow, readiness::unavailable,
+                p -> startupPuller = p);
     }
 
     /** The snapshot image as offered: the v4 payload written at the envelope's payload offset, then sealed. */

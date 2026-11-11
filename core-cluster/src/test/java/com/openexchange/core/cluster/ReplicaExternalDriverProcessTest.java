@@ -64,11 +64,21 @@ import static org.junit.Assert.assertTrue;
  * ({@code /ready} 503 {@code recovery=fenced:oracle mismatch at <P>: ...}, {@code shadow_oracle_mismatch_total 1},
  * alive); SIGTERM exits 143; a restart on the same dirs re-latches at the same P; kill -9 of the driver while held
  * exits 1 within the client driver timeout plus the fatal grace, stderr naming the driver loss.</p>
+ *
+ * <p>The pull leg on the external driver ({@link #anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap},
+ * its own rig, both fixed pull endpoints set as on an isolated host): the members' logs purged past 0 with a genuine
+ * ALIGNED at P_cm on member 1, the child bootstraps by a pull ({@code restore_path=PULLED_SHADOW}), verifies, and a
+ * SIGTERM exits 143; the members then prune past its log with a newer ALIGNED on member 1, the restarted child pulls it
+ * and exits 3 (a decided restart: {@code cluster/} moved to {@code cluster.rebootstrap-*} by its close); the next start
+ * restores LOCAL_SHADOW from the pulled shadow and a SIGTERM exits 143.</p>
  */
 public class ReplicaExternalDriverProcessTest {
 
     private static final int PORT_BASE = 33000; // members 33000/33100/33200, the replica at slot 3 (33300)
     private static final int PORT_BASE_HOLD = 47400;
+    private static final int PORT_BASE_PULL = 55400; // members 55400/55500/55600, the replica at slot 3 (55700)
+    private static final int PULL_SEGMENT = 64 * 1024;
+    private static final long REBOOTSTRAP_WAIT_MS = 300_000;
     /** The smallest verify wait the rig's backup cycle allows (2 x 12 000 + the 12 000 cool-down). */
     private static final long VERIFY_WAIT_MS = 36_000;
     private static final String CREDENTIAL = "8:REPLICA:" + "88".repeat(32);
@@ -129,7 +139,7 @@ public class ReplicaExternalDriverProcessTest {
                     image = ReplicaRig.payloadOf(c.aeron, c.archive, aligned);
                 }
                 for (final Member m : r.rig.live()) {
-                    ReplicaRig.assertPayloadEqualsMember(pCm, image, r.imageAtSnapshot.get(m.id));
+                    ReplicaRig.assertPayloadEqualsMember(pCm, image, r.memberImage(m.id, pCm));
                 }
                 System.out.println("GREEN external follow: ALIGNED (digest-checked load) at P_cm=" + pCm + " (" + image.length
                         + " B) equals " + r.rig.live().size() + " members' images; driver " + driver.kind + "; "
@@ -304,6 +314,139 @@ public class ReplicaExternalDriverProcessTest {
                 }
             }
         }
+    }
+
+    @Test(timeout = 1_500_000)
+    public void anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap() throws Exception {
+        try (ReplicaRig r = new ReplicaRig(new ShadowClusterRig(PORT_BASE_PULL, "replica-external-driver-pull", 3, "64k",
+                PULL_SEGMENT))) {
+            final Path base = r.rig.tmp.toPath();
+            final List<ReplicaChild> children = new ArrayList<>();
+            Driver driver = null;
+            try {
+                r.bootAll();
+                final Member leader = r.rig.awaitLeader(null);
+                final Member host = r.rig.followerOtherThan(leader, null);
+                r.story(host, 4);
+                final Member m1 = r.rig.members.get(1);
+                final Member keeper = r.rig.members.get(2);
+                // a live copy of member 1's log in member 2's archive (from 0, following): the test producer builds
+                // its shadows from it after the members' logs were purged
+                final long copy = r.rig.liveLogCopy(m1, keeper);
+                driver = startDriver(base);
+                final Path state = base.resolve("replica-state");
+                final Runnable pump = () -> r.rig.pumpMs(100);
+                final int nodePort = ReplicaRig.freeTcp();
+                final Map<String, String> env = replicaEnv(driver, state, nodePort, "external", PORT_BASE_PULL);
+                env.put("SHADOW_PULL_SOURCES", r.rig.sources(r.rig.members.get(0), m1, keeper));
+                env.put("SHADOW_PULL_PERIOD_MS", "1000");
+                env.put("SHADOW_PULL_REPLICATION_ENDPOINT", "localhost:" + freeUdp());
+                env.put("SHADOW_PULL_RESPONSE_ENDPOINT", "localhost:" + freeUdp());
+
+                // 1. B4: every member's log purged past 0, an ALIGNED at P_cm on member 1; the child pulls it
+                r.tool.deposits(600);
+                final long pA = r.rig.snapshotAll();
+                r.tool.deposits(60);
+                pruneAndProduce(r, m1, keeper, copy, pA, -1);
+                final ReplicaChild first = ReplicaChild.start(base, "pull-1", env, List.of("replica"));
+                children.add(first);
+                first.awaitLine("[REPLICA] bootstrap done: restore_path=PULLED_SHADOW", 180_000, pump);
+                assertTrue("the pull is logged" + first.tails(), first.out().contains("[SHADOW-PULL] pulled "));
+                final long verifyAt = r.rig.snapshotAll();
+                first.awaitLine("[REPLICA] alignment: the state at " + verifyAt + " equals the member snapshot", 120_000,
+                        pump);
+                awaitReady(first, nodePort, 120_000, pump);
+                first.process.destroy(); // SIGTERM
+                final int sigterm = first.awaitExit(30_000);
+                assertEquals("SIGTERM after a pulled bootstrap exits 143" + first.tails(), 143, sigterm);
+                final long lStopBound = leader.cfg.consensusModuleContext().commitPositionCounter().get();
+                System.out.println("GREEN external B4 pull: restore_path=PULLED_SHADOW from P_cm=" + pA + " over both"
+                        + " fixed endpoints; verified at " + verifyAt + "; SIGTERM exit 143; "
+                        + ReplicaChild.line(first.out(), "[SHADOW-PULL] pulled "));
+
+                // 2. the members prune past the child's log with a newer ALIGNED on member 1: the restart exits 3
+                r.tool.deposits(900);
+                r.rig.snapshotAll();
+                r.tool.deposits(300);
+                final long pB = r.rig.snapshotAll();
+                r.tool.deposits(60);
+                pruneAndProduce(r, m1, keeper, copy, pB, lStopBound);
+                r.windowGap();
+                final ReplicaChild second = ReplicaChild.start(base, "pull-2", env, List.of("replica"));
+                children.add(second);
+                final long t0 = System.nanoTime();
+                final int exit = awaitExitPumping(second, REBOOTSTRAP_WAIT_MS, pump);
+                final long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+                assertEquals("a decided re-bootstrap exits 3" + second.tails(), 3, exit);
+                assertTrue("the restart is logged" + second.tails(), second.err().contains(
+                        "replica re-bootstrap: members pruned past L.stop=") && second.err().contains(
+                        "; pulled ALIGNED at " + pB + " from "));
+                final File[] moved = state.toFile().listFiles((d, n) -> n.startsWith("cluster.rebootstrap-"));
+                assertTrue("cluster/ moved aside", moved != null && moved.length == 1);
+                assertTrue("the backup RecordingLog moved", new File(moved[0], "recording.log").isFile());
+                assertFalse("BASE_DIR/cluster is gone", state.resolve("cluster").toFile().exists());
+                System.out.println("GREEN external re-bootstrap: exit 3 after " + ms + " ms, moved to " + moved[0].getName()
+                        + "; " + ReplicaChild.line(second.err(), "replica re-bootstrap: members pruned past"));
+
+                // 3. the supervised restart: LOCAL_SHADOW from the pulled shadow, then SIGTERM -> 143
+                r.windowGap();
+                final ReplicaChild third = ReplicaChild.start(base, "pull-3", env, List.of("replica"));
+                children.add(third);
+                third.awaitLine("[REPLICA] bootstrap done: restore_path=LOCAL_SHADOW", 180_000, pump);
+                r.rig.pumpMs(2_000);
+                third.process.destroy(); // SIGTERM
+                assertEquals("SIGTERM after the re-bootstrap exits 143" + third.tails(), 143, third.awaitExit(30_000));
+                System.out.println("GREEN external restart after the re-bootstrap: "
+                        + ReplicaChild.line(third.out(), "bootstrap done: restore_path=LOCAL_SHADOW") + "; SIGTERM 143");
+            } finally {
+                for (final ReplicaChild c : children) {
+                    c.destroyForcibly();
+                }
+                if (driver != null) {
+                    driver.process.destroyForcibly();
+                    driver.process.waitFor(20, TimeUnit.SECONDS);
+                    deleteTree(driver.dir);
+                }
+            }
+        }
+    }
+
+    /**
+     * Every member's log purged to the segment boundary below {@code p} (which must lie past {@code mustPass}), then
+     * a genuine ALIGNED at {@code p} on {@code m1}, built from the live log copy (it still starts at 0).
+     */
+    private static void pruneAndProduce(final ReplicaRig r, final Member m1, final Member keeper, final long copy,
+                                        final long p, final long mustPass) {
+        final long boundary = p / PULL_SEGMENT * PULL_SEGMENT;
+        assertTrue("the purge boundary " + boundary + " lies past " + mustPass, boundary > Math.max(0, mustPass));
+        final com.openexchange.cluster.testkit.RecordedLog log = r.rig.captureCopy(m1, keeper, copy);
+        for (final Member m : r.rig.live()) {
+            assertEquals("member " + m.id + " log start after the purge", boundary, r.rig.purgeLogTo(m, boundary));
+        }
+        final com.openexchange.core.infrastructure.persistence.TestShadowProducer.Written w = r.rig.producer(m1)
+                .produce(new com.openexchange.core.infrastructure.persistence.TestShadowProducer.Who(
+                        com.openexchange.cluster.shadow.ProducerKind.FOLLOWER, 800 + (int)(p % 100)), log, p);
+        assertTrue(w.toString(), w.ok());
+        System.out.println("[external-driver] members purged to " + boundary + "; ALIGNED at " + p + " on member "
+                + m1.id);
+    }
+
+    private static int freeUdp() throws IOException {
+        try (java.net.DatagramSocket s = new java.net.DatagramSocket(0)) {
+            return s.getLocalPort();
+        }
+    }
+
+    /** The child's exit status, pumping the test's cluster sessions while it runs. */
+    private static int awaitExitPumping(final ReplicaChild child, final long timeoutMs, final Runnable pump)
+            throws Exception {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (child.process.isAlive()) {
+            assertTrue(child.name + " did not exit within " + timeoutMs + " ms" + child.tails(),
+                    System.nanoTime() < deadline);
+            pump.run();
+        }
+        return child.process.exitValue();
     }
 
     // ------------------------------------------------------------------------------------------------ helpers

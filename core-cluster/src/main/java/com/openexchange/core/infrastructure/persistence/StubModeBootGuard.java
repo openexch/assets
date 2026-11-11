@@ -16,6 +16,11 @@ import com.openexchange.cluster.SnapshotCadence;
  *   <tr><td>guard row 2</td><td>{@code SNAPSHOT_MODE=shadow}, {@code SNAPSHOT_PRUNE_ENABLED=true} and
  *       {@code SHADOW_FLOOR_ENABLED=false}</td><td>refuse, unless {@value #UNCHECKED_PROPERTY} is true (a
  *       test-only override, the {@code ShadowSelfCheck} pattern)</td></tr>
+ *   <tr><td>guard row 3</td><td>{@code SHADOW_PULL_SOURCES} names this node's own archive control endpoint
+ *       ({@link #enforcePullSources}, once the endpoint is known)</td><td>refuse with the kit's text</td></tr>
+ *   <tr><td>guard row 4</td><td>{@code SHADOW_ANCHOR_RULE=any-verified}, an empty {@code SHADOW_PULL_SOURCES},
+ *       {@code SHADOW_PULL_KINDS} wider than ALIGNED</td><td>allowed, one {@code [BOOT-GUARD] CRITICAL: } line
+ *       each</td></tr>
  *   <tr><td>guard row OK</td><td>otherwise</td><td>{@code [BOOT-GUARD] snapshotMode=<mode> prune=<bool> floor=wired}</td></tr>
  * </table>
  *
@@ -49,6 +54,38 @@ public final class StubModeBootGuard {
         }
     }
 
+    /**
+     * Guard row 3: the pull sources against this node's own archive control endpoint, run once the cluster
+     * configuration named it and before any Aeron component launches.
+     *
+     * @param ownArchiveEndpoint {@code host:port} of this node's archive control channel
+     * @throws StandbySnapshotBootGuard.Refused with {@code CORE BOOT GUARD: } and the kit's text
+     */
+    public static void enforcePullSources(final SnapshotModeSettings settings, final String ownArchiveEndpoint) {
+        try {
+            settings.pullSettingsFor(ownArchiveEndpoint);
+        } catch (final IllegalArgumentException ownEndpoint) {
+            final StandbySnapshotBootGuard.Refused refused =
+                    new StandbySnapshotBootGuard.Refused(ownEndpoint.getMessage(), ownEndpoint);
+            System.err.println(refused.getMessage());
+            throw refused;
+        }
+    }
+
+    /** {@code host:port} of an {@code aeron:udp?endpoint=host:port} channel, or null. */
+    public static String endpointOf(final String channel) {
+        if (channel == null) {
+            return null;
+        }
+        final String key = "endpoint=";
+        final int at = channel.indexOf(key);
+        if (at < 0) {
+            return null;
+        }
+        final int end = channel.indexOf('|', at);
+        return channel.substring(at + key.length(), end < 0 ? channel.length() : end);
+    }
+
     private static SnapshotModeSettings check(final SnapshotModeSettings.Source source, final boolean pruneEnabled) {
         final SnapshotModeSettings settings;
         try {
@@ -63,6 +100,9 @@ public final class StubModeBootGuard {
             }
             System.err.println("[BOOT-GUARD] CRITICAL: SNAPSHOT_MODE=shadow with SHADOW_FLOOR_ENABLED=false let through by "
                     + UNCHECKED_PROPERTY + "=true (test only): this node may purge log below a stub it cannot restore");
+        }
+        for (final String line : settings.criticalLines()) {
+            System.err.println("[BOOT-GUARD] CRITICAL: " + line);
         }
         System.out.println("[BOOT-GUARD] snapshotMode=" + settings.mode().text() + " prune=" + pruneEnabled
                 + " floor=" + (settings.mode() == SnapshotMode.SHADOW && pruneEnabled

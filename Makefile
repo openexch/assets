@@ -26,8 +26,9 @@ integration:
 # Nightly: the heavy harness behind flags (harness B9). The 100k cluster restore is the evidence
 # (restore + replay -> ready <= 30 s, corrupt CRC refused); the 1M sizing and the 30k-line strided splice are reports.
 nightly:
-	mvn -pl core-cluster -am test -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
+	mvn -pl core-cluster -am test -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest,ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
 	mvn -pl core-cluster -am test -Dtest='ShadowEquivalenceClusterTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.equivalence.100k=true
+	mvn -pl core-cluster -am test -Dtest='ShadowPullerClusterTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.pull.100k=true
 
 # The shadow equivalence story with 1M open orders: a large box only (three members, the replica and their images
 # in one JVM do not fit a CI runner). MILLION_HEAP sets the test JVM heap. Run it alone: on a shared box wrap it in
