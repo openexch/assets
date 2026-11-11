@@ -70,7 +70,7 @@ jobs:
       - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests, shadow equivalence, forged member snapshot)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test
-          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest,ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints'
+          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest,ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true -Dcore.pull.external=true
         env:

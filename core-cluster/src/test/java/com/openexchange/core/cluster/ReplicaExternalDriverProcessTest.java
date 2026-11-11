@@ -316,8 +316,15 @@ public class ReplicaExternalDriverProcessTest {
         }
     }
 
+    /**
+     * The replica's bootstrap pull and re-bootstrap on an external driver: three in-process members, a child replica
+     * and an external driver child in one runner, about 80 s with several cluster snapshots. Nightly only
+     * ({@code -Dcore.pull.external=true}): on a loaded PR runner the in-process members lose their leader heartbeat.
+     */
     @Test(timeout = 1_500_000)
     public void anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap() throws Exception {
+        org.junit.Assume.assumeTrue("the external-driver pull rows run only with -Dcore.pull.external=true",
+                Boolean.getBoolean("core.pull.external"));
         try (ReplicaRig r = new ReplicaRig(new ShadowClusterRig(PORT_BASE_PULL, "replica-external-driver-pull", 3, "64k",
                 PULL_SEGMENT))) {
             final Path base = r.rig.tmp.toPath();

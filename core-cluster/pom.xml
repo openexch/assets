@@ -132,7 +132,7 @@
              runs on the PR gate as its two-toggle variant (the properties below); the nightly job and a tag run the
              five-toggle default and the 100k variant. The shadow puller story, the leader gate (three members, the
              leader kill, the 100k variant), the re-bootstrap story and the external-driver pull rows of
-             ShadowRestoreExternalDriverProcessTest (-Dcore.pull.external=true) are nightly only. -->
+             ShadowRestoreExternalDriverProcessTest and ReplicaExternalDriverProcessTest (-Dcore.pull.external=true) are nightly only. -->
         <profile>
             <id>fast</id>
             <build>
