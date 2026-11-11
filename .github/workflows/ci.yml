@@ -67,12 +67,23 @@ jobs:
           java-version: 21
           cache: maven
 
-      - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests)
+      - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests, shadow equivalence, forged member snapshot)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test
-          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest'
+          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The shadow equivalence story again with 100k open orders before the first toggle
+      # (the default five-toggle story ran in the step above).
+      - name: Nightly harness (shadow equivalence, 100k open orders)
+        run: >-
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          -Dtest='ShadowEquivalenceClusterTest'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dcore.equivalence.100k=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -4,10 +4,8 @@ package com.openexchange.core.cluster;
 import com.openexchange.core.application.engine.feed.FeedState;
 import com.openexchange.core.domain.Asset;
 import com.openexchange.core.domain.FixedPoint;
-import com.openexchange.core.domain.Market;
 import com.openexchange.core.infrastructure.generated.AdminAckDecoder;
 import com.openexchange.core.infrastructure.generated.ConfigDecision;
-import com.openexchange.core.infrastructure.generated.CoreConfigEncoder;
 import com.openexchange.core.infrastructure.generated.DepositEncoder;
 import com.openexchange.core.infrastructure.generated.FeedPositionReportDecoder;
 import com.openexchange.core.infrastructure.generated.GateReason;
@@ -132,18 +130,7 @@ public class FeedStateRestoreClusterTest {
     private final MessageHeaderEncoder headerEnc = new MessageHeaderEncoder();
 
     private int coreConfig(final long corr, final long version) {
-        final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(ingress, 0, headerEnc).correlationId(corr)
-                .configVersion(version).behaviorVersion(version).genesisId(GENESIS);
-        final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(Market.ALL.length);
-        for (final Market d : Market.ALL) {
-            m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id()).quoteAssetId(d.quoteAsset().id())
-                    .tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L).lotSize(0);
-        }
-        final CoreConfigEncoder.AssetsEncoder a = e.assetsCount(Asset.values().length);
-        for (final Asset d : Asset.values()) {
-            a.next().assetId(d.id()).code(d.name()).scale((short) 8);
-        }
-        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
+        return CoreRestoreRig.Encoders.coreConfig(ingress, corr, version, GENESIS);
     }
 
     private int engineConfig(final long js, final long cfg, final ConfigDecision decision) {

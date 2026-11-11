@@ -111,8 +111,25 @@ Ports are `CLUSTER_PORT_BASE + node id * CLUSTER_PORT_STRIDE + offset`, with off
 | `REPLICA_READY_SHADOW_AGE_MS` | `1800000` | newest shadow age allowed for `/ready`; `0` disables |
 | `REPLICA_READY_TIME_LAG_MS` | `3000` | wall clock minus cluster time of the last applied frame; `0` disables |
 | `REPLICA_SHADOW_BUFFER_MB` | `512` | serialize buffer; an image larger than this fences |
+| `REPLICA_MISMATCH_HOLD_MS` | `0` | an oracle mismatch holds the replica until it is stopped; a value (1..604800000) exits 1 after that long |
+| `REPLICA_MISMATCH_DIR` | `BASE_DIR/mismatch` | where a mismatch dumps both images and `report.txt`; created and checked writable at boot |
+| `REPLICA_MISMATCH_DUMP_MAX_MB` | `2048` | cap per dumped image file (0..16384); `0` writes the report only |
+| `REPLICA_FENCE_PURGE_WAIT_MS` | `30000` | how long a history fence waits for the purge of its suspect shadows before exit 1 (1000..600000) |
+| `REPLICA_MEMBER_CADENCE_MS` | `0` | the members' snapshot cadence; when set, `REPLICA_READY_SHADOW_AGE_MS` must cover it plus `REPLICA_VERIFY_WAIT_MS` |
 
 The remaining `REPLICA_*` settings (backup timeouts, catch-up buffers, driver MTU and term length, stream ids) are listed with their ranges in `core-cluster/src/main/java/com/openexchange/core/replica/ReplicaSettings.java`. After a normal restart the replica reports 503 `unverified continuation` until it has compared its state with the next member snapshot, about one member snapshot interval.
+
+At every ALIGNED position the replica compares its state with the member snapshot its backup retrieved there. A
+difference of the same history holds the replica instead of exiting: nothing is applied or written, `/ready` reads 503
+`recovery=fenced:oracle mismatch at <P>: <detail>`, `/metrics` keeps serving (`shadow_oracle_mismatch_total`,
+`shadow_oracle_mismatch_position`), and both images plus `report.txt` are in `REPLICA_MISMATCH_DIR/<P>/`. Read
+`/metrics`, copy the dump, adjudicate offline, then stop the replica (exit 143) and wipe or keep `BASE_DIR`; a restart
+re-latches at the same position. A member copy of another genesis, or a member snapshot the replica applied past
+without a SNAPSHOT action, is a history fence: the replica's own shadows above its last equal compare are purged (on a restore start, only those above the restore point), then
+it exits 1; wipe `BASE_DIR`. Switch a member to `SNAPSHOT_MODE=shadow` only when, over the agreed window,
+`shadow_oracle_mismatch_total` and `shadow_oracle_other_genesis_total` did not move, `shadow_oracle_match_total` rose
+by as much as `shadow_trigger_total{kind="ALIGNED"}`, and `shadow_replica_verified` is 1. Details in cluster-kit's
+`docs/replica.md` ("Live oracle").
 
 HTTP endpoints: each engine member serves `/health`, `/ready` and `/metrics` on its probe port. The bridge serves `/health` and `/metrics` on `BRIDGE_METRICS_PORT` (default 9600), the projector on `PROJECTOR_METRICS_PORT` (default 9601).
 

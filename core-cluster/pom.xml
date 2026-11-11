@@ -127,8 +127,10 @@
     <profiles>
         <!-- The PR gate: everything except the long replica process tests (several minutes each: re-genesis matrix,
              alignment trust after a restart, bootstrap, partial copies, housekeeping, backup window, readiness flap,
-             self-check). CI's nightly job and the release tag build run them; a plain `mvn verify` runs everything.
-             An explicit -Dtest overrides these excludes. -->
+             self-check, the forged member snapshot). CI's nightly job and the release tag build run them; a plain
+             `mvn verify` runs everything. An explicit -Dtest overrides these excludes. The shadow equivalence test
+             runs on the PR gate as its two-toggle variant (the properties below); the nightly job and a tag run the
+             five-toggle default and the 100k variant. -->
         <profile>
             <id>fast</id>
             <build>
@@ -146,8 +148,14 @@
                                 <exclude>**/ReplicaBackupWindowTest.java</exclude>
                                 <exclude>**/ReplicaReadyDoesNotFlapTest.java</exclude>
                                 <exclude>**/ReplicaSelfCheckTest.java</exclude>
+                                <exclude>**/OracleMismatchTest.java</exclude>
                                 <exclude>**/*$*</exclude>
                             </excludes>
+                            <systemPropertyVariables>
+                                <core.equivalence.aligned>2</core.equivalence.aligned>
+                                <core.equivalence.standby>2</core.equivalence.standby>
+                                <core.equivalence.users>2</core.equivalence.users>
+                            </systemPropertyVariables>
                         </configuration>
                     </plugin>
                 </plugins>

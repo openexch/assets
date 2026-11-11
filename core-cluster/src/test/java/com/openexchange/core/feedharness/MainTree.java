@@ -32,7 +32,7 @@ public final class MainTree {
      * lock-pinned harness (harness-eb559a7, feed_harness_sha256 85f2c1d7...) carries it as {@code main_tree_ref_id}.
      */
     public static final String MONEY_SCHEMA_MAIN_TREE_ID =
-            "846876f79aa96ce4fc4abad0f2107800a878b4229bb32278b0389e8c8c0b58e5";
+            "e647a077fde8b4350186fc8ca37f322e54539d19aa7fe54e2d6eaf0eccc84aa7";
 
     private MainTree() {
     }

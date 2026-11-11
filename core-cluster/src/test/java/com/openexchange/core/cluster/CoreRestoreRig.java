@@ -282,6 +282,31 @@ final class CoreRestoreRig {
             return MessageHeaderEncoder.ENCODED_LENGTH + outcome.encodedLength();
         }
 
+        /**
+         * An ADMIN CoreConfig (every market and asset, the rig's ticks and bands) at {@code version} for config and
+         * behaviour, into {@code into} (a CoreConfig does not fit {@link #buf}). Version 1 is the ADOPT of
+         * {@code genesis}; a later version is a switch of the adopted genesis.
+         */
+        static int coreConfig(final UnsafeBuffer into, final long corr, final long version, final long genesis) {
+            final com.openexchange.core.infrastructure.generated.CoreConfigEncoder e =
+                    new com.openexchange.core.infrastructure.generated.CoreConfigEncoder()
+                            .wrapAndApplyHeader(into, 0, new MessageHeaderEncoder()).correlationId(corr)
+                            .configVersion(version).behaviorVersion(version).genesisId(genesis);
+            final com.openexchange.core.infrastructure.generated.CoreConfigEncoder.MarketsEncoder m =
+                    e.marketsCount(Market.ALL.length);
+            for (final Market d : Market.ALL) {
+                m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id())
+                        .quoteAssetId(d.quoteAsset().id()).tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L)
+                        .lotSize(0);
+            }
+            final com.openexchange.core.infrastructure.generated.CoreConfigEncoder.AssetsEncoder a =
+                    e.assetsCount(Asset.values().length);
+            for (final Asset d : Asset.values()) {
+                a.next().assetId(d.id()).code(d.name()).scale((short)8);
+            }
+            return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
+        }
+
         int orderSnapshot(final long corr, final long user) {
             query.wrapAndApplyHeader(buf, 0, header).correlationId(corr).userId(user).fromOrderId(0);
             return MessageHeaderEncoder.ENCODED_LENGTH + query.encodedLength();
@@ -359,7 +384,8 @@ final class CoreRestoreRig {
                     if (adminAck.refTemplateId() == 80) {
                         registered.incrementAndGet();
                     }
-                    frames.add("ADMINACK ref=" + adminAck.refTemplateId() + " result=" + adminAck.result());
+                    frames.add("ADMINACK ref=" + adminAck.refTemplateId() + " result=" + adminAck.result() + " reason="
+                            + com.openexchange.core.infrastructure.generated.CoreRejectReason.get(adminAck.reason()));
                     break;
                 case DepositAckDecoder.TEMPLATE_ID:
                     depositAck.wrapAndApplyHeader(buffer, offset, header);

@@ -23,9 +23,12 @@ import java.util.Objects;
  * and LOCAL positions. The skeleton is the kit's {@code cluster.replica}; this class binds the core.
  *
  * <p>Order (the {@code AeronCluster} discipline, AC:58-67): install the lifecycle, parse {@link ReplicaSettings} under
- * the {@value ReplicaSettings#PREFIX} guard BEFORE any Aeron component, build the binding, then
- * {@code ReplicaProcess.run}. A refused setting, a failed launch or a fatal fault exits 1 through the lifecycle; a
- * signal exits 143; there is no cluster termination for a replica.</p>
+ * the {@value ReplicaSettings#PREFIX} guard BEFORE any Aeron component (the mismatch dump dir included), build the
+ * binding, then {@code ReplicaProcess.launch} with the lifecycle's host and wait for the stop. A refused setting, a
+ * failed launch or a fatal fault exits 1 through the lifecycle; a signal exits 143; there is no cluster termination
+ * for a replica. An oracle mismatch (the members' snapshot at an ALIGNED position differs from the replica's image,
+ * same genesis) holds instead of exiting: the process stays up with {@code /ready} 503 and its metrics served until
+ * it is stopped (143), the external driver is lost (1) or {@code REPLICA_MISMATCH_HOLD_MS} elapses (1).</p>
  *
  * <p>Rules: the replica's engine is touched only by the kit follower thread through
  * {@code ReplayContainer}; it publishes nothing (no event sink, journal sink or transport hooks: the applier's
@@ -63,7 +66,40 @@ public final class CoreShadowReplicaMain {
         final Binding binding = new Binding(() -> lifecycle.fatal(EngineLifecycle.EXIT_FATAL, CORE_CONFIG_FAILED));
         log.info("Core replica R%d starting: members=%s driverMode=%s source=%s",
                 settings.slot(), settings.memberHosts(), settings.driverMode(), settings.sourceType());
-        ReplicaProcess.run(settings.config(), binding, lifecycle);
+        final ReplicaProcess.Host host = host(ReplicaProcess.of(lifecycle));
+        try (ReplicaProcess ignored = ReplicaProcess.launch(settings.config(), binding, host, null)) {
+            lifecycle.awaitStop();
+        }
+    }
+
+    /**
+     * The lifecycle's host with the oracle mismatch hold logged as CRITICAL through the core logger. A hold changes
+     * nothing in the lifecycle: the process keeps running (endpoint, metrics, housekeeping) until the operator's stop
+     * (143), driver loss (1, the error handler stays armed) or the kit's {@code REPLICA_MISMATCH_HOLD_MS} bound (1).
+     */
+    static ReplicaProcess.Host host(final ReplicaProcess.Host lifecycle) {
+        return new ReplicaProcess.Host() {
+            @Override
+            public void fatal(final String reason) {
+                lifecycle.fatal(reason);
+            }
+
+            @Override
+            public void onError(final Throwable t, final boolean externalDriver) {
+                lifecycle.onError(t, externalDriver);
+            }
+
+            @Override
+            public void awaitExternalDriver(final String aeronDir, final long timeoutMs) {
+                lifecycle.awaitExternalDriver(aeronDir, timeoutMs);
+            }
+
+            @Override
+            public void hold(final String reason) {
+                log.error("CRITICAL replica HOLD: %s (nothing is applied or written; /ready reads fenced, /metrics and"
+                        + " the mismatch dump stay served until the process is stopped)", reason);
+            }
+        };
     }
 
     /**

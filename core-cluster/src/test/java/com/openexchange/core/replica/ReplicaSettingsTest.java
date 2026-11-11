@@ -492,4 +492,97 @@ public class ReplicaSettingsTest {
         }
         assertEquals(132_000, with("REPLICA_VERIFY_WAIT_MS", "132000").config().verifyWaitMs());
     }
+
+    /**
+     * The live oracle's settings: each at its boundaries with the kit's refusal text behind the boot guard prefix, the
+     * non-integer text, the defaults, the readiness age cross-check (only when the member cadence is set) and the
+     * mismatch dir boot check.
+     */
+    @Test
+    public void oracleHoldDumpPurgeAndCadenceSettings() throws Exception {
+        final String[][] rows = {
+                // key, min, max, refusal below min, refusal above max
+                {"REPLICA_MISMATCH_HOLD_MS", "0", "604800000",
+                        "REPLICA_MISMATCH_HOLD_MS must be 0 (hold until stopped) or 1..604800000 ms: -1",
+                        "REPLICA_MISMATCH_HOLD_MS must be 0 (hold until stopped) or 1..604800000 ms: 604800001"},
+                {"REPLICA_MISMATCH_DUMP_MAX_MB", "0", "16384",
+                        "REPLICA_MISMATCH_DUMP_MAX_MB must be 0..16384: -1",
+                        "REPLICA_MISMATCH_DUMP_MAX_MB must be 0..16384: 16385"},
+                {"REPLICA_FENCE_PURGE_WAIT_MS", "1000", "600000",
+                        "REPLICA_FENCE_PURGE_WAIT_MS must be 1000..600000 ms: 999",
+                        "REPLICA_FENCE_PURGE_WAIT_MS must be 1000..600000 ms: 600001"},
+                {"REPLICA_MEMBER_CADENCE_MS", "0", "86400000",
+                        "REPLICA_MEMBER_CADENCE_MS must be 0 (not checked) or 1..86400000 ms: -1",
+                        "REPLICA_MEMBER_CADENCE_MS must be 0 (not checked) or 1..86400000 ms: 86400001"},
+        };
+        int n = 0;
+        for (final String[] r : rows) {
+            final ReplicaSettings.Key key = ReplicaSettings.Key.valueOf(r[0]);
+            final long min = Long.parseLong(r[1]);
+            final long max = Long.parseLong(r[2]);
+            // the cadence max needs a readiness age that covers it
+            final String[] age = r[0].equals("REPLICA_MEMBER_CADENCE_MS")
+                    ? new String[] {"REPLICA_READY_SHADOW_AGE_MS", "86400000", "REPLICA_VERIFY_WAIT_MS", null}
+                    : new String[] {"REPLICA_READY_SHADOW_AGE_MS", null, "REPLICA_VERIFY_WAIT_MS", null};
+            assertEquals(r[0] + " min", min, with(r[0], r[1]).numeric(key));
+            if (r[0].equals("REPLICA_MEMBER_CADENCE_MS")) {
+                // a cadence at the max cannot be covered by the age max (86400000) plus any verify wait: refused
+                assertEquals("REPLICA_READY_SHADOW_AGE_MS 86400000 is below the member cadence plus REPLICA_VERIFY_WAIT_MS ("
+                        + (86_400_000L + 180_000L) + "): a dropped ALIGNED would flap readiness",
+                        refusal(r[0], r[2], age[0], age[1]));
+                assertEquals(r[0] + " covered", 86_220_000L, with(r[0], "86220000", age[0], age[1])
+                        .numeric(key));
+            } else {
+                assertEquals(r[0] + " max", max, with(r[0], r[2]).numeric(key));
+            }
+            assertEquals(r[0] + " min-1", r[3], refusal(r[0], Long.toString(min - 1)));
+            assertEquals(r[0] + " max+1", r[4], refusal(r[0], Long.toString(max + 1)));
+            assertEquals(r[0] + " non-integer", r[0] + "='12x' is not an integer", refusal(r[0], "12x"));
+            n += 5;
+        }
+        final ReplicaSettings d = with();
+        assertEquals("hold until stopped", 0, d.numeric(ReplicaSettings.Key.REPLICA_MISMATCH_HOLD_MS));
+        assertEquals(2048, d.numeric(ReplicaSettings.Key.REPLICA_MISMATCH_DUMP_MAX_MB));
+        assertEquals(30_000, d.numeric(ReplicaSettings.Key.REPLICA_FENCE_PURGE_WAIT_MS));
+        assertEquals("cadence not checked", 0, d.numeric(ReplicaSettings.Key.REPLICA_MEMBER_CADENCE_MS));
+        assertEquals("dump dir default", new File(d.baseDir(), "mismatch"), d.mismatchDir());
+        final ReplicaConfig cfg = with("REPLICA_MISMATCH_HOLD_MS", "5000", "REPLICA_MISMATCH_DIR", "/var/lib/dump",
+                "REPLICA_MISMATCH_DUMP_MAX_MB", "7", "REPLICA_FENCE_PURGE_WAIT_MS", "4000",
+                "REPLICA_MEMBER_CADENCE_MS", "300000").config();
+        assertEquals(5_000, cfg.mismatchHoldMs());
+        assertEquals(new File("/var/lib/dump"), cfg.mismatchDir());
+        assertEquals(7, cfg.mismatchDumpMaxMb());
+        assertEquals(4_000, cfg.fencePurgeWaitMs());
+        assertEquals(300_000, cfg.memberCadenceMs());
+
+        // the cross-check: production defaults (age 30 min) cover a 5 min cadence plus the 3 min verify wait
+        assertEquals(300_000, with("REPLICA_MEMBER_CADENCE_MS", "300000").numeric(
+                ReplicaSettings.Key.REPLICA_MEMBER_CADENCE_MS));
+        assertEquals("REPLICA_READY_SHADOW_AGE_MS 479999 is below the member cadence plus REPLICA_VERIFY_WAIT_MS"
+                        + " (480000): a dropped ALIGNED would flap readiness",
+                refusal("REPLICA_MEMBER_CADENCE_MS", "300000", "REPLICA_READY_SHADOW_AGE_MS", "479999"));
+        assertEquals(480_000, with("REPLICA_MEMBER_CADENCE_MS", "300000", "REPLICA_READY_SHADOW_AGE_MS", "480000")
+                .numeric(ReplicaSettings.Key.REPLICA_READY_SHADOW_AGE_MS));
+        assertEquals("an age of 0 (the input off) is not cross-checked", 0, with("REPLICA_MEMBER_CADENCE_MS",
+                "300000", "REPLICA_READY_SHADOW_AGE_MS", "0").numeric(ReplicaSettings.Key.REPLICA_READY_SHADOW_AGE_MS));
+
+        // the dump dir boot check: created when missing; a path under a regular file is refused with the prefix
+        final java.nio.file.Path tmp = java.nio.file.Files.createTempDirectory("replica-settings-dump");
+        try {
+            final File dir = tmp.resolve("a/b/mismatch").toFile();
+            with("REPLICA_MISMATCH_DIR", dir.getPath()).requireMismatchDirWritable();
+            assertTrue("created at boot", dir.isDirectory());
+            final File file = tmp.resolve("plain-file").toFile();
+            assertTrue(file.createNewFile());
+            final File under = new File(file, "mismatch");
+            final ReplicaSettings bad = with("REPLICA_MISMATCH_DIR", under.getPath());
+            final IllegalStateException e = assertThrows(IllegalStateException.class, bad::requireMismatchDirWritable);
+            assertEquals(ReplicaSettings.PREFIX + "REPLICA_MISMATCH_DIR is not writable: " + under.getAbsolutePath(),
+                    e.getMessage());
+        } finally {
+            org.agrona.IoUtil.delete(tmp.toFile(), true);
+        }
+        System.out.println("GREEN oracle settings: " + rows.length + " settings, " + n + " boundary rows, the age"
+                + " cross-check and the dump dir boot check");
+    }
 }
