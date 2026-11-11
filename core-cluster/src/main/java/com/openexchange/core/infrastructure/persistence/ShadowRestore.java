@@ -16,6 +16,8 @@ import com.openexchange.cluster.shadow.ShadowEntry;
 import com.openexchange.cluster.shadow.ShadowHeader;
 import com.openexchange.cluster.shadow.ShadowIdentity;
 import com.openexchange.cluster.shadow.ShadowImageLoader;
+import com.openexchange.cluster.shadow.ShadowPullSettings;
+import com.openexchange.cluster.shadow.ShadowPuller;
 import com.openexchange.cluster.shadow.ShadowStub;
 import com.openexchange.cluster.shadow.ShadowVerdicts;
 import io.aeron.Aeron;
@@ -60,6 +62,9 @@ import java.util.function.LongConsumer;
  *       this boot.</li>
  *   <li><b>TAIL</b> downwards from P_cm over {@code newestBelow(pos, logStart)}: CONFLICT and
  *       refusals continue below; the single-recording precondition is a pre-engine check.</li>
+ *   <li><b>PULL</b> (only with {@code SHADOW_PULL_SOURCES} set): one startup pull from the sources' archives,
+ *       bounded by {@code SHADOW_PULL_STARTUP_WAIT_MS}; after a VERIFIED pull one re-scan and one repeat of rules
+ *       1-3, no loop.</li>
  *   <li><b>Virtual genesis</b> (section 7) when the 7.1 precondition holds, loud.</li>
  *   <li>Otherwise {@link Halt} with the 7.3 text (G1).</li>
  * </ol>
@@ -77,7 +82,8 @@ import java.util.function.LongConsumer;
  * counting {@link TailEgressSink} (rule 12.15: nothing is published from {@code onStart}). Every wait has a deadline
  * from a setting (rule 12.10); a watchdog covers an apply that blocks inside the money-journal ring (rule 12.14).</p>
  *
- * <p>Never writes {@code RecordingLog}, never schedules, never publishes, never purges.</p>
+ * <p>Never writes {@code RecordingLog}, never schedules, never publishes, never purges (the startup puller purges
+ * only the partial or refused copies it created itself).</p>
  */
 final class ShadowRestore {
 
@@ -199,6 +205,26 @@ final class ShadowRestore {
     record Inputs(File clusterDir, AeronArchive.Context archiveContext, int clusterId, long recoveryPosition) {
     }
 
+    /**
+     * What the startup pull (3b) needs: the {@code SHADOW_PULL_*} rows (disabled: 3b is skipped), this node's host
+     * for the listing clients' response channel, the service's role, a readiness detail sink and a hook that sees
+     * the puller (the host exports its counters).
+     */
+    record StartupPull(ShadowPullSettings settings, String responseHost, java.util.function.BooleanSupplier leaderNow,
+                       Consumer<String> status, Consumer<ShadowPuller> created) {
+        StartupPull {
+            Objects.requireNonNull(settings, "settings");
+            Objects.requireNonNull(responseHost, "responseHost");
+            Objects.requireNonNull(leaderNow, "leaderNow");
+            Objects.requireNonNull(status, "status");
+            Objects.requireNonNull(created, "created");
+        }
+
+        static StartupPull disabled() {
+            return new StartupPull(ShadowPullSettings.disabled(), "localhost", () -> false, t -> { }, p -> { });
+        }
+    }
+
     /** A loaded candidate that passed every pre-engine check. */
     private record Loaded(LogicalShadow shadow, ShadowEntry entry, ShadowImageLoader.LoadedShadow image) {
     }
@@ -220,6 +246,7 @@ final class ShadowRestore {
     private final LongConsumer termSink;
     private final CoreEventSink liveSink;
     private final Consumer<String> watchdogHalt;
+    private final StartupPull pull;
     private final NanoClock clock = SystemNanoClock.INSTANCE;
 
     private boolean restoreAttempted;
@@ -233,8 +260,9 @@ final class ShadowRestore {
     ShadowRestore(final Inputs in, final CoreLogApplier applier, final SnapshotModeSettings settings,
                   final SnapshotModeCounters counters, final ShadowCounters shadowCounters, final ShadowVerdicts verdicts,
                   final Faults faults, final LongConsumer termSink, final CoreEventSink liveSink,
-                  final Consumer<String> watchdogHalt) {
+                  final Consumer<String> watchdogHalt, final StartupPull pull) {
         this.in = Objects.requireNonNull(in, "in");
+        this.pull = Objects.requireNonNull(pull, "pull");
         this.applier = Objects.requireNonNull(applier, "applier");
         this.settings = Objects.requireNonNull(settings, "settings");
         this.counters = Objects.requireNonNull(counters, "counters");
@@ -325,95 +353,27 @@ final class ShadowRestore {
                     + scan.usable().size() + " conflicts=" + scan.conflicts().size() + " errors=" + scan.errors()
                     + " logRecording=" + logRecordingId + " logStart=" + logStart);
 
-            // 1. EQUAL
-            String equal = "none";
-            final ShadowCatalog.Answer eq = scan.equalAt(pCm);
-            Loaded chosen = null;
-            Path path = null;
-            if (eq.kind() == ShadowCatalog.Answer.Kind.CONFLICT) {
-                conflict(SnapshotModeCounters.ConflictAt.EQUAL, eq.shadow());
-                equal = "conflict";
-            } else if (eq.kind() == ShadowCatalog.Answer.Kind.FOUND) {
-                chosen = check(loader, eq.shadow(), local, "EQUAL");
-                equal = chosen == null ? "refused" : "found";
-                path = chosen == null ? null : Path.EQUAL;
-            }
+            Selection sel = select(scan, pCm, logStart, terms, local, loader, aeron, archive);
 
-            // 2. SKIP
-            String skip = "none";
-            if (chosen == null) {
-                final ShadowCatalog.Answer sk = scan.newestAtOrAbove(pCm + 1);
-                if (sk.kind() == ShadowCatalog.Answer.Kind.CONFLICT) {
-                    conflict(SnapshotModeCounters.ConflictAt.SKIP, sk.shadow());
-                    skip = "conflict";
-                } else if (sk.kind() == ShadowCatalog.Answer.Kind.FOUND) {
-                    final ShadowHeader h = sk.shadow().representative().header();
-                    final MoneyJournalTail.Result tail = h.journalEnabledFlag()
-                            ? readJournalTail(aeron, archive) : null;
-                    if (!faults.skipSafeOff && !skipSafe(h, tail)) {
-                        counters.increment(SnapshotModeCounters.C.SKIP_UNSAFE_TOTAL);
-                        System.out.println("[shadow restore] SKIP candidate P_s=" + sk.shadow().logPosition()
-                                + " is not skip-safe on this node (journalSeq=" + h.journalSeq() + ", local journal "
-                                + tail + "): SKIP abandoned for this boot");
-                        skip = "unsafe";
-                    } else {
-                        chosen = check(loader, sk.shadow(), local, "SKIP");
-                        skip = chosen == null ? "refused" : "found";
-                        path = chosen == null ? null : Path.SKIP;
-                    }
+            // 3b. PULL (only with sources configured): one bounded startup pull, then one repeat of rules 1-3
+            String pulled = "disabled: " + ShadowPullSettings.SOURCES + " empty";
+            if (sel.chosen() == null && pull.settings().enabled()) {
+                final ShadowPuller.Report report = pull(aeron, pCm, logStart, stub.genesisId());
+                pulled = report.text();
+                if (report.kind() == ShadowPuller.Report.Kind.VERIFIED) {
+                    final ShadowCatalog.Scan again = catalog.scan();
+                    counters.set(SnapshotModeCounters.C.RESTORE_CANDIDATES_SCANNED, again.all().size());
+                    System.out.println("[shadow restore] after the pull: " + again.all().size()
+                            + " shadow recording(s), usable=" + again.usable().size() + "; rules 1-3 once more");
+                    sel = select(again, pCm, logStart, terms, local, loader, aeron, archive);
                 }
             }
 
-            // 3. TAIL, iterating downwards (review F4)
-            final List<String> tailNotes = new ArrayList<>();
-            if (chosen == null) {
-                long pos = pCm;
-                while (true) {
-                    final ShadowCatalog.Answer t = scan.newestBelow(pos, logStart);
-                    if (t.kind() == ShadowCatalog.Answer.Kind.EMPTY) {
-                        break;
-                    }
-                    final long ps = t.shadow().logPosition();
-                    if (t.kind() == ShadowCatalog.Answer.Kind.CONFLICT) {
-                        conflict(SnapshotModeCounters.ConflictAt.TAIL, t.shadow());
-                        tailNotes.add("conflict@" + ps);
-                        if (faults.tailIterationOff) {
-                            break;
-                        }
-                        pos = ps;
-                        continue;
-                    }
-                    final String multi = singleRecording(terms, ps, pCm);
-                    if (multi != null) {
-                        counters.refuse(SnapshotModeCounters.Refusal.MULTI_RECORDING);
-                        System.out.println("[shadow restore] TAIL candidate P_s=" + ps + " refused: " + multi);
-                        tailNotes.add("multi-recording@" + ps);
-                        if (faults.tailIterationOff) {
-                            break;
-                        }
-                        pos = ps;
-                        continue;
-                    }
-                    final Loaded l = check(loader, t.shadow(), local, "TAIL");
-                    if (l == null) {
-                        tailNotes.add("refused@" + ps);
-                        if (faults.tailIterationOff) {
-                            break;
-                        }
-                        pos = ps;
-                        continue;
-                    }
-                    chosen = l;
-                    path = Path.TAIL;
-                    break;
-                }
-            }
-
-            if (chosen != null) {
+            if (sel.chosen() != null) {
                 // the tail replays the ONE recording the precondition named (6.4), not merely the newest term's
-                final long tailRecording = path == Path.TAIL
-                        ? rangeRecording(terms, chosen.shadow().logPosition(), pCm) : logRecordingId;
-                return restoreFrom(chosen, path, stub, tailRecording, aeron, archive, startNs);
+                final long tailRecording = sel.path() == Path.TAIL
+                        ? rangeRecording(terms, sel.chosen().shadow().logPosition(), pCm) : logRecordingId;
+                return restoreFrom(sel.chosen(), sel.path(), stub, tailRecording, aeron, archive, startNs);
             }
 
             // 4. virtual genesis (7.1), else 5. halt (7.3)
@@ -423,14 +383,155 @@ final class ShadowRestore {
                 return virtualGenesis(stub, rangeRecording(terms, 0, pCm), aeron, archive, startNs);
             }
             throw new Halt("FATAL shadow restore: stub at P_cm=" + pCm + " and no restore path: shadows usable="
-                    + scan.usable().size() + " (EQUAL " + equal + ", SKIP " + skip + ", TAIL "
-                    + (tailNotes.isEmpty() ? "none" : String.join(" ", tailNotes)) + " above log start " + logStart
-                    + "), log starts at " + logStart + (logStart > 0 ? " > 0" : "") + " (virtual genesis refused: "
-                    + precondition + "). Runbook: (1) ClusterTool invalidate-latest-snapshot until the newest valid"
-                    + " group is a full image whose log is retained, then boot; (2) or restore this node's cluster dir"
-                    + " from a peer; (3) or pull a shadow with P_s >= " + logStart + " once a shadow puller exists.");
+                    + scan.usable().size() + " (EQUAL " + sel.equal() + ", SKIP " + sel.skip() + ", TAIL "
+                    + (sel.tailNotes().isEmpty() ? "none" : String.join(" ", sel.tailNotes())) + " above log start "
+                    + logStart + "), log starts at " + logStart + (logStart > 0 ? " > 0" : "")
+                    + " (virtual genesis refused: " + precondition + "). Runbook: (1) ClusterTool"
+                    + " invalidate-latest-snapshot until the newest valid group is a full image whose log is retained,"
+                    + " then boot; (2) or restore this node's cluster dir from a peer; (3) pull: " + pulled
+                    + " (a shadow with P_s >= " + logStart + " from " + ShadowPullSettings.SOURCES + ").");
         } finally {
             CloseHelper.quietClose(archive);
+        }
+    }
+
+    /** What rules 1-3 chose over one scan, and why each said no. */
+    private record Selection(Loaded chosen, Path path, String equal, String skip, List<String> tailNotes) {
+    }
+
+    /** Rules 1-3 (EQUAL, SKIP, TAIL downwards) over one scan; the first candidate that passes every check. */
+    private Selection select(final ShadowCatalog.Scan scan, final long pCm, final long logStart, final List<Term> terms,
+                             final ShadowIdentity.LocalIdentity local, final ShadowImageLoader loader,
+                             final Aeron aeron, final AeronArchive archive) {
+        // 1. EQUAL
+        String equal = "none";
+        final ShadowCatalog.Answer eq = scan.equalAt(pCm);
+        Loaded chosen = null;
+        Path path = null;
+        if (eq.kind() == ShadowCatalog.Answer.Kind.CONFLICT) {
+            conflict(SnapshotModeCounters.ConflictAt.EQUAL, eq.shadow());
+            equal = "conflict";
+        } else if (eq.kind() == ShadowCatalog.Answer.Kind.FOUND) {
+            chosen = check(loader, eq.shadow(), local, "EQUAL");
+            equal = chosen == null ? "refused" : "found";
+            path = chosen == null ? null : Path.EQUAL;
+        }
+
+        // 2. SKIP
+        String skip = "none";
+        if (chosen == null) {
+            final ShadowCatalog.Answer sk = scan.newestAtOrAbove(pCm + 1);
+            if (sk.kind() == ShadowCatalog.Answer.Kind.CONFLICT) {
+                conflict(SnapshotModeCounters.ConflictAt.SKIP, sk.shadow());
+                skip = "conflict";
+            } else if (sk.kind() == ShadowCatalog.Answer.Kind.FOUND) {
+                final ShadowHeader h = sk.shadow().representative().header();
+                final MoneyJournalTail.Result tail = h.journalEnabledFlag()
+                        ? readJournalTail(aeron, archive) : null;
+                if (!faults.skipSafeOff && !skipSafe(h, tail)) {
+                    counters.increment(SnapshotModeCounters.C.SKIP_UNSAFE_TOTAL);
+                    System.out.println("[shadow restore] SKIP candidate P_s=" + sk.shadow().logPosition()
+                            + " is not skip-safe on this node (journalSeq=" + h.journalSeq() + ", local journal "
+                            + tail + "): SKIP abandoned for this boot");
+                    skip = "unsafe";
+                } else {
+                    chosen = check(loader, sk.shadow(), local, "SKIP");
+                    skip = chosen == null ? "refused" : "found";
+                    path = chosen == null ? null : Path.SKIP;
+                }
+            }
+        }
+
+        // 3. TAIL, iterating downwards (review F4)
+        final List<String> tailNotes = new ArrayList<>();
+        if (chosen == null) {
+            long pos = pCm;
+            while (true) {
+                final ShadowCatalog.Answer t = scan.newestBelow(pos, logStart);
+                if (t.kind() == ShadowCatalog.Answer.Kind.EMPTY) {
+                    break;
+                }
+                final long ps = t.shadow().logPosition();
+                if (t.kind() == ShadowCatalog.Answer.Kind.CONFLICT) {
+                    conflict(SnapshotModeCounters.ConflictAt.TAIL, t.shadow());
+                    tailNotes.add("conflict@" + ps);
+                    if (faults.tailIterationOff) {
+                        break;
+                    }
+                    pos = ps;
+                    continue;
+                }
+                final String multi = singleRecording(terms, ps, pCm);
+                if (multi != null) {
+                    counters.refuse(SnapshotModeCounters.Refusal.MULTI_RECORDING);
+                    System.out.println("[shadow restore] TAIL candidate P_s=" + ps + " refused: " + multi);
+                    tailNotes.add("multi-recording@" + ps);
+                    if (faults.tailIterationOff) {
+                        break;
+                    }
+                    pos = ps;
+                    continue;
+                }
+                final Loaded l = check(loader, t.shadow(), local, "TAIL");
+                if (l == null) {
+                    tailNotes.add("refused@" + ps);
+                    if (faults.tailIterationOff) {
+                        break;
+                    }
+                    pos = ps;
+                    continue;
+                }
+                chosen = l;
+                path = Path.TAIL;
+                break;
+            }
+        }
+        return new Selection(chosen, path, equal, skip, tailNotes);
+    }
+
+    /**
+     * 3b: one startup pull on this (the onStart) thread with its own clients, closed after. The target ranks an
+     * ALIGNED at exactly P_cm first (EQUAL), then the newest with {@code logStart <= P_s < P_cm} (a TAIL base), then
+     * the newest above P_cm (a SKIP base, judged by rule 2 after). {@code SHADOW_PULL_STARTUP_WAIT_MS} from now is the
+     * one bound: a replication still in flight at the deadline is stopped and purged.
+     */
+    private ShadowPuller.Report pull(final Aeron aeron, final long pCm, final long logStart, final long genesisId) {
+        final ShadowPullSettings ps = pull.settings();
+        final long t0 = clock.nanoTime();
+        final long deadline = t0 + TimeUnit.MILLISECONDS.toNanos(ps.startupWaitMs());
+        final String detail = "restore: pulling a shadow for P_cm=" + pCm + " from " + ps.sources();
+        pull.status().accept(detail);
+        System.out.println("[shadow restore] 3b " + detail + " (deadline " + ps.startupWaitMs() + " ms, log start "
+                + logStart + ")");
+        final ShadowPuller.Target target = alias -> alias.logPosition() == pCm ? 0
+                : alias.logPosition() >= logStart && alias.logPosition() < pCm ? 1
+                : alias.logPosition() > pCm ? 2 : -1;
+        final io.aeron.archive.client.AeronArchive.Context ctx = in.archiveContext().clone();
+        final ShadowPuller puller = new ShadowPuller(aeron, ctx, CoreLogApplier.ENGINE_ID_CORE, in.clusterId(),
+                () -> genesisId, pull.leaderNow(), pull.responseHost(), ps, verdicts, shadowCounters, clock,
+                TimeUnit.MILLISECONDS.toNanos(settings.loadTimeoutMs()), Thread.currentThread().getName());
+        pull.created().accept(puller);
+        final org.agrona.concurrent.AgentInvoker invoker = aeron.conductorAgentInvoker();
+        try {
+            final ShadowPuller.Report report = puller.pullOnce(target, deadline, () -> {
+                if (invoker != null) {
+                    invoker.invoke();
+                }
+            });
+            final long ms = TimeUnit.NANOSECONDS.toMillis(clock.nanoTime() - t0);
+            if (report.kind() == ShadowPuller.Report.Kind.VERIFIED) {
+                pull.status().accept("restore: pulled shadow " + report.pulled().alias().format() + " from "
+                        + report.pulledFrom());
+                System.out.println("[shadow restore] 3b pulled shadow " + report.pulled().alias().format() + " from "
+                        + report.pulledFrom() + " in " + ms + " ms (" + report.text() + ")"
+                        + (ms > settings.readyBudgetMs() ? "; above SNAPSHOT_RESTORE_READY_BUDGET_MS="
+                        + settings.readyBudgetMs() + " (a measurement, not a limit)" : ""));
+            } else {
+                System.out.println("[shadow restore] 3b nothing pulled in " + ms + " ms: " + report.text());
+            }
+            return report;
+        } finally {
+            puller.close();
         }
     }
 

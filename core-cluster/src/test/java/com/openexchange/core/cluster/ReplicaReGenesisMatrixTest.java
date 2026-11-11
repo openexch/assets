@@ -290,6 +290,96 @@ public class ReplicaReGenesisMatrixTest {
                 + notEvaluated + ": not evaluated", notEvaluated.isEmpty());
     }
 
+    private static final int PORT_BASE_GENESIS_START = 51000;
+    private static final int PORT_BASE_GENESIS_START_NC = 51600;
+    private static final long REGENESIS_GENESIS_START = 0x4EED5EEDL;
+
+    /**
+     * A replica that started at GENESIS (no local shadow named its genesis; it learned it from the ADOPT) keeps running
+     * while every member is wiped and another genesis ADOPTed, {@code cluster/} kept; the new history stays below the
+     * old L stop, so L is not extended. The new cluster's first member snapshot is named: the genesis check, armed at
+     * the ADOPT, compares it against the adopted genesis and fences with the cluster-genesis text (exit 1). Control
+     * {@code GENESIS_CHECK_OFF} -> {@code a genesis-start replica followed another history without a fence}.
+     */
+    @Test(timeout = 1_800_000)
+    public void genesisStartReplicaFencesOnAKeptReGenesis() throws Exception {
+        final String[] fatal = genesisStart(PORT_BASE_GENESIS_START, "genesis-start", ReplicaRig.off());
+        assertGenesisStartFenced(fatal);
+        System.out.println("GREEN genesis-start replica fenced on a kept re-genesis: " + fatal[0]);
+        RestoreDrillDryRun.nc("genesis-start GENESIS_CHECK_OFF", "a genesis-start replica followed another history"
+                + " without a fence", () -> {
+                    try {
+                        assertGenesisStartFenced(genesisStart(PORT_BASE_GENESIS_START_NC, "genesis-start-nc",
+                                ReplicaRig.off(ReplicaNegativeControl.GENESIS_CHECK_OFF)));
+                    } catch (final AssertionError | RuntimeException e) {
+                        throw e;
+                    } catch (final Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                });
+    }
+
+    private static void assertGenesisStartFenced(final String[] fatal) {
+        if (fatal[0] == null || !fatal[0].equals(fatal[1])) {
+            throw new AssertionError("a genesis-start replica followed another history without a fence: fatal "
+                    + fatal[0] + ", expected " + fatal[1] + "; " + fatal[2]);
+        }
+    }
+
+    /** {fatal or null, the expected cluster-genesis text, the readiness detail at the end}. */
+    private static String[] genesisStart(final int portBase, final String cell, final Set<ReplicaNegativeControl> off)
+            throws Exception {
+        try (ReplicaRig r = new ReplicaRig(portBase, "replica-regenesis-" + cell)) {
+            r.bootAll();
+            final Member leader = r.rig.awaitLeader(null);
+            r.story(r.rig.followerOtherThan(leader, null), 4);
+            r.startReplica(r.builder(ReplicaRig.SLOT, "replica").verifyWaitMs(VERIFY_WAIT_MS).testHooks(r.faults, off)
+                    .build());
+            r.awaitBootstrapped(ReplicaRig.WAIT_MS);
+            assertEquals(ReplicaReadiness.RestorePath.GENESIS, r.replica.readiness().restorePath());
+            // the old history runs well past where the new one's first snapshot will land
+            while (r.commit() < 1024 * 1024) {
+                r.traffic(60, 12);
+            }
+            r.awaitCaughtUp(120_000);
+            final long p1 = r.rig.snapshotAll();
+            r.awaitVerified(p1, ShadowKind.ALIGNED, 120_000);
+            final long g1 = r.replica.follower().knownGenesis();
+            final long oldStop = r.replica.follower().recordedPosition();
+            System.out.println("[regenesis] " + cell + ": GENESIS start, VERIFIED at " + p1 + ", genesis " + g1
+                    + ", L stop " + oldStop + "; re-genesis with the replica running, cluster/ kept");
+
+            r.rig.forgetAll();
+            for (final Member m : r.rig.members) {
+                r.rig.kill(m);
+            }
+            for (final Member m : r.rig.members) {
+                IoUtil.delete(m.baseDir, false);
+            }
+            for (final Member m : r.rig.members) {
+                r.rig.restart(m);
+                r.hook(m);
+            }
+            r.rig.adoptGenesis = REGENESIS_GENESIS_START;
+            final Member leader2 = r.rig.awaitLeader(null);
+            r.story(r.rig.followerOtherThan(leader2, null), 4);
+            assertTrue("precondition: the new history stays below the old L stop " + oldStop + " (commit "
+                    + r.commit() + ")", r.commit() < oldStop);
+            final long first = r.rig.snapshotAll();
+            final long bound = fenceBoundMs(r) + r.replica.config().fencePurgeWaitMs();
+            try {
+                r.rig.await(() -> !r.fatals.isEmpty() || !r.holds.isEmpty(), bound, "fence");
+            } catch (final AssertionError timeout) {
+                // judged by the caller
+            }
+            final String detail = "first new snapshot at " + first + ", bound " + bound + " ms, holds " + r.holds
+                    + ", /ready " + r.probe().detail();
+            System.out.println("[regenesis] " + cell + ": fatals " + r.fatals + "; " + detail);
+            return new String[] {r.fatals.isEmpty() ? null : r.fatals.get(0),
+                clusterGenesisText(REGENESIS_GENESIS_START, g1), detail};
+        }
+    }
+
     /** The window-A shape, tried until the STANDBY of the new history was written (or the attempts ran out). */
     private static Running untilWindowA(final int portBase, final String cell, final Set<ReplicaNegativeControl> off) {
         Running last = null;

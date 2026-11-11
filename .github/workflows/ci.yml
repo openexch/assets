@@ -70,9 +70,9 @@ jobs:
       - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests, shadow equivalence, forged member snapshot)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test
-          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest'
+          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest,ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap'
           -Dsurefire.failIfNoSpecifiedTests=false
-          -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
+          -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true -Dcore.pull.external=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -84,6 +84,17 @@ jobs:
           -Dtest='ShadowEquivalenceClusterTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.equivalence.100k=true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The member puller story with 100 000 accounts before the snapshot (a shadow of several MB); the default
+      # three-member story and the three-member leader gate ran in the first step.
+      - name: Nightly harness (shadow puller, 100k accounts)
+        run: >-
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          -Dtest='ShadowPullerClusterTest'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dcore.pull.100k=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

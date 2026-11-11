@@ -164,6 +164,46 @@ public final class ServiceProbe {
         return hk == null ? null : hk.floor();
     }
 
+    /** A shadow puller counter by its metric name: the running puller's plus the startup pull's. */
+    public static long pull(final CoreClusteredService service, final String metricName) {
+        for (final com.openexchange.cluster.shadow.ShadowPuller.Counter c
+                : com.openexchange.cluster.shadow.ShadowPuller.Counter.values()) {
+            if (c.metricName().equals(metricName)) {
+                return service.pullCounter(c);
+            }
+        }
+        throw new IllegalArgumentException("no puller counter " + metricName);
+    }
+
+    /** {@code shadow_pull_refused_total{reason}}. */
+    public static long pullRefused(final CoreClusteredService service, final String reason) {
+        return service.pullRefused(reason);
+    }
+
+    /** The node's running shadow puller, null before the ADOPT, without sources or without a floor. */
+    public static com.openexchange.cluster.shadow.ShadowPuller puller(final CoreClusteredService service) {
+        final MemberShadowHousekeeping hk = (MemberShadowHousekeeping)field(service, "shadowHousekeeping");
+        return hk == null ? null : hk.puller();
+    }
+
+    /** A floor, retention or housekeeping counter by its metric name; -1 while the floor is not wired. */
+    public static long housekeeping(final CoreClusteredService service, final String metricName) {
+        final MemberShadowHousekeeping hk = (MemberShadowHousekeeping)field(service, "shadowHousekeeping");
+        for (final com.openexchange.cluster.shadow.ShadowHousekeeping.Counter c
+                : com.openexchange.cluster.shadow.ShadowHousekeeping.Counter.values()) {
+            if (c.metricName().equals(metricName)) {
+                return hk == null ? -1 : hk.counters().get(c);
+            }
+        }
+        throw new IllegalArgumentException("no housekeeping counter " + metricName);
+    }
+
+    /** The leader gate's negative control: the puller sees a role that never reads LEADER. */
+    public static void pullLeaderGateOff(final CoreClusteredService service) {
+        System.err.println("[SHADOW-PULL] NC: the leader gate reads a role that is never LEADER (test only)");
+        service.pullLeaderGateOff = true;
+    }
+
     /** Purge passes the node's {@code SnapshotLogPruner} ran (-1 when there is no pruner). */
     public static long prunesRun(final CoreClusteredService service) {
         final com.openexchange.cluster.SnapshotLogPruner p =

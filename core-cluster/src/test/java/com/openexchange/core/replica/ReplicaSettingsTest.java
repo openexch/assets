@@ -494,6 +494,25 @@ public class ReplicaSettingsTest {
     }
 
     /**
+     * {@code REPLICA_DRIVER_DIR_ACTIVE_MS}: the default (Aeron's driver timeout), both ends of the range, the kit's
+     * refusal text one step outside each, the non-integer text, and the value reaching the embedded driver context.
+     */
+    @Test
+    public void driverDirActiveSetting() throws Exception {
+        final String k = "REPLICA_DRIVER_DIR_ACTIVE_MS";
+        final ReplicaSettings.Key key = ReplicaSettings.Key.valueOf(k);
+        assertEquals(10_000, with().numeric(key));
+        assertEquals(10_000, with().config().driverDirActiveMs());
+        assertEquals(2_000, with(k, "2000").numeric(key));
+        assertEquals(600_000, with(k, "600000").numeric(key));
+        assertEquals("REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 1999", refusal(k, "1999"));
+        assertEquals("REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 600001", refusal(k, "600001"));
+        assertEquals(k + "='12x' is not an integer", refusal(k, "12x"));
+        assertEquals(30_000, com.openexchange.cluster.replica.ReplicaContexts.driver(with(k, "30000").config())
+                .driverTimeoutMs());
+    }
+
+    /**
      * The live oracle's settings: each at its boundaries with the kit's refusal text behind the boot guard prefix, the
      * non-integer text, the defaults, the readiness age cross-check (only when the member cadence is set) and the
      * mismatch dir boot check.
@@ -584,5 +603,54 @@ public class ReplicaSettingsTest {
         }
         System.out.println("GREEN oracle settings: " + rows.length + " settings, " + n + " boundary rows, the age"
                 + " cross-check and the dump dir boot check");
+    }
+
+    @Test
+    public void rebootstrapAndPullRows() {
+        final String[][] rows = {
+                {"SHADOW_REBOOTSTRAP_REPLAY_FAILURES", "0", "1000", "SHADOW_REBOOTSTRAP_REPLAY_FAILURES must be 0..1000: "},
+                {"SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE", "1", "100", "SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE must be 1..100: "},
+                {"SHADOW_REBOOTSTRAP_WINDOW_MS", "60000", "604800000",
+                        "SHADOW_REBOOTSTRAP_WINDOW_MS must be 60000..604800000 ms: "},
+                {"SHADOW_REBOOTSTRAP_KEEP", "1", "100", "SHADOW_REBOOTSTRAP_KEEP must be 1..100: "},
+                {"SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS", "1000", "86400000",
+                        "SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS must be 1000..86400000 ms: "},
+        };
+        for (final String[] r : rows) {
+            final ReplicaSettings.Key key = ReplicaSettings.Key.valueOf(r[0]);
+            final long min = Long.parseLong(r[1]);
+            final long max = Long.parseLong(r[2]);
+            assertEquals(r[0] + " min", min, with(r[0], r[1]).numeric(key));
+            assertEquals(r[0] + " max", max, with(r[0], r[2]).numeric(key));
+            assertEquals(r[3] + (min - 1), refusal(r[0], Long.toString(min - 1)));
+            assertEquals(r[3] + (max + 1), refusal(r[0], Long.toString(max + 1)));
+            assertEquals(r[0] + "='3x' is not an integer", refusal(r[0], "3x"));
+        }
+        final ReplicaSettings d = with();
+        assertEquals(3, d.numeric(ReplicaSettings.Key.SHADOW_REBOOTSTRAP_REPLAY_FAILURES));
+        assertEquals(3, d.config().rebootstrapReplayFailures());
+        assertEquals(3, d.config().rebootstrapMaxConsecutive());
+        assertEquals(3_600_000L, d.config().rebootstrapWindowMs());
+        assertEquals(2, d.config().rebootstrapKeep());
+        assertEquals(60_000L, d.config().rebootstrapNotTakenLogMs());
+        assertEquals(false, d.config().pullSettings().enabled());
+        assertTrue("an empty source list is a CRITICAL line: " + d.pullWarnings(), d.pullWarnings().contains(
+                "CRITICAL " + com.openexchange.cluster.shadow.ShadowPullSettings.DISABLED_LINE));
+
+        // the pull rows are the member table's (one kit parser), handed to the kit config
+        final ReplicaSettings pulling = with("SHADOW_PULL_SOURCES", "10.0.0.1:9301,10.0.0.2:9301",
+                "SHADOW_PULL_REPLICATION_ENDPOINT", "10.0.0.9:9450", "SHADOW_PULL_RESPONSE_ENDPOINT", "10.0.0.9:9451",
+                "SHADOW_PULL_STARTUP_WAIT_MS", "1000");
+        assertEquals("[10.0.0.1:9301, 10.0.0.2:9301]", pulling.config().pullSettings().sources().toString());
+        assertEquals("10.0.0.9:9450", pulling.config().pullSettings().replicationEndpoint().text());
+        assertEquals("10.0.0.9:9451", pulling.config().pullSettings().responseEndpoint().text());
+        assertEquals(1000, pulling.config().pullSettings().startupWaitMs());
+        assertEquals("SHADOW_PULL_PERIOD_MS must be 500..3600000 ms: 100", refusal("SHADOW_PULL_PERIOD_MS", "100"));
+        assertEquals("SHADOW_PULL_SOURCES entry 'x' is not host:port", refusal("SHADOW_PULL_SOURCES", "x"));
+        // this replica's own archive endpoint (slot 3, base 9300, stride 0: p1 = 9301 on 10.0.0.9)
+        final String own = with().config().archiveControlEndpoint();
+        assertEquals("SHADOW_PULL_SOURCES lists this node's own archive endpoint " + own,
+                refusal("SHADOW_PULL_SOURCES", "10.0.0.1:9301," + own));
+        System.out.println("GREEN replica re-bootstrap and pull rows: own endpoint " + own);
     }
 }

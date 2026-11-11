@@ -15,7 +15,8 @@ import static org.junit.Assert.assertTrue;
  * A stopped recording above L on a cluster snapshot stream that the backup
  * RecordingLog does not reference (the shape a failed backup cycle leaves: a retrieved set never recorded) is an
  * orphan; housekeeping purges it after two passes with the backup BACKING_UP and the same re-check, and never purges
- * L, a referenced recording or a shadow.
+ * L, a referenced recording or a shadow. A genesis-start replica holds every purge from the ADOPT until its genesis
+ * check compared a named member snapshot, so the test takes one member snapshot after the orphan exists.
  */
 public class ReplicaOrphanAboveLTest {
 
@@ -40,11 +41,13 @@ public class ReplicaOrphanAboveLTest {
             assertTrue("the orphan sits above L=" + l + ": " + orphan, orphan > l);
             System.out.println("[orphan] a stopped, unreferenced recording rec=" + orphan + " on stream "
                     + SERVICE_SNAPSHOT_STREAM + " above L=" + l);
+            // the purge gate opens once the genesis check compared the first member snapshot named after the ADOPT
+            r.rig.snapshotAll();
             try {
-                r.rig.await(() -> !r.inReplicaArchive(orphan), 60_000, "v6");
+                r.rig.await(() -> !r.inReplicaArchive(orphan), 120_000, "v6");
             } catch (final AssertionError timeout) {
                 throw new AssertionError("orphan recording rec=" + orphan + " above L=" + l + " not purged"
-                        + " within 60 s (shadow_replica_orphan_recordings="
+                        + " within 120 s of a member snapshot (shadow_replica_orphan_recordings="
                         + r.metric("shadow_replica_orphan_recordings") + ", backup state "
                         + r.metric("shadow_replica_backup_state") + ")");
             }

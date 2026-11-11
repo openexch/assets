@@ -6,6 +6,8 @@ import com.openexchange.cluster.shadow.ShadowCatalog;
 import com.openexchange.cluster.shadow.ShadowCounters;
 import com.openexchange.cluster.shadow.ShadowFloor;
 import com.openexchange.cluster.shadow.ShadowHousekeeping;
+import com.openexchange.cluster.shadow.ShadowPullSettings;
+import com.openexchange.cluster.shadow.ShadowPuller;
 import com.openexchange.cluster.shadow.ShadowRetention;
 import com.openexchange.cluster.shadow.ShadowVerdicts;
 import com.openexchange.cluster.shadow.StubPeek;
@@ -43,6 +45,12 @@ import java.util.function.LongSupplier;
  * thread may be inside {@link #run} at that moment ({@code SnapshotLogPruner.stop} does not join), so both take one
  * lock: a close that finds the hook running marks it closed and the hook releases on its way out; a closed
  * housekeeping never builds again. A same-JVM restart of the member therefore re-registers.</p>
+ *
+ * <p>The puller (with {@code SHADOW_PULL_SOURCES} set): one {@link ShadowPuller} thread
+ * ({@code shadow-puller-core-<memberId>}) started by the first wake after the ADOPT (the genesis it filters on is
+ * the recorded one) and closed with the housekeeping (from {@code onTerminate}). It reads the service's role through
+ * {@code leaderNow} only: while this node leads, it lists and pulls nothing and aborts what is in flight. A pulled
+ * copy reaches the floor and retention only after its local deep read (the next catalog scan sees it).</p>
  */
 final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
 
@@ -58,6 +66,11 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
     private final org.agrona.ErrorHandler fatalErrors;
     private final NanoClock clock = SystemNanoClock.INSTANCE;
     private final ShadowFloor floor;
+    private final ShadowPullSettings pullSettings;
+    private final String responseHost;
+    private final java.util.function.BooleanSupplier leaderNow;
+    private final String pullerThreadName;
+    private volatile ShadowPuller puller;
 
     private static final long NEVER = Long.MIN_VALUE;
 
@@ -80,6 +93,27 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
                              final ShadowCounters shadowCounters, final ShadowVerdicts verdicts,
                              final ShadowHousekeeping.Counters counters, final LongSupplier genesisId,
                              final org.agrona.ErrorHandler fatalErrors) {
+        this(clusterDir, archiveContext, clusterId, settings, snapshotModeCounters, shadowCounters, verdicts, counters,
+                genesisId, fatalErrors, ShadowPullSettings.disabled(), "localhost", () -> false, "shadow-puller-core");
+    }
+
+    /**
+     * @param pullSettings     the {@code SHADOW_PULL_*} rows checked against this node's own archive endpoint
+     * @param responseHost     this node's host (the listing clients' response channel when no endpoint is set)
+     * @param leaderNow        the service's role: true while LEADER
+     * @param pullerThreadName the puller thread's name
+     */
+    MemberShadowHousekeeping(final File clusterDir, final AeronArchive.Context archiveContext, final int clusterId,
+                             final SnapshotModeSettings settings, final SnapshotModeCounters snapshotModeCounters,
+                             final ShadowCounters shadowCounters, final ShadowVerdicts verdicts,
+                             final ShadowHousekeeping.Counters counters, final LongSupplier genesisId,
+                             final org.agrona.ErrorHandler fatalErrors, final ShadowPullSettings pullSettings,
+                             final String responseHost, final java.util.function.BooleanSupplier leaderNow,
+                             final String pullerThreadName) {
+        this.pullSettings = Objects.requireNonNull(pullSettings, "pullSettings");
+        this.responseHost = Objects.requireNonNull(responseHost, "responseHost");
+        this.leaderNow = Objects.requireNonNull(leaderNow, "leaderNow");
+        this.pullerThreadName = Objects.requireNonNull(pullerThreadName, "pullerThreadName");
         this.clusterDir = Objects.requireNonNull(clusterDir, "clusterDir");
         this.archiveContext = Objects.requireNonNull(archiveContext, "archiveContext");
         this.clusterId = clusterId;
@@ -91,7 +125,8 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
         this.genesisId = Objects.requireNonNull(genesisId, "genesisId");
         this.fatalErrors = Objects.requireNonNull(fatalErrors, "fatalErrors");
         this.floor = new ShadowFloor(this::latestSnapshotPosition, this::newestImage,
-                h -> ShadowRestore.skipSafe(h, journal), settings.floorMargin(), this::logStartPosition, counters);
+                h -> ShadowRestore.skipSafe(h, journal), settings.floorMargin(), settings.anchorRule(),
+                this::logStartPosition, counters);
     }
 
     /** The watermark supplier the pruner must hold (4.1 runtime net: {@code watermarkIs(floor())}). */
@@ -125,6 +160,7 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
             if (archive == null) {
                 archive = AeronArchive.connect(archiveContext.clone());
             }
+            startPullerOnce();
             if (housekeeping == null && !build()) {
                 return;
             }
@@ -139,6 +175,25 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
             housekeeping = null;
             throw failed;
         }
+    }
+
+    /** The puller starts once, after the ADOPT (it filters candidates on the recorded genesis). */
+    private void startPullerOnce() {
+        if (puller != null || !pullSettings.enabled() || genesisId.getAsLong() <= 0) {
+            return;
+        }
+        final ShadowPuller p = new ShadowPuller(archive.context().aeron(), archiveContext, CoreLogApplier.ENGINE_ID_CORE,
+                clusterId, genesisId, leaderNow, responseHost, pullSettings, verdicts, shadowCounters, clock,
+                TimeUnit.MILLISECONDS.toNanos(settings.loadTimeoutMs()), pullerThreadName);
+        puller = p;
+        p.start();
+        System.out.println("[SHADOW-PULL] puller started: sources=" + pullSettings.sources() + " periodMs="
+                + pullSettings.periodMs() + " kinds=" + pullSettings.kinds() + " genesisId=" + genesisId.getAsLong());
+    }
+
+    /** The running puller, null before the ADOPT or without sources. */
+    ShadowPuller puller() {
+        return puller;
     }
 
     private boolean build() {
@@ -161,7 +216,8 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
         housekeeping = new ShadowHousekeeping(catalog, retention, floor, clock, settings.scanPeriodMs(),
                 settings.deepReadPaceMs(), this::refreshJournal, counters);
         System.out.println("[SHADOW-HK] housekeeping armed: archive=" + catalog.archiveId() + " genesisId=" + genesis
-                + " retainN=" + settings.retainN() + " margin=" + settings.floorMargin().text() + " scanPeriodMs="
+                + " retainN=" + settings.retainN() + " margin=" + settings.floorMargin().text() + " anchorRule="
+                + settings.anchorRule().text() + " scanPeriodMs="
                 + settings.scanPeriodMs() + " deepReadPaceMs=" + settings.deepReadPaceMs());
         return true;
     }
@@ -374,6 +430,10 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
     }
 
     private void release() {
+        final ShadowPuller p = puller;
+        if (p != null) {
+            CloseHelper.quietClose(p); // stops its thread, aborts and purges what is in flight
+        }
         CloseHelper.quietClose(retention);
         retention = null;
         housekeeping = null;

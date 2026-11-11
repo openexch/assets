@@ -94,6 +94,9 @@ public class ShadowRefusalTest {
             System.out.println("GREEN 11.3 pruned log -> " + halt);
             assertTrue(halt, halt.contains("log starts at " + start + " > 0"));
             assertTrue(halt, halt.contains("Runbook: (1) ClusterTool invalidate-latest-snapshot"));
+            // the startup pull (3b) is named: no source configured
+            assertTrue(halt, halt.contains("(3) pull: disabled: SHADOW_PULL_SOURCES empty (a shadow with P_s >= "
+                    + start + " from SHADOW_PULL_SOURCES)"));
             assertNoVirtualGenesisOnAPrunedLog(s, start);
             assertNull("no restore path line", s.pathLine());
 

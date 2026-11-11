@@ -130,7 +130,9 @@
              self-check, the forged member snapshot). CI's nightly job and the release tag build run them; a plain
              `mvn verify` runs everything. An explicit -Dtest overrides these excludes. The shadow equivalence test
              runs on the PR gate as its two-toggle variant (the properties below); the nightly job and a tag run the
-             five-toggle default and the 100k variant. -->
+             five-toggle default and the 100k variant. The shadow puller story, the leader gate (three members, the
+             leader kill, the 100k variant), the re-bootstrap story and the external-driver pull rows of
+             ShadowRestoreExternalDriverProcessTest and ReplicaExternalDriverProcessTest (-Dcore.pull.external=true) are nightly only. -->
         <profile>
             <id>fast</id>
             <build>
@@ -149,6 +151,10 @@
                                 <exclude>**/ReplicaReadyDoesNotFlapTest.java</exclude>
                                 <exclude>**/ReplicaSelfCheckTest.java</exclude>
                                 <exclude>**/OracleMismatchTest.java</exclude>
+                                <exclude>**/ReplicaReBootstrapTest.java</exclude>
+                                <exclude>**/MemberPullInteropTest.java</exclude>
+                                <exclude>**/ShadowPullerClusterTest.java</exclude>
+                                <exclude>**/LeaderDoesNotPullTest.java</exclude>
                                 <exclude>**/*$*</exclude>
                             </excludes>
                             <systemPropertyVariables>

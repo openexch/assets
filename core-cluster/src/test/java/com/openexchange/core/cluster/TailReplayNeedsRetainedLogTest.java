@@ -16,7 +16,8 @@ import static org.junit.Assert.assertTrue;
 /**
  * Core half (the kit half is {@code ShadowFloorPrunerTest.tailReplayNeedsRetainedLogKitHalf}):
  * on a real single member in shadow mode, with the LIVE housekeeping and pruner (no test-side purge). Shadows at
- * P_1 &lt; P_2 &lt; P_cm with the margin on purge nothing (no covering shadow); once P_3 = P_cm is VERIFIED the floor
+ * P_1 &lt; P_2 &lt; P_cm with the margin on purge nothing (no covering shadow); once P_3 = P_cm is VERIFIED from two
+ * producers (the default anchor rule's two witnesses) the floor
  * moves to P_2 and the pruner purges the log below P_2 on its own; then a CONFLICT at P_3 takes EQUAL away and the
  * restart restores TAIL from P_2 with an image equal to the pre-crash one. Control: {@code SHADOW_FLOOR_MARGIN=none}
  * (the floor taken from the anchor instead of the margin) purges past P_2: {@code tail start <p2> below log start
@@ -85,6 +86,8 @@ public class TailReplayNeedsRetainedLogTest {
             throw new AssertionError("purged below P_1 before any covering shadow: log start " + s.rig.logStart(s.m));
         }
 
+        // P_3 = P_cm from two producers of one digest: the anchor rule's two witnesses
+        s.produce(log, pCm);
         s.produce(log, pCm);
         final long expected = "none".equals(margin) ? pCm : p2;
         final ShadowFloor.Evaluation moved = awaitFloor(s, ShadowFloor.Evaluation.Kind.FLOOR, expected, 3,

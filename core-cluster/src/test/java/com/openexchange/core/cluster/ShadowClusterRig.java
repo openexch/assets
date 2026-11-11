@@ -467,11 +467,38 @@ final class ShadowClusterRig implements AutoCloseable {
         return archive(m).getStartPosition(logRecordingId(m));
     }
 
-    /** {@code purgeSegments} of {@code m}'s log recording to {@code newStart} (a segment boundary). */
+    /**
+     * {@code purgeSegments} of {@code m}'s log recording to {@code newStart} (a segment boundary); returns the start
+     * after it. The archive refuses a detach of the segment it is still writing, so this first waits (bounded) until
+     * the recording has reached {@code newStart}. The member's own pruner purges to the segment below its snapshot
+     * after each snapshot, asynchronously: a start already at or past {@code newStart}, before or during this call,
+     * means there is nothing left to detach, and the start is returned as it is.
+     */
     long purgeLogTo(final Member m, final long newStart) {
         final long rec = logRecordingId(m);
-        archive(m).purgeSegments(rec, newStart);
-        return archive(m).getStartPosition(rec);
+        final AeronArchive archive = archive(m);
+        await(() -> archive.getStartPosition(rec) >= newStart || recordedEnd(archive, rec) >= newStart, OP_TIMEOUT_MS,
+                () -> "member " + m.id + " log rec=" + rec + " did not record past the purge boundary " + newStart
+                        + " within " + OP_TIMEOUT_MS + " ms (start " + archive.getStartPosition(rec) + ", recorded "
+                        + recordedEnd(archive, rec) + ")");
+        if (archive.getStartPosition(rec) < newStart) {
+            try {
+                archive.purgeSegments(rec, newStart);
+            } catch (final io.aeron.archive.client.ArchiveException e) {
+                if (archive.getStartPosition(rec) < newStart) {
+                    throw e;
+                }
+                System.out.println("[rig] member " + m.id + " log rec=" + rec + ": its own pruner reached " + newStart
+                        + " first (" + e.getMessage() + ")");
+            }
+        }
+        return archive.getStartPosition(rec);
+    }
+
+    /** The recorded end of {@code rec}: the live recording position, else its stop position. */
+    private static long recordedEnd(final AeronArchive archive, final long rec) {
+        final long live = archive.getRecordingPosition(rec);
+        return live != AeronArchive.NULL_POSITION ? live : archive.getStopPosition(rec);
     }
 
     /** The nonce {@link #adopt} ADOPTs: {@link #GENESIS} unless a re-genesis test sets another. */
@@ -599,6 +626,104 @@ final class ShadowClusterRig implements AutoCloseable {
                     .ownsAeronClient(false));
         }
         return new TestShadowProducer.MemberArchive(m.producerAeron, m.producerArchive);
+    }
+
+    /**
+     * A live replication of {@code src}'s log recording into {@code dst}'s archive (from 0, following the log); the
+     * members' own log purges (the pruner after a snapshot, {@link #purgeLogTo}) never touch it, so
+     * {@link #captureCopy} reads the log from 0 at any time. Holds one replay of {@code src}'s archive. Returns the
+     * copy's recording id (the active recording on {@code dst} that is neither its own log nor a shadow).
+     */
+    long liveLogCopy(final Member src, final Member dst) {
+        final AeronArchive a = archive(dst);
+        final long own = logRecordingId(dst);
+        a.replicate(logRecordingId(src), Aeron.NULL_VALUE, AeronArchive.Configuration.controlStreamId(),
+                "aeron:udp?endpoint=" + archiveEndpoint(src), null);
+        final long[] found = {-1};
+        await(() -> {
+            a.listRecordings(0, 1_000, (controlSessionId, correlationId, recordingId, startTimestamp, stopTimestamp,
+                                        startPosition, stopPosition, initialTermId, segmentFileLength, termBufferLength,
+                                        mtuLength, sessionId, streamId, strippedChannel, originalChannel,
+                                        sourceIdentity) -> {
+                if (recordingId != own && startPosition == 0 && stopPosition == AeronArchive.NULL_POSITION
+                        && !originalChannel.contains("alias=oxs.")) {
+                    found[0] = recordingId;
+                }
+            });
+            return found[0] >= 0;
+        }, 30_000, "the live log copy never appeared on member " + dst.id);
+        System.out.println("[rig] live copy of member " + src.id + "'s log on member " + dst.id + ": rec=" + found[0]);
+        return found[0];
+    }
+
+    /** The log committed on {@code src} read from 0 out of the live copy {@code copy} on {@code dst}. */
+    RecordedLog captureCopy(final Member src, final Member dst, final long copy) {
+        final long commit = src.cfg.consensusModuleContext().commitPositionCounter().get();
+        await(() -> archive(dst).getRecordingPosition(copy) >= commit, 30_000,
+                "the live log copy never reached the commit position " + commit);
+        return TestShadowProducer.captureLog(aeron(dst), archive(dst), copy, 0, commit);
+    }
+
+    // ---------------------------------------------------------------------------------------------- pulls
+
+    /** {@code m}'s archive control endpoint {@code localhost:<p1>} (a pull source entry). */
+    String archiveEndpoint(final Member m) {
+        return "localhost:" + ClusterConfig.calculatePort(m.id, portBase, ClusterConfig.ARCHIVE_CONTROL_PORT_OFFSET);
+    }
+
+    /** The {@code SHADOW_PULL_SOURCES} text naming {@code sources}' archives, in order. */
+    String sources(final Member... sources) {
+        final StringBuilder sb = new StringBuilder();
+        for (final Member m : sources) {
+            sb.append(sb.length() == 0 ? "" : ",").append(archiveEndpoint(m));
+        }
+        return sb.toString();
+    }
+
+    /** Shadow-mode settings with {@code extra} on top ({@code Key} name, value pairs). */
+    static com.openexchange.core.infrastructure.persistence.SnapshotModeSettings shadowSettings(final String... extra) {
+        final java.util.Map<com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key, String> m =
+                new java.util.HashMap<>();
+        m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow");
+        for (int i = 0; i < extra.length; i += 2) {
+            m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.valueOf(extra[i]),
+                    extra[i + 1]);
+        }
+        return com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.with(m);
+    }
+
+    /** One local catalog scan of {@code m}'s archive (genesis {@link #adoptGenesis}), through the rig's client. */
+    com.openexchange.cluster.shadow.ShadowCatalog.Scan scan(final Member m) {
+        return new com.openexchange.cluster.shadow.ShadowCatalog(aeron(m), archive(m),
+                com.openexchange.core.infrastructure.persistence.CoreLogApplier.ENGINE_ID_CORE,
+                m.cfg.consensusModuleContext().clusterId(), adoptGenesis,
+                new com.openexchange.cluster.shadow.ShadowVerdicts(),
+                com.openexchange.cluster.shadow.ShadowCatalog.DEFAULT_LIST_BATCH,
+                org.agrona.concurrent.SystemNanoClock.INSTANCE, TimeUnit.SECONDS.toNanos(30),
+                new com.openexchange.cluster.shadow.ShadowCounters()).scan();
+    }
+
+    /**
+     * Test seam: purges every shadow recording of {@code m}'s archive (a wiped shadow store), stopped ones only. The
+     * member's own puller must be closed first or it pulls them back.
+     */
+    int purgeShadows(final Member m) {
+        final List<Long> ids = new ArrayList<>();
+        archive(m).listRecordingsForUri(0, 10_000,
+                com.openexchange.cluster.shadow.ShadowAlias.prefix(
+                        com.openexchange.core.infrastructure.persistence.CoreLogApplier.ENGINE_ID_CORE),
+                com.openexchange.cluster.shadow.ShadowAlias.STREAM_ID,
+                (controlSessionId, correlationId, recordingId, startTimestamp, stopTimestamp, startPosition,
+                 stopPosition, initialTermId, segmentFileLength, termBufferLength, mtuLength, sessionId, streamId,
+                 strippedChannel, originalChannel, sourceIdentity) -> {
+                    if (stopPosition != AeronArchive.NULL_POSITION) {
+                        ids.add(recordingId);
+                    }
+                });
+        for (final long id : ids) {
+            archive(m).purgeRecording(id);
+        }
+        return ids.size();
     }
 
     // ---------------------------------------------------------------------------------------------- oracles

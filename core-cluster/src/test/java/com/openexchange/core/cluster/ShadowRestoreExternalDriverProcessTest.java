@@ -184,6 +184,146 @@ public class ShadowRestoreExternalDriverProcessTest {
     }
 
     /**
+     * The startup pull (3b) and the steady-state puller on an external driver, both fixed pull endpoints set (the
+     * isolated-host shape): the source is a second archive in the test JVM (its own embedded driver, UDP control on a
+     * free port) holding a genuine ALIGNED at P_cm; the child has no shadow of its own, so rules 1-3 find nothing and
+     * 3b pulls it: {@code restored path=EQUAL}, {@code /ready}, SIGTERM exits 143. Then a 3b against a source that never
+     * answers (the pulled copy purged by a boot without sources first): kill -9 of the driver during the pull exits 1 at
+     * once. Then the steady-state puller running (the restore pulled again, the puller listing its source every
+     * period): kill -9 of the driver exits 1 at once. About two minutes: nightly only
+     * ({@code -Dcore.pull.external=true}).
+     */
+    @Test(timeout = 900_000)
+    public void aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints() throws Exception {
+        org.junit.Assume.assumeTrue("the external-driver pull rows run only with -Dcore.pull.external=true",
+                Boolean.getBoolean("core.pull.external"));
+        final Node node = new Node("pull-external-", 50800);
+        final int srcPort = freePort();
+        final Path srcDir = dir("pull-external-source-");
+        final Path srcAeron = shmDir("pull-external-source-aeron-");
+        final io.aeron.archive.ArchivingMediaDriver source = io.aeron.archive.ArchivingMediaDriver.launch(
+                new io.aeron.driver.MediaDriver.Context().aeronDirectoryName(srcAeron.toString())
+                        .dirDeleteOnStart(true).dirDeleteOnShutdown(true)
+                        .threadingMode(io.aeron.driver.ThreadingMode.SHARED),
+                new io.aeron.archive.Archive.Context().aeronDirectoryName(srcAeron.toString())
+                        .archiveDir(srcDir.resolve("archive").toFile()).deleteArchiveOnStart(true)
+                        .controlChannel("aeron:udp?endpoint=localhost:" + srcPort)
+                        .replicationChannel("aeron:udp?endpoint=localhost:0")
+                        .localControlChannel("aeron:ipc").recordingEventsEnabled(false).archiveId(0x5A5AL)
+                        .threadingMode(io.aeron.archive.ArchiveThreadingMode.SHARED));
+        clients.add(source);
+        final Aeron srcAeronClient = Aeron.connect(new Aeron.Context().aeronDirectoryName(srcAeron.toString()));
+        clients.add(srcAeronClient);
+        final AeronArchive srcArchive = AeronArchive.connect(new AeronArchive.Context().aeron(srcAeronClient)
+                .ownsAeronClient(false).controlRequestChannel("aeron:ipc").controlResponseChannel("aeron:ipc"));
+        clients.add(srcArchive);
+
+        node.startDriver();
+        node.startEngine(Map.of(), List.of());
+        node.awaitReady(90_000);
+        final Clients c = node.clients();
+        c.adopt();
+        c.deposits(200);
+        final long pCm = node.snapshot();
+        c.deposits(30);
+        node.quiet();
+        final RecordedLog log = node.captureLog();
+        final Written w = new TestShadowProducer(srcAeronClient, srcArchive, layoutClusterId(node),
+                srcDir.resolve("archive").toFile()).produce(new Who(ProducerKind.FOLLOWER, 850), log, pCm);
+        assertTrue(w.toString(), w.ok());
+        c.close();
+        node.killEngine();
+
+        final Map<String, String> pulling = Map.of("SHADOW_PULL_SOURCES", "localhost:" + srcPort,
+                "SHADOW_PULL_REPLICATION_ENDPOINT", "localhost:" + freePort(),
+                "SHADOW_PULL_RESPONSE_ENDPOINT", "localhost:" + freePort(),
+                "SHADOW_PULL_PERIOD_MS", "1000", "SHADOW_PULL_STARTUP_WAIT_MS", "30000");
+        final Process first = node.startEngine(pulling, List.of());
+        node.awaitReady(120_000);
+        String out = node.log();
+        final Matcher m = PATH.matcher(out);
+        assertTrue("a restore path line: " + tail(out), m.find());
+        assertEquals("EQUAL from the pulled shadow: " + m.group(), "EQUAL", m.group(1));
+        assertEquals(pCm, Long.parseLong(m.group(2)));
+        assertTrue("3b pulled: " + tail(out), out.contains("[shadow restore] 3b pulled shadow "));
+        assertTrue("external driver mode: " + tail(out), out.contains("Driver mode EXTERNAL"));
+        System.out.println("GREEN external 3b: " + m.group() + " | " + line(out, "3b pulled shadow"));
+        first.destroy(); // SIGTERM
+        assertTrue("the node stops on SIGTERM", first.waitFor(60, TimeUnit.SECONDS));
+        assertEquals("SIGTERM exit: " + tail(node.log()), 143, first.exitValue());
+        Thread.sleep(12_000);
+
+        // no local shadow at all for the next rows: a boot without sources (EQUAL from the pulled copy, no puller)
+        // purges the pulled copy through the test JVM's client, then stops
+        final Process plain = node.startEngine(Map.of(), List.of());
+        node.awaitReady(120_000);
+        purgeShadows(node);
+        node.closeArchive();
+        plain.destroy();
+        assertTrue("the plain node stops on SIGTERM", plain.waitFor(60, TimeUnit.SECONDS));
+        Thread.sleep(12_000);
+
+        // a 3b against a source that never answers: kill -9 of the driver during the pull exits 1 at once
+        final Map<String, String> silent = Map.of("SHADOW_PULL_SOURCES", "localhost:" + freePort(),
+                "SHADOW_PULL_REPLICATION_ENDPOINT", "localhost:" + freePort(),
+                "SHADOW_PULL_RESPONSE_ENDPOINT", "localhost:" + freePort(), "SHADOW_PULL_STARTUP_WAIT_MS", "120000");
+        final Process waiting = node.startEngine(silent, List.of());
+        node.awaitLine("[shadow restore] 3b restore: pulling a shadow", 90_000);
+        node.closeAeron();
+        long t0 = System.nanoTime();
+        node.driver.destroyForcibly();
+        assertTrue("the node exits after the driver kill during 3b", waiting.waitFor(45, TimeUnit.SECONDS));
+        long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        out = node.log();
+        assertEquals("driver loss during 3b exits 1: " + tail(out), 1, waiting.exitValue());
+        assertTrue("within the client driver timeout plus the halt: " + ms, ms < 18_000);
+        assertFalse("no restore path line", out.contains("restored path="));
+        System.out.println("GREEN external 3b driver kill: exit 1 after " + ms + " ms | "
+                + line(out, "media driver lost in EXTERNAL driver mode"));
+        Thread.sleep(12_000); // the dead node's mark files time out before a new node may claim them
+
+        // the steady-state puller running: kill -9 of the driver exits 1 at once
+        node.startDriver();
+        final Process running = node.startEngine(pulling, List.of());
+        node.awaitReady(120_000);
+        node.awaitLine("[SHADOW-PULL] puller started", 30_000);
+        node.closeAeron();
+        t0 = System.nanoTime();
+        node.driver.destroyForcibly();
+        assertTrue("the node exits after the driver kill", running.waitFor(45, TimeUnit.SECONDS));
+        ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        out = node.log();
+        if (running.exitValue() != 1) {
+            throw new AssertionError("external driver loss did not halt a pulling node: exit " + running.exitValue()
+                    + tail(out));
+        }
+        assertTrue("within the client driver timeout plus the halt: " + ms, ms < 18_000);
+        System.out.println("GREEN external steady-state puller driver kill: exit 1 after " + ms + " ms | "
+                + line(out, "media driver lost in EXTERNAL driver mode"));
+    }
+
+    private static int layoutClusterId(final Node node) {
+        return node.layout.consensusModuleContext().clusterId();
+    }
+
+    /** Purges every stopped shadow recording of the child's archive (through the test JVM's IPC client). */
+    private static void purgeShadows(final Node node) {
+        final List<Long> ids = new ArrayList<>();
+        node.archive().listRecordingsForUri(0, 10_000, com.openexchange.cluster.shadow.ShadowAlias.prefix(
+                        com.openexchange.core.infrastructure.persistence.CoreLogApplier.ENGINE_ID_CORE),
+                com.openexchange.cluster.shadow.ShadowAlias.STREAM_ID,
+                (cs, corr, id, st, sp, startPosition, stopPosition, it, sfl, tbl, mtu, sid, str, ch, oc, src) -> {
+                    if (stopPosition != AeronArchive.NULL_POSITION) {
+                        ids.add(id);
+                    }
+                });
+        for (final long id : ids) {
+            node.archive().purgeRecording(id);
+        }
+        assertTrue("the pulled copy was purged", !ids.isEmpty());
+    }
+
+    /**
      * Q9 drill, child leg (D6): the engine halts ({@code Runtime.halt}) right after {@code onTakeSnapshot}
      * returns, before Aeron's {@code awaitRecordingComplete} and the service ack, at least 5 times. Proof that a kill
      * landed in the window: right after the halt, the snapshot's group is NOT in {@code RecordingLog}. Every restart

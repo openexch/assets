@@ -56,6 +56,7 @@ public class ReplicaBootstrapTest {
     private static final int PORT_BASE_RESTART = 29800;
     private static final int PORT_BASE_REFUSALS = 30400;
     private static final int PORT_BASE_PRUNED = 31000;
+    private static final int PORT_BASE_PULL = 49600;
     private static final int SEGMENT = 64 * 1024;
 
     @Test(timeout = 900_000)
@@ -270,6 +271,7 @@ public class ReplicaBootstrapTest {
             }, 120_000, () -> "the pruned-log refusal did not happen: " + r.probe().detail());
             assertTrue("pruned-log runbook text: " + r.fatals, r.fatals.get(0).startsWith(
                     "FATAL replica: no local shadow and the cluster log starts at " + boundary + " > 0."));
+            assertTrue("the refusal names the disabled pull: " + r.fatals, r.fatals.get(0).endsWith(" pull: disabled"));
             assertEquals("/ready was 200 during a refused bootstrap", 0, readySamples[0]);
             r.rig.pumpMs(2_000);
             assertFalse("/ready after the refusal", r.probe().ready());
@@ -286,6 +288,94 @@ public class ReplicaBootstrapTest {
             RestoreDrillDryRun.nc("GENESIS_PRECONDITION_OFF", "genesis on a pruned log: start=",
                     () -> assertNoGenesisOnPrunedLog(r));
             System.out.println("GREEN pruned log boundary=" + boundary);
+        }
+    }
+
+    /**
+     * Bootstrap case 3 with pull sources (the three members' archives): on a log pruned above 0 and no local shadow,
+     * a corrupted copy as the only candidate is refused for its content and the bootstrap refuses with the pull named
+     * ({@code pull: tried 3 sources, 1 candidates, refused 1, last: CORRUPT}); with a genuine ALIGNED at P_cm on
+     * another member the replica pulls it, verifies it locally, restores from it ({@code restore_path} PULLED_SHADOW,
+     * code 3), follows, and its next ALIGNED equals the members'. Before that, candidates of two geneses across the
+     * sources refuse with the two-geneses text.
+     */
+    @Test(timeout = 900_000)
+    public void aPrunedLogIsBootstrappedFromAPulledShadow() throws Exception {
+        try (ReplicaRig r = new ReplicaRig(new ShadowClusterRig(PORT_BASE_PULL, "replica-bootstrap-pull", 3, "64k",
+                SEGMENT))) {
+            r.bootAll();
+            final Member leader = r.rig.awaitLeader(null);
+            final Member host = r.rig.followerOtherThan(leader, null);
+            r.story(host, 4);
+            r.tool.deposits(900);
+            final long pCm = r.rig.snapshotAll();
+            r.tool.deposits(60);
+            final long boundary = pCm / SEGMENT * SEGMENT;
+            assertTrue("the log must span more than one segment before P_cm=" + pCm, boundary > 0);
+            final List<Member> ms = r.rig.members;
+            // the members' committed logs from 0, read before the purge (the shadows are built from them)
+            final RecordedLog log0 = r.rig.captureCommitted(ms.get(0));
+            final RecordedLog log1 = r.rig.captureCommitted(ms.get(1));
+            final RecordedLog log2 = r.rig.captureCommitted(ms.get(2));
+            for (final Member m : r.rig.live()) {
+                assertEquals("member " + m.id + " log start after the purge", boundary, r.rig.purgeLogTo(m, boundary));
+            }
+            final java.util.Map<String, String> env = java.util.Map.of(
+                    com.openexchange.cluster.shadow.ShadowPullSettings.SOURCES,
+                    r.rig.sources(ms.get(0), ms.get(1), ms.get(2)),
+                    com.openexchange.cluster.shadow.ShadowPullSettings.PERIOD_MS, "1000",
+                    com.openexchange.cluster.shadow.ShadowPullSettings.STARTUP_WAIT_MS, "8000");
+            final com.openexchange.cluster.shadow.ShadowPullSettings pull =
+                    com.openexchange.cluster.shadow.ShadowPullSettings.parse(env::get, null);
+
+            // (1) the only candidate is a corrupted copy on member 1
+            final TestShadowProducer p1 = r.rig.producer(ms.get(1));
+            final TestShadowProducer.Written bad = p1.produce(new Who(ProducerKind.FOLLOWER, 501), log1, pCm);
+            assertTrue(bad.toString(), bad.ok());
+            p1.flipPayloadByte(bad);
+            r.startReplica(r.builder(ReplicaRig.SLOT, "replica-corrupt").pullSettings(pull).build());
+            r.rig.await(() -> !r.fatals.isEmpty(), 120_000, () -> "the corrupt-only pull never refused: "
+                    + r.probe().detail());
+            if (r.replica.readiness().restorePath() == ReplicaReadiness.RestorePath.PULLED_SHADOW) {
+                throw new AssertionError("a corrupt shadow restored the replica");
+            }
+            assertTrue("corrupt-only refusal: " + r.fatals, r.fatals.get(0).endsWith(
+                    " pull: tried 3 sources, 1 candidates, refused 1, last: CORRUPT"));
+            System.out.println("[bootstrap] pull corrupt only: " + r.fatals.get(0));
+            r.stopReplica();
+            r.windowGap();
+
+            // (2) another genesis among the candidates: the puller's two-geneses check refuses
+            final TestShadowProducer.Written foreign = r.rig.producer(ms.get(0)).produceForeignGenesis(
+                    new Who(ProducerKind.FOLLOWER, 503), log0, pCm, 0x7777L);
+            assertTrue(foreign.toString(), foreign.ok());
+            r.startReplica(r.builder(ReplicaRig.SLOT + 1, "replica-geneses").pullSettings(pull).build());
+            r.rig.await(() -> !r.fatals.isEmpty(), 120_000, () -> "the two-geneses pull never refused: "
+                    + r.probe().detail());
+            final String genesesText = r.fatals.get(0);
+            assertTrue("two geneses across the sources: " + r.fatals, r.fatals.get(0).startsWith(
+                    "FATAL replica: the pull sources list shadows of 2 geneses"));
+            System.out.println("[bootstrap] pull two geneses: " + genesesText);
+            r.stopReplica();
+            r.windowGap();
+            // the foreign copy goes before the genuine row (the members prune to their next snapshot after it)
+            assertTrue("member 0's foreign copy purged", r.rig.purgeShadows(ms.get(0)) >= 1);
+
+            // (3) a genuine ALIGNED at P_cm on member 2 (the corrupt copy is still listed): pulled, verified, restored, followed
+            final TestShadowProducer.Written good = r.rig.producer(ms.get(2)).produce(
+                    new Who(ProducerKind.FOLLOWER, 502), log2, pCm);
+            assertTrue(good.toString(), good.ok());
+            r.startReplica(r.builder(ReplicaRig.SLOT, "replica-pulled").pullSettings(pull).build());
+            r.awaitBootstrapped(ReplicaRig.WAIT_MS);
+            assertEquals(ReplicaReadiness.RestorePath.PULLED_SHADOW, r.replica.readiness().restorePath());
+            assertEquals("restore_path code", 3, r.metric("shadow_replica_restore_path"));
+            assertEquals("restored at P_cm", pCm, r.replica.follower().restoredPosition());
+            r.awaitCaughtUp(60_000);
+            final long next = aligned(r, host);
+            System.out.println("[bootstrap] PULLED_SHADOW at " + pCm + " (log start " + boundary
+                    + "); the next ALIGNED at " + next + " equals the members'");
+
+            System.out.println("GREEN bootstrap pull: corrupt refused, two geneses refused, PULLED_SHADOW at " + pCm);
         }
     }
 
@@ -385,7 +475,7 @@ public class ReplicaBootstrapTest {
     private static long aligned(final ReplicaRig r, final Member host) {
         final long p = r.rig.snapshotAll();
         final LogicalShadow s = r.awaitVerified(p, ShadowKind.ALIGNED, 60_000);
-        ReplicaRig.assertPayloadEqualsMember(p, r.payload(s), r.imageAtSnapshot.get(host.id));
+        ReplicaRig.assertPayloadEqualsMember(p, r.payload(s), r.memberImage(host.id, p));
         return p;
     }
 
