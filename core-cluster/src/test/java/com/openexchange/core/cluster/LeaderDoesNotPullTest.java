@@ -22,9 +22,9 @@ import static org.junit.Assert.assertTrue;
  * The leader never pulls, on a real cluster: every member lists every other member's archive, a genuine ALIGNED sits
  * on a follower's archive, and the leader's puller (running, its role read from the service) lists nothing and pulls
  * nothing while it leads, its skipped passes counted; the control hands the leader's puller a role that never reads
- * LEADER and the leader pulls. With three members ({@code -Dcore.pull.members=3}, the default; the PR gate runs 2) the
- * leader is killed: the new leader pulls nothing while it leads, and the old leader, restarted as a follower, pulls
- * within one period.
+ * LEADER and the leader pulls. With three members ({@code -Dcore.pull.members=3}, the default and the nightly job's;
+ * 2 runs the gate without the kill) the leader is killed: the new leader pulls nothing while it leads, and the old
+ * leader, restarted as a follower, pulls within one period.
  */
 public class LeaderDoesNotPullTest {
 

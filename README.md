@@ -54,7 +54,7 @@ With the dependencies already in `~/.m2`, the Makefile targets work without `-s`
 | `make integration` | boots a real single-node embedded-driver cluster in-process and drives it over the wire |
 | `make nightly` | the slow tests (100k-account restore, 1M sizing, large scenario, the long replica process tests) that CI runs on its nightly schedule |
 
-Pull requests run `mvn verify -Pfast`, which leaves the long replica process tests to the nightly job (the shadow puller and leader-gate stories run there with two members, `core.pull.members=2`; the nightly job runs three members, the re-bootstrap and the member-replica pull stories, and the 100k-account pull with `-Dcore.pull.100k=true`); a plain `mvn verify` runs everything. `integration` and `nightly` launch clusters. On a machine that also runs a live engine, pin them to spare cores, for example `taskset -c 20-23 make integration`.
+Pull requests run `mvn verify -Pfast`, which leaves the long replica process tests to the nightly job (the shadow puller, leader-gate, re-bootstrap, member-replica pull and external-driver pull (`-Dcore.pull.external=true`) stories run in the nightly job with three members, and the 100k-account pull with `-Dcore.pull.100k=true`); a plain `mvn verify` runs everything. `integration` and `nightly` launch clusters. On a machine that also runs a live engine, pin them to spare cores, for example `taskset -c 20-23 make integration`.
 
 The feed harness jar used by cluster-tools' compatibility tests is built with `mvn -s .mvn-settings.xml -pl core-cluster -am -Pfeed-harness -DskipTests package` and published on demand by `.github/workflows/feed-harness.yml` (run it by hand on the commit to publish) as the asset `core-feed-harness-<sha>.jar` of the single `feed-harness` prerelease.
 
@@ -139,6 +139,7 @@ The leader never pulls: while a member leads, its puller lists nothing (`shadow_
 | `SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE`, `SHADOW_REBOOTSTRAP_WINDOW_MS` | `3`, `3600000` | the loop guard: more re-bootstraps than this inside the window refuse with exit 1 (1..100; 60000..604800000) |
 | `SHADOW_REBOOTSTRAP_KEEP` | `2` | moved-aside `cluster.rebootstrap-*` dirs kept (1..100) |
 | `SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS` | `60000` | at most one `re-bootstrap not taken` line per interval (1000..86400000) |
+| `REPLICA_DRIVER_DIR_ACTIVE_MS` | `10000` | embedded driver only: an existing `AERON_DIR` whose driver heartbeat is at most this old belongs to a live driver, and the replica refuses to start instead of taking over an aeronmd (2000..600000); a crashed driver's directory counts as stale only after this long |
 
 The remaining `REPLICA_*` settings (backup timeouts, catch-up buffers, driver MTU and term length, stream ids) are listed with their ranges in `core-cluster/src/main/java/com/openexchange/core/replica/ReplicaSettings.java`. After a normal restart the replica reports 503 `unverified continuation` until it has compared its state with the next member snapshot, about one member snapshot interval.
 

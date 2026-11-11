@@ -467,11 +467,38 @@ final class ShadowClusterRig implements AutoCloseable {
         return archive(m).getStartPosition(logRecordingId(m));
     }
 
-    /** {@code purgeSegments} of {@code m}'s log recording to {@code newStart} (a segment boundary). */
+    /**
+     * {@code purgeSegments} of {@code m}'s log recording to {@code newStart} (a segment boundary); returns the start
+     * after it. The archive refuses a detach of the segment it is still writing, so this first waits (bounded) until
+     * the recording has reached {@code newStart}. The member's own pruner purges to the segment below its snapshot
+     * after each snapshot, asynchronously: a start already at or past {@code newStart}, before or during this call,
+     * means there is nothing left to detach, and the start is returned as it is.
+     */
     long purgeLogTo(final Member m, final long newStart) {
         final long rec = logRecordingId(m);
-        archive(m).purgeSegments(rec, newStart);
-        return archive(m).getStartPosition(rec);
+        final AeronArchive archive = archive(m);
+        await(() -> archive.getStartPosition(rec) >= newStart || recordedEnd(archive, rec) >= newStart, OP_TIMEOUT_MS,
+                () -> "member " + m.id + " log rec=" + rec + " did not record past the purge boundary " + newStart
+                        + " within " + OP_TIMEOUT_MS + " ms (start " + archive.getStartPosition(rec) + ", recorded "
+                        + recordedEnd(archive, rec) + ")");
+        if (archive.getStartPosition(rec) < newStart) {
+            try {
+                archive.purgeSegments(rec, newStart);
+            } catch (final io.aeron.archive.client.ArchiveException e) {
+                if (archive.getStartPosition(rec) < newStart) {
+                    throw e;
+                }
+                System.out.println("[rig] member " + m.id + " log rec=" + rec + ": its own pruner reached " + newStart
+                        + " first (" + e.getMessage() + ")");
+            }
+        }
+        return archive.getStartPosition(rec);
+    }
+
+    /** The recorded end of {@code rec}: the live recording position, else its stop position. */
+    private static long recordedEnd(final AeronArchive archive, final long rec) {
+        final long live = archive.getRecordingPosition(rec);
+        return live != AeronArchive.NULL_POSITION ? live : archive.getStopPosition(rec);
     }
 
     /** The nonce {@link #adopt} ADOPTs: {@link #GENESIS} unless a re-genesis test sets another. */

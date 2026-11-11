@@ -91,6 +91,11 @@ public final class ReplicaSettings {
         REPLICA_DRIVER_MTU("replica.driver.mtu"),
         /** The embedded driver's IPC and publication term length (16m). */
         REPLICA_DRIVER_TERM_LENGTH("replica.driver.term.length"),
+        /**
+         * The embedded driver's check of an existing driver directory: a driver heartbeat at most this old is a live
+         * driver's, refused (10000, Aeron's driver timeout). A crashed driver's directory is stale only after this.
+         */
+        REPLICA_DRIVER_DIR_ACTIVE_MS("replica.driver.dir.active.ms"),
         REPLICA_SHADOW_BUFFER_MB("replica.shadow.buffer.mb"),
         REPLICA_ALIGNED_WAIT_MS("replica.aligned.wait.ms"),
         /** The members' standby schedule; read here only to derive the two defaults below. */
@@ -310,6 +315,8 @@ public final class ReplicaSettings {
         // the default is the kit's constant, never a second literal
         size(Key.REPLICA_DRIVER_TERM_LENGTH, Integer.toString(ReplicaConfig.DEFAULT_DRIVER_TERM_LENGTH), 64 * 1024,
                 1024 * 1024 * 1024, true);
+        checked(Key.REPLICA_DRIVER_DIR_ACTIVE_MS, ReplicaConfig.DEFAULT_DRIVER_DIR_ACTIVE_MS,
+                ReplicaConfig::driverDirActiveRefusal);
         integer(Key.REPLICA_SHADOW_BUFFER_MB, ReplicaConfig.DEFAULT_SHADOW_BUFFER_MB, 16,
                 ReplicaConfig.MAX_SHADOW_BUFFER_MB);
         integer(Key.REPLICA_ALIGNED_WAIT_MS, ReplicaConfig.DEFAULT_ALIGNED_WAIT_MS, 1000, 3_600_000L);
@@ -683,6 +690,7 @@ public final class ReplicaSettings {
                 .catchupSndbuf(catchupSndbuf)
                 .driverMtu(intOf(Key.REPLICA_DRIVER_MTU))
                 .driverTermLength(intOf(Key.REPLICA_DRIVER_TERM_LENGTH))
+                .driverDirActiveMs(numeric(Key.REPLICA_DRIVER_DIR_ACTIVE_MS))
                 .catchupRcvWnd(catchupRcvWnd)
                 .shadowBufferMb(intOf(Key.REPLICA_SHADOW_BUFFER_MB))
                 .alignedWaitMs(numeric(Key.REPLICA_ALIGNED_WAIT_MS))

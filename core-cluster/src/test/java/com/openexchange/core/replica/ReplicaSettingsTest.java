@@ -494,6 +494,25 @@ public class ReplicaSettingsTest {
     }
 
     /**
+     * {@code REPLICA_DRIVER_DIR_ACTIVE_MS}: the default (Aeron's driver timeout), both ends of the range, the kit's
+     * refusal text one step outside each, the non-integer text, and the value reaching the embedded driver context.
+     */
+    @Test
+    public void driverDirActiveSetting() throws Exception {
+        final String k = "REPLICA_DRIVER_DIR_ACTIVE_MS";
+        final ReplicaSettings.Key key = ReplicaSettings.Key.valueOf(k);
+        assertEquals(10_000, with().numeric(key));
+        assertEquals(10_000, with().config().driverDirActiveMs());
+        assertEquals(2_000, with(k, "2000").numeric(key));
+        assertEquals(600_000, with(k, "600000").numeric(key));
+        assertEquals("REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 1999", refusal(k, "1999"));
+        assertEquals("REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 600001", refusal(k, "600001"));
+        assertEquals(k + "='12x' is not an integer", refusal(k, "12x"));
+        assertEquals(30_000, com.openexchange.cluster.replica.ReplicaContexts.driver(with(k, "30000").config())
+                .driverTimeoutMs());
+    }
+
+    /**
      * The live oracle's settings: each at its boundaries with the kit's refusal text behind the boot guard prefix, the
      * non-integer text, the defaults, the readiness age cross-check (only when the member cadence is set) and the
      * mismatch dir boot check.

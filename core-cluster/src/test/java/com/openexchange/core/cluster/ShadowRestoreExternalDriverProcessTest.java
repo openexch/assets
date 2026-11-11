@@ -190,10 +190,13 @@ public class ShadowRestoreExternalDriverProcessTest {
      * 3b pulls it: {@code restored path=EQUAL}, {@code /ready}, SIGTERM exits 143. Then a 3b against a source that never
      * answers (the pulled copy purged by a boot without sources first): kill -9 of the driver during the pull exits 1 at
      * once. Then the steady-state puller running (the restore pulled again, the puller listing its source every
-     * period): kill -9 of the driver exits 1 at once.
+     * period): kill -9 of the driver exits 1 at once. About two minutes: nightly only
+     * ({@code -Dcore.pull.external=true}).
      */
     @Test(timeout = 900_000)
     public void aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints() throws Exception {
+        org.junit.Assume.assumeTrue("the external-driver pull rows run only with -Dcore.pull.external=true",
+                Boolean.getBoolean("core.pull.external"));
         final Node node = new Node("pull-external-", 50800);
         final int srcPort = freePort();
         final Path srcDir = dir("pull-external-source-");

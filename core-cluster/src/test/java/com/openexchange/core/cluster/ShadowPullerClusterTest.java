@@ -32,7 +32,7 @@ import static org.junit.Assert.assertTrue;
  * equal to the leader's, the time to ready recorded. Then the same follower with a source that answers nothing halts
  * with the pull named in the runbook text.
  *
- * <p>Variants: {@code -Dcore.pull.members} 2 or 3 (default 3; the PR gate runs 2), {@code -Dcore.pull.100k=true}
+ * <p>Variants: {@code -Dcore.pull.members} 2 or 3 (default 3, the nightly job's), {@code -Dcore.pull.100k=true}
  * (100 000 accounts before the snapshot, a shadow of several MB).</p>
  */
 public class ShadowPullerClusterTest {
