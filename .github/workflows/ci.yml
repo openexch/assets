@@ -128,7 +128,7 @@ jobs:
       - name: Nightly shadow (puller, leader gate, re-bootstrap, interop, external pull and producer rows, follower producer)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test
-          -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap,ShadowRestoreExternalDriverProcessTest#theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest'
+          -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap,ShadowRestoreExternalDriverProcessTest#theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest,EmbeddedDriverDirProcessTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.pull.external=true -Dcore.producer.external=true -Dcore.producer.guard.nightly=true
         env:

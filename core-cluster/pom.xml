@@ -135,7 +135,8 @@
              ShadowRestoreExternalDriverProcessTest and ReplicaExternalDriverProcessTest (-Dcore.pull.external=true) are nightly only.
              The follower producer: the two-member role story and the capacity and opt-out guard rows run here; the
              three-member role story (-Dcore.producer.members=3), the other guard rows (-Dcore.producer.guard.nightly=true), the log window rows, the two live producers with the floor-side alarm, the late leader detection drill,
-             the abort on leadership and the crashed-write sweep are nightly only. -->
+             the abort on leadership, the crashed-write sweep and the member embedded-driver directory process rows
+             (EmbeddedDriverDirProcessTest; the kit's EmbeddedDriverDirTest covers the check on every PR) are nightly only. -->
         <profile>
             <id>fast</id>
             <build>
@@ -163,6 +164,7 @@
                                 <exclude>**/FollowerShadowWindowClusterTest.java</exclude>
                                 <exclude>**/DualProducerLiveTest.java</exclude>
                                 <exclude>**/DesignatedFollowerLateLeaderDetectionTest.java</exclude>
+                                <exclude>**/EmbeddedDriverDirProcessTest.java</exclude>
                                 <exclude>**/*$*</exclude>
                             </excludes>
                             <systemPropertyVariables>
