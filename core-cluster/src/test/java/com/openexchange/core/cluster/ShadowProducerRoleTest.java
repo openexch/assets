@@ -112,6 +112,8 @@ public class ShadowProducerRoleTest {
 
             for (int s = 0; s < 3; s++) {
                 tool.deposits(50);
+                // a loaded runner can elect between snapshots: the designation follows the leader of this term
+                leader = rig.awaitLeader(null);
                 final long[] before = writes(rig);
                 final long p = rig.snapshotAll();
                 assertProducedBy(rig, leader, p, before);
@@ -135,6 +137,7 @@ public class ShadowProducerRoleTest {
             awaitArmed(rig);
             for (int s = 0; s < 2; s++) {
                 tool2.deposits(50);
+                leader = rig.awaitLeader(null);
                 final long[] before = writes(rig);
                 final long p = rig.snapshotAll();
                 assertProducedBy(rig, leader, p, before);
@@ -219,13 +222,30 @@ public class ShadowProducerRoleTest {
                         : "a non-designated follower produced: member " + m.id + " at " + p);
             }
         }
+        // exactly one node per TERM (contract 4.4): an election after this P_cm moves the designation with the leader,
+        // so the expected node is the current leader's designated, not the one of the term that wrote at p
+        final int[] seen = new int[] {-1, -1};
         rig.await(() -> {
+            Member now = null;
             int ones = 0;
             for (final Member m : rig.live()) {
                 ones += ServiceProbe.producerDesignated(m.service) == 1 ? 1 : 0;
+                if (m.role() == io.aeron.cluster.service.Cluster.Role.LEADER) {
+                    now = m;
+                }
             }
-            return ones == 1 && ServiceProbe.producerDesignated(dm.service) == 1;
-        }, 10_000, "shadow_producer_designated reads 1 on exactly one node (member " + d + ")");
+            if (now == null) {
+                return false;
+            }
+            seen[0] = now.id;
+            seen[1] = ones;
+            return ones == 1 && ServiceProbe.producerDesignated(rig.members.get(designated(rig, now.id)).service) == 1;
+        }, 10_000, () -> "shadow_producer_designated reads 1 on exactly one node (member " + d + " under leader "
+                + leader.id + "; now leader " + seen[0] + ", nodes reading 1: " + seen[1] + ")");
+        if (seen[0] != leader.id) {
+            System.out.println("[role] an election after P_cm=" + p + ": leader " + leader.id + " -> " + seen[0]
+                    + ", the gauge moved to member " + designated(rig, seen[0]));
+        }
     }
 
     /** The usable F copy of {@code m} at exactly {@code p} in its own archive, or null. */
