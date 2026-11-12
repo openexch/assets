@@ -50,7 +50,18 @@ import java.util.function.LongSupplier;
  * ({@code shadow-puller-core-<memberId>}) started by the first wake after the ADOPT (the genesis it filters on is
  * the recorded one) and closed with the housekeeping (from {@code onTerminate}). It reads the service's role through
  * {@code leaderNow} only: while this node leads, it lists and pulls nothing and aborts what is in flight. A pulled
- * copy reaches the floor and retention only after its local deep read (the next catalog scan sees it).</p>
+ * copy reaches the floor and retention only after its local deep read (the next catalog scan sees it). A member
+ * passes the puller the current leader's archive endpoint ({@link #leaderArchiveEndpoint}): a discovery pass skips it,
+ * so nobody replicates from the leader's archive while it leads.</p>
+ *
+ * <p>The follower producer's writer ({@link #producer}, shadow mode only): armed once by the first wake after the ADOPT
+ * that has a catalog scan, with this producer's identity {@code F<memberId>} and the replica's seeding rule (the seq
+ * over header-bearing copies and header-less TOO_SHORT aliases of this producer, the position over its usable copies
+ * only), its own archive client and one image buffer; published through a volatile the service reads in its guard. After
+ * every scan the kit's {@link CrashedWriteSweep} purges this producer's crashed writes from before this process
+ * (through retention), and under {@code two-producers} the floor-side {@link WitnessAlarm} raises its CRITICAL line on
+ * every member when the newest ALIGNED position has had fewer than two producers for longer than its window.
+ * {@link #close} closes the writer thread (aborting a write in flight) before the archive clients.</p>
  */
 final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
 
@@ -83,6 +94,33 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
     private final ReentrantLock lock = new ReentrantLock();
     private volatile boolean closed;
     private long peekedRecordingId = Long.MIN_VALUE;
+
+    /** Builds the member's writer (production: the kit's public constructor; a test seam swaps a faulty one in). */
+    @FunctionalInterface
+    interface WriterFactory {
+        com.openexchange.cluster.shadow.ShadowWriter create(Aeron aeron, AeronArchive archive,
+                                                            com.openexchange.cluster.shadow.ShadowProducer producer,
+                                                            com.openexchange.cluster.shadow.ShadowSelfCheck selfCheck,
+                                                            String ipcTermLength, NanoClock clock, long connectTimeoutNs,
+                                                            long offerTimeoutNs, long recordTimeoutNs,
+                                                            long initialProducerSeq, long initialLastWrittenPosition,
+                                                            ShadowCounters counters);
+
+        WriterFactory PRODUCTION = com.openexchange.cluster.shadow.ShadowWriter::new;
+    }
+
+    /** The producer wiring; null: this member arms no writer (off mode, {@code SHADOW_PRODUCER=none}, unit tests). */
+    record ProducerWiring(int memberId, int members,
+                          com.openexchange.cluster.shadow.ShadowWriterThread.ShadowWriteListener listener,
+                          WriterFactory writerFactory, boolean sweepOff, boolean witnessAlarmOff) {
+    }
+
+    private volatile ProducerWiring producerWiring;
+    private volatile java.util.function.Supplier<String> leaderArchiveEndpoint = () -> null;
+    private volatile MemberShadowProducer.Armed armed;
+    private AeronArchive writerArchive;
+    private com.openexchange.cluster.shadow.CrashedWriteSweep sweep;
+    private volatile com.openexchange.cluster.shadow.WitnessAlarm witnessAlarm;
     private ShadowFloor.NewestImage peekedKind = ShadowFloor.NewestImage.UNKNOWN;
 
     /**
@@ -129,6 +167,34 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
                 this::logStartPosition, counters);
     }
 
+    /** Wires the follower producer (before the pruner starts); shadow mode with {@code SHADOW_PRODUCER} enabled only. */
+    MemberShadowHousekeeping producer(final ProducerWiring wiring) {
+        this.producerWiring = wiring;
+        if (wiring != null && settings.mode() == SnapshotMode.SHADOW
+                && settings.anchorRule() == ShadowFloor.AnchorRule.TWO_PRODUCERS && !wiring.witnessAlarmOff()) {
+            witnessAlarm = new com.openexchange.cluster.shadow.WitnessAlarm(
+                    TimeUnit.MILLISECONDS.toNanos(settings.witnessAlarmMs()));
+        }
+        return this;
+    }
+
+    /** The current leader's archive endpoint for the puller's skip (null: none known). */
+    MemberShadowHousekeeping leaderArchiveEndpoint(final java.util.function.Supplier<String> endpoint) {
+        this.leaderArchiveEndpoint = Objects.requireNonNull(endpoint, "endpoint");
+        return this;
+    }
+
+    /** The armed writer, its thread and image buffer; null until armed. Read by the service thread. */
+    MemberShadowProducer.Armed armedProducer() {
+        return armed;
+    }
+
+    /** {@code shadow_floor_witness_missing{kind}}: 1 while the alarm holds and the kind is missing. */
+    int witnessMissing(final com.openexchange.cluster.shadow.ProducerKind kind) {
+        final com.openexchange.cluster.shadow.WitnessAlarm a = witnessAlarm;
+        return a == null ? 0 : a.missing(kind);
+    }
+
     /** The watermark supplier the pruner must hold (4.1 runtime net: {@code watermarkIs(floor())}). */
     ShadowFloor floor() {
         return floor;
@@ -165,6 +231,7 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
                 return;
             }
             housekeeping.poll();
+            afterScan(housekeeping.scan());
         } catch (final RuntimeException failed) {
             forwardFatal(failed);
             // a lost archive client is reconnected next wake; the floor keeps its last scan (or none: UNKNOWN)
@@ -185,10 +252,92 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
         final ShadowPuller p = new ShadowPuller(archive.context().aeron(), archiveContext, CoreLogApplier.ENGINE_ID_CORE,
                 clusterId, genesisId, leaderNow, responseHost, pullSettings, verdicts, shadowCounters, clock,
                 TimeUnit.MILLISECONDS.toNanos(settings.loadTimeoutMs()), pullerThreadName);
+        p.deferredSource(() -> leaderArchiveEndpoint.get());
         puller = p;
         p.start();
         System.out.println("[SHADOW-PULL] puller started: sources=" + pullSettings.sources() + " periodMs="
                 + pullSettings.periodMs() + " kinds=" + pullSettings.kinds() + " genesisId=" + genesisId.getAsLong());
+    }
+
+    /** After every catalog poll: arm the writer once, sweep this producer's crashed writes, the witness alarm. */
+    private void afterScan(final ShadowCatalog.Scan scan) {
+        final ProducerWiring w = producerWiring;
+        if (w == null || scan == null || !scan.known()) {
+            return;
+        }
+        // a one-member cluster designates nobody: no writer, no image buffer
+        if (armed == null && w.members() >= 2 && settings.mode() == SnapshotMode.SHADOW
+                && settings.producerSettings().enabled()) {
+            arm(w, scan);
+        }
+        final MemberShadowProducer.Armed a = armed;
+        if (a != null && sweep != null && !w.sweepOff()) {
+            sweep.sweep(scan, a.firstProducerSeq(), retention);
+        }
+        final com.openexchange.cluster.shadow.WitnessAlarm alarm = witnessAlarm;
+        if (alarm != null && leaderNow.getAsBoolean()) {
+            // a leader neither pulls nor produces, so its own archive never holds a fresh two-producer anchor (and it
+            // never purges below P_cm on one): the followers' floors carry the alarm; leading starts a fresh window
+            if (alarm.holding()) {
+                witnessAlarm = new com.openexchange.cluster.shadow.WitnessAlarm(
+                        TimeUnit.MILLISECONDS.toNanos(settings.witnessAlarmMs()));
+            }
+        } else if (alarm != null) {
+            final com.openexchange.cluster.shadow.WitnessAlarm.Result r = alarm.observe(clock.nanoTime(), scan);
+            if (r.criticalLine() != null) {
+                System.err.println("[SHADOW-FLOOR] CRITICAL: " + r.criticalLine());
+            }
+        }
+    }
+
+    /**
+     * Arms the writer with this producer's seq and position from the local catalog (the replica's rule): the seq over
+     * header-bearing copies AND header-less TOO_SHORT aliases (else a restarted writer reuses a crashed seq), the
+     * position over usable copies only (a CORRUPT or CONFLICT copy at P must not block a re-write at P).
+     */
+    private void arm(final ProducerWiring w, final ShadowCatalog.Scan scan) {
+        final com.openexchange.cluster.shadow.ShadowProducer producer = new com.openexchange.cluster.shadow.ShadowProducer(
+                clusterId, com.openexchange.cluster.shadow.ProducerKind.FOLLOWER, w.memberId());
+        long maxSeq = 0;
+        long maxPos = -1;
+        for (final com.openexchange.cluster.shadow.ShadowEntry e : scan.all()) {
+            final com.openexchange.cluster.shadow.ShadowHeader h = e.header();
+            if (h != null && h.producerKind() == producer.kind().code() && h.producerId() == producer.producerId()) {
+                maxSeq = Math.max(maxSeq, h.producerSeq());
+                if (e.state().usable()) {
+                    maxPos = Math.max(maxPos, h.logPosition());
+                }
+            } else if (h == null && e.alias() != null && e.alias().producerKind() == producer.kind().code()
+                    && e.alias().producerId() == producer.producerId()) {
+                maxSeq = Math.max(maxSeq, e.alias().producerSeq());
+            }
+        }
+        final com.openexchange.cluster.shadow.ShadowProducerSettings ps = settings.producerSettings();
+        final com.openexchange.cluster.shadow.ShadowImageBuffer image = new com.openexchange.cluster.shadow.ShadowImageBuffer(
+                new org.agrona.concurrent.UnsafeBuffer(java.nio.ByteBuffer.allocateDirect(
+                        ps.bufferBytes() + com.openexchange.cluster.shadow.ShadowHeader.LENGTH)));
+        writerArchive = AeronArchive.connect(archiveContext.clone());
+        final com.openexchange.cluster.shadow.ShadowWriter writer = (w.writerFactory() == null
+                ? WriterFactory.PRODUCTION : w.writerFactory()).create(archive.context().aeron(), writerArchive, producer,
+                new com.openexchange.core.replica.ApplierSelfCheck("[SHADOW-PRODUCER]"), ps.termLength(), clock,
+                TimeUnit.MILLISECONDS.toNanos(ps.connectTimeoutMs()), TimeUnit.MILLISECONDS.toNanos(ps.offerTimeoutMs()),
+                TimeUnit.MILLISECONDS.toNanos(ps.recordTimeoutMs()), maxSeq + 1, maxPos, shadowCounters);
+        final com.openexchange.cluster.shadow.ShadowWriterThread thread =
+                new com.openexchange.cluster.shadow.ShadowWriterThread(writer, w.listener(), this::onWriterError,
+                        shadowCounters);
+        sweep = new com.openexchange.cluster.shadow.CrashedWriteSweep(producer, "[SHADOW-HK]", System.out::println,
+                shadowCounters);
+        armed = new MemberShadowProducer.Armed(writer, thread, image, maxSeq + 1);
+        System.out.println("[SHADOW-PRODUCER] writer armed: producer=F" + w.memberId() + " nextSeq=" + (maxSeq + 1)
+                + " lastWritten=" + maxPos + " bufferMb=" + ps.bufferMb() + " termLength=" + ps.termLength());
+    }
+
+    /** The writer thread's errors: an {@code Error} reaches the member's halt path, anything else is one line. */
+    private void onWriterError(final Throwable t) {
+        System.err.println("[SHADOW-PRODUCER] CRITICAL: shadow writer thread error: " + t);
+        if (t instanceof Error) {
+            fatalErrors.onError(t);
+        }
     }
 
     /** The running puller, null before the ADOPT or without sources. */
@@ -434,6 +583,12 @@ final class MemberShadowHousekeeping implements Runnable, AutoCloseable {
         if (p != null) {
             CloseHelper.quietClose(p); // stops its thread, aborts and purges what is in flight
         }
+        final MemberShadowProducer.Armed a = armed;
+        if (a != null) {
+            CloseHelper.quietClose(a.thread()); // aborts a write in flight (its cleanup purges), joins
+        }
+        CloseHelper.quietClose(writerArchive);
+        writerArchive = null;
         CloseHelper.quietClose(retention);
         retention = null;
         housekeeping = null;

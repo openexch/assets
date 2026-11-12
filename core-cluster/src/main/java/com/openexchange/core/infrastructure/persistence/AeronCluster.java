@@ -76,6 +76,9 @@ public final class AeronCluster {
         // the "CORE BOOT GUARD: " prefix and exit 1 before the service, the journal runtime or any Aeron component
         // exists. The service takes the parsed settings; it never re-reads the environment.
         final SnapshotModeSettings snapshotModeSettings = StubModeBootGuard.enforce();
+        // guard row 6: the log channel settings, the driver directory bound and the kernel's grant of the log socket
+        // buffers, before any driver is launched or connected (every mode, both driver modes)
+        final StubModeBootGuard.Transport transport = StubModeBootGuard.enforceTransport();
         final ElectionTimingSettings electionTiming = ElectionTimingSettings.fromEnv();
         final CoreClusteredService coreService = new CoreClusteredService(snapshotModeSettings);
 
@@ -99,9 +102,11 @@ public final class AeronCluster {
         final ClusterConfig clusterConfig = ClusterConfig.create(nodeId, hostAddresses, hostAddresses, portBase,
                 coreService);
 
-        // guard row 3: a pull source list must never name this node's own archive (refused before any launch)
+        // guard rows 3 and 5: a pull source list must never name this node's own archive, and a member's archive must
+        // be spelled as the members table spells it (the leader-source skip compares text); refused before any launch
         StubModeBootGuard.enforcePullSources(snapshotModeSettings,
-                StubModeBootGuard.endpointOf(clusterConfig.archiveContext().controlChannel()));
+                StubModeBootGuard.endpointOf(clusterConfig.archiveContext().controlChannel()),
+                StubModeBootGuard.memberArchiveEndpoints(clusterConfig.consensusModuleContext().clusterMembers()));
 
         final File resolvedBaseDir = getBaseDir(nodeId);
         clusterConfig.baseDir(resolvedBaseDir);
@@ -134,8 +139,8 @@ public final class AeronCluster {
 
         clusterConfig.consensusModuleContext().ingressChannel(TransportConfig.udpChannel("aeron:udp"));
         clusterConfig.consensusModuleContext().egressChannel(TransportConfig.udpChannel("aeron:udp"));
-        clusterConfig.consensusModuleContext().logChannel(
-                "aeron:udp?term-length=" + TransportConfig.logTermLength());
+        // rcv-wnd, so-rcvbuf and so-sndbuf on the URI: the log image gets them under either driver mode
+        clusterConfig.consensusModuleContext().logChannel(transport.log().uri());
 
         clusterConfig.consensusModuleContext()
                 .leaderHeartbeatIntervalNs(electionTiming.heartbeatIntervalNs())
@@ -155,7 +160,7 @@ public final class AeronCluster {
         if (driverMode == DriverMode.EXTERNAL) {
             launchWithExternalDriver(clusterConfig, nodeId, lifecycle, journalRuntime, feedRuntime);
         } else {
-            launchWithEmbeddedDriver(clusterConfig, lifecycle, journalRuntime, feedRuntime);
+            launchWithEmbeddedDriver(clusterConfig, lifecycle, journalRuntime, feedRuntime, transport.driverDirActiveMs());
         }
     }
 
@@ -193,16 +198,39 @@ public final class AeronCluster {
         }
     }
 
+    /** What else may own an embedded member driver's directory (the refusal text). */
+    static final String DRIVER_DIR_OTHERS = "another core member's embedded driver or an aeronmd";
+
+    /**
+     * The embedded member driver over the kit's directory check: a directory whose driver heartbeat is at most
+     * {@code CORE_DRIVER_DIR_ACTIVE_MS} old is a live driver and refuses the boot (exit 1, the directory untouched); a
+     * stale one is deleted and recreated. Aeron's {@code dirDeleteOnStart(true)} skipped that liveness check entirely.
+     */
+    static ClusteredMediaDriver launchEmbeddedDriver(final ClusterConfig clusterConfig, final long driverDirActiveMs,
+                                                     final java.util.function.Supplier<ClusteredMediaDriver> launch) {
+        final String dir = clusterConfig.mediaDriverContext().aeronDirectoryName();
+        try {
+            return com.openexchange.cluster.EmbeddedDriverDir.launch(dir, driverDirActiveMs, launch, DRIVER_DIR_OTHERS,
+                    "member");
+        } catch (final com.openexchange.cluster.EmbeddedDriverDir.LiveDriverException live) {
+            final StandbySnapshotBootGuard.Refused refused =
+                    new StandbySnapshotBootGuard.Refused(live.getMessage(), live);
+            System.err.println(refused.getMessage());
+            throw refused;
+        }
+    }
+
     private static void launchWithEmbeddedDriver(
             final ClusterConfig clusterConfig, final EngineLifecycle lifecycle,
             final com.openexchange.core.infrastructure.journal.MoneyJournalRuntime journalRuntime,
-            final com.openexchange.core.infrastructure.feed.BalanceFeedRuntime feedRuntime) {
+            final com.openexchange.core.infrastructure.feed.BalanceFeedRuntime feedRuntime,
+            final long driverDirActiveMs) {
         try (
-                ClusteredMediaDriver ignored = watchQuorum(lifecycle, ClusteredMediaDriver.launch(
-                        clusterConfig.mediaDriverContext()
-                                .dirDeleteOnStart(true)
+                ClusteredMediaDriver ignored = watchQuorum(lifecycle, launchEmbeddedDriver(clusterConfig,
+                        driverDirActiveMs, () -> ClusteredMediaDriver.launch(
+                        com.openexchange.cluster.EmbeddedDriverDir.guard(clusterConfig.mediaDriverContext(),
+                                        driverDirActiveMs)
                                 .dirDeleteOnShutdown(true)
-                                .driverTimeoutMs(500)
                                 .timerIntervalNs(TimeUnit.MICROSECONDS.toNanos(500))
                                 .clientLivenessTimeoutNs(TimeUnit.SECONDS.toNanos(5))
                                 .publicationUnblockTimeoutNs(TimeUnit.SECONDS.toNanos(10))
@@ -213,7 +241,7 @@ public final class AeronCluster {
                                 .publicationTermBufferLength(16 * 1024 * 1024)
                                 .mtuLength(8192),
                         clusterConfig.archiveContext(),
-                        clusterConfig.consensusModuleContext().terminationHook(lifecycle::onClusterTermination)));
+                        clusterConfig.consensusModuleContext().terminationHook(lifecycle::onClusterTermination))));
                 // Journal writer is a driver/archive client: start only after ClusteredMediaDriver
                 // is up, and let it outlive the container so the ring drains through shutdown.
                 com.openexchange.core.infrastructure.journal.MoneyJournalRuntime ignoredJournal =

@@ -42,10 +42,16 @@ public class SkipWindowSnapshotTest {
 
     private static final int PORT_BASE = 22000;
     private static final Pattern LOG_POSITION = Pattern.compile("logPosition=(\\d+)");
+    /**
+     * No row kills a leader, so nothing here needs the rig's fast 1 s failure detection, and every row offers deposits
+     * right after a snapshot: a runner pause of about a second there must not become an election that drops them.
+     */
+    private static final long LEADER_HEARTBEAT_TIMEOUT_MS = 5_000;
 
     @Test
     public void dryRunAFollowerSnapshotsAtASameTermActionInsideItsReplayWindow() throws Exception {
         try (ShadowClusterRig rig = new ShadowClusterRig(PORT_BASE, "rcs-s4-dry-skipwindow")) {
+            rig.leaderHeartbeatTimeoutMs = LEADER_HEARTBEAT_TIMEOUT_MS;
             rig.bootAll();
             final Member leader = rig.awaitLeader(null);
             final Member f = rig.followerOtherThan(leader, null);
@@ -126,6 +132,7 @@ public class SkipWindowSnapshotTest {
         for (final Member m : rig.members) {
             m.settings = StubStory.shadow();
         }
+        rig.leaderHeartbeatTimeoutMs = LEADER_HEARTBEAT_TIMEOUT_MS;
         rig.bootAll();
         final Member leader = rig.awaitLeader(null);
         final Member f = rig.followerOtherThan(leader, null);
@@ -143,7 +150,8 @@ public class SkipWindowSnapshotTest {
         final long[] pos = log.positions();
         final int ix = Arrays.binarySearch(pos, pX);
         assertTrue("P_x " + pX + " is a frame end of f's log", ix >= 0 && ix + 8 < pos.length);
-        final long pS = pos[ix + 8];
+        // eight deposits past P_x, not eight frames: timer frames alone in (P_x, P_s] make a double apply invisible
+        final long pS = afterSessionMessages(log, pX, 8);
         final Written w = rig.producer(f).produce(new Who(ProducerKind.FOLLOWER, 300), log, pS);
         assertTrue(w.toString(), w.ok());
         assertTrue("P_cm < P_x < P_s: " + pCm + " " + pX + " " + pS, pCm < pX && pX < pS);
@@ -221,6 +229,18 @@ public class SkipWindowSnapshotTest {
             RestoreDrillDryRun.nc("11.4-window-clause-off", "final image differs from baseline after restore from P_x (double apply)",
                     () -> restartFromPx(w, "window clause off"));
         }
+    }
+
+    /** The frame end of the {@code n}-th session message after {@code from} (each one a deposit in these stories). */
+    private static long afterSessionMessages(final RecordedLog log, final long from, final int n) {
+        int seen = 0;
+        for (final com.openexchange.cluster.testkit.LogFrame frame : log.frames()) {
+            if (frame.position() > from && frame.kind() == com.openexchange.cluster.log.FrameKind.SESSION_MESSAGE
+                    && ++seen == n) {
+                return frame.position();
+            }
+        }
+        throw new AssertionError("fewer than " + n + " session messages after " + from + " in f's log");
     }
 
     /** The {@code [SNAPSHOT]} line whose logPosition is {@code pX}, and that it lies strictly inside {@code (pCm, pS)}. */

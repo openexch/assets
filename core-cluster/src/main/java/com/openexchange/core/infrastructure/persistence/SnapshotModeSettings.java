@@ -39,7 +39,17 @@ public final class SnapshotModeSettings {
         SHADOW_PULL_MAX_INFLIGHT("shadow.pull.max.inflight", "1"),
         SHADOW_PULL_KINDS("shadow.pull.kinds", "ALIGNED"),
         SHADOW_PULL_REPLICATION_ENDPOINT("shadow.pull.replication.endpoint", ""),
-        SHADOW_PULL_RESPONSE_ENDPOINT("shadow.pull.response.endpoint", "");
+        SHADOW_PULL_RESPONSE_ENDPOINT("shadow.pull.response.endpoint", ""),
+        SHADOW_PRODUCER("shadow.producer", "designated-follower"),
+        SHADOW_TERM_LENGTH("shadow.term.length", "4m"),
+        SHADOW_PRODUCER_BUFFER_MB("shadow.producer.buffer.mb", "512"),
+        SHADOW_WRITE_CONNECT_TIMEOUT_MS("shadow.write.connect.timeout.ms", "10000"),
+        SHADOW_WRITE_OFFER_TIMEOUT_MS("shadow.write.offer.timeout.ms", "30000"),
+        SHADOW_WRITE_RECORD_TIMEOUT_MS("shadow.write.record.timeout.ms", "60000"),
+        SHADOW_PRODUCER_WINDOW_BUDGET_PCT("shadow.producer.window.budget.pct", "50"),
+        SHADOW_PRODUCER_SERIALIZE_ESTIMATE_MS("shadow.producer.serialize.estimate.ms", "1000"),
+        SHADOW_PRODUCER_RATE_WINDOW_MS("shadow.producer.rate.window.ms", "10000"),
+        SHADOW_WITNESS_ALARM_MS("shadow.witness.alarm.ms", "7200000");
 
         private final String property;
         private final String defaultText;
@@ -83,6 +93,10 @@ public final class SnapshotModeSettings {
     private final ShadowFloor.AnchorRule anchorRule;
     private final java.util.function.Function<String, String> pullEnv;
     private final ShadowPullSettings pullSettings;
+    private final com.openexchange.cluster.shadow.ShadowProducerSettings producerSettings;
+    /** True when {@code SHADOW_PRODUCER} was set (the off-mode CRITICAL line names an explicit value only). */
+    private final boolean producerExplicit;
+    private final long witnessAlarmMs;
 
     private SnapshotModeSettings(final Source source) {
         this.mode = SnapshotMode.parse(raw(source, Key.SNAPSHOT_MODE));
@@ -99,6 +113,10 @@ public final class SnapshotModeSettings {
         // the puller rows: the kit's one parser (its ranges and refusal texts), read through this table's source
         this.pullEnv = name -> raw(source, Key.valueOf(name));
         this.pullSettings = ShadowPullSettings.parse(pullEnv, null);
+        // the follower producer rows: the kit's one parser (also the replica's names and texts)
+        this.producerSettings = com.openexchange.cluster.shadow.ShadowProducerSettings.parse(pullEnv);
+        this.producerExplicit = source.get(Key.SHADOW_PRODUCER.name(), Key.SHADOW_PRODUCER.property()) != null;
+        this.witnessAlarmMs = range(source, Key.SHADOW_WITNESS_ALARM_MS, 1000, 604_800_000L);
     }
 
     /** The settings of this process. @throws IllegalArgumentException with the 3.5 text of the first bad setting */
@@ -213,21 +231,49 @@ public final class SnapshotModeSettings {
         return ShadowPullSettings.parse(pullEnv, ownArchiveEndpoint);
     }
 
-    /** The CRITICAL lines a member prints at boot: the anchor rule's opt-out, the disabled puller, a kinds widening. */
+    /** The {@code SHADOW_PRODUCER*} and {@code SHADOW_WRITE_*} rows (the kit's parser). */
+    public com.openexchange.cluster.shadow.ShadowProducerSettings producerSettings() {
+        return producerSettings;
+    }
+
+    /**
+     * {@code SHADOW_WITNESS_ALARM_MS} (default 7200000, 1000..604800000): how long the newest ALIGNED position may have
+     * fewer than two producers before the floor-side CRITICAL line, and how long a designated follower may write no
+     * ALIGNED before its own diagnostic line.
+     */
+    public long witnessAlarmMs() {
+        return witnessAlarmMs;
+    }
+
+    /**
+     * The CRITICAL lines a member prints at boot: the anchor rule's opt-out, the disabled puller, a kinds widening,
+     * {@code SHADOW_PRODUCER=none} in shadow mode, an explicit {@code SHADOW_PRODUCER=designated-follower} in off mode.
+     */
     public java.util.List<String> criticalLines() {
         final java.util.List<String> out = new java.util.ArrayList<>();
         if (anchorRule.criticalLine() != null) {
             out.add(anchorRule.criticalLine());
         }
         out.addAll(pullSettings.criticalLines());
+        if (mode == SnapshotMode.SHADOW) {
+            out.addAll(producerSettings.criticalLines());
+        } else if (producerExplicit && producerSettings.enabled()) {
+            out.add(PRODUCER_IGNORED_LINE);
+        }
         return out;
     }
+
+    /** The off-mode line of an explicit {@code SHADOW_PRODUCER=designated-follower}. */
+    public static final String PRODUCER_IGNORED_LINE = "SHADOW_PRODUCER=designated-follower ignored: SNAPSHOT_MODE=off";
 
     @Override
     public String toString() {
         return "snapshotMode=" + mode.text() + " retainN=" + retainN + " floorMargin=" + floorMargin.text()
                 + " deepReadPaceMs=" + deepReadPaceMs + " scanPeriodMs=" + scanPeriodMs + " tailReplayTimeoutMs="
                 + tailReplayTimeoutMs + " readyBudgetMs=" + readyBudgetMs + " consensusSnapshotMaxBytes="
-                + consensusSnapshotMaxBytes + " loadTimeoutMs=" + loadTimeoutMs + " floorEnabled=" + floorEnabled;
+                + consensusSnapshotMaxBytes + " loadTimeoutMs=" + loadTimeoutMs + " floorEnabled=" + floorEnabled
+                + " producer=" + producerSettings.mode().text() + " producerBufferMb=" + producerSettings.bufferMb()
+                + " windowBudgetPct=" + producerSettings.windowBudgetPct() + " serializeEstimateMs="
+                + producerSettings.serializeEstimateMs() + " witnessAlarmMs=" + witnessAlarmMs;
     }
 }

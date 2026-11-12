@@ -278,4 +278,121 @@ public final class ServiceProbe {
         return table == null ? 0 : ((com.openexchange.cluster.auth.ClassAuthorisationService)table)
                 .deniedCount(com.openexchange.cluster.auth.ClassAuthorisationService.BACKUP_QUERY);
     }
+
+    // ------------------------------------------------------------------------------------------------ follower producer
+
+    private static MemberShadowProducer producer(final CoreClusteredService service) {
+        return (MemberShadowProducer)field(service, "shadowProducer");
+    }
+
+    /** {@code shadow_producer_skipped_total{reason}} by its label ({@code leader_unknown}, {@code capacity}, ...). */
+    public static long producerSkipped(final CoreClusteredService service, final String label) {
+        for (final MemberShadowProducer.Skip s : MemberShadowProducer.Skip.values()) {
+            if (s.label.equals(label)) {
+                return producer(service).skipped(s);
+            }
+        }
+        throw new IllegalArgumentException("no producer skip reason " + label);
+    }
+
+    /** {@code shadow_producer_written_total}. */
+    public static long producerWritten(final CoreClusteredService service) {
+        return producer(service).written();
+    }
+
+    /** {@code shadow_producer_serialize_total}. */
+    public static long producerSerialized(final CoreClusteredService service) {
+        return producer(service).serialized();
+    }
+
+    /** Serializes that ran at callback depth 0 (outside {@code onTakeSnapshot}); 0 in production. */
+    public static long producerSerializedOutsideCallback(final CoreClusteredService service) {
+        return producer(service).serializedOutsideCallback();
+    }
+
+    /** {@code shadow_producer_designated}: 1, 0 or -1 (leader unknown). */
+    public static int producerDesignated(final CoreClusteredService service) {
+        return producer(service).designated();
+    }
+
+    /** {@code shadow_producer_aborted_leader_total}. */
+    public static long producerAbortedLeader(final CoreClusteredService service) {
+        return producer(service).abortedLeader();
+    }
+
+    /** The last abort latency (role change to the writer's ABORTED result), ns; -1 none. */
+    public static long producerAbortLatencyNs(final CoreClusteredService service) {
+        return producer(service).abortLatencyNsLast();
+    }
+
+    /** {@code shadow_producer_deferred_window_total}. */
+    public static long producerDeferredWindow(final CoreClusteredService service) {
+        return producer(service).deferredWindow();
+    }
+
+    /** The guard's {@code W}: the log receiver window the producer read from the log channel URI. */
+    public static long producerWindow(final CoreClusteredService service) {
+        return producer(service).receiverWindow();
+    }
+
+    /** The log term event's leader as this process saw it: {@code {term, id}}, {@code {-1, -1}} before any frame. */
+    public static long[] logTermLeader(final CoreClusteredService service) {
+        return producer(service).logTermLeader();
+    }
+
+    /** The kit writer's {@code shadow_write_total{kind}} on this node. */
+    public static long shadowWriteTotal(final CoreClusteredService service,
+                                        final com.openexchange.cluster.shadow.ShadowKind kind) {
+        return ((com.openexchange.cluster.shadow.ShadowCounters)field(service, "shadowCounters")).writeTotal(kind);
+    }
+
+    /** A kit shadow counter of this node. */
+    public static long shadowCounter(final CoreClusteredService service,
+                                     final com.openexchange.cluster.shadow.ShadowCounters.Counter c) {
+        return ((com.openexchange.cluster.shadow.ShadowCounters)field(service, "shadowCounters")).get(c);
+    }
+
+    /** {@code shadow_floor_witness_missing{kind}}. */
+    public static int witnessMissing(final CoreClusteredService service,
+                                     final com.openexchange.cluster.shadow.ProducerKind kind) {
+        final MemberShadowHousekeeping hk = (MemberShadowHousekeeping)field(service, "shadowHousekeeping");
+        return hk == null ? 0 : hk.witnessMissing(kind);
+    }
+
+    /** Whether the member's writer is armed. */
+    public static boolean producerArmed(final CoreClusteredService service) {
+        final MemberShadowHousekeeping hk = (MemberShadowHousekeeping)field(service, "shadowHousekeeping");
+        return hk != null && hk.armedProducer() != null;
+    }
+
+    /** {@code applicationCallbackFailed}: a callback threw on this node. */
+    public static boolean applicationCallbackFailed(final CoreClusteredService service) {
+        return (Boolean)field(service, "applicationCallbackFailed");
+    }
+
+    /**
+     * Sets one producer seam of the service's faults before its launch ({@code ShadowRestore.Faults} field name; a
+     * boolean, int or long value). The production instance is never modified: a fresh one is installed first.
+     */
+    public static void producerFault(final CoreClusteredService service, final String name, final Object value) {
+        if (service.shadowFaults == ShadowRestore.Faults.NONE) {
+            service.shadowFaults = ShadowRestore.Faults.testing();
+        }
+        try {
+            final Field f = ShadowRestore.Faults.class.getDeclaredField(name);
+            f.setAccessible(true);
+            f.set(service.shadowFaults, value);
+        } catch (final ReflectiveOperationException e) {
+            throw new AssertionError("no fault seam " + name, e);
+        }
+        System.err.println("[SHADOW-PRODUCER] NC: seam " + name + "=" + value + " (test only)");
+    }
+
+    /** A writer that holds every chunk offer for {@code holdMs} (a slow write the role tests abort). */
+    public static void slowWriter(final CoreClusteredService service, final long holdMs) {
+        producerFault(service, "writerFactory", (MemberShadowHousekeeping.WriterFactory)(aeron, archive, producer,
+                selfCheck, term, clock, c, o, r, seq, pos, counters) ->
+                com.openexchange.cluster.shadow.SlowShadowWriters.slow(aeron, archive, producer, selfCheck, term, clock,
+                        c, o, r, seq, pos, counters, holdMs));
+    }
 }

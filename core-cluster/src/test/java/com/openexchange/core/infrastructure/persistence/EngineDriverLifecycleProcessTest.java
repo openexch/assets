@@ -330,6 +330,9 @@ public class EngineDriverLifecycleProcessTest {
         env.put("TRANSPORT_DRIVER_MODE", "external");
         env.put("TRANSPORT_IDLE_MODE", "backoff");
         env.put("TRANSPORT_LOG_TERM_LENGTH", "4m");
+        env.put("TRANSPORT_LOG_RCV_WINDOW", "2m"); // at most half the log term (the boot refuses more)
+        env.put("TRANSPORT_LOG_SO_RCVBUF", "2m");
+        env.put("TRANSPORT_LOG_SO_SNDBUF", "2m");
         env.put("TRANSPORT_SNAPSHOT_TERM_LENGTH", "4m");
         env.put("CLUSTER_NODE", "0");
         env.put("CLUSTER_ADDRESSES", "localhost");

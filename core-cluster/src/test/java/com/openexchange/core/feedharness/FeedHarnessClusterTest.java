@@ -337,6 +337,9 @@ public class FeedHarnessClusterTest {
                 e.put("TRANSPORT_DRIVER_THREADING", "shared");
                 e.put("TRANSPORT_TERM_LENGTH", "4m");
                 e.put("TRANSPORT_LOG_TERM_LENGTH", "16m");
+                e.put("TRANSPORT_LOG_RCV_WINDOW", "8m"); // at most half the log term (the boot refuses more)
+                e.put("TRANSPORT_LOG_SO_RCVBUF", "8m");
+                e.put("TRANSPORT_LOG_SO_SNDBUF", "8m");
                 e.put("TRANSPORT_SNAPSHOT_TERM_LENGTH", "8m");
                 procs.add(pb.start());
             }

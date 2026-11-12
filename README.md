@@ -80,11 +80,16 @@ The main engine settings:
 | `AERON_DIR` | Aeron default + `-core-<id>-driver` | media driver directory in external mode |
 | `TRANSPORT_IDLE_MODE` | `backoff` | `busy_spin` for dedicated cores |
 | `TRANSPORT_INTERFACE`, `TRANSPORT_MTU` (`8192`), `TRANSPORT_TERM_LENGTH` (`16m`), `TRANSPORT_LOG_TERM_LENGTH` (`64m`), `TRANSPORT_SNAPSHOT_TERM_LENGTH` (`64m`) | | transport tuning |
+| `TRANSPORT_LOG_RCV_WINDOW` | `16m` | the log channel's receiver window (`rcv-wnd`), 64k..`TRANSPORT_LOG_TERM_LENGTH`/2; above half the term refuses the boot |
+| `TRANSPORT_LOG_SO_RCVBUF`, `TRANSPORT_LOG_SO_SNDBUF` | `16m` | the log channel's socket buffers (64k..1g); `SO_RCVBUF` below the window refuses the boot |
+| `CORE_DRIVER_DIR_ACTIVE_MS` | `10000` | embedded mode: a driver directory whose heartbeat is at most this old belongs to a live driver and refuses the boot (2000..600000); external mode ignores it |
 | `BALANCE_FEED_CHANNEL`, `BALANCE_FEED_STREAM_ID` | unset (off) | optional balance update side channel |
 | `CORE_LEADER_HEARTBEAT_INTERVAL_MS` | `100` | how often the leader sends a heartbeat |
 | `CORE_LEADER_HEARTBEAT_TIMEOUT_MS` | `1000` | how long followers wait without a heartbeat before they start an election; at least 3 x the interval |
 | `CORE_ELECTION_TIMEOUT_MS` | `1000` | election round timeout |
 | `CORE_NODE_PORT` | `9700 + node id` | HTTP probe port |
+
+The log channel's socket buffers are probed at boot in both driver modes: when the kernel grants less than `TRANSPORT_LOG_SO_RCVBUF` / `TRANSPORT_LOG_SO_SNDBUF`, the member exits 1 with `CORE BOOT GUARD:` naming `net.core.rmem_max` / `net.core.wmem_max`, the current and the needed value. Every member host needs `net.core.rmem_max` and `net.core.wmem_max` >= 16777216 with the defaults (`sysctl -w`, persisted in `/etc/sysctl.d`). In external mode the URI's `rcv-wnd`, `so-rcvbuf` and `so-sndbuf` override the aeronmd's own defaults for the log image. A restart within `CORE_DRIVER_DIR_ACTIVE_MS` of a kill of the member's own embedded driver refuses until the bound passes: the process manager's restart delay must cover it.
 
 The three timing settings decide the leaderless window after a leader dies (about heartbeat timeout plus one election) and how often load or a GC pause on a healthy leader is taken for a death. No client is acked before a quorum commits and applies its command, so a failover never loses an acked command; during the window ingress is refused and clients retry with their request id. Every member of a cluster must use the same values.
 
@@ -109,6 +114,23 @@ A member in `SNAPSHOT_MODE=shadow` can copy shadows from other archives (a peer 
 | `SHADOW_ANCHOR_RULE` | `two-producers` | below the newest snapshot a member purges its log only behind an ALIGNED shadow two distinct producers wrote with one digest; `any-verified` (one producer is enough) boots with a CRITICAL line |
 
 The leader never pulls: while a member leads, its puller lists nothing (`shadow_pull_skipped_leader_total`) and aborts any copy in flight (`shadow_pull_aborted_leader_total`). A member that holds one producer's ALIGNED at a position pulls another producer's copy of that position once, as the second witness the anchor needs. At start, when a stub snapshot has no local shadow to restore from (EQUAL, SKIP, TAIL), the member pulls one from its sources before it considers virtual genesis; the halt text then names what the pull tried (`(3) pull: tried <n> sources, <c> candidates, refused <r>, last: <reason>` or `(3) pull: disabled: SHADOW_PULL_SOURCES empty`). The consensus module waits for the service without a bound, so restart one member at a time while pulls are enabled. Metrics: `shadow_pull_total`, `shadow_pull_bytes_total`, `shadow_pull_retries_total`, `shadow_pull_refused_total{reason}`, `shadow_pull_source_unreachable_total`, `shadow_pull_skipped_leader_total`, `shadow_pull_aborted_leader_total`, `shadow_anchor_witnesses`, `shadow_floor_no_witness_total`, `shadow_anchor_rule_two_producers`.
+
+### Follower producer
+
+In `SNAPSHOT_MODE=shadow` one follower per term (the member after the leader in `CLUSTER_ADDRESSES` order, wrapping) writes an ALIGNED shadow of its own image at each committed snapshot position into its own archive; with the replica's copy it is the second producer the purge anchor needs. Details in cluster-kit's `docs/shadow.md` ("The follower producer").
+
+| variable | default | meaning |
+|---|---|---|
+| `SHADOW_PRODUCER` | `designated-follower` | `none`: this member never writes an ALIGNED (CRITICAL at boot); set explicitly to `designated-follower` with `SNAPSHOT_MODE=off` logs CRITICAL and is ignored |
+| `SHADOW_PRODUCER_BUFFER_MB` | `512` | the image buffer (1..2047); an image above it is a counted skip |
+| `SHADOW_TERM_LENGTH` | `4m` | the shadow IPC term (64k..16m, power of two) |
+| `SHADOW_WRITE_CONNECT_TIMEOUT_MS`, `SHADOW_WRITE_OFFER_TIMEOUT_MS`, `SHADOW_WRITE_RECORD_TIMEOUT_MS` | `10000`, `30000`, `60000` | writer timeouts (1..86400000) |
+| `SHADOW_PRODUCER_WINDOW_BUDGET_PCT` | `50` | share of the log receiver window a serialize may fill at the recent ingress rate (1..100) |
+| `SHADOW_PRODUCER_SERIALIZE_ESTIMATE_MS` | `1000` | serialize time assumed before the first one (1..600000) |
+| `SHADOW_PRODUCER_RATE_WINDOW_MS` | `10000` | ingress rate horizon (1000..3600000) |
+| `SHADOW_WITNESS_ALARM_MS` | `7200000` | how long the newest ALIGNED may have fewer than two producers before the floor-side CRITICAL (1000..604800000) |
+
+The leader's archive is never a pull source while it leads (`shadow_pull_source_skipped_leader_total`); a `SHADOW_PULL_SOURCES` entry that names a member's archive endpoint under another spelling than `CLUSTER_ADDRESSES` refuses the boot. Metrics: `shadow_producer_designated` (1, 0, -1 leader unknown), `shadow_producer_written_total`, `shadow_producer_serialize_total`, `shadow_producer_serialize_ms_last`, `shadow_producer_last_position`, `shadow_producer_skipped_total{reason}`, `shadow_producer_deferred_window_total`, `shadow_producer_aborted_leader_total`, `shadow_producer_leader_mismatch_total`, `shadow_producer_serialize_failed_total`, `shadow_crashed_writes_purged_total`, `shadow_floor_witness_missing{kind}`, `shadow_pull_source_skipped_leader_total`. The floor-side line `no two-producer anchor for <n> min ... missing kind <R|F>` is raised by every follower; a leader does not evaluate it.
 
 ### Replica
 

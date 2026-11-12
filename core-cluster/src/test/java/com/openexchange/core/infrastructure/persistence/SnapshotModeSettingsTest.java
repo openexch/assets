@@ -29,6 +29,7 @@ public class SnapshotModeSettingsTest {
             new Range(SnapshotModeSettings.Key.SNAPSHOT_RESTORE_READY_BUDGET_MS, 1000, 86_400_000L),
             new Range(SnapshotModeSettings.Key.CONSENSUS_SNAPSHOT_MAX_BYTES, 4096, 1_073_741_824L),
             new Range(SnapshotModeSettings.Key.SHADOW_LOAD_TIMEOUT_MS, 1000, 86_400_000L),
+            new Range(SnapshotModeSettings.Key.SHADOW_WITNESS_ALARM_MS, 1000, 604_800_000L),
     };
 
     private static SnapshotModeSettings parse(final String mode, final SnapshotModeSettings.Key key, final String value) {
@@ -47,6 +48,7 @@ public class SnapshotModeSettingsTest {
             case SNAPSHOT_RESTORE_READY_BUDGET_MS -> s.readyBudgetMs();
             case CONSENSUS_SNAPSHOT_MAX_BYTES -> s.consensusSnapshotMaxBytes();
             case SHADOW_LOAD_TIMEOUT_MS -> s.loadTimeoutMs();
+            case SHADOW_WITNESS_ALARM_MS -> s.witnessAlarmMs();
             default -> throw new IllegalArgumentException(key.name());
         };
     }
@@ -287,5 +289,106 @@ public class SnapshotModeSettingsTest {
     private static SnapshotModeSettings.Source source(final String mode, final String env, final String value,
                                              final String unused) {
         return (e, p) -> e.equals("SNAPSHOT_MODE") ? mode : e.equals(env) ? value : null;
+    }
+
+    /** One producer row: the setting, its min and max, the unit text of its refusal, the read-back. */
+    private record ProducerRange(SnapshotModeSettings.Key key, long min, long max, String unit,
+                                 java.util.function.ToLongFunction<com.openexchange.cluster.shadow.ShadowProducerSettings> read) {
+    }
+
+    private static final ProducerRange[] PRODUCER_RANGES = {
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_PRODUCER_BUFFER_MB, 1, 2047, "", p -> p.bufferMb()),
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_WRITE_CONNECT_TIMEOUT_MS, 1, 86_400_000L, " ms",
+                    p -> p.connectTimeoutMs()),
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_WRITE_OFFER_TIMEOUT_MS, 1, 86_400_000L, " ms",
+                    p -> p.offerTimeoutMs()),
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_WRITE_RECORD_TIMEOUT_MS, 1, 86_400_000L, " ms",
+                    p -> p.recordTimeoutMs()),
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_PRODUCER_WINDOW_BUDGET_PCT, 1, 100, "",
+                    p -> p.windowBudgetPct()),
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_PRODUCER_SERIALIZE_ESTIMATE_MS, 1, 600_000L, " ms",
+                    p -> p.serializeEstimateMs()),
+            new ProducerRange(SnapshotModeSettings.Key.SHADOW_PRODUCER_RATE_WINDOW_MS, 1000, 3_600_000L, " ms",
+                    p -> p.rateWindowMs()),
+    };
+
+    /**
+     * The follower producer rows of the settings table: each numeric row at its boundaries in both modes with the kit
+     * parser's text, the term length rule, {@code SHADOW_PRODUCER} values and its two CRITICAL lines (none in shadow
+     * mode; an explicit designated-follower in off mode), and the defaults.
+     */
+    @Test
+    public void followerProducerRowsAtTheirBoundaries() {
+        for (final String mode : new String[] {"off", "shadow"}) {
+            for (final ProducerRange r : PRODUCER_RANGES) {
+                final String name = r.key().name();
+                assertEquals(mode + " " + name + " min", r.min(), r.read().applyAsLong(
+                        parse(mode, r.key(), Long.toString(r.min())).producerSettings()));
+                assertEquals(mode + " " + name + " max", r.max(), r.read().applyAsLong(
+                        parse(mode, r.key(), Long.toString(r.max())).producerSettings()));
+                assertEquals(name + " must be " + r.min() + ".." + r.max() + r.unit() + ": " + (r.min() - 1),
+                        assertThrows(IllegalArgumentException.class,
+                                () -> parse(mode, r.key(), Long.toString(r.min() - 1))).getMessage());
+                assertEquals(name + " must be " + r.min() + ".." + r.max() + r.unit() + ": " + (r.max() + 1),
+                        assertThrows(IllegalArgumentException.class,
+                                () -> parse(mode, r.key(), Long.toString(r.max() + 1))).getMessage());
+                assertEquals(name + " is not an integer: 5s", assertThrows(IllegalArgumentException.class,
+                        () -> parse(mode, r.key(), "5s")).getMessage());
+            }
+            assertEquals("SHADOW_TERM_LENGTH 32k outside [64k, 16m] or not a power of two (every replay maps 3 x the"
+                    + " recording's term length)", assertThrows(IllegalArgumentException.class,
+                    () -> parse(mode, SnapshotModeSettings.Key.SHADOW_TERM_LENGTH, "32k")).getMessage());
+            assertEquals("64k", parse(mode, SnapshotModeSettings.Key.SHADOW_TERM_LENGTH, "64k").producerSettings()
+                    .termLength());
+            assertEquals("16m", parse(mode, SnapshotModeSettings.Key.SHADOW_TERM_LENGTH, "16m").producerSettings()
+                    .termLength());
+            assertTrue(assertThrows(IllegalArgumentException.class,
+                    () -> parse(mode, SnapshotModeSettings.Key.SHADOW_PRODUCER, "both")).getMessage()
+                    .startsWith("SHADOW_PRODUCER 'both'"));
+        }
+        final com.openexchange.cluster.shadow.ShadowProducerSettings d = SnapshotModeSettings.defaults().producerSettings();
+        assertEquals(com.openexchange.cluster.shadow.ShadowProducerSettings.Mode.DESIGNATED_FOLLOWER, d.mode());
+        assertEquals("4m", d.termLength());
+        assertEquals(512, d.bufferMb());
+        assertEquals(10_000, d.connectTimeoutMs());
+        assertEquals(30_000, d.offerTimeoutMs());
+        assertEquals(60_000, d.recordTimeoutMs());
+        assertEquals(50, d.windowBudgetPct());
+        assertEquals(1_000, d.serializeEstimateMs());
+        assertEquals(10_000, d.rateWindowMs());
+        assertEquals(7_200_000L, SnapshotModeSettings.defaults().witnessAlarmMs());
+
+        // SHADOW_PRODUCER=none in shadow mode: the CRITICAL line; the default is silent in both modes
+        final SnapshotModeSettings none = parse("shadow", SnapshotModeSettings.Key.SHADOW_PRODUCER, "none");
+        assertTrue(none.criticalLines().toString(), none.criticalLines().contains(
+                "SHADOW_PRODUCER=none: this member never writes an ALIGNED: the two-producer anchor depends on other"
+                        + " producers"));
+        assertTrue(SnapshotModeSettings.with(Map.of(SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow")).criticalLines()
+                .stream().noneMatch(l -> l.startsWith("SHADOW_PRODUCER")));
+        assertTrue(SnapshotModeSettings.defaults().criticalLines().stream().noneMatch(l -> l.startsWith("SHADOW_PRODUCER")));
+        // an explicit designated-follower in off mode: ignored, one CRITICAL line
+        final SnapshotModeSettings ignored = parse("off", SnapshotModeSettings.Key.SHADOW_PRODUCER, "designated-follower");
+        assertTrue(ignored.criticalLines().toString(), ignored.criticalLines().contains(
+                "SHADOW_PRODUCER=designated-follower ignored: SNAPSHOT_MODE=off"));
+    }
+
+    /**
+     * Guard row 5: a member's archive under another spelling in {@code SHADOW_PULL_SOURCES} refuses the boot (the
+     * leader-source skip compares text); the members table is read from the cluster members string.
+     */
+    @Test
+    public void aMemberSourceSpelledDifferentlyFromTheMembersTableRefusesTheBoot() {
+        final String members = "0,localhost:9302,localhost:9303,localhost:9304,localhost:9305,localhost:9301|"
+                + "1,localhost:9402,localhost:9403,localhost:9404,localhost:9405,localhost:9401";
+        final java.util.Map<Integer, String> table = StubModeBootGuard.memberArchiveEndpoints(members);
+        assertEquals(java.util.Map.of(0, "localhost:9301", 1, "localhost:9401"), table);
+        final SnapshotModeSettings s = parse("shadow", SnapshotModeSettings.Key.SHADOW_PULL_SOURCES, "127.0.0.1:9401");
+        assertEquals("CORE BOOT GUARD: SHADOW_PULL_SOURCES entry 127.0.0.1:9401 names member 1's archive endpoint"
+                + " localhost:9401 with a different spelling: spell it as the cluster members table does so the leader"
+                + " skip can recognise it", assertThrows(StandbySnapshotBootGuard.Refused.class,
+                () -> StubModeBootGuard.enforcePullSources(s, "localhost:9301", table)).getMessage());
+        // spelled as the table does: accepted
+        StubModeBootGuard.enforcePullSources(parse("shadow", SnapshotModeSettings.Key.SHADOW_PULL_SOURCES,
+                "localhost:9401"), "localhost:9301", table);
     }
 }

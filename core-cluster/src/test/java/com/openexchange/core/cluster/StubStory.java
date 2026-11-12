@@ -42,7 +42,8 @@ final class StubStory implements AutoCloseable {
     }
 
     static SnapshotModeSettings shadow() {
-        return SnapshotModeSettings.with(Map.of(SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow"));
+        return SnapshotModeSettings.with(Map.of(SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow",
+                SnapshotModeSettings.Key.SHADOW_PRODUCER, "none"));
     }
 
     static SnapshotModeSettings off() {

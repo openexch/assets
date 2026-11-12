@@ -132,7 +132,11 @@
              runs on the PR gate as its two-toggle variant (the properties below); the nightly job and a tag run the
              five-toggle default and the 100k variant. The shadow puller story, the leader gate (three members, the
              leader kill, the 100k variant), the re-bootstrap story and the external-driver pull rows of
-             ShadowRestoreExternalDriverProcessTest and ReplicaExternalDriverProcessTest (-Dcore.pull.external=true) are nightly only. -->
+             ShadowRestoreExternalDriverProcessTest and ReplicaExternalDriverProcessTest (-Dcore.pull.external=true) are nightly only.
+             The follower producer: the two-member role story and the capacity and opt-out guard rows run here; the
+             three-member role story (-Dcore.producer.members=3), the other guard rows (-Dcore.producer.guard.nightly=true), the log window rows, the two live producers with the floor-side alarm, the late leader detection drill,
+             the abort on leadership, the crashed-write sweep and the member embedded-driver directory process rows
+             (EmbeddedDriverDirProcessTest; the kit's EmbeddedDriverDirTest covers the check on every PR) are nightly only. -->
         <profile>
             <id>fast</id>
             <build>
@@ -155,6 +159,12 @@
                                 <exclude>**/MemberPullInteropTest.java</exclude>
                                 <exclude>**/ShadowPullerClusterTest.java</exclude>
                                 <exclude>**/LeaderDoesNotPullTest.java</exclude>
+                                <exclude>**/ShadowProducerNeverOnLeaderTest.java</exclude>
+                                <exclude>**/ShadowProducerCrashSweepTest.java</exclude>
+                                <exclude>**/FollowerShadowWindowClusterTest.java</exclude>
+                                <exclude>**/DualProducerLiveTest.java</exclude>
+                                <exclude>**/DesignatedFollowerLateLeaderDetectionTest.java</exclude>
+                                <exclude>**/EmbeddedDriverDirProcessTest.java</exclude>
                                 <exclude>**/*$*</exclude>
                             </excludes>
                             <systemPropertyVariables>

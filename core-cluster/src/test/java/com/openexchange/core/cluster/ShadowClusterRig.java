@@ -60,6 +60,10 @@ final class ShadowClusterRig implements AutoCloseable {
     static final int MEMBERS = 3;
     static final long ONE = FixedPoint.fromDouble(1.0);
     static final long OP_TIMEOUT_MS = 60_000;
+    /** The rigs' convention (fast elections after a leader kill); a test without leader kills may raise it. */
+    static final long DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MS = 1_000;
+    /** The startup canvass at the default heartbeat timeout (a raised one gets twice its own value). */
+    private static final long STARTUP_CANVASS_MS = 2_000;
     private static final String INGRESS_CHANNEL = "aeron:udp?term-length=1m|mtu=8192";
     static final long GENESIS = 0x5EEDL;
 
@@ -144,7 +148,7 @@ final class ShadowClusterRig implements AutoCloseable {
             }
             final long target = last;
             await(() -> in.lastDepositAckCorr >= target, OP_TIMEOUT_MS, () -> "deposit ack for corr " + target + " (last "
-                    + in.lastDepositAckCorr + ")");
+                    + in.lastDepositAckCorr + "; roles " + roles() + ": an election drops uncommitted ingress)");
         }
     }
 
@@ -155,6 +159,12 @@ final class ShadowClusterRig implements AutoCloseable {
     final String logTermLength;
     /** The archive segment length; 0 keeps ClusterConfig's (64 MiB). */
     final int segmentLength;
+    /**
+     * The consensus modules' leader heartbeat timeout, read at each boot. Three members, their drivers and archives
+     * share one JVM: on a loaded runner a pause of about a second right after a snapshot is enough for an election, and
+     * an election drops the client ingress the old leader had not committed ({@link Client#deposits} offers once).
+     */
+    long leaderHeartbeatTimeoutMs = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MS;
     /** Every stderr line that names (the halt texts), recorded like the stdout tee. */
     final Tee errTee;
     private final PrintStream originalErr;
@@ -233,9 +243,11 @@ final class ShadowClusterRig implements AutoCloseable {
                 .ingressChannel(INGRESS_CHANNEL)
                 .logChannel("aeron:udp?term-length=" + logTermLength)
                 .leaderHeartbeatIntervalNs(TimeUnit.MILLISECONDS.toNanos(100))
-                .leaderHeartbeatTimeoutNs(TimeUnit.SECONDS.toNanos(1))
+                .leaderHeartbeatTimeoutNs(TimeUnit.MILLISECONDS.toNanos(leaderHeartbeatTimeoutMs))
                 .electionTimeoutNs(TimeUnit.SECONDS.toNanos(1))
-                .startupCanvassTimeoutNs(TimeUnit.SECONDS.toNanos(2))
+                // Aeron requires the canvass to be at least twice the heartbeat timeout: 2 s at the default
+                .startupCanvassTimeoutNs(TimeUnit.MILLISECONDS.toNanos(leaderHeartbeatTimeoutMs
+                        * Math.max(2, (STARTUP_CANVASS_MS + leaderHeartbeatTimeoutMs - 1) / leaderHeartbeatTimeoutMs)))
                 .terminationTimeoutNs(TimeUnit.SECONDS.toNanos(2));
         if (segmentLength > 0) {
             m.cfg.archiveContext().segmentFileLength(segmentLength);
@@ -330,6 +342,16 @@ final class ShadowClusterRig implements AutoCloseable {
     void pumpMs(final long ms) {
         final long until = System.currentTimeMillis() + ms;
         await(() -> System.currentTimeMillis() >= until, ms + 1_000, "pump");
+    }
+
+    /** Each live member's role, for failure texts. */
+    String roles() {
+        final StringBuilder sb = new StringBuilder();
+        for (final Member m : members) {
+            sb.append(sb.length() == 0 ? "" : ", ").append(m.id).append('=')
+                    .append(m.killed || m.cfg == null ? "killed" : String.valueOf(m.role()));
+        }
+        return sb.toString();
     }
 
     Member awaitLeader(final Member except) {
@@ -685,6 +707,8 @@ final class ShadowClusterRig implements AutoCloseable {
         final java.util.Map<com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key, String> m =
                 new java.util.HashMap<>();
         m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow");
+        // the restore and puller rows stand the test producer in for the follower: the real one is opted in by name
+        m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SHADOW_PRODUCER, "none");
         for (int i = 0; i < extra.length; i += 2) {
             m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.valueOf(extra[i]),
                     extra[i + 1]);
@@ -721,7 +745,20 @@ final class ShadowClusterRig implements AutoCloseable {
                     }
                 });
         for (final long id : ids) {
-            archive(m).purgeRecording(id);
+            // a peer's puller or this member's own deep read may be replaying the recording: retry, bounded
+            final long deadline = System.currentTimeMillis() + OP_TIMEOUT_MS;
+            while (true) {
+                try {
+                    archive(m).purgeRecording(id);
+                    break;
+                } catch (final io.aeron.archive.client.ArchiveException replaying) {
+                    if (System.currentTimeMillis() > deadline || replaying.getMessage() == null
+                            || !replaying.getMessage().contains("active replay")) {
+                        throw replaying;
+                    }
+                    pumpMs(200);
+                }
+            }
         }
         return ids.size();
     }

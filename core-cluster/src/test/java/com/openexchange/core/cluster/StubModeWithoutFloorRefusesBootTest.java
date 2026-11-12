@@ -90,6 +90,9 @@ public class StubModeWithoutFloorRefusesBootTest {
         e.put("TRANSPORT_DRIVER_MODE", "embedded");
         e.put("TRANSPORT_IDLE_MODE", "backoff");
         e.put("TRANSPORT_LOG_TERM_LENGTH", "4m");
+        e.put("TRANSPORT_LOG_RCV_WINDOW", "2m"); // at most half the log term (the boot refuses more)
+        e.put("TRANSPORT_LOG_SO_RCVBUF", "2m");
+        e.put("TRANSPORT_LOG_SO_SNDBUF", "2m");
         e.put("TRANSPORT_SNAPSHOT_TERM_LENGTH", "4m");
         e.put("CLUSTER_NODE", "0");
         e.put("CLUSTER_ADDRESSES", "localhost");

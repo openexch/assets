@@ -25,14 +25,16 @@ import static org.junit.Assert.assertTrue;
 /**
  * The member puller on a real cluster (every member in {@code shadow} mode, embedded drivers, real UDP archive control
  * channels and real replications): every member lists every other member's archive ({@code SHADOW_PULL_SOURCES}),
- * a genuine ALIGNED written into the leader's archive after the pullers started is pulled by every follower, verified
+ * a genuine ALIGNED written into a follower's archive after the pullers started is pulled by the other follower (no
+ * member pulls from the leader's archive: the leader-source skip), verified
  * locally (alias and payload digest equal to the source's); a byte-flipped copy at a second position is refused for
  * its content on every follower and never pulled again in three periods; a follower whose shadows were wiped and whose
  * log was purged below P_cm restores at restart through the startup pull (3b): {@code restored path=EQUAL}, image
  * equal to the leader's, the time to ready recorded. Then the same follower with a source that answers nothing halts
  * with the pull named in the runbook text.
  *
- * <p>Variants: {@code -Dcore.pull.members} 2 or 3 (default 3, the nightly job's), {@code -Dcore.pull.100k=true}
+ * <p>Variants: {@code -Dcore.pull.members} 3 (the only value: with the leader-source skip a follower's only non-leader
+ * source in a two-member cluster is itself), {@code -Dcore.pull.100k=true}
  * (100 000 accounts before the snapshot, a shadow of several MB).</p>
  */
 public class ShadowPullerClusterTest {
@@ -44,8 +46,9 @@ public class ShadowPullerClusterTest {
 
     static int members() {
         final int n = Integer.getInteger("core.pull.members", 3);
-        if (n < 2 || n > 3) {
-            throw new IllegalArgumentException("the test refuses: core.pull.members must be 2..3: " + n);
+        if (n != 3) {
+            throw new IllegalArgumentException("the test refuses: core.pull.members must be 3 (a follower's source is"
+                    + " its follower peer; the leader's archive is never a source): " + n);
         }
         return n;
     }
@@ -72,6 +75,8 @@ public class ShadowPullerClusterTest {
             rig.bootAll();
             final Member leader = rig.awaitLeader(null);
             final Member f = rig.followerOtherThan(leader, null);
+            // the source: f's follower peer (members skip the leader's archive while it leads)
+            final Member src = rig.followerOtherThan(leader, f);
             final Client admin = rig.connect(SessionClass.ADMIN, leader);
             rig.adopt(admin);
             final Client tool = rig.connect(SessionClass.TOOL, leader);
@@ -88,22 +93,23 @@ public class ShadowPullerClusterTest {
                         "member " + m.id + "'s puller never started");
             }
 
-            // a genuine ALIGNED at P_cm appears on the leader's archive after the pullers started (C2)
+            // a genuine ALIGNED at P_cm appears on a follower's archive after the pullers started (C2)
             final RecordedLog log = rig.captureCommitted(leader);
             StubStory.indexOf(log, pCm);
-            final TestShadowProducer producer = rig.producer(leader);
+            final TestShadowProducer producer = rig.producer(src);
             final Written good = producer.produce(who(), log, pCm);
             assertTrue(good.toString(), good.ok());
-            final ShadowEntry source = rig.scan(leader).entry(good.recordingId());
-            assertNotNull("the source copy is listed on the leader", source);
+            final ShadowEntry source = rig.scan(src).entry(good.recordingId());
+            assertNotNull("the source copy is listed on member " + src.id, source);
+            final List<Member> pullers = List.of(f);
             final long t0 = System.nanoTime();
-            for (final Member m : followers(rig, leader)) {
+            for (final Member m : pullers) {
                 rig.await(() -> ServiceProbe.pull(m.service, "shadow_pull_total") >= 1, 2 * PERIOD_MS + 30_000,
                         () -> "member " + m.id + " never pulled the ALIGNED at P_cm=" + pCm + ": "
                                 + ServiceProbe.puller(m.service).counters().snapshot());
             }
             final long pulledMs = (System.nanoTime() - t0) / 1_000_000;
-            for (final Member m : followers(rig, leader)) {
+            for (final Member m : pullers) {
                 assertEquals("member " + m.id + " pulled exactly once", 1, ServiceProbe.pull(m.service, "shadow_pull_total"));
                 final ShadowEntry copy = copyOf(rig.scan(m), source);
                 assertNotNull("member " + m.id + " holds a usable copy with the source's full alias "
@@ -112,7 +118,9 @@ public class ShadowPullerClusterTest {
                         source.header().payloadDigest(), copy.header().payloadDigest());
             }
             assertEquals("the leader never pulls", 0, ServiceProbe.pull(leader.service, "shadow_pull_total"));
-            System.out.println("GREEN pull: " + (n - 1) + " follower(s) hold " + source.alias().format() + " in "
+            assertTrue("the leader's archive was skipped as a source", ServiceProbe.pull(f.service,
+                    "shadow_pull_source_skipped_leader_total") >= 1);
+            System.out.println("GREEN pull: " + pullers.size() + " follower(s) hold " + source.alias().format() + " in "
                     + pulledMs + " ms (period " + PERIOD_MS + " ms), " + source.stopPosition() + " B");
 
             // a corrupted copy at a second position (above P_cm): refused for its content, never pulled again
@@ -120,17 +128,17 @@ public class ShadowPullerClusterTest {
             final Written bad = producer.produce(who(), log, p2);
             assertTrue(bad.toString(), bad.ok());
             producer.flipPayloadByte(bad);
-            for (final Member m : followers(rig, leader)) {
+            for (final Member m : pullers) {
                 rig.await(() -> ServiceProbe.pullRefused(m.service, "CORRUPT") >= 1, 2 * PERIOD_MS + 30_000,
                         () -> "member " + m.id + " never refused the corrupt copy at " + p2 + ": "
                                 + ServiceProbe.puller(m.service).counters().snapshot());
             }
             final long[] started = new long[rig.members.size()];
-            for (final Member m : followers(rig, leader)) {
+            for (final Member m : pullers) {
                 started[m.id] = ServiceProbe.pull(m.service, "shadow_pull_started_total");
             }
             rig.pumpMs(3 * PERIOD_MS + 500);
-            for (final Member m : followers(rig, leader)) {
+            for (final Member m : pullers) {
                 // every member lists every peer: a peer's just-pulled copy of the corrupt source (same full alias,
                 // its own recording) is listed there until its purge, so a member may refuse it a second time as a
                 // second source recording. The rule is per source recording: each refused once, none re-pulled.
@@ -145,7 +153,7 @@ public class ShadowPullerClusterTest {
                 }
                 assertEquals("still one pull", 1, ServiceProbe.pull(m.service, "shadow_pull_total"));
             }
-            System.out.println("GREEN refused: CORRUPT at " + p2 + " on every follower, not retried in 3 periods");
+            System.out.println("GREEN refused: CORRUPT at " + p2 + " on the pulling follower, not retried in 3 periods");
 
             // a wiped follower: its puller stopped, its shadows purged, its log purged below P_cm; the restart pulls
             ServiceProbe.puller(f.service).close();

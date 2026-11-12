@@ -21,6 +21,14 @@ import com.openexchange.cluster.SnapshotCadence;
  *   <tr><td>guard row 4</td><td>{@code SHADOW_ANCHOR_RULE=any-verified}, an empty {@code SHADOW_PULL_SOURCES},
  *       {@code SHADOW_PULL_KINDS} wider than ALIGNED</td><td>allowed, one {@code [BOOT-GUARD] CRITICAL: } line
  *       each</td></tr>
+ *   <tr><td>guard row 5</td><td>a {@code SHADOW_PULL_SOURCES} entry resolves to a member's archive endpoint under
+ *       another spelling ({@link #enforcePullSources} with the members table)</td><td>refuse with the kit's text; an
+ *       entry that does not resolve is one {@code [BOOT-GUARD] CRITICAL: } line and kept; the boot line classifies
+ *       each source</td></tr>
+ *   <tr><td>guard row 6</td><td>the log channel settings ({@code TRANSPORT_LOG_RCV_WINDOW},
+ *       {@code TRANSPORT_LOG_SO_RCVBUF}, {@code TRANSPORT_LOG_SO_SNDBUF}) or {@code CORE_DRIVER_DIR_ACTIVE_MS} fail
+ *       their range, or the kernel grants a log socket buffer smaller than configured ({@link #enforceTransport}, every
+ *       mode and both driver modes)</td><td>refuse with the setting's text or the probe's text naming the sysctl</td></tr>
  *   <tr><td>guard row OK</td><td>otherwise</td><td>{@code [BOOT-GUARD] snapshotMode=<mode> prune=<bool> floor=wired}</td></tr>
  * </table>
  *
@@ -62,11 +70,109 @@ public final class StubModeBootGuard {
      * @throws StandbySnapshotBootGuard.Refused with {@code CORE BOOT GUARD: } and the kit's text
      */
     public static void enforcePullSources(final SnapshotModeSettings settings, final String ownArchiveEndpoint) {
+        enforcePullSources(settings, ownArchiveEndpoint, null);
+    }
+
+    /**
+     * Guard rows 3 and 5: the own endpoint, then the spelling of every source against the members table.
+     *
+     * @param memberArchiveEndpoints member id to archive control endpoint as the members table spells it; null skips row 5
+     */
+    public static void enforcePullSources(final SnapshotModeSettings settings, final String ownArchiveEndpoint,
+                                          final java.util.Map<Integer, String> memberArchiveEndpoints) {
         try {
-            settings.pullSettingsFor(ownArchiveEndpoint);
+            final com.openexchange.cluster.shadow.ShadowPullSettings ps = settings.pullSettingsFor(ownArchiveEndpoint);
+            if (memberArchiveEndpoints != null && ps.enabled()) {
+                final com.openexchange.cluster.shadow.ShadowPullSettings.SpellingCheck check =
+                        ps.checkSpelling(memberArchiveEndpoints);
+                for (final String line : check.criticalLines()) {
+                    System.err.println("[BOOT-GUARD] CRITICAL: " + line);
+                }
+                System.out.println("[BOOT-GUARD] " + check.bootLine());
+            }
         } catch (final IllegalArgumentException ownEndpoint) {
             final StandbySnapshotBootGuard.Refused refused =
                     new StandbySnapshotBootGuard.Refused(ownEndpoint.getMessage(), ownEndpoint);
+            System.err.println(refused.getMessage());
+            throw refused;
+        }
+    }
+
+    /** The members table of a {@code clusterMembers} string: member id to its archive control endpoint. */
+    public static java.util.Map<Integer, String> memberArchiveEndpoints(final String clusterMembers) {
+        final java.util.Map<Integer, String> out = new java.util.TreeMap<>();
+        if (clusterMembers == null || clusterMembers.isBlank()) {
+            return out;
+        }
+        for (final io.aeron.cluster.ClusterMember m : io.aeron.cluster.ClusterMember.parse(clusterMembers)) {
+            out.put(m.id(), m.archiveEndpoint());
+        }
+        return out;
+    }
+
+    /** What guard row 6 accepted: the log channel settings and the embedded driver directory bound. */
+    public record Transport(com.openexchange.core.infrastructure.TransportConfig.LogTransport log, long driverDirActiveMs) {
+    }
+
+    /** Guard row 6 over this process's environment and the real kernel. */
+    public static Transport enforceTransport() {
+        return enforceTransport(com.openexchange.core.infrastructure.TransportConfig::settingFromEnv,
+                com.openexchange.cluster.SocketBufferProbe.SYSTEM);
+    }
+
+    /**
+     * Guard row 6: the log channel settings and the driver directory bound parse and fit their ranges, then the kernel
+     * probe (a scratch UDP socket, {@code setOption} then {@code getOption}, for both buffers) grants each configured
+     * buffer in full. Runs before any driver is launched or connected. The kernel limits are kernel-wide, so in
+     * external mode the probe measures what the aeronmd's log socket on this host will get.
+     *
+     * @throws StandbySnapshotBootGuard.Refused with {@code CORE BOOT GUARD: } and the text
+     */
+    public static Transport enforceTransport(final java.util.function.Function<String, String> env,
+                                             final com.openexchange.cluster.SocketBufferProbe.Kernel kernel) {
+        return enforceTransport(env, kernel, false);
+    }
+
+    /** {@code probeOff}: the negative-control seam only (the probe answers nothing whatever the kernel granted). */
+    static Transport enforceTransport(final java.util.function.Function<String, String> env,
+                                      final com.openexchange.cluster.SocketBufferProbe.Kernel kernel,
+                                      final boolean probeOff) {
+        try {
+            final com.openexchange.core.infrastructure.TransportConfig.LogTransport log =
+                    com.openexchange.core.infrastructure.TransportConfig.LogTransport.parse(env);
+            final long activeMs = com.openexchange.core.infrastructure.TransportConfig.driverDirActiveMs(env);
+            if (!probeOff) {
+                final com.openexchange.cluster.SocketBufferProbe.Request rcv =
+                        new com.openexchange.cluster.SocketBufferProbe.Request(
+                                com.openexchange.core.infrastructure.TransportConfig.LOG_SO_RCVBUF, log.soRcvbufText(),
+                                log.soRcvbuf(), com.openexchange.cluster.SocketBufferProbe.RMEM_MAX,
+                                com.openexchange.core.infrastructure.TransportConfig.LOG_RCV_WINDOW);
+                final com.openexchange.cluster.SocketBufferProbe.Request snd =
+                        new com.openexchange.cluster.SocketBufferProbe.Request(
+                                com.openexchange.core.infrastructure.TransportConfig.LOG_SO_SNDBUF, log.soSndbufText(),
+                                log.soSndbuf(), com.openexchange.cluster.SocketBufferProbe.WMEM_MAX, null);
+                final com.openexchange.cluster.SocketBufferProbe.Result r =
+                        com.openexchange.cluster.SocketBufferProbe.rcvbuf(kernel, rcv);
+                if (r.refused()) {
+                    throw new IllegalArgumentException(r.refusalText());
+                }
+                final com.openexchange.cluster.SocketBufferProbe.Result s =
+                        com.openexchange.cluster.SocketBufferProbe.sndbuf(kernel, snd);
+                if (s.refused()) {
+                    throw new IllegalArgumentException(s.refusalText());
+                }
+                System.out.println("[BOOT-GUARD] log channel " + log.uri() + ": " + r.line() + "; " + s.line());
+            } else {
+                System.err.println("[BOOT-GUARD] CRITICAL: the log socket buffer probe is off (test seam only)");
+            }
+            return new Transport(log, activeMs);
+        } catch (final IllegalArgumentException bad) {
+            final StandbySnapshotBootGuard.Refused refused = new StandbySnapshotBootGuard.Refused(bad.getMessage(), bad);
+            System.err.println(refused.getMessage());
+            throw refused;
+        } catch (final java.io.IOException unverifiable) {
+            final StandbySnapshotBootGuard.Refused refused = new StandbySnapshotBootGuard.Refused(
+                    "the log socket buffer probe could not open a scratch UDP socket: " + unverifiable, unverifiable);
             System.err.println(refused.getMessage());
             throw refused;
         }
