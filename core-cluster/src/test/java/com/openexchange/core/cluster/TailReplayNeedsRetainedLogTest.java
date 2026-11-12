@@ -59,7 +59,7 @@ public class TailReplayNeedsRetainedLogTest {
         final long pCm = s.snapshot();
         s.deposits(120);
         final RecordedLog log = s.log();
-        final int iCm = StubStory.indexOf(log, pCm);
+        StubStory.indexOf(log, pCm);
         // P_1 in the first segment, P_2 the last frame end below P_cm's segment: the floor P_2 purges a segment above
         // P_1 and keeps P_2; the floor P_cm (the control) purges past P_2
         final long cmSegment = pCm / StubStory.SEGMENT * StubStory.SEGMENT;
@@ -100,7 +100,7 @@ public class TailReplayNeedsRetainedLogTest {
                 + moved + " log start " + s.rig.logStart(s.m));
 
         // EQUAL lost: a second copy at P_3 with different content
-        assertTrue(s.producer().produceDifferentContent(s.who(), log, pCm, log.positions()[iCm + 2]).ok());
+        assertTrue(s.producer().produceDifferentContent(s.who(), log, pCm, com.openexchange.core.infrastructure.persistence.TestShadowProducer.firstChangeAfter(log, pCm)).ok());
         return new long[] {p1, p2, pCm};
     }
 

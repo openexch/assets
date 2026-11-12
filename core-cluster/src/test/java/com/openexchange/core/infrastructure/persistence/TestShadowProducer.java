@@ -238,6 +238,12 @@ public final class TestShadowProducer {
      * genuine shadow at {@code x} from another producer this is a catalog {@code CONFLICT} at {@code x}.
      */
     public Written produceDifferentContent(final Who who, final RecordedLog log, final long x, final long y) {
+        // S(y) equal to S(x) (a frame that leaves the image as it was) is an agreeing copy, never a CONFLICT
+        final int appVersion = appVersionOf(log);
+        if (Arrays.equals(imageAt(log, appVersion, x), imageAt(log, appVersion, y))) {
+            throw new IllegalArgumentException("S(" + y + ") equals S(" + x + "): no different content; pick y with"
+                    + " firstChangeAfter");
+        }
         final Written w = produceBackwardShift(who, log, x, y);
         return new Written("DIFFERENT_CONTENT", w.result(), w.headerPosition(), w.contentPosition(),
                 w.headerClusterTime(), w.contentLastLogTime(), w.recordingId(), w.payloadLength(), w.genesisId());
@@ -368,6 +374,31 @@ public final class TestShadowProducer {
         }
         throw new IllegalStateException("no " + (sameMs ? "same-ms" : "later-ms") + " state-changing frame pair after "
                 + fromExclusive + " in " + frames.size() + " frames");
+    }
+
+    /**
+     * The first frame end {@code y > x} whose image differs from {@code S(x)}: the content {@link #produceDifferentContent}
+     * needs. Which frames change the image is not fixed by frame index (a timer or session event can leave it as it was),
+     * so a test asks the log instead of counting frames.
+     */
+    public static long firstChangeAfter(final RecordedLog log, final long x) {
+        final int appVersion = appVersionOf(log);
+        final byte[] sx = imageAt(log, appVersion, x);
+        final Arm arm = new Arm(appVersion).genesis();
+        for (final LogFrame frame : log.frames()) {
+            frame.deliver(arm.container);
+            if (frame.position() > x && frame.kind() != FrameKind.CLUSTER_ACTION && !Arrays.equals(sx, arm.image())) {
+                return frame.position();
+            }
+        }
+        throw new IllegalStateException("no frame after " + x + " changes the image");
+    }
+
+    private static byte[] imageAt(final RecordedLog log, final int appVersion, final long p) {
+        final Arm arm = new Arm(appVersion).genesis();
+        log.replay(-1, p, arm.container);
+        requireAt(arm, p, "image");
+        return arm.image();
     }
 
     /** A backward-shifted restore (content {@code S(y)} at cursor {@code x}) followed by the frames {@code (x, y]}. */

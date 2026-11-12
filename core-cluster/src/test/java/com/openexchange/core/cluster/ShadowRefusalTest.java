@@ -251,7 +251,10 @@ public class ShadowRefusalTest {
             final long q1 = at(log, pCm, -3);
             final long q2 = at(log, pCm, -9);
             s.produce(log, q1);
-            assertTrue(s.producer().produceDifferentContent(s.who(), log, q1, at(log, pCm, -2)).ok());
+            // the first frame after q1 that changes the image (a frame count can land on a timer that changes nothing)
+            final long y1 = com.openexchange.core.infrastructure.persistence.TestShadowProducer.firstChangeAfter(log, q1);
+            System.out.println("[11.3] different content at q1=" + q1 + ": S(" + y1 + "), P_cm-2=" + at(log, pCm, -2));
+            assertTrue(s.producer().produceDifferentContent(s.who(), log, q1, y1).ok());
             s.produce(log, q2);
             final byte[] pre = s.quiesce();
             restartAndAwaitEqual(s, pre);
@@ -292,7 +295,7 @@ public class ShadowRefusalTest {
             final long pCm = lastPcm;
             final long s1 = at(log, pCm, 3);
             s.produce(log, s1);
-            assertTrue(s.producer().produceDifferentContent(s.who(), log, s1, at(log, pCm, 4)).ok());
+            assertTrue(s.producer().produceDifferentContent(s.who(), log, s1, com.openexchange.core.infrastructure.persistence.TestShadowProducer.firstChangeAfter(log, s1)).ok());
             final long q = at(log, pCm, -8);
             s.produce(log, q);
             restartAndAwaitEqual(s, s.quiesce());
@@ -460,7 +463,7 @@ public class ShadowRefusalTest {
             final RecordedLog log = story(s);
             final long pCm = lastPcm;
             s.produce(log, pCm);
-            assertTrue(s.producer().produceDifferentContent(s.who(), log, pCm, at(log, pCm, 2)).ok());
+            assertTrue(s.producer().produceDifferentContent(s.who(), log, pCm, com.openexchange.core.infrastructure.persistence.TestShadowProducer.firstChangeAfter(log, pCm)).ok());
             final long q = at(log, pCm, -8);
             s.produce(log, q);
             restartAndAwaitEqual(s, s.quiesce());
