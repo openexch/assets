@@ -152,7 +152,24 @@ public final class CoreClusteredService implements ClusteredService {
     public CoreClusteredService(final SnapshotModeSettings settings) {
         this.snapshotModeSettings = java.util.Objects.requireNonNull(settings, "settings");
         this.snapshotMode = settings.mode();
+        this.shadowProducer = new MemberShadowProducer(new MemberShadowProducer.Host(snapshotMode,
+                settings.producerSettings(), readiness, () -> readyOutsideSnapshot, () -> consensusReadiness, () -> isLeader,
+                () -> leadershipTermId, () -> termBaseLogPosition, this::skipWindowActive, () -> shadowHousekeeping,
+                () -> shadowFaults, settings.witnessAlarmMs()));
     }
+
+    /** The follower producer (node-local: decides only whether THIS node writes a copy of its own image). */
+    private final MemberShadowProducer shadowProducer;
+    /**
+     * The readiness verdict of the last background poll while the consensus module was not in its SNAPSHOT state (the
+     * producer's readiness leg): during a ClusterAction the module is in SNAPSHOT and readiness is withdrawn on every
+     * node by construction, so the leg reads the verdict from just before the action.
+     */
+    private volatile boolean readyOutsideSnapshot;
+    /** The current term's base log position (term event, or the RecordingLog after a shadow restore); -1 unknown. */
+    private long termBaseLogPosition = -1L;
+    /** Negative-control state only: an action whose serialize the {@code produceOutsideCallback} seam moved. */
+    private long pendingOutsideCallbackPosition = -1L;
 
     /**
      * Idle-path drain timer. A CONSTANT id, recognised by value in {@link #onTimerEvent}, so every node
@@ -431,6 +448,7 @@ public final class CoreClusteredService implements ClusteredService {
 
     private void applyOnStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
+        wireProducer();
         if (consensusReadiness != null) { consensusReadiness.start(cluster.aeron()); }
         this.idleStrategy = cluster.idleStrategy();
         this.isLeader = cluster.role() == Cluster.Role.LEADER;
@@ -450,6 +468,44 @@ public final class CoreClusteredService implements ClusteredService {
         // Started, not ready: the snapshot is loaded but the log replay may
         // still be running. Readiness waits for current consensus and application evidence.
         readiness.started();
+    }
+
+    /**
+     * The producer's static inputs from the consensus context: the members table (designation, the leader's archive
+     * endpoint) and the log channel's receiver window (the window guard's {@code W}).
+     */
+    private void wireProducer() {
+        final io.aeron.cluster.ConsensusModule.Context ctx = consensusContext;
+        if (ctx == null) {
+            return; // in-process unit tests without ClusterConfig: the producer stays unarmed
+        }
+        shadowProducer.members(ctx.clusterMembers());
+        shadowProducer.receiverWindow(logReceiverWindow(ctx.logChannel()));
+    }
+
+    /** True while the consensus module's state counter reads SNAPSHOT (false when there is no context). */
+    private boolean consensusModuleInSnapshot() {
+        final io.aeron.cluster.ConsensusModule.Context ctx = consensusContext;
+        final io.aeron.Counter state = ctx == null ? null : ctx.moduleStateCounter();
+        return state != null && !state.isClosed()
+                && state.get() == io.aeron.cluster.ConsensusModule.State.SNAPSHOT.code();
+    }
+
+    /**
+     * The receiver window the log image gets: {@code min(rcv-wnd, term-length / 2)} from the log channel URI. Without
+     * {@code rcv-wnd} on the URI (a test rig's channel) the bound is {@code term-length / 2}, said in one line.
+     */
+    static long logReceiverWindow(final String logChannel) {
+        final io.aeron.ChannelUri uri = io.aeron.ChannelUri.parse(logChannel);
+        final String term = uri.get(io.aeron.CommonContext.TERM_LENGTH_PARAM_NAME);
+        final long termLength = term == null ? 16L * 1024 * 1024 : org.agrona.SystemUtil.parseSize("term-length", term);
+        final String wnd = uri.get(io.aeron.CommonContext.RECEIVER_WINDOW_LENGTH_PARAM_NAME);
+        if (wnd == null) {
+            System.out.println("[SHADOW-PRODUCER] the log channel has no rcv-wnd: the window guard uses term-length/2 = "
+                    + termLength / 2 + " B as W");
+            return termLength / 2;
+        }
+        return Math.min(org.agrona.SystemUtil.parseSize("rcv-wnd", wnd), termLength / 2);
     }
 
     /**
@@ -626,6 +682,47 @@ public final class CoreClusteredService implements ClusteredService {
             body.gauge(c.metricName(), "Shadow catalog/loader counter on this node", () -> shadowCounters.get(c));
         }
         pullMetrics(body);
+        producerMetrics(body);
+    }
+
+    /** The follower producer's series, the kit writer's labelled ones and the floor-side witness gauge. */
+    private void producerMetrics(final com.openexchange.core.infrastructure.metrics.CoreMetricsBody body) {
+        shadowProducer.metrics(body);
+        final com.openexchange.cluster.shadow.ShadowKind[] kinds = com.openexchange.cluster.shadow.ShadowKind.values();
+        final String[] kindNames = new String[kinds.length];
+        final java.util.function.LongSupplier[] kindValues = new java.util.function.LongSupplier[kinds.length];
+        for (int i = 0; i < kinds.length; i++) {
+            final com.openexchange.cluster.shadow.ShadowKind k = kinds[i];
+            kindNames[i] = k.name();
+            kindValues[i] = () -> shadowCounters.writeTotal(k);
+        }
+        body.labelledGauge("shadow_write_total", "Shadows this node's writer wrote, by kind (cumulative)", "kind",
+                kindNames, kindValues);
+        final com.openexchange.cluster.shadow.ShadowWriter.Reason[] reasons =
+                com.openexchange.cluster.shadow.ShadowWriter.Reason.values();
+        final String[] reasonNames = new String[reasons.length];
+        final java.util.function.LongSupplier[] reasonValues = new java.util.function.LongSupplier[reasons.length];
+        for (int i = 0; i < reasons.length; i++) {
+            final com.openexchange.cluster.shadow.ShadowWriter.Reason r = reasons[i];
+            reasonNames[i] = r.name();
+            reasonValues[i] = () -> shadowCounters.writeFailed(r);
+        }
+        body.labelledGauge("shadow_write_failed_total", "Shadow writes this node's writer refused or failed, by reason"
+                + " (cumulative)", "reason", reasonNames, reasonValues);
+        final com.openexchange.cluster.shadow.ProducerKind[] pk = com.openexchange.cluster.shadow.ProducerKind.values();
+        final String[] pkNames = new String[pk.length];
+        final java.util.function.LongSupplier[] pkValues = new java.util.function.LongSupplier[pk.length];
+        for (int i = 0; i < pk.length; i++) {
+            final com.openexchange.cluster.shadow.ProducerKind k = pk[i];
+            pkNames[i] = String.valueOf(k.letter());
+            pkValues[i] = () -> {
+                final MemberShadowHousekeeping hk = shadowHousekeeping;
+                return hk == null ? 0 : hk.witnessMissing(k);
+            };
+        }
+        body.labelledGauge("shadow_floor_witness_missing", "1 while the newest ALIGNED position has had fewer than two"
+                + " producers for longer than SHADOW_WITNESS_ALARM_MS and this kind is missing", "kind", pkNames,
+                pkValues);
     }
 
     /** The refusal reasons {@code shadow_pull_refused_total} is exported with (the puller's classes). */
@@ -733,7 +830,18 @@ public final class CoreClusteredService implements ClusteredService {
                             shadowCounters, shadowVerdicts,
                             new com.openexchange.cluster.shadow.ShadowHousekeeping.Counters(),
                             () -> publishedGenesisId, cluster.context().errorHandler(), pullSettings(), pullHost(),
-                            this::leaderNow, "shadow-puller-core-" + cluster.memberId());
+                            this::leaderNow, "shadow-puller-core-" + cluster.memberId())
+                            .leaderArchiveEndpoint(shadowProducer::leaderArchiveEndpoint);
+                    // the producer's slot is the cluster member id (cluster.memberId() is still -1 in onStart: the
+                    // consensus context names it); the witness alarm is wired with it, whether or not this node produces
+                    final io.aeron.cluster.ConsensusModule.Context cctx = consensusContext;
+                    if (snapshotMode == SnapshotMode.SHADOW && cctx != null && cctx.clusterMembers() != null) {
+                        final int members = io.aeron.cluster.ClusterMember.parse(cctx.clusterMembers()).length;
+                        shadowHousekeeping.producer(new MemberShadowHousekeeping.ProducerWiring(cctx.clusterMemberId(),
+                                members,
+                                shadowProducer::onWriteResult, shadowFaults.writerFactory, shadowFaults.sweepOff,
+                                shadowFaults.witnessAlarmOff));
+                    }
                     final com.openexchange.cluster.shadow.ShadowFloor floor = shadowHousekeeping.floor();
                     logPruner.watermark(prunerWatermarkOverride != null ? prunerWatermarkOverride : floor)
                             .wake(floor::purgeRequested)
@@ -839,6 +947,18 @@ public final class CoreClusteredService implements ClusteredService {
         }
         if (publishedGenesisId == 0 && shadowHousekeeping != null) {
             publishedGenesisId = new CoreShadowIdentity(engine).genesisId(); // ADOPT seen: the floor may arm
+        }
+        if (!consensusModuleInSnapshot()) {
+            readyOutsideSnapshot = readiness.ready();
+        }
+        shadowProducer.onBackgroundWork(nowNs, cluster.logPosition(), cluster.memberId());
+        if (pendingOutsideCallbackPosition >= 0) {
+            // negative control only: the serialize after the action, at depth 0 (the engine may hold later frames)
+            final long p = pendingOutsideCallbackPosition;
+            pendingOutsideCallbackPosition = -1L;
+            shadowProducer.onClusterAction(p, true, false, cluster.memberId(), cluster.time(),
+                    cluster.aeron().context().interServiceTimeoutNs(), applicationCallbackDepth, applier,
+                    new CoreShadowIdentity(engine));
         }
         // At most once a second, and only on the leader: is the cluster due a
         // snapshot? Everything past that gate is a long compare.
@@ -1261,13 +1381,26 @@ public final class CoreClusteredService implements ClusteredService {
         }
         publishedGenesisId = new CoreShadowIdentity(engine).genesisId();
 
+        // The follower producer: after the stub was offered, before the callback returns (S(P_cm) exactly)
+        final String shadow;
+        final long shadowStartNs = System.nanoTime();
+        if (shadowFaults.produceOutsideCallback && stub) {
+            pendingOutsideCallbackPosition = actionPosition;
+            shadow = "deferred";
+        } else {
+            shadow = shadowProducer.onClusterAction(actionPosition, stub, inWindow, cluster.memberId(), cluster.time(),
+                    cluster.aeron().context().interServiceTimeoutNs(), applicationCallbackDepth, applier,
+                    new CoreShadowIdentity(engine));
+        }
+        final long shadowMs = (System.nanoTime() - shadowStartNs) / 1_000_000;
+
         System.out.println("[SNAPSHOT] accounts=" + engine.accountCount() + " bytes=" + length
                 + " chunks=" + chunks + " maxMessageLength=" + snapshotPublication.maxMessageLength()
                 + " serializeMs=" + ((serializedNs - startNs) / 1_000_000)
                 + " offerMs=" + ((offeredNs - serializedNs) / 1_000_000)
                 + " recordMs=" + ((recordedNs - offeredNs) / 1_000_000)
                 + " logPosition=" + cluster.logPosition() + " kind=" + (stub ? "stub" : "full")
-                + (inWindow ? " inSkipWindow=true" : ""));
+                + (inWindow ? " inSkipWindow=true" : "") + " shadow=" + shadow + " shadowSerializeMs=" + shadowMs);
         nodeMetrics.stampSnapshot(System.currentTimeMillis(), length, chunks, serializedNs - startNs,
                 offeredNs - serializedNs, recordedNs - offeredNs, cluster.logPosition());
 
@@ -1362,6 +1495,8 @@ public final class CoreClusteredService implements ClusteredService {
                                          int leaderMemberId, int logSessionId, TimeUnit timeUnit, int appVersion) {
         // Seen live and during replay (in log order): the latest term names the timer ids this node arms as leader.
         this.leadershipTermId = leadershipTermId;
+        this.termBaseLogPosition = termBaseLogPosition;
+        shadowProducer.onNewLeadershipTermEvent(leadershipTermId, leaderMemberId); // the cross-check of the wire id
         skipped(com.openexchange.cluster.log.FrameKind.NEW_LEADERSHIP_TERM, logPosition); // never dropped; closes a SKIP window past P_s
         // Never fenced at the base: a latched applier refuses every entry, so a term event on a stopped node stays silent.
         if (!applier.failed()) {
@@ -1409,6 +1544,8 @@ public final class CoreClusteredService implements ClusteredService {
         // A member that is no longer leader drops any snapshot request it was
         // waiting on: the consensus module reads that toggle only while leading.
         snapshotCadence.roleChanged(isLeader);
+        // A write in flight when this node becomes LEADER is aborted; the writer purges the partial recording
+        shadowProducer.onRoleChange(isLeader);
         // Anything still queued belongs to a leadership this node no longer holds: a demoted node
         // cannot offer, and consumers resynchronise through the snapshot-request messages.
         for (int i = 0; i < egressQueues.length; i++) {
@@ -1595,7 +1732,29 @@ public final class CoreClusteredService implements ClusteredService {
             throw principalLess;
         }
         this.leadershipTermId = outcome.leadershipTermId();
+        this.termBaseLogPosition = termBase(cluster.context().clusterDir(), outcome.leadershipTermId());
         this.skipWindow = outcome.window();
+    }
+
+    /**
+     * The base log position of {@code term} from this node's RecordingLog (the term entry Aeron itself appends); -1
+     * when there is none. A shadow restore replays from the restore position, so the term's own frame is never
+     * delivered to this service: the producer's cursor takes the term base from here.
+     */
+    static long termBase(final java.io.File clusterDir, final long term) {
+        if (term < 0) {
+            return -1L;
+        }
+        try (io.aeron.cluster.RecordingLog log = new io.aeron.cluster.RecordingLog(clusterDir, false)) {
+            for (final io.aeron.cluster.RecordingLog.Entry e : log.entries()) {
+                if (e.type == io.aeron.cluster.RecordingLog.ENTRY_TYPE_TERM && e.leadershipTermId == term) {
+                    return e.termBaseLogPosition;
+                }
+            }
+        } catch (final RuntimeException unreadable) {
+            System.err.println("[SHADOW-PRODUCER] the term base of term " + term + " is unreadable: " + unreadable);
+        }
+        return -1L;
     }
 
     /** The 3b inputs: the pull rows of this node, its host, its role and the readiness detail. */

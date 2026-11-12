@@ -40,6 +40,13 @@ jobs:
       # GitHub Packages at the version pinned in pom.xml: no more checking out match
       # at floating main and installing a mutable "1.0" into ~/.m2.
 
+      # A member refuses to boot when the kernel grants its log channel less socket buffer than configured
+      # (TRANSPORT_LOG_SO_RCVBUF / TRANSPORT_LOG_SO_SNDBUF, 16m by default; the process tests boot members).
+      - name: Kernel socket buffer limits for the log channel
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+          sysctl net.core.rmem_max net.core.wmem_max
+
       # verify runs the gate: unit tests, the determinism corpus, and
       # ClusterBootSmokeTest (boots a real in-process single-node core cluster).
       # Pull requests and main pushes use -Pfast, which leaves out the long replica
@@ -67,12 +74,17 @@ jobs:
           java-version: 21
           cache: maven
 
+      - name: Kernel socket buffer limits for the log channel
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+          sysctl net.core.rmem_max net.core.wmem_max
+
       - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests, shadow equivalence, forged member snapshot)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test
-          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest,ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap'
+          -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest'
           -Dsurefire.failIfNoSpecifiedTests=false
-          -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true -Dcore.pull.external=true
+          -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -87,9 +99,53 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Nightly shadow rows: the member puller, the leader gate, the replica re-bootstrap, the interop and external-driver
+  # pull rows, and the follower producer (three-member role story, guard rows, abort on leadership, crashed-write
+  # sweep). A job of its own so each nightly job stays under its timeout.
+  nightly-shadow:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      # The log channel defaults to 16m socket buffers; the member boot probe refuses a kernel that grants less.
+      - name: Kernel socket buffer limits for the log channel
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+          sysctl net.core.rmem_max net.core.wmem_max
+
+      - name: Nightly shadow (puller, leader gate, re-bootstrap, interop, external pull and producer rows, follower producer)
+        run: >-
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap,ShadowRestoreExternalDriverProcessTest#theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dcore.pull.external=true -Dcore.producer.external=true -Dcore.producer.guard.nightly=true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nightly shadow (follower producer, three members)
+        run: >-
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          -Dtest='ShadowProducerRoleTest'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dcore.producer.members=3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # The member puller story with 100 000 accounts before the snapshot (a shadow of several MB); the default
       # three-member story and the three-member leader gate ran in the first step.
-      - name: Nightly harness (shadow puller, 100k accounts)
+      - name: Nightly shadow (shadow puller, 100k accounts)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test
           -Dtest='ShadowPullerClusterTest'

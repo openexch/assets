@@ -22,6 +22,18 @@ import org.agrona.ExpandableArrayBuffer;
  */
 public final class ApplierSelfCheck implements ShadowSelfCheck {
 
+    private final String logPrefix;
+
+    /** The replica's ({@code [REPLICA]} lines). */
+    public ApplierSelfCheck() {
+        this("[REPLICA]");
+    }
+
+    /** @param logPrefix the host's line prefix ({@code [SHADOW-PRODUCER]} on a member) */
+    public ApplierSelfCheck(final String logPrefix) {
+        this.logPrefix = java.util.Objects.requireNonNull(logPrefix, "logPrefix");
+    }
+
     @Override
     public boolean verify(final DirectBuffer payload, final int length) {
         try {
@@ -48,8 +60,8 @@ public final class ApplierSelfCheck implements ShadowSelfCheck {
         }
     }
 
-    private static boolean refuse(final String why) {
-        System.err.println("[REPLICA] CRITICAL: shadow self-check refused the image: " + why);
+    private boolean refuse(final String why) {
+        System.err.println(logPrefix + " CRITICAL: shadow self-check refused the image: " + why);
         return false;
     }
 

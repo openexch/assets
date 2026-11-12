@@ -63,6 +63,10 @@ import static org.junit.Assert.assertTrue;
  *       journal writer agent stopped by a {@code Faults.afterTailFrames} hook, ends in the
  *       {@code SNAPSHOT_TAIL_REPLAY_TIMEOUT_MS} halt {@code tail replay timed out at <p> (journal ring full?)}, never a
  *       silent hang. The embedded leg of this row runs in {@link ShadowRestoreClusterTest}'s rig.</li>
+ *   <li>the follower producer on external drivers (two members, nightly with {@code -Dcore.producer.external=true}):
+ *       the designated follower writes a VERIFIED ALIGNED, its log image carries the URI's 16m receiver window and
+ *       socket buffer under a driver whose own defaults are 128k and 0, and a driver kill inside its write exits 1
+ *       with no write completed after the kill.</li>
  * </ul>
  * The faults are installed inside the child through JDWP at the service's {@code onStart} breakpoint
  * ({@code ChildFaults}, the {@code EngineDriverLifecycleProcessTest.OnStartHold} technique): the production entry point
@@ -302,6 +306,227 @@ public class ShadowRestoreExternalDriverProcessTest {
                 + line(out, "media driver lost in EXTERNAL driver mode"));
     }
 
+    /**
+     * How long the slow writer holds the first payload chunk of every follower ALIGNED write in the producer row: longer
+     * than the 10 s client driver timeout plus the halt, so the write is still held when the member halts. (Measured
+     * with a 5 s hold: the writer, the archive and the IPC publication share the dead driver's mapped buffers, so a
+     * write can still complete between the driver's death and the client's keepalive timeout.)
+     */
+    private static final long PRODUCER_HOLD_MS = 30_000;
+    private static final long LOG_RCV_WINDOW = 16L * 1024 * 1024;
+
+    /**
+     * The follower producer on external drivers: two members, each the production entry point in a child JVM on its own
+     * aeronmd-shaped driver started with {@code aeron.rcv.initial.window.length=128k} and {@code aeron.socket.so_rcvbuf=0}
+     * (so a 16m window on the follower's log image can only come from the log channel URI), the log channel at its
+     * defaults ({@code term-length=64m}, {@code rcv-wnd=16m}, {@code so-rcvbuf=16m}, {@code so-sndbuf=16m}), the writer
+     * slowed by a 30 s hold on its first payload chunk (installed through JDWP at {@code onStart}). Rows: both members
+     * boot through the socket buffer probe in external mode; at P_cm1 the follower (the designated member of a two-member
+     * cluster) writes an {@code F<id>} ALIGNED that its own archive holds VERIFIED; the follower's log image metadata
+     * reads {@code receiverWindowLength} and {@code socketRcvbufLength} 16m; at P_cm2, inside the held write, kill -9 of
+     * the follower's driver exits the follower 1 within the client driver timeout plus the halt, and no write completes
+     * after the kill. Nightly only ({@code -Dcore.producer.external=true}); control
+     * {@code -Dcore.producer.nc=PRODUCER_NONE} ({@code SHADOW_PRODUCER=none}) fails the first assertion.
+     */
+    @Test(timeout = 1_200_000)
+    public void theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne() throws Exception {
+        org.junit.Assume.assumeTrue("the external-driver producer rows run only with -Dcore.producer.external=true",
+                Boolean.getBoolean("core.producer.external"));
+        final boolean producerNone = "PRODUCER_NONE".equals(System.getProperty("core.producer.nc", ""));
+        System.setProperty("cluster.port.stride", Integer.toString(ClusterPorts.SHARED_HOST_STRIDE));
+        ClusterPorts.resetStrideForTest();
+        final int portBase = 58400;
+        final List<Node> nodes = List.of(new Node("producer-external-0-", portBase, 0, 2),
+                new Node("producer-external-1-", portBase, 1, 2));
+        final Map<String, String> env = Map.of("SHADOW_PRODUCER", producerNone ? "none" : "designated-follower",
+                "SHADOW_PRODUCER_BUFFER_MB", "16", "SHADOW_SCAN_PERIOD_MS", "500", "SHADOW_DEEP_READ_PACE_MS", "0",
+                "TRANSPORT_LOG_TERM_LENGTH", "64m", "TRANSPORT_LOG_RCV_WINDOW", "16m",
+                "TRANSPORT_LOG_SO_RCVBUF", "16m", "TRANSPORT_LOG_SO_SNDBUF", "16m");
+        final List<String> driverProps = List.of("-Daeron.rcv.initial.window.length=131072",
+                "-Daeron.socket.so_rcvbuf=0");
+        final List<ChildFaultInstaller> installers = new ArrayList<>();
+        for (final Node n : nodes) {
+            n.startDriver(driverProps);
+            final int jdwp = freePort();
+            n.startEngine(env, List.of("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:"
+                    + jdwp));
+            installers.add(new ChildFaultInstaller(jdwp, "slowShadowWriter", PRODUCER_HOLD_MS));
+        }
+        try {
+            for (final Node n : nodes) {
+                n.awaitReady(180_000);
+                n.awaitLine("[restore-child] installed a slow shadow writer", 10_000);
+            }
+        } finally {
+            for (final ChildFaultInstaller i : installers) {
+                i.close();
+            }
+        }
+        for (final Node n : nodes) {
+            final String out = n.log();
+            assertTrue("external driver mode on member " + n.nodeId + ": " + tail(out),
+                    out.contains("Driver mode EXTERNAL"));
+            final String probe = line(out, "[BOOT-GUARD] log channel ");
+            assertTrue("the socket buffer probe ran in external mode on member " + n.nodeId + ": " + tail(out),
+                    probe != null && probe.contains("rcv-wnd=16m"));
+            System.out.println("[producer-external] member " + n.nodeId + ": " + probe);
+        }
+        final Node leader = awaitLeader(nodes);
+        final Node follower = nodes.get(1 - leader.nodeId);
+        System.out.println("[producer-external] leader member " + leader.nodeId + ", designated follower member "
+                + follower.nodeId);
+
+        // P_cm1: the designated follower writes its ALIGNED on the external driver; its own archive holds it VERIFIED
+        final Clients c = new Clients(nodes);
+        c.adopt();
+        c.deposits(200);
+        for (final Node n : nodes) { // the writer arms on the first housekeeping wake after the ADOPT (none: never)
+            if (!producerNone) {
+                n.awaitLine("[SHADOW-PRODUCER] writer armed: producer=F" + n.nodeId, 60_000);
+            }
+        }
+        final long p1 = leader.snapshot();
+        c.close(); // the waits below do not poll the sessions (their keepalive would lapse)
+        awaitSnapshotAt(follower, p1);
+        try {
+            follower.awaitLine("[SHADOW-PRODUCER] wrote the ALIGNED at P_cm=" + p1 + ":", PRODUCER_HOLD_MS + 60_000);
+        } catch (final AssertionError none) {
+            throw new AssertionError("shadow_write_total{kind=ALIGNED} == 1 fails on member " + follower.nodeId
+                    + ": no ALIGNED at P_cm=" + p1 + " from the designated follower on an external driver: "
+                    + line(follower.log(), "logPosition=" + p1 + " "));
+        }
+        final com.openexchange.cluster.shadow.ShadowEntry written = verifiedCopy(follower, p1);
+        System.out.println("GREEN external producer: member " + follower.nodeId + " wrote and holds VERIFIED "
+                + written.alias() + " at P_cm=" + p1 + " | " + line(follower.log(), "wrote the ALIGNED at P_cm=" + p1));
+
+        // the follower's log image: the window and the socket buffer come from the URI, not the driver defaults
+        final long[] window = logImageWindow(follower, 64L * 1024 * 1024);
+        assertEquals("receiverWindowLength of the follower's log image under the external driver (driver default 128k)",
+                LOG_RCV_WINDOW, window[0]);
+        assertEquals("socketRcvbufLength of the follower's log image under the external driver (driver default 0)",
+                LOG_RCV_WINDOW, window[1]);
+        System.out.println("GREEN external log image: receiverWindowLength=" + window[0] + " socketRcvbufLength="
+                + window[1] + " (aeronmd started with rcv initial window 131072, so_rcvbuf 0)");
+
+        // P_cm2: kill -9 of the follower's driver inside the held write
+        final Clients c2 = new Clients(nodes);
+        c2.deposits(50);
+        c2.close();
+        final int held = count(follower.log(), "holding the first payload chunk");
+        final long p2 = leader.snapshot();
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (count(follower.log(), "holding the first payload chunk") <= held) {
+            assertTrue("the follower never started its write at P_cm2=" + p2 + ": " + tail(follower.log()),
+                    System.nanoTime() < deadline);
+            Thread.sleep(20);
+        }
+        for (final Node n : nodes) {
+            n.closeAeron();
+        }
+        final long t0 = System.nanoTime();
+        follower.driver.destroyForcibly(); // kill -9 of the follower's media driver during its ALIGNED write
+        assertTrue("the follower exits after its driver kill: " + tail(follower.log()),
+                follower.engine.waitFor(45, TimeUnit.SECONDS));
+        final long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        final String out = follower.log();
+        if (follower.engine.exitValue() != 1) {
+            throw new AssertionError("external driver loss did not halt a producing node: exit "
+                    + follower.engine.exitValue() + tail(out));
+        }
+        assertTrue("within the client driver timeout plus the halt: " + ms, ms < 18_000);
+        assertFalse("no ALIGNED completed after the kill: " + tail(out),
+                out.contains("[SHADOW-PRODUCER] wrote the ALIGNED at P_cm=" + p2 + ":"));
+        assertEquals("shadow_write_total{ALIGNED} did not move after the kill", 1,
+                count(out, "[SHADOW-PRODUCER] wrote the ALIGNED at P_cm="));
+        System.out.println("GREEN external producer driver kill mid-write at P_cm2=" + p2 + ": exit 1 after " + ms
+                + " ms | " + line(out, "media driver lost in EXTERNAL driver mode"));
+    }
+
+    /** The member whose role counter reads LEADER. */
+    private static Node awaitLeader(final List<Node> nodes) throws InterruptedException {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        while (System.nanoTime() < deadline) {
+            for (final Node n : nodes) {
+                if (n.role() == io.aeron.cluster.service.Cluster.Role.LEADER) {
+                    return n;
+                }
+            }
+            Thread.sleep(50);
+        }
+        throw new AssertionError("no leader among the external-driver members");
+    }
+
+    private static void awaitSnapshotAt(final Node node, final long p) throws InterruptedException {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        while (node.latestSnapshot() < p) {
+            assertTrue("member " + node.nodeId + " never recorded the snapshot at " + p, System.nanoTime() < deadline);
+            Thread.sleep(50);
+        }
+    }
+
+    /** The follower's own {@code F<id>} ALIGNED at exactly {@code p}, deep-read VERIFIED through its archive. */
+    private static com.openexchange.cluster.shadow.ShadowEntry verifiedCopy(final Node node, final long p)
+            throws InterruptedException {
+        final com.openexchange.cluster.shadow.ShadowCatalog catalog = new com.openexchange.cluster.shadow.ShadowCatalog(
+                node.aeron(), node.archive(), com.openexchange.core.infrastructure.persistence.CoreLogApplier.ENGINE_ID_CORE,
+                layoutClusterId(node), GENESIS, new com.openexchange.cluster.shadow.ShadowVerdicts(),
+                com.openexchange.cluster.shadow.ShadowCatalog.DEFAULT_LIST_BATCH,
+                org.agrona.concurrent.SystemNanoClock.INSTANCE, TimeUnit.SECONDS.toNanos(30),
+                new com.openexchange.cluster.shadow.ShadowCounters());
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        String last = "no scan";
+        while (System.nanoTime() < deadline) {
+            final com.openexchange.cluster.shadow.ShadowCatalog.Scan scan = catalog.scan();
+            for (final com.openexchange.cluster.shadow.ShadowEntry e : scan.all()) {
+                if (e.alias() != null && e.alias().logPosition() == p && e.header() != null
+                        && e.header().producerKind() == ProducerKind.FOLLOWER.code()
+                        && e.header().producerId() == node.nodeId
+                        && e.header().kindEnum() == com.openexchange.cluster.shadow.ShadowKind.ALIGNED) {
+                    final com.openexchange.cluster.shadow.ShadowCatalog.DeepResult r = catalog.verifyDeep(e);
+                    last = e.state() + " deep " + r.kind();
+                    if (r.kind() == com.openexchange.cluster.shadow.ShadowCatalog.DeepResult.Kind.VERIFIED) {
+                        return e;
+                    }
+                }
+            }
+            Thread.sleep(200);
+        }
+        throw new AssertionError("no VERIFIED F" + node.nodeId + " ALIGNED at " + p + " in member " + node.nodeId
+                + "'s archive: " + last);
+    }
+
+    /**
+     * {@code {receiverWindowLength, socketRcvbufLength}} from the metadata of the node's image log buffer whose term
+     * length is {@code termLength} (the cluster log; no other image of a member uses that term length).
+     */
+    private static long[] logImageWindow(final Node node, final long termLength) throws IOException {
+        final List<long[]> found = new ArrayList<>();
+        final List<String> seen = new ArrayList<>();
+        try (Stream<Path> files = Files.list(node.aeronDir.resolve("images"))) {
+            for (final Path f : files.filter(x -> x.toString().endsWith(".logbuffer")).toList()) {
+                try (io.aeron.LogBuffers lb = new io.aeron.LogBuffers(f.toString())) {
+                    final org.agrona.concurrent.UnsafeBuffer md = lb.metaDataBuffer();
+                    seen.add(f.getFileName() + " term=" + lb.termLength() + " rcvWnd="
+                            + io.aeron.logbuffer.LogBufferDescriptor.receiverWindowLength(md));
+                    if (lb.termLength() == termLength) {
+                        found.add(new long[] {io.aeron.logbuffer.LogBufferDescriptor.receiverWindowLength(md),
+                                io.aeron.logbuffer.LogBufferDescriptor.socketRcvbufLength(md)});
+                    }
+                }
+            }
+        }
+        assertEquals("one log image on member " + node.nodeId + ": " + seen, 1, found.size());
+        return found.get(0);
+    }
+
+    private static int count(final String out, final String needle) {
+        int n = 0;
+        for (int i = out.indexOf(needle); i >= 0; i = out.indexOf(needle, i + needle.length())) {
+            n++;
+        }
+        return n;
+    }
+
     private static int layoutClusterId(final Node node) {
         return node.layout.consensusModuleContext().clusterId();
     }
@@ -497,6 +722,8 @@ public class ShadowRestoreExternalDriverProcessTest {
         final Path aeronDir;
         final int portBase;
         final int probePort;
+        final int nodeId;
+        final int members;
         final ClusterConfig layout;
         Process driver;
         Process engine;
@@ -505,12 +732,19 @@ public class ShadowRestoreExternalDriverProcessTest {
         private int starts;
 
         Node(final String prefix, final int portBase) throws IOException {
+            this(prefix, portBase, 0, 1);
+        }
+
+        /** Member {@code nodeId} of a {@code members}-member cluster on this host (port stride 100 when more than one). */
+        Node(final String prefix, final int portBase, final int nodeId, final int members) throws IOException {
             this.base = dir(prefix);
             this.aeronDir = shmDir(prefix + "aeron-");
             this.portBase = portBase;
             this.probePort = freePort();
-            // the same layout the child derives (CLUSTER_NODE 0, one host, BASE_DIR); built for its paths and contexts
-            this.layout = ClusterConfig.create(0, List.of("localhost"), List.of("localhost"), portBase,
+            this.nodeId = nodeId;
+            this.members = members;
+            // the same layout the child derives (CLUSTER_NODE, the hosts, BASE_DIR); built for its paths and contexts
+            this.layout = ClusterConfig.create(nodeId, hosts(members), hosts(members), portBase,
                     new TimerPerOrderControlService());
             layout.baseDir(base.resolve("state").toFile());
             layout.aeronDirectoryName(aeronDir.toString());
@@ -521,7 +755,13 @@ public class ShadowRestoreExternalDriverProcessTest {
         }
 
         void startDriver() throws Exception {
+            startDriver(List.of());
+        }
+
+        /** An aeronmd-shaped driver process; {@code props} are extra {@code -D} driver settings. */
+        void startDriver(final List<String> props) throws Exception {
             final List<String> cmd = java();
+            cmd.addAll(props);
             cmd.addAll(List.of("-Daeron.dir=" + aeronDir, "-Daeron.dir.delete.on.start=true",
                     "-Daeron.dir.delete.on.shutdown=true", "-Daeron.term.buffer.sparse.file=true",
                     "-cp", System.getProperty("java.class.path"), "io.aeron.driver.MediaDriver"));
@@ -557,12 +797,19 @@ public class ShadowRestoreExternalDriverProcessTest {
             env.put("TRANSPORT_DRIVER_MODE", "external");
             env.put("TRANSPORT_IDLE_MODE", "backoff");
             env.put("TRANSPORT_LOG_TERM_LENGTH", "4m");
+        env.put("TRANSPORT_LOG_RCV_WINDOW", "2m"); // at most half the log term (the boot refuses more)
+        env.put("TRANSPORT_LOG_SO_RCVBUF", "2m");
+        env.put("TRANSPORT_LOG_SO_SNDBUF", "2m");
             env.put("TRANSPORT_SNAPSHOT_TERM_LENGTH", "4m");
-            env.put("CLUSTER_NODE", "0");
-            env.put("CLUSTER_ADDRESSES", "localhost");
+            env.put("CLUSTER_NODE", Integer.toString(nodeId));
+            env.put("CLUSTER_ADDRESSES", String.join(",", hosts(members)));
+            if (members > 1) {
+                env.put("CLUSTER_PORT_STRIDE", Integer.toString(ClusterPorts.SHARED_HOST_STRIDE));
+            }
             env.put("CLUSTER_PORT_BASE", String.valueOf(portBase));
             env.put("CORE_NODE_PORT", String.valueOf(probePort));
             env.put("SNAPSHOT_MODE", "shadow");
+            env.put("SHADOW_PRODUCER", "none"); // the test producer stands in for the follower here
             env.putAll(extraEnv);
             engine = pb.redirectErrorStream(true).redirectOutput(logFile().toFile()).start();
             processes.add(engine);
@@ -635,7 +882,20 @@ public class ShadowRestoreExternalDriverProcessTest {
         }
 
         Clients clients() throws InterruptedException {
-            return new Clients(this);
+            return new Clients(List.of(this));
+        }
+
+        /** The consensus module's role counter on this node's driver ({@code Cluster.Role}), null before it exists. */
+        io.aeron.cluster.service.Cluster.Role role() {
+            final org.agrona.concurrent.status.CountersReader counters = aeron().countersReader();
+            final io.aeron.cluster.service.Cluster.Role[] role = {null};
+            counters.forEach((counterId, typeId, keyBuffer, label) -> {
+                if (typeId == io.aeron.cluster.ConsensusModule.Configuration.CLUSTER_NODE_ROLE_TYPE_ID
+                        && counters.getCounterState(counterId) == org.agrona.concurrent.status.CountersReader.RECORD_ALLOCATED) {
+                    role[0] = io.aeron.cluster.service.Cluster.Role.get(counters.getCounterValue(counterId));
+                }
+            });
+            return role[0];
         }
 
         long logRecordingId() {
@@ -706,13 +966,20 @@ public class ShadowRestoreExternalDriverProcessTest {
         final List<Session> all = new ArrayList<>();
         long corr = 1;
 
-        Clients(final Node node) throws InterruptedException {
+        Clients(final List<Node> nodes) throws InterruptedException {
             clients.add(this);
-            admin = session(node, SessionClass.ADMIN);
-            tool = session(node, SessionClass.TOOL);
+            admin = session(nodes, SessionClass.ADMIN);
+            tool = session(nodes, SessionClass.TOOL);
         }
 
-        private Session session(final Node node, final SessionClass cls) throws InterruptedException {
+        private Session session(final List<Node> nodes, final SessionClass cls) throws InterruptedException {
+            final Node node = nodes.get(0);
+            final StringBuilder endpoints = new StringBuilder();
+            for (final Node n : nodes) {
+                endpoints.append(endpoints.length() == 0 ? "" : ",").append(n.nodeId).append("=localhost:")
+                        .append(ClusterConfig.calculatePort(n.nodeId, n.portBase,
+                                ClusterConfig.CLIENT_FACING_PORT_OFFSET));
+            }
             final Listener in = new Listener();
             final long deadline = System.currentTimeMillis() + 60_000;
             RuntimeException last = null;
@@ -725,8 +992,7 @@ public class ShadowRestoreExternalDriverProcessTest {
                             .egressChannel("aeron:udp?endpoint=localhost:0")
                             .ingressChannel("aeron:udp")
                             .aeronDirectoryName(node.aeronDir.toString())
-                            .ingressEndpoints("0=localhost:" + ClusterConfig.calculatePort(0, node.portBase,
-                                    ClusterConfig.CLIENT_FACING_PORT_OFFSET))
+                            .ingressEndpoints(endpoints.toString())
                             .messageTimeoutNs(TimeUnit.SECONDS.toNanos(5)));
                     final Session s = new Session(client, in);
                     all.add(s);
@@ -790,7 +1056,7 @@ public class ShadowRestoreExternalDriverProcessTest {
      * JDWP: the child starts with {@code suspend=y}; at the service's {@code onStart} breakpoint this calls
      * {@code ChildFaults.<method>(service, n)} on the service thread (the child's own instance), then detaches.
      */
-    private static final class ChildFaultInstaller implements AutoCloseable {
+    static final class ChildFaultInstaller implements AutoCloseable {
         private final com.sun.jdi.VirtualMachine vm;
         private final Thread events;
         private volatile Throwable failure;
@@ -887,6 +1153,14 @@ public class ShadowRestoreExternalDriverProcessTest {
     }
 
     // ---------------------------------------------------------------------------------------------------- helpers
+
+    private static List<String> hosts(final int members) {
+        final List<String> hosts = new ArrayList<>();
+        for (int i = 0; i < members; i++) {
+            hosts.add("localhost");
+        }
+        return hosts;
+    }
 
     private static List<String> java() {
         return new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),

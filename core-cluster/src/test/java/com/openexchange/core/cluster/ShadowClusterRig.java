@@ -685,6 +685,8 @@ final class ShadowClusterRig implements AutoCloseable {
         final java.util.Map<com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key, String> m =
                 new java.util.HashMap<>();
         m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow");
+        // the restore and puller rows stand the test producer in for the follower: the real one is opted in by name
+        m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SHADOW_PRODUCER, "none");
         for (int i = 0; i < extra.length; i += 2) {
             m.put(com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.valueOf(extra[i]),
                     extra[i + 1]);
@@ -721,7 +723,20 @@ final class ShadowClusterRig implements AutoCloseable {
                     }
                 });
         for (final long id : ids) {
-            archive(m).purgeRecording(id);
+            // a peer's puller or this member's own deep read may be replaying the recording: retry, bounded
+            final long deadline = System.currentTimeMillis() + OP_TIMEOUT_MS;
+            while (true) {
+                try {
+                    archive(m).purgeRecording(id);
+                    break;
+                } catch (final io.aeron.archive.client.ArchiveException replaying) {
+                    if (System.currentTimeMillis() > deadline || replaying.getMessage() == null
+                            || !replaying.getMessage().contains("active replay")) {
+                        throw replaying;
+                    }
+                    pumpMs(200);
+                }
+            }
         }
         return ids.size();
     }

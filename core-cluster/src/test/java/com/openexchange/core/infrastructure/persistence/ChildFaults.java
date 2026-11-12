@@ -71,4 +71,13 @@ public final class ChildFaults {
         });
         System.out.println("[restore-child] installed Faults.afterTailFrames(" + n + ", stop journal writer)");
     }
+
+    /**
+     * The follower producer's writer holds the first payload chunk of every ALIGNED write for {@code holdMs} (the slow
+     * writer of the in-process rows), so a driver kill lands inside a write.
+     */
+    public static void slowShadowWriter(final Object service, final long holdMs) {
+        ServiceProbe.slowWriter((CoreClusteredService)service, holdMs);
+        System.out.println("[restore-child] installed a slow shadow writer (" + holdMs + " ms hold)");
+    }
 }

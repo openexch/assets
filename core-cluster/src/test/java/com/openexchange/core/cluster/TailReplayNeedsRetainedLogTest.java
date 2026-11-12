@@ -27,6 +27,7 @@ public class TailReplayNeedsRetainedLogTest {
 
     private static SnapshotModeSettings settings(final String margin) {
         return SnapshotModeSettings.with(Map.of(SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow",
+                SnapshotModeSettings.Key.SHADOW_PRODUCER, "none",
                 SnapshotModeSettings.Key.SHADOW_FLOOR_MARGIN, margin,
                 SnapshotModeSettings.Key.SHADOW_SCAN_PERIOD_MS, "500",
                 SnapshotModeSettings.Key.SHADOW_DEEP_READ_PACE_MS, "0"));

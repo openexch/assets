@@ -152,6 +152,40 @@ final class ShadowRestore {
          */
         java.util.function.LongConsumer tailFrameObserver;
 
+        // ---- the follower producer's seams (each switches one rule off, or injects one fault)
+        /** Designation off: every FOLLOWER produces. */
+        boolean designationOff;
+        /** The role leg off: the leader produces too. */
+        boolean producerOnLeader;
+        /** The skip-window leg off. */
+        boolean alignedGuardOff;
+        /** The readiness leg off. */
+        boolean readyGuardOff;
+        /** The client liveness leg off. */
+        boolean livenessBoundOff;
+        /** The window budget leg off. */
+        boolean windowGuardOff;
+        /** The capacity catch removed: an oversize image fails the callback. */
+        boolean capacityGuardOff;
+        /** Designation reads the log's term event only (a mid-term restart never sees it). */
+        boolean leaderFromLogOnly;
+        /** No abort on becoming LEADER: an in-flight write finishes. */
+        boolean leaderFinishesWrite;
+        /** The crashed-write sweep off. */
+        boolean sweepOff;
+        /** The floor-side witness alarm off. */
+        boolean witnessAlarmOff;
+        /** The serialize runs in doBackgroundWork after the action instead of inside the callback. */
+        boolean produceOutsideCallback;
+        /** The readiness leg reads not-ready (a readiness withdrawal right before the action). */
+        boolean notReadyInjected;
+        /** Replaces the commit wire's leader id ({@code >= 0}); -1 leaves it. */
+        int wireLeaderOverride = -1;
+        /** Sleeps this long on the service thread after the producer's serialize (a slow serialize). */
+        long producerSerializeDelayMs;
+        /** Builds the member's shadow writer instead of the production constructor (a slow or crashing writer). */
+        MemberShadowHousekeeping.WriterFactory writerFactory;
+
         static Faults afterTailFrames(final long n, final Runnable hook) {
             if (n < 0) {
                 throw new IllegalArgumentException("n must be >= 0: " + n);

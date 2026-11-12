@@ -296,6 +296,7 @@ public class ShadowRestoreClusterTest {
             final com.openexchange.core.infrastructure.persistence.SnapshotModeSettings settings =
                     com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.with(java.util.Map.of(
                             com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SNAPSHOT_MODE, "shadow",
+                            com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SHADOW_PRODUCER, "none",
                             com.openexchange.core.infrastructure.persistence.SnapshotModeSettings.Key.SNAPSHOT_TAIL_REPLAY_TIMEOUT_MS,
                             "3000"));
             final com.openexchange.core.infrastructure.journal.MoneyJournal small =
