@@ -62,6 +62,10 @@
         <argLine></argLine>
         <!-- The test JVM heap; the dev-box-only 1M equivalence variant raises it (make nightly-million). -->
         <surefire.heap>2g</surefire.heap>
+        <!-- Per test-class fork (reuseForks=false): a hung fork is killed after this many seconds and the module
+             fails with "There was a timeout in the fork". The slowest class today is about 13 minutes
+             (ReplicaAlignmentTrustTest, nightly); raise it with -Dsurefire.fork.timeout.seconds, 0 waits forever. -->
+        <surefire.fork.timeout.seconds>1800</surefire.fork.timeout.seconds>
     </properties>
 
     <dependencyManagement>
@@ -196,6 +200,7 @@
                         <!-- Aeron-heavy tests accumulate native + heap memory; a fresh JVM per
                              test class (deterministic heap) keeps results runner-independent. -->
                         <reuseForks>false</reuseForks>
+                        <forkedProcessTimeoutInSeconds>${surefire.fork.timeout.seconds}</forkedProcessTimeoutInSeconds>
                         <argLine>
                             ${argLine}
                             -Xmx${surefire.heap}

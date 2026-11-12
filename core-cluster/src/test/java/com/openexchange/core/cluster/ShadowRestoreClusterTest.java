@@ -364,6 +364,16 @@ public class ShadowRestoreClusterTest {
                             + rig.tee.all("[shadow restore] tail"));
                 }
             } finally {
+                // In-process the halt is a recorder, not Runtime.halt: f's service thread is still blocked in the
+                // abandoned ring. Close f while the drainer runs, so the thread can leave the ring and the container
+                // close returns; stopping the drainer first left it spinning and the close retrying forever. Also on
+                // a failed assertion above, where the drainer may not have started yet.
+                if (stopWriter) {
+                    if (unblock.getState() == Thread.State.NEW) {
+                        unblock.start();
+                    }
+                    rig.kill(f);
+                }
                 unblock.interrupt();
                 org.agrona.CloseHelper.quietClose(writer[0]);
             }
