@@ -329,6 +329,12 @@ final class CoreRestoreRig {
 
     // ---------------------------------------------------------------- egress
 
+    /** One deposit ack as {@link Listener#depositTap} sees it. */
+    @FunctionalInterface
+    interface DepositAckTap {
+        void onDepositAck(long correlationId, boolean duplicate);
+    }
+
     /** Counts acks and rejects; keeps only the rare frames as text. Decoded on the polling thread. */
     static final class Listener implements EgressListener {
         final AtomicInteger registered = new AtomicInteger();
@@ -344,6 +350,8 @@ final class CoreRestoreRig {
         int depositAcks;
         /** Deposit acks with the replay flag: the stored decision of a requestId already applied. */
         int depositDuplicates;
+        /** Sees every deposit ack's correlation id and replay flag (null: none); runs on the polling thread. */
+        DepositAckTap depositTap;
         /** The newest {@code newAvailable} per {@code userId * 64 + assetId}. */
         final java.util.Map<Long, Long> availableByUserAsset = new java.util.concurrent.ConcurrentHashMap<>();
         final List<String> frames = new CopyOnWriteArrayList<>();
@@ -411,6 +419,10 @@ final class CoreRestoreRig {
                     }
                     if (depositAck.correlationId() > maxDepositAckCorr) {
                         maxDepositAckCorr = depositAck.correlationId();
+                    }
+                    if (depositTap != null) {
+                        depositTap.onDepositAck(depositAck.correlationId(),
+                                depositAck.duplicate() == com.openexchange.core.infrastructure.generated.BoolFlag.TRUE);
                     }
                     availableByUserAsset.put(depositAck.userId() * 64 + depositAck.assetId(), depositAck.newAvailable());
                     break;

@@ -154,7 +154,9 @@
              (EmbeddedDriverDirProcessTest; the kit's EmbeddedDriverDirTest covers the check on every PR) are nightly only.
              The replica under order load (lag, supplier loss, leader loss, replica kill and restart, wipe and pull,
              re-bootstrap; the external-driver load row of ReplicaExternalDriverProcessTest with -Dcore.lag.external=true)
-             and the load generator smoke (-Dcore.loadgen.smoke=true) are nightly only. -->
+             and the load generator smoke (-Dcore.loadgen.smoke=true) are nightly only, and so is the rig's deposit
+             identity row under a leader kill (ShadowClusterRigDepositIdentityTest; the two-member role story above uses
+             the same re-offer on every PR). -->
         <profile>
             <id>fast</id>
             <build>
@@ -189,6 +191,7 @@
                                 <exclude>**/ReplicaKillRestartUnderLoadTest.java</exclude>
                                 <exclude>**/ReplicaWipePullBootstrapUnderLoadTest.java</exclude>
                                 <exclude>**/ReBootstrapUnderLoadTest.java</exclude>
+                                <exclude>**/ShadowClusterRigDepositIdentityTest.java</exclude>
                                 <exclude>**/*$*</exclude>
                             </excludes>
                             <systemPropertyVariables>

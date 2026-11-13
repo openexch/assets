@@ -167,10 +167,13 @@ final class ShadowClusterRig implements AutoCloseable {
 
         /**
          * {@code n} deposits of {@code ONE} USD to users {@code 1 + i % 5}, then waits for the last ack. With identity
-         * ({@link #withIdentity()}) each carries its own requestId ({@link #requestHigh}, the correlation id), and when
-         * no ack arrives for the election window ({@code leaderHeartbeatTimeoutMs + ELECTION_TIMEOUT_MS}) the unacked tail is offered again
-         * ONCE with the same ids: the core answers a deposit it already applied with its stored decision (the replay
-         * flag) and credits nothing, so the re-offer never doubles money; an election drops uncommitted ingress, so
+         * ({@link #withIdentity()}) each carries its own requestId ({@link #requestHigh}, the correlation id), and while
+         * the last ack is missing the unacked tail is offered again with the same ids, each time no ack arrived for the
+         * election window ({@code leaderHeartbeatTimeoutMs + ELECTION_TIMEOUT_MS}) AND the session is connected to the
+         * member that is leader now (a re-offer during the election would go to the old leader's publication, which
+         * still accepts for a few seconds after that leader died, and be lost). It stops at the last ack or after
+         * {@link #REOFFER_TOTAL_MS}. The core answers a deposit it already applied with its stored decision (the replay
+         * flag) and credits nothing, so a re-offer never doubles money; an election drops uncommitted ingress, so
          * without it the tail would never be answered.
          */
         void deposits(final int n) {
@@ -213,20 +216,35 @@ final class ShadowClusterRig implements AutoCloseable {
 
         /**
          * Offers the last {@code k} deposits again with their requestIds (an ack the client never saw: the deposit was
-         * applied) and waits for {@code k} more answers; returns how many of them carried the replay flag.
+         * applied) and waits until each of those {@code k} correlation ids is answered; returns how many of them were
+         * answered with the replay flag. Counted per correlation id, so a late answer of an earlier election re-offer
+         * of the same deposit is not counted twice.
          */
         int reofferLast(final int k) {
             final CoreRestoreRig.Encoders enc = new CoreRestoreRig.Encoders();
-            final int before = in.depositAcks;
-            final int dupBefore = in.depositDuplicates;
-            for (int i = depositLog.size() - k; i < depositLog.size(); i++) {
-                final long[] d = depositLog.get(i);
-                offer(enc.buf, encodeDeposit(enc, d[0], d[1]));
-                reoffered++;
+            final java.util.Set<Long> asked = new java.util.HashSet<>();
+            final java.util.Set<Long> answered = new java.util.HashSet<>();
+            final int[] replays = {0};
+            in.depositTap = (corrId, duplicate) -> {
+                if (asked.contains(corrId) && answered.add(corrId) && duplicate) {
+                    replays[0]++;
+                }
+            };
+            try {
+                for (int i = depositLog.size() - k; i < depositLog.size(); i++) {
+                    asked.add(depositLog.get(i)[0]);
+                }
+                for (int i = depositLog.size() - k; i < depositLog.size(); i++) {
+                    final long[] d = depositLog.get(i);
+                    offer(enc.buf, encodeDeposit(enc, d[0], d[1]));
+                    reoffered++;
+                }
+                await(() -> answered.size() >= k, OP_TIMEOUT_MS, () -> "answers of " + k
+                        + " re-offered deposits (" + answered.size() + " answered; roles " + roles() + ")");
+                return replays[0];
+            } finally {
+                in.depositTap = null;
             }
-            await(() -> in.depositAcks >= before + k, OP_TIMEOUT_MS, () -> "answers of " + k + " re-offered deposits ("
-                    + (in.depositAcks - before) + " seen; roles " + roles() + ")");
-            return in.depositDuplicates - dupBefore;
         }
 
         private int encodeDeposit(final CoreRestoreRig.Encoders enc, final long c, final long user) {
@@ -239,7 +257,8 @@ final class ShadowClusterRig implements AutoCloseable {
             final long windowMs = leaderHeartbeatTimeoutMs + ELECTION_TIMEOUT_MS;
             final long[] lastSeen = {in.maxDepositAckCorr};
             final long[] progressAt = {System.currentTimeMillis()};
-            final boolean[] reofferedOnce = {false};
+            final int[] rounds = {0};
+            final String[] waiting = {null};
             await(() -> {
                 if (in.maxDepositAckCorr >= target) {
                     return true;
@@ -248,26 +267,75 @@ final class ShadowClusterRig implements AutoCloseable {
                 if (in.maxDepositAckCorr != lastSeen[0]) {
                     lastSeen[0] = in.maxDepositAckCorr;
                     progressAt[0] = now;
-                } else if (!reofferedOnce[0] && now - progressAt[0] >= windowMs) {
-                    reofferedOnce[0] = true;
-                    int tail = 0;
-                    for (int i = fromIndex; i < depositLog.size(); i++) {
-                        final long[] d = depositLog.get(i);
-                        if (d[0] > in.maxDepositAckCorr) {
-                            offer(enc.buf, encodeDeposit(enc, d[0], d[1]));
-                            reoffered++;
-                            tail++;
-                        }
-                    }
-                    System.out.println("[rig] re-offered the unacked deposit tail once: " + tail + " deposits after "
-                            + windowMs + " ms without an ack (roles " + roles() + ")");
-                    progressAt[0] = now;
+                    return false;
                 }
+                if (now - progressAt[0] < windowMs) {
+                    return false;
+                }
+                final String notYet = notConnectedToTheLeader();
+                if (notYet != null) {
+                    waiting[0] = notYet;
+                    return false; // the stall clock keeps running: the re-offer goes out once the session follows
+                }
+                rounds[0]++;
+                int tail = 0;
+                for (int i = fromIndex; i < depositLog.size(); i++) {
+                    final long[] d = depositLog.get(i);
+                    if (d[0] > in.maxDepositAckCorr) {
+                        offer(enc.buf, encodeDeposit(enc, d[0], d[1]));
+                        reoffered++;
+                        tail++;
+                    }
+                }
+                System.out.println("[rig] re-offered the unacked deposit tail (round " + rounds[0] + "): " + tail
+                        + " deposits after " + (now - progressAt[0]) + " ms without an ack, the session on leader "
+                        + session.client.leaderMemberId() + " term " + session.client.leadershipTermId() + " (roles "
+                        + roles() + (waiting[0] == null ? "" : "; waited for: " + waiting[0]) + ")");
+                waiting[0] = null;
+                progressAt[0] = System.currentTimeMillis();
                 return false;
-            }, OP_TIMEOUT_MS, () -> "deposit ack for corr " + target + " (last " + in.maxDepositAckCorr + "; re-offered "
-                    + reoffered + "; roles " + roles() + ": an election drops uncommitted ingress)");
+            }, REOFFER_TOTAL_MS, () -> "deposit ack for corr " + target + " (last " + in.maxDepositAckCorr
+                    + "; re-offered " + reoffered + " in " + rounds[0] + " rounds within " + REOFFER_TOTAL_MS
+                    + " ms (core.rig.reoffer.total.ms); roles " + roles()
+                    + (waiting[0] == null ? "" : "; last wait: " + waiting[0])
+                    + ": an election drops uncommitted ingress)");
+        }
+
+        /**
+         * Null when this session can carry a re-offer: a live member is LEADER, the session's leader is that member
+         * (its NewLeaderEvent arrived) and the ingress publication to it is connected. Otherwise why not.
+         */
+        private String notConnectedToTheLeader() {
+            final AeronCluster client = session.client;
+            if (client.isClosed()) {
+                return "the session is closed";
+            }
+            Member leader = null;
+            for (final Member m : members) {
+                if (!m.killed && m.role() == Cluster.Role.LEADER) {
+                    leader = m;
+                    break;
+                }
+            }
+            if (leader == null) {
+                return "no live member is LEADER";
+            }
+            if (client.leaderMemberId() != leader.id) {
+                return "the session still names leader " + client.leaderMemberId() + ", member " + leader.id + " leads";
+            }
+            final io.aeron.Publication ingress = client.ingressPublication();
+            if (ingress == null || !ingress.isConnected()) {
+                return "the ingress publication to member " + leader.id + " is not connected";
+            }
+            return null;
         }
     }
+
+    /**
+     * The bound of a deposit wait with identity, re-offers included ({@code -Dcore.rig.reoffer.total.ms}, default
+     * {@link #OP_TIMEOUT_MS}).
+     */
+    static final long REOFFER_TOTAL_MS = Long.getLong("core.rig.reoffer.total.ms", OP_TIMEOUT_MS);
 
     /** The rig's former deposit helper (no requestId, no re-offer): reproduces the strand of an election. */
     static final boolean DEPOSITS_WITHOUT_IDENTITY =
@@ -287,7 +355,7 @@ final class ShadowClusterRig implements AutoCloseable {
     /**
      * The consensus modules' leader heartbeat timeout, read at each boot. Three members, their drivers and archives
      * share one JVM: on a loaded runner a pause of about a second right after a snapshot is enough for an election, and
-     * an election drops the client ingress the old leader had not committed ({@link Client#deposits} offers once).
+     * an election drops the client ingress the old leader had not committed (a client without identity offers its deposits once).
      */
     long leaderHeartbeatTimeoutMs = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MS;
     /** Every stderr line that names (the halt texts), recorded like the stdout tee. */

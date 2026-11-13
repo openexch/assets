@@ -46,7 +46,8 @@ public class ShadowProducerCrashSweepTest {
             final Member d = rig.members.get(ShadowProducerRoleTest.designated(rig, leader.id));
             final Client admin = rig.connect(SessionClass.ADMIN, leader);
             rig.adopt(admin);
-            final Client tool = rig.connect(SessionClass.TOOL, leader);
+            // identity: a loaded runner can elect right after a snapshot, which drops the deposits not yet committed
+            final Client tool = rig.connect(SessionClass.TOOL, leader).withIdentity();
             tool.deposits(100);
             ShadowProducerRoleTest.awaitArmed(rig);
             final long p1 = rig.snapshotAll();
@@ -80,7 +81,7 @@ public class ShadowProducerCrashSweepTest {
                         + ServiceProbe.shadowCounter(d.service, ShadowCounters.Counter.CRASHED_WRITES_PURGED_TOTAL));
             }
             final long sweptMs = (System.nanoTime() - swept0) / 1_000_000;
-            final Client tool2 = rig.connect(SessionClass.TOOL, rig.awaitLeader(null));
+            final Client tool2 = rig.connect(SessionClass.TOOL, rig.awaitLeader(null)).withIdentity();
             tool2.deposits(20);
             final Member leaderNow = rig.awaitLeader(null);
             final Member dNow = rig.members.get(ShadowProducerRoleTest.designated(rig, leaderNow.id));

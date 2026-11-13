@@ -16,8 +16,10 @@ import static org.junit.Assert.assertTrue;
 /**
  * The rig's deposits under an election (three members, the clients on a follower's driver). A first batch is acked;
  * a second batch is offered and the leader is killed before any of its answers is awaited, so the tail the old leader
- * had not answered is dropped or committed without an ack. The rig re-offers that tail once, with the same requestIds,
- * after the election window; the core answers what it already applied with its stored decision and credits nothing.
+ * had not answered is dropped or committed without an ack. The rig re-offers that tail with the same requestIds once
+ * the session follows the new leader and no ack came for the election window (again after each further window, within
+ * {@code core.rig.reoffer.total.ms}); the core answers what it already applied with its stored decision and credits
+ * nothing.
  * Then ten applied
  * deposits are offered again on purpose (an ack the client never saw): ten replay answers, no credit. Every user's
  * balance is exactly the deposits it was sent.

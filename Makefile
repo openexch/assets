@@ -32,7 +32,7 @@ nightly:
 # The shadow rows (puller, leader gate, re-bootstrap, interop, the follower producer). The log channel's socket buffers
 # need net.core.rmem_max and wmem_max >= 16777216 on this host (the member boot probe refuses less).
 nightly-shadow:
-	mvn -pl core-cluster -am test -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest,EmbeddedDriverDirProcessTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.producer.guard.nightly=true
+	mvn -pl core-cluster -am test -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest,EmbeddedDriverDirProcessTest,ShadowClusterRigDepositIdentityTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.producer.guard.nightly=true
 	mvn -pl core-cluster -am test -Dtest='ShadowProducerRoleTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.producer.members=3
 	mvn -pl core-cluster -am test -Dtest='ShadowPullerClusterTest' -Dsurefire.failIfNoSpecifiedTests=false -Dcore.pull.100k=true
 

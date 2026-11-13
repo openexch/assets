@@ -133,8 +133,9 @@ jobs:
           retention-days: 14
 
   # Nightly shadow rows: the member puller, the leader gate, the replica re-bootstrap, the interop and external-driver
-  # pull rows, and the follower producer (three-member role story, guard rows, abort on leadership, crashed-write
-  # sweep). A job of its own so each nightly job stays under its timeout.
+  # pull rows, the follower producer (three-member role story, guard rows, abort on leadership, crashed-write
+  # sweep) and the rig's deposit identity under a leader kill. A job of its own so each nightly job stays under its
+  # timeout.
   nightly-shadow:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -161,7 +162,7 @@ jobs:
       - name: Nightly shadow (puller, leader gate, re-bootstrap, interop, external pull and producer rows, follower producer)
         run: >-
           mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
-          -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap,ShadowRestoreExternalDriverProcessTest#theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest,EmbeddedDriverDirProcessTest'
+          -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap,ShadowRestoreExternalDriverProcessTest#theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest,EmbeddedDriverDirProcessTest,ShadowClusterRigDepositIdentityTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.pull.external=true -Dcore.producer.external=true -Dcore.producer.guard.nightly=true
         env:
