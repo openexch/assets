@@ -103,7 +103,8 @@ public class ShadowProducerRoleTest {
             Member leader = rig.awaitLeader(null);
             final Client admin = rig.connect(SessionClass.ADMIN, leader);
             rig.adopt(admin);
-            final Client tool = rig.connect(SessionClass.TOOL, leader);
+            // identity: a loaded runner can elect right after a snapshot, which drops the deposits not yet committed
+            final Client tool = rig.connect(SessionClass.TOOL, leader).withIdentity();
             if (big) {
                 accounts(rig, tool, 100_000);
             }
@@ -129,7 +130,7 @@ public class ShadowProducerRoleTest {
                 rig.restart(old); // two members: no quorum until it is back
             }
             leader = rig.awaitLeader(n == 2 ? null : old);
-            final Client tool2 = rig.connect(SessionClass.TOOL, leader);
+            final Client tool2 = rig.connect(SessionClass.TOOL, leader).withIdentity();
             if (n > 2) {
                 rig.restart(old);
             }

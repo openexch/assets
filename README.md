@@ -28,7 +28,7 @@ v1 has no user-facing gateway yet.
 | `core-cluster` | the engine: domain model, deterministic engine, Aeron cluster service. Entry point `com.openexchange.core.Main` | `core-cluster/target/core-cluster.jar` |
 | `core-bridge` | Java settlement bridge: tails the matching engine's settlement journal and forwards trades and terminal order statuses into the cluster. Entry point `com.openexchange.core.bridge.BridgeMain` | `core-bridge/target/core-bridge.jar` |
 | `core-projector` | follows the money journal (an Aeron Archive recording) and projects every money movement into PostgreSQL, resumable from the PostgreSQL high-water mark. Entry point `com.openexchange.core.projector.ProjectorMain` | `core-projector/target/core-projector.jar` |
-| `core-loadgen` | money-path benchmark driver: hold, ME order, trade, settlement journal, bridge, settle, with latencies measured from the scheduled send time. Entry point `com.openexchange.core.loadgen.MoneyLoadGenerator` | `core-loadgen/target/core-loadgen.jar` |
+| `core-loadgen` | money-path benchmark driver: hold, ME order, trade, settlement journal, bridge, settle, with latencies measured from the scheduled send time. Entry point `com.openexchange.core.loadgen.MoneyLoadGenerator`; the order load generator `com.openexchange.core.loadgen.CoreOrderLoadGenerator` (see Order load generator) | `core-loadgen/target/core-loadgen.jar` |
 
 `grafana/` holds Prometheus scrape config and alert rules.
 
@@ -54,7 +54,7 @@ With the dependencies already in `~/.m2`, the Makefile targets work without `-s`
 | `make integration` | boots a real single-node embedded-driver cluster in-process and drives it over the wire |
 | `make nightly` | the slow tests (100k-account restore, 1M sizing, large scenario, the long replica process tests) that CI runs on its nightly schedule |
 
-Pull requests run `mvn verify -Pfast`, which leaves the long replica process tests to the nightly job (the shadow puller, leader-gate, re-bootstrap, member-replica pull and the two external-driver pull (`-Dcore.pull.external=true`) stories run in the nightly job with three members, and the 100k-account pull with `-Dcore.pull.100k=true`); a plain `mvn verify` runs everything. `integration` and `nightly` launch clusters. On a machine that also runs a live engine, pin them to spare cores, for example `taskset -c 20-23 make integration`.
+Pull requests run `mvn verify -Pfast`, which leaves the long replica process tests to the nightly job (the shadow puller, leader-gate, re-bootstrap, member-replica pull and the two external-driver pull (`-Dcore.pull.external=true`) stories run in the nightly job with three members, and the 100k-account pull with `-Dcore.pull.100k=true`); a plain `mvn verify` runs everything. The nightly replica load rows (lag, supplier loss, leader loss, replica kill, wipe and re-bootstrap under order load) take every bound as a `-Dcore.lag.*` property; the supplier-loss bound `core.lag.peerloss.bound.s` defaults to 30 s because the recovery is the supplier's liveness timeout (about 3 s), the backup's 12 s cool-down, one backup query and the catch-up of the bytes written meanwhile, measured at 16 to 28 s on the dev box; 20 s failed one run in four. `integration` and `nightly` launch clusters. On a machine that also runs a live engine, pin them to spare cores, for example `taskset -c 20-23 make integration`.
 
 The feed harness jar used by cluster-tools' compatibility tests is built with `mvn -s .mvn-settings.xml -pl core-cluster -am -Pfeed-harness -DskipTests package` and published on demand by `.github/workflows/feed-harness.yml` (run it by hand on the commit to publish) as the asset `core-feed-harness-<sha>.jar` of the single `feed-harness` prerelease.
 
@@ -80,8 +80,9 @@ The main engine settings:
 | `AERON_DIR` | Aeron default + `-core-<id>-driver` | media driver directory in external mode |
 | `TRANSPORT_IDLE_MODE` | `backoff` | `busy_spin` for dedicated cores |
 | `TRANSPORT_INTERFACE`, `TRANSPORT_MTU` (`8192`), `TRANSPORT_TERM_LENGTH` (`16m`), `TRANSPORT_LOG_TERM_LENGTH` (`64m`), `TRANSPORT_SNAPSHOT_TERM_LENGTH` (`64m`) | | transport tuning |
-| `TRANSPORT_LOG_RCV_WINDOW` | `16m` | the log channel's receiver window (`rcv-wnd`), 64k..`TRANSPORT_LOG_TERM_LENGTH`/2; above half the term refuses the boot |
+| `TRANSPORT_LOG_RCV_WINDOW` | min(16m, term/2), logged at boot | the log channel's receiver window (`rcv-wnd`), 64k..`TRANSPORT_LOG_TERM_LENGTH`/2. Unset, it derives min(16m, `TRANSPORT_LOG_TERM_LENGTH`/2) (a 16m term gets 8m, the fixture's 1m term 512k, 32m and 64m terms 16m) and the boot guard's line names it: `[BOOT-GUARD] log channel <uri> rcv-wnd 8m derived (min(16m, term/2) of 16m): ...`; a term below 128k cannot derive a legal window and refuses. An explicit value is taken as given (`rcv-wnd <w> set`); above half the term it refuses the boot |
 | `TRANSPORT_LOG_SO_RCVBUF`, `TRANSPORT_LOG_SO_SNDBUF` | `16m` | the log channel's socket buffers (64k..1g); `SO_RCVBUF` below the window refuses the boot |
+| `ARCHIVE_SEGMENT_LENGTH` | max(64m, `TRANSPORT_LOG_TERM_LENGTH`), logged at boot | the archive's segment file length (members and the replica). A log purge removes whole segments only, so a log keeps up to one segment below the floor; a small box or a test fixture sets it down (the docker fixture runs 1m) so its logs actually purge. A power of two in [64k, 1g] and at least `TRANSPORT_LOG_TERM_LENGTH` (Aeron would raise the log's segments to the term silently); anything else refuses the boot. The boot guard's line names it: `[BOOT-GUARD] archive segment 1m set (1048576 B; ...)`. `-Daeron.archive.segment.file.length` is not read: the core sets the length explicitly |
 | `CORE_DRIVER_DIR_ACTIVE_MS` | `10000` | embedded mode: a driver directory whose heartbeat is at most this old belongs to a live driver and refuses the boot (2000..600000); external mode ignores it |
 | `BALANCE_FEED_CHANNEL`, `BALANCE_FEED_STREAM_ID` | unset (off) | optional balance update side channel |
 | `CORE_LEADER_HEARTBEAT_INTERVAL_MS` | `100` | how often the leader sends a heartbeat |
@@ -180,6 +181,22 @@ by as much as `shadow_trigger_total{kind="ALIGNED"}`, and `shadow_replica_verifi
 `docs/replica.md` ("Live oracle").
 
 HTTP endpoints: each engine member serves `/health`, `/ready` and `/metrics` on its probe port. The bridge serves `/health` and `/metrics` on `BRIDGE_METRICS_PORT` (default 9600), the projector on `PROJECTOR_METRICS_PORT` (default 9601).
+
+## Order load generator
+
+`CoreOrderLoadGenerator` drives the core alone through one authenticated GATEWAY session (`CORE_AUTH_CREDENTIAL`): a ramp places `--open-orders` resting LIMIT GTC orders over `--users` and `--markets`, then a steady open-loop phase sends `--rate` slots per second for `--duration` seconds, a slot being one CreateOrder plus one CancelOrder of the oldest open order (`--mix create-only` sends the create alone). It ships in the same jar as a second main class:
+
+```
+java -cp core-loadgen/target/core-loadgen.jar com.openexchange.core.loadgen.CoreOrderLoadGenerator \
+  --core-hosts 10.0.0.1,10.0.0.2,10.0.0.3 --core-port-base 9300 --rate 1000 --duration 60 --out results
+```
+
+- Identity: every CreateOrder, CancelOrder and Deposit carries a fresh 128-bit requestId (the core rejects a create without one); the clientOrderId is the requestId; the correlationId is the slot number.
+- Elections: on a NewLeader event, or when an answer is older than `--reoffer-after-ms` (default 2000, the heartbeat timeout plus one election), the unanswered commands are offered once more with the same ids. The core answers a command it already applied with its stored decision (`duplicate` set) and applies nothing; such answers are counted as `replayed`. A command still unanswered when the run drains is `unanswered` and the run exits 1.
+- The user-count rule: the core keeps 256 requestId decisions per user for 15 minutes, and the ramp's creates and the two `--prefund` deposits per user take requestIds from the same cap, so the run needs `--users` >= ceil((2 x rate x 900 + open orders) / (256 - deposits)), deposits 2 with `--prefund` and 0 without (7032 at 1000 slots/s with no ramp and no prefunding, 7481 with the default 100000 open orders and `--prefund`); below it the generator refuses to start rather than measure `TOO_MANY_PENDING_REQUESTS`.
+- Measurement: create and cancel to their OrderAck from the slot's scheduled time (a stall is never hidden), the warm-up (`--warmup`) excluded; `summary.json` (build sha, settings, counts, rejects by reason, percentiles, the leader's `core_log_position` growth when `--metrics-url` is given) and `seconds.tsv` (per-second maxima) under `--out`.
+- Optional: `--prefund` deposits to every user through a TOOL session (`CORE_TOOL_AUTH_CREDENTIAL`), `--gate-open` opens the global gate through an ADMIN session (`CORE_ADMIN_AUTH_CREDENTIAL`). `--aeron-dir` attaches to an external aeronmd, otherwise an embedded driver runs with `--idle busy_spin|backoff`. A bad setting exits 2 with one line naming the flag; `--help` lists them.
+- In a test JVM the same `CoreOrderLoadGenerator.Session` runs against a rig's sessions (`tick` on the polling thread, the session as the egress listener).
 
 ## Releases
 

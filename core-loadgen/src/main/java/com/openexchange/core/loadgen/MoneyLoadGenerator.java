@@ -14,7 +14,6 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.Header;
 import org.HdrHistogram.Histogram;
-import org.HdrHistogram.SingleWriterRecorder;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableDirectByteBuffer;
 import org.agrona.collections.Long2LongHashMap;
@@ -207,38 +206,22 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     // ---- latency tracks (ns) ----
     /**
      * The duty thread is the ONLY writer (recordValue, wait-free); the interval-log thread and the
-     * final report are the only readers, serialized by the synchronized flip methods. Cumulative
-     * keeps the newHist() bounds/digits, so the final report and hgrm output are unchanged.
+     * final report are the only readers, serialized by the synchronized flip methods (LatencyTracks).
      */
     private static final class Track {
         final String name;
-        private final SingleWriterRecorder recorder = new SingleWriterRecorder(3);
-        private final Histogram cumulative = newHist();
-        private Histogram recycled;
+        private final LatencyTracks.Track t;
 
-        Track(final String name) { this.name = name; }
-
-        void recordValue(final long v) { recorder.recordValue(v); }
-
-        /** Fold the interval since the last flip into cumulative; recycled IS that interval. */
-        private void flip() {
-            recycled = recorder.getIntervalHistogram(recycled);
-            cumulative.add(recycled);
+        Track(final String name) {
+            this.name = name;
+            this.t = new LatencyTracks.Track(name);
         }
 
-        synchronized Histogram cumulative() {
-            flip();
-            return cumulative;
-        }
+        void recordValue(final long v) { t.recordValue(v); }
 
-        synchronized void printIntervalLine(final PrintStream out, final String stampPrefix) {
-            flip();
-            out.printf(Locale.ROOT, "%strack=%s n=%d p50_ms=%.2f p99_ms=%.2f max_ms=%.2f%n",
-                    stampPrefix, name, recycled.getTotalCount(),
-                    recycled.getValueAtPercentile(50) / 1e6,
-                    recycled.getValueAtPercentile(99) / 1e6,
-                    recycled.getMaxValue() / 1e6);
-        }
+        Histogram cumulative() { return t.cumulative(); }
+
+        void printIntervalLine(final PrintStream out, final String stampPrefix) { t.printIntervalLine(out, stampPrefix); }
     }
 
     private final Track holdAckHist = new Track("hold-ack");
@@ -256,7 +239,6 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     /** ILOG emission order; names match the hgrm file names. */
     private final Track[] tracks = {
             holdAckHist, orderAckHist, meLegHist, tradeToSettledHist, settleLeadHist, orderToSettledHist };
-    private static Histogram newHist() { return new Histogram(TimeUnit.MINUTES.toNanos(2), 3); }
     private static final DateTimeFormatter ILOG_TS =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
 
@@ -512,11 +494,10 @@ public final class MoneyLoadGenerator implements AutoCloseable {
     private void run() {
         if (prefund) prefundUsers();
 
-        final long nanosPerOrder = 1_000_000_000L / rate;
         final long startNs = System.nanoTime();
         this.measureStartNs = startNs + TimeUnit.SECONDS.toNanos(warmupSec);
         final long sendEndNs = measureStartNs + TimeUnit.SECONDS.toNanos(durationSec);
-        long nextScheduledNs = startNs;
+        final OpenLoopSchedule schedule = new OpenLoopSchedule(startNs, rate);
         long lastKeepAliveNs = startNs;
         long orderSeq = 0;
 
@@ -553,13 +534,12 @@ public final class MoneyLoadGenerator implements AutoCloseable {
             // Send exactly on the fixed timeline. The schedule NEVER resets to `now`:
             // if we are behind (window full / backpressure), orders go out late and their
             // latency is charged from the slot they SHOULD have occupied (CO-safe).
-            if (now >= nextScheduledNs) {
-                final long backlog = (now - nextScheduledNs) / nanosPerOrder;
+            if (schedule.due(now)) {
+                final long backlog = schedule.backlog(now);
                 if (backlog > scheduleBacklogMax) scheduleBacklogMax = backlog;
                 if (pending.size() < window) {
                     ++orderSeq;
-                    startLifecycle(orderIdBase + orderSeq, orderSeq, nextScheduledNs);
-                    nextScheduledNs += nanosPerOrder;
+                    startLifecycle(orderIdBase + orderSeq, orderSeq, schedule.t0(schedule.take(now)));
                 }
                 // window full: keep polling; the slot stays owed and is sent as soon as
                 // capacity frees, still stamped with its original scheduled time.
@@ -944,7 +924,7 @@ public final class MoneyLoadGenerator implements AutoCloseable {
         }
     }
 
-    private static long clamp(final long ns) { return Math.max(0, Math.min(ns, TimeUnit.MINUTES.toNanos(2) - 1)); }
+    private static long clamp(final long ns) { return LatencyTracks.clamp(ns); }
 
     /**
      * Core substrate report. The headline is deliberately ACKED round trips per second, not offers:

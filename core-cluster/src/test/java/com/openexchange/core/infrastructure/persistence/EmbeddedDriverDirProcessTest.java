@@ -169,6 +169,83 @@ public class EmbeddedDriverDirProcessTest {
         System.out.println("GREEN (b): after the bound the member replaced the stale directory and is ready");
     }
 
+    /**
+     * A member with a 16m log term and no receive window (the dev-laptop and dev-box profiles) boots and reaches the
+     * service: the unset window derives {@code min(16m, term / 2)} = 8m and the boot line says so. Before the
+     * derivation the unset window was a fixed 16m and the boot guard refused every 16m term with exit 1.
+     */
+    @Test
+    public void aSixteenMegTermMemberWithNoWindowReachesTheService() throws Exception {
+        final Path base = tmp("w");
+        final String aeronDir = base.resolve("aeron").toString();
+        final Map<String, String> profile = new java.util.HashMap<>();
+        profile.put("TRANSPORT_LOG_TERM_LENGTH", "16m");
+        profile.put("TRANSPORT_LOG_RCV_WINDOW", "");
+        profile.put("TRANSPORT_LOG_SO_RCVBUF", "");
+        profile.put("TRANSPORT_LOG_SO_SNDBUF", "");
+        final Child member = child("w-sixteen", base, aeronDir, profile);
+        awaitReady(member, 90_000);
+        final String out = Files.readString(member.log);
+        assertTrue(out, out.contains("[BOOT-GUARD] log channel aeron:udp?term-length=16m|rcv-wnd=8m|so-rcvbuf=16m"
+                + "|so-sndbuf=16m rcv-wnd 8m derived (min(16m, term/2) of 16m): "));
+        System.out.println("GREEN 16m term, no window: ready; " + line(out, "[BOOT-GUARD] log channel"));
+    }
+
+    /**
+     * A member booted with {@code ARCHIVE_SEGMENT_LENGTH=1m} records its log in 1 MiB segments and the boot guard names
+     * the length. Before the setting the archive context hard-coded 64 MiB and silently overrode the child's
+     * {@code -Daeron.archive.segment.file.length=1048576}, so the log recording carried 64 MiB segments and a small
+     * fixture's logs never purged.
+     */
+    @Test
+    public void aMemberBootedWithAOneMegSegmentLengthRecordsOneMegSegments() throws Exception {
+        final Path base = tmp("seg");
+        final String aeronDir = base.resolve("aeron").toString();
+        final Map<String, String> profile = new java.util.HashMap<>();
+        profile.put("TRANSPORT_LOG_TERM_LENGTH", "1m");
+        // explicit, so the same row boots on a head without the derived window
+        profile.put("TRANSPORT_LOG_RCV_WINDOW", "512k");
+        profile.put("ARCHIVE_SEGMENT_LENGTH", "1m");
+        final Child member = child("seg", base, aeronDir, profile);
+        awaitReady(member, 90_000);
+        member.process.destroy();
+        assertTrue("the member did not stop", member.process.waitFor(30, TimeUnit.SECONDS));
+        final String out = Files.readString(member.log);
+        final java.io.ByteArrayOutputStream catalog = new java.io.ByteArrayOutputStream();
+        io.aeron.archive.ArchiveTool.describe(new java.io.PrintStream(catalog, true, "UTF-8"),
+                base.resolve("state-seg").resolve(ClusterConfig.ARCHIVE_SUB_DIR).toFile());
+        final String descriptors = catalog.toString("UTF-8");
+        String logDescriptor = null;
+        for (final String l : descriptors.split("\n")) {
+            if (l.contains("|streamId=100|")) {
+                logDescriptor = l;
+            }
+        }
+        assertTrue("no log recording (stream 100) in the catalog: " + descriptors, logDescriptor != null);
+        final java.util.regex.Matcher m = java.util.regex.Pattern.compile("segmentFileLength=(\\d+)")
+                .matcher(logDescriptor);
+        assertTrue(logDescriptor, m.find());
+        assertEquals("the log recording's segment length: " + logDescriptor, 1_048_576L, Long.parseLong(m.group(1)));
+        assertTrue(out, out.contains("[BOOT-GUARD] archive segment 1m set (1048576 B; "));
+        System.out.println("GREEN 1m segments: " + line(out, "[BOOT-GUARD] archive segment") + "; log recording "
+                + m.group());
+    }
+
+    /** Control: a segment length below the log term refuses the boot with exit 1 and the text (Aeron would raise it). */
+    @Test
+    public void aSegmentLengthBelowTheLogTermRefusesTheBoot() throws Exception {
+        final Path base = tmp("segrefuse");
+        final Map<String, String> profile = new java.util.HashMap<>();
+        profile.put("ARCHIVE_SEGMENT_LENGTH", "1m");
+        final Child member = child("segrefuse", base, base.resolve("aeron").toString(), profile);
+        assertTrue("the member did not exit", member.process.waitFor(60, TimeUnit.SECONDS));
+        final String out = Files.readString(member.log);
+        assertEquals(out, 1, member.process.exitValue());
+        assertTrue(out, out.contains("CORE BOOT GUARD: ARCHIVE_SEGMENT_LENGTH 1m below TRANSPORT_LOG_TERM_LENGTH 4m:"
+                + " Aeron would raise the log's segments to the term silently"));
+        System.out.println("GREEN refusal: " + line(out, "ARCHIVE_SEGMENT_LENGTH"));
+    }
+
     // ------------------------------------------------------------------------------------------------ children
 
     private record Child(Process process, Path log, int probePort) {
@@ -200,6 +277,8 @@ public class EmbeddedDriverDirProcessTest {
         e.put("CLUSTER_PORT_BASE", String.valueOf(freePort()));
         e.put("CORE_NODE_PORT", String.valueOf(probePort));
         e.putAll(env);
+        // an empty value in env means unset: the profile shape that sets nothing
+        e.values().removeIf(String::isEmpty);
         final Process p = pb.redirectErrorStream(true).redirectOutput(log.toFile()).start();
         processes.add(p);
         return new Child(p, log, probePort);

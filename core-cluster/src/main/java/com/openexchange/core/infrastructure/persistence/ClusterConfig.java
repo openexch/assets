@@ -146,7 +146,9 @@ public final class ClusterConfig {
                 .recordingEventsEnabled(false)
                 .threadingMode(ArchiveThreadingMode.DEDICATED)
                 .catalogCapacity(1024 * 1024)
-                .segmentFileLength(64 * 1024 * 1024)
+                // ARCHIVE_SEGMENT_LENGTH (default max(64m, log term)); the boot guard refused a bad value already
+                .segmentFileLength(
+                        com.openexchange.core.infrastructure.TransportConfig.ArchiveSegment.fromEnv().lengthInt())
                 .maxConcurrentRecordings(10)
                 .maxConcurrentReplays(10);
 

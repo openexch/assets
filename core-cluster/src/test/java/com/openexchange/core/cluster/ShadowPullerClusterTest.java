@@ -30,8 +30,10 @@ import static org.junit.Assert.assertTrue;
  * locally (alias and payload digest equal to the source's); a byte-flipped copy at a second position is refused for
  * its content on every follower and never pulled again in three periods; a follower whose shadows were wiped and whose
  * log was purged below P_cm restores at restart through the startup pull (3b): {@code restored path=EQUAL}, image
- * equal to the leader's, the time to ready recorded. Then the same follower with a source that answers nothing halts
- * with the pull named in the runbook text.
+ * equal to the leader's, the time to ready recorded. Then the same follower restarts with dead local shadows
+ * (descriptors kept, segment files deleted): the restore's first scan reads each once, the scan after its pull holds
+ * them (scan_ms well under the first's), and it restores EQUAL. Then the same follower with a source that answers
+ * nothing halts with the pull named in the runbook text.
  *
  * <p>Variants: {@code -Dcore.pull.members} 3 (the only value: with the leader-source skip a follower's only non-leader
  * source in a two-member cluster is itself), {@code -Dcore.pull.100k=true}
@@ -183,6 +185,36 @@ public class ShadowPullerClusterTest {
                     + " ms (SNAPSHOT_RESTORE_READY_BUDGET_MS "
                     + f.settings.readyBudgetMs() + " is a measurement)");
 
+            // dead local shadows: f's shadow recordings keep their descriptors and lose their segment files. The
+            // restore's first scan reads each dead descriptor once (the archive answers a missing segment only after
+            // its replay connect timeout); the scan after the 3b pull holds them instead of reading them again
+            rig.await(() -> ServiceProbe.puller(f.service) != null, 30_000, "f's puller never restarted");
+            ServiceProbe.puller(f.service).close();
+            final List<Long> dead = shadowRecordings(rig, f);
+            assertTrue("f holds a shadow to kill: " + dead, !dead.isEmpty());
+            rig.tee.clear();
+            rig.errTee.clear();
+            rig.kill(f);
+            assertTrue("segment files deleted for " + dead, deleteSegments(f, dead) >= dead.size());
+            rig.restart(f);
+            rig.await(() -> !rig.tee.all("restored path=").isEmpty(), 180_000,
+                    "no restore path line after the dead-shadow restart");
+            rig.awaitReady(f, 180_000);
+            assertTrue(f.halts.toString(), f.halts.isEmpty());
+            RestoreDrillDryRun.requirePathLine(rig.tee, "EQUAL", "startup pull over dead local shadows");
+            final String first = StubStory.line(rig.tee.lines, "[shadow restore] restore from stub");
+            final String after = StubStory.line(rig.tee.lines, "[shadow restore] after the pull:");
+            assertNotNull("the restore pulled: " + rig.tee.all("[shadow restore]"), after);
+            assertTrue("the first scan found the dead shadows: " + first, field(first, "errors") >= dead.size());
+            final long firstMs = field(first, "scan_ms");
+            final long afterMs = field(after, "scan_ms");
+            assertTrue("non-vacuous: the dead reads cost the first scan " + firstMs + " ms (" + first + ")",
+                    firstMs >= 1_000);
+            assertTrue("the scan after the pull read the dead shadows again: " + afterMs + " ms against the first "
+                    + firstMs + " ms (" + after + ")", afterMs * 2 < firstMs);
+            System.out.println("GREEN 3b dead local shadows: " + dead.size() + " dead, first scan " + firstMs
+                    + " ms, scan after the pull " + afterMs + " ms (held), restored EQUAL");
+
             // the same member, its shadows wiped again, with a source that answers nothing: the halt names the pull
             rig.await(() -> ServiceProbe.puller(f.service) != null, 30_000, "f's puller never restarted");
             ServiceProbe.puller(f.service).close();
@@ -201,6 +233,48 @@ public class ShadowPullerClusterTest {
             assertTrue(halt, halt.contains("(3) pull: tried 1 sources, 0 candidates, refused 0, last: no candidate"));
             System.out.println("GREEN 3b unreachable source -> " + halt.trim());
         }
+    }
+
+    /** The recording ids of {@code m}'s stopped shadow recordings (stream {@code ShadowAlias.STREAM_ID}). */
+    static List<Long> shadowRecordings(final ShadowClusterRig rig, final Member m) {
+        final List<Long> ids = new ArrayList<>();
+        rig.archive(m).listRecordingsForUri(0, 10_000,
+                com.openexchange.cluster.shadow.ShadowAlias.prefix(
+                        com.openexchange.core.infrastructure.persistence.CoreLogApplier.ENGINE_ID_CORE),
+                com.openexchange.cluster.shadow.ShadowAlias.STREAM_ID,
+                (controlSessionId, correlationId, recordingId, startTimestamp, stopTimestamp, startPosition,
+                 stopPosition, initialTermId, segmentFileLength, termBufferLength, mtuLength, sessionId, streamId,
+                 strippedChannel, originalChannel, sourceIdentity) -> {
+                    if (stopPosition != io.aeron.archive.client.AeronArchive.NULL_POSITION
+                            && streamId == com.openexchange.cluster.shadow.ShadowAlias.STREAM_ID) {
+                        ids.add(recordingId);
+                    }
+                });
+        return ids;
+    }
+
+    /** Deletes the segment files of {@code ids} from a killed member's archive directory; the catalog keeps them. */
+    static int deleteSegments(final Member m, final List<Long> ids) {
+        int deleted = 0;
+        final java.io.File[] files = m.archiveDir().listFiles();
+        for (final java.io.File file : files == null ? new java.io.File[0] : files) {
+            final String name = file.getName();
+            final int dash = name.indexOf('-');
+            if (name.endsWith(".rec") && dash > 0 && ids.contains(Long.parseLong(name.substring(0, dash)))
+                    && file.delete()) {
+                deleted++;
+            }
+        }
+        return deleted;
+    }
+
+    /** {@code <name>=<long>} in a restore line. */
+    static long field(final String line, final String name) {
+        final java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b" + name + "=(\\d+)").matcher(line);
+        if (!m.find()) {
+            throw new AssertionError("no " + name + "= in: " + line);
+        }
+        return Long.parseLong(m.group(1));
     }
 
     /** The live members other than {@code leader}. */

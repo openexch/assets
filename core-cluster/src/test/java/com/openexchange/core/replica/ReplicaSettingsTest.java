@@ -243,6 +243,27 @@ public class ReplicaSettingsTest {
                 refusal("REPLICA_DRIVER_TERM_LENGTH", "3m"));
     }
 
+    /**
+     * {@code ARCHIVE_SEGMENT_LENGTH} reaches the replica's archive context with the members' rule and refusal texts
+     * (default 64m; before the setting the replica's archive always took the kit's 64 MiB).
+     */
+    @Test
+    public void archiveSegmentLengthReachesTheReplicaArchive() {
+        final org.agrona.ErrorHandler none = t -> { };
+        assertEquals(64 * 1024 * 1024, com.openexchange.cluster.replica.ReplicaContexts.archive(with().config(), none)
+                .segmentFileLength());
+        final ReplicaSettings one = with("TRANSPORT_LOG_TERM_LENGTH", "1m", "ARCHIVE_SEGMENT_LENGTH", "1m");
+        assertEquals(1024L * 1024, one.numeric(ReplicaSettings.Key.ARCHIVE_SEGMENT_LENGTH));
+        assertEquals(1024 * 1024, com.openexchange.cluster.replica.ReplicaContexts.archive(one.config(), none)
+                .segmentFileLength());
+        assertTrue(one.toString(), one.toString().contains("ARCHIVE_SEGMENT_LENGTH=1048576"));
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 1m below TRANSPORT_LOG_TERM_LENGTH 64m: Aeron would raise the log's"
+                + " segments to the term silently", refusal("ARCHIVE_SEGMENT_LENGTH", "1m"));
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 3m is not a power of two",
+                refusal("TRANSPORT_LOG_TERM_LENGTH", "1m", "ARCHIVE_SEGMENT_LENGTH", "3m"));
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 2g outside [64k, 1g]", refusal("ARCHIVE_SEGMENT_LENGTH", "2g"));
+    }
+
     @Test
     public void derivedDefaultsFollowTheirSources() {
         final ReplicaSettings s = with("SNAPSHOT_STANDBY_INTERVAL_MINUTES", "20", "REPLICA_MEMBER_BACKUP_WINDOW_MS",

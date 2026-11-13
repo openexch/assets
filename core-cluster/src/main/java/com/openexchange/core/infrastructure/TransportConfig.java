@@ -104,7 +104,9 @@ public final class TransportConfig {
     public static final String LOG_SO_SNDBUF = "TRANSPORT_LOG_SO_SNDBUF";
     /** {@code CORE_DRIVER_DIR_ACTIVE_MS}: the embedded driver directory bound (external mode ignores it). */
     public static final String DRIVER_DIR_ACTIVE_MS = "CORE_DRIVER_DIR_ACTIVE_MS";
+    /** The cap of the derived window: an unset window is {@code min(16m, term / 2)}. */
     public static final String DEFAULT_LOG_RCV_WINDOW = "16m";
+    public static final long MAX_DERIVED_LOG_WINDOW = 16L * 1024 * 1024;
     public static final String DEFAULT_LOG_SO_BUF = "16m";
     public static final long MIN_LOG_WINDOW = 64 * 1024;
     public static final long MIN_LOG_SO_BUF = 64 * 1024;
@@ -116,13 +118,26 @@ public final class TransportConfig {
      * they govern that channel under an embedded driver and under an external aeronmd alike (a URI value overrides the
      * driver context's default for that channel only); every other channel keeps the driver's own values.
      *
+     * <p>An unset (or blank) {@code TRANSPORT_LOG_RCV_WINDOW} derives {@code min(16m, term-length / 2)}, rendered as
+     * Aeron accepts it ({@code 8m}, {@code 512k}, or bytes) and named by {@link #windowLine()} in the boot guard's
+     * line; an explicit value is taken as given and never changed.</p>
+     *
      * <p>Refused at boot: a size that does not parse; {@code rcv-wnd} below 64k or above {@code term-length / 2}
-     * (Aeron would clamp the window to half the term silently); a socket buffer outside [64k, 1g]; {@code so-rcvbuf}
-     * below {@code rcv-wnd} (Aeron refuses that too, but late, at the subscription inside the follower's election).
-     * The kernel's grant of the two buffers is a separate boot probe ({@code SocketBufferProbe}).</p>
+     * (Aeron would clamp the window to half the term silently); a term below 128k when the window is derived (no legal
+     * window); a socket buffer outside [64k, 1g]; {@code so-rcvbuf} below {@code rcv-wnd} (Aeron refuses that too, but
+     * late, at the subscription inside the follower's election). The kernel's grant of the two buffers is a separate
+     * boot probe ({@code SocketBufferProbe}).</p>
      */
     public record LogTransport(String termLengthText, long termLength, String rcvWindowText, long rcvWindow,
-                               String soRcvbufText, long soRcvbuf, String soSndbufText, long soSndbuf) {
+                               String soRcvbufText, long soRcvbuf, String soSndbufText, long soSndbuf,
+                               boolean rcvWindowDerived) {
+
+        /** The window as the boot line names it: {@code rcv-wnd <w> derived (min(16m, term/2) of <t>)} or {@code set}. */
+        public String windowLine() {
+            return rcvWindowDerived
+                    ? "rcv-wnd " + rcvWindowText + " derived (min(16m, term/2) of " + termLengthText + ")"
+                    : "rcv-wnd " + rcvWindowText + " set";
+        }
 
         /** The log channel URI: {@code aeron:udp?term-length=<t>|rcv-wnd=<w>|so-rcvbuf=<r>|so-sndbuf=<s>}. */
         public String uri() {
@@ -141,11 +156,23 @@ public final class TransportConfig {
          */
         public static LogTransport parse(final java.util.function.Function<String, String> env) {
             final String term = text(env, LOG_TERM_LENGTH, "64m");
-            final String window = text(env, LOG_RCV_WINDOW, DEFAULT_LOG_RCV_WINDOW);
             final String rcv = text(env, LOG_SO_RCVBUF, DEFAULT_LOG_SO_BUF);
             final String snd = text(env, LOG_SO_SNDBUF, DEFAULT_LOG_SO_BUF);
             final long t = size(LOG_TERM_LENGTH, term);
-            final long w = size(LOG_RCV_WINDOW, window);
+            final boolean derived = text(env, LOG_RCV_WINDOW, null) == null;
+            final String window;
+            final long w;
+            if (derived) {
+                w = Math.min(MAX_DERIVED_LOG_WINDOW, t / 2);
+                if (w < MIN_LOG_WINDOW) {
+                    throw new IllegalArgumentException(LOG_TERM_LENGTH + " " + term + " too small for a 64k receive"
+                            + " window");
+                }
+                window = sizeText(w);
+            } else {
+                window = text(env, LOG_RCV_WINDOW, null);
+                w = size(LOG_RCV_WINDOW, window);
+            }
             final long r = size(LOG_SO_RCVBUF, rcv);
             final long s = size(LOG_SO_SNDBUF, snd);
             if (w < MIN_LOG_WINDOW) {
@@ -163,7 +190,18 @@ public final class TransportConfig {
                         + ": Aeron refuses this inside the follower's election (SubscriptionParams); set so-rcvbuf >="
                         + " rcv-wnd");
             }
-            return new LogTransport(term, t, window, w, rcv, r, snd, s);
+            return new LogTransport(term, t, window, w, rcv, r, snd, s, derived);
+        }
+
+        /** {@code bytes} as Aeron's size syntax accepts it: {@code <n>m}, {@code <n>k}, or plain bytes. */
+        static String sizeText(final long bytes) {
+            if (bytes % (1024L * 1024) == 0) {
+                return bytes / (1024L * 1024) + "m";
+            }
+            if (bytes % 1024 == 0) {
+                return bytes / 1024 + "k";
+            }
+            return Long.toString(bytes);
         }
 
         /** This process's settings (env first, then the system property, else the default). */
@@ -181,6 +219,74 @@ public final class TransportConfig {
             if (v < MIN_LOG_SO_BUF || v > MAX_LOG_SO_BUF) {
                 throw new IllegalArgumentException(name + " " + text + " outside [64k, 1g]");
             }
+        }
+    }
+
+    /** {@code ARCHIVE_SEGMENT_LENGTH}: the archive's segment file length, the granule a log purge removes. */
+    public static final String ARCHIVE_SEGMENT_LENGTH = "ARCHIVE_SEGMENT_LENGTH";
+    public static final String DEFAULT_ARCHIVE_SEGMENT_LENGTH = "64m";
+    public static final long MIN_ARCHIVE_SEGMENT_LENGTH = 64 * 1024;
+    public static final long MAX_ARCHIVE_SEGMENT_LENGTH = 1024L * 1024 * 1024;
+
+    /**
+     * The archive's segment file length. Every recording of the archive is cut into segment files of this length and a
+     * log purge removes whole segments only, so the length is also how far behind the floor a log keeps its start.
+     *
+     * <p>An unset (or blank) value is {@code max(64m, term-length)}: 64m as before the setting existed, and the log
+     * term when the term is longer, because Aeron raises the segment of a recording to its term length without a word.
+     * An explicit value is taken as given and must be a power of two in [64k, 1g] (Aeron's own range) and at least the
+     * log channel's term length (below it Aeron would raise the log's segments to the term silently). A recording whose
+     * term is longer than the segment (a snapshot on a 64m IPC term, for example) still gets its term as segment; only
+     * the log is checked, because the log is what a purge shortens.</p>
+     */
+    public record ArchiveSegment(String text, long length, boolean derived) {
+
+        /** As the boot line names it: {@code archive segment <s> set} or {@code ... derived (max(64m, term) of <t>)}. */
+        public String line(final String termText) {
+            return derived
+                    ? "archive segment " + text + " derived (max(64m, term) of " + termText + ")"
+                    : "archive segment " + text + " set";
+        }
+
+        /**
+         * @param env the setting's raw text by its env name, null when unset (reads {@code ARCHIVE_SEGMENT_LENGTH} and
+         *            {@code TRANSPORT_LOG_TERM_LENGTH})
+         * @throws IllegalArgumentException with the refusal text (no host prefix)
+         */
+        public static ArchiveSegment parse(final java.util.function.Function<String, String> env) {
+            final String raw = env.apply(ARCHIVE_SEGMENT_LENGTH);
+            final String termRaw = env.apply(LOG_TERM_LENGTH);
+            final String term = termRaw == null || termRaw.isBlank() ? "64m" : termRaw.trim();
+            final long t = size(LOG_TERM_LENGTH, term);
+            if (raw == null || raw.isBlank()) {
+                final long dflt = size(ARCHIVE_SEGMENT_LENGTH, DEFAULT_ARCHIVE_SEGMENT_LENGTH);
+                return t > dflt
+                        ? new ArchiveSegment(term, t, true)
+                        : new ArchiveSegment(DEFAULT_ARCHIVE_SEGMENT_LENGTH, dflt, false);
+            }
+            final String text = raw.trim();
+            final long s = size(ARCHIVE_SEGMENT_LENGTH, text);
+            if (s < MIN_ARCHIVE_SEGMENT_LENGTH || s > MAX_ARCHIVE_SEGMENT_LENGTH) {
+                throw new IllegalArgumentException(ARCHIVE_SEGMENT_LENGTH + " " + text + " outside [64k, 1g]");
+            }
+            if (Long.bitCount(s) != 1) {
+                throw new IllegalArgumentException(ARCHIVE_SEGMENT_LENGTH + " " + text + " is not a power of two");
+            }
+            if (s < t) {
+                throw new IllegalArgumentException(ARCHIVE_SEGMENT_LENGTH + " " + text + " below " + LOG_TERM_LENGTH
+                        + " " + term + ": Aeron would raise the log's segments to the term silently");
+            }
+            return new ArchiveSegment(text, s, false);
+        }
+
+        /** This process's setting (env first, then {@code archive.segment.length}, else the default). */
+        public static ArchiveSegment fromEnv() {
+            return parse(TransportConfig::settingFromEnv);
+        }
+
+        /** The length as Aeron's {@code segmentFileLength(int)} takes it (at most 1g, so it fits). */
+        public int lengthInt() {
+            return Math.toIntExact(length);
         }
     }
 

@@ -380,12 +380,17 @@ final class ShadowRestore {
                     shadowCounters);
             final ShadowImageLoader loader = new ShadowImageLoader(aeron, archive, verdicts, clock, loadTimeoutNs,
                     shadowCounters);
+            // a descriptor this restore's first scan cannot read (a segment file gone: the archive answers only after
+            // its replay connect timeout) stays SCAN_ERROR for the rest of the restore instead of being read again
+            catalog.holdUnknown(true);
+            final long scan0 = clock.nanoTime();
             final ShadowCatalog.Scan scan = catalog.scan();
             counters.set(SnapshotModeCounters.C.RESTORE_CANDIDATES_SCANNED, scan.all().size());
             System.out.println("[shadow restore] restore from stub P_cm=" + pCm + " term=" + stub.leadershipTermId()
                     + " genesisId=" + stub.genesisId() + ": " + scan.all().size() + " shadow recording(s), usable="
                     + scan.usable().size() + " conflicts=" + scan.conflicts().size() + " errors=" + scan.errors()
-                    + " logRecording=" + logRecordingId + " logStart=" + logStart);
+                    + " logRecording=" + logRecordingId + " logStart=" + logStart + " scan_ms="
+                    + TimeUnit.NANOSECONDS.toMillis(clock.nanoTime() - scan0));
 
             Selection sel = select(scan, pCm, logStart, terms, local, loader, aeron, archive);
 
@@ -395,10 +400,13 @@ final class ShadowRestore {
                 final ShadowPuller.Report report = pull(aeron, pCm, logStart, stub.genesisId());
                 pulled = report.text();
                 if (report.kind() == ShadowPuller.Report.Kind.VERIFIED) {
+                    final long scan1 = clock.nanoTime();
                     final ShadowCatalog.Scan again = catalog.scan();
                     counters.set(SnapshotModeCounters.C.RESTORE_CANDIDATES_SCANNED, again.all().size());
                     System.out.println("[shadow restore] after the pull: " + again.all().size()
-                            + " shadow recording(s), usable=" + again.usable().size() + "; rules 1-3 once more");
+                            + " shadow recording(s), usable=" + again.usable().size() + " errors=" + again.errors()
+                            + " scan_ms=" + TimeUnit.NANOSECONDS.toMillis(clock.nanoTime() - scan1)
+                            + "; rules 1-3 once more");
                     sel = select(again, pCm, logStart, terms, local, loader, aeron, archive);
                 }
             }

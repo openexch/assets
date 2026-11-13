@@ -253,8 +253,14 @@ final class CoreRestoreRig {
         private final RequestOrderSnapshotEncoder query = new RequestOrderSnapshotEncoder();
 
         int deposit(final long corr, final long user, final int asset, final long amount) {
+            return deposit(corr, user, asset, amount, 0, 0);
+        }
+
+        /** A deposit with its requestId (0/0: none, so it never dedupes). */
+        int deposit(final long corr, final long user, final int asset, final long amount, final long requestHigh,
+                    final long requestLow) {
             deposit.wrapAndApplyHeader(buf, 0, header).correlationId(corr).userId(user).assetId(asset).amount(amount)
-                    .requestIdHigh(0).requestIdLow(0);
+                    .requestIdHigh(requestHigh).requestIdLow(requestLow);
             return MessageHeaderEncoder.ENCODED_LENGTH + deposit.encodedLength();
         }
 
@@ -323,6 +329,12 @@ final class CoreRestoreRig {
 
     // ---------------------------------------------------------------- egress
 
+    /** One deposit ack as {@link Listener#depositTap} sees it. */
+    @FunctionalInterface
+    interface DepositAckTap {
+        void onDepositAck(long correlationId, boolean duplicate);
+    }
+
     /** Counts acks and rejects; keeps only the rare frames as text. Decoded on the polling thread. */
     static final class Listener implements EgressListener {
         final AtomicInteger registered = new AtomicInteger();
@@ -333,6 +345,15 @@ final class CoreRestoreRig {
         String lastAckStatus;
         String firstReject;
         long lastDepositAckCorr = -1;
+        /** The highest deposit ack correlation id (a replayed ack of an older deposit does not lower it). */
+        long maxDepositAckCorr = -1;
+        int depositAcks;
+        /** Deposit acks with the replay flag: the stored decision of a requestId already applied. */
+        int depositDuplicates;
+        /** Sees every deposit ack's correlation id and replay flag (null: none); runs on the polling thread. */
+        DepositAckTap depositTap;
+        /** The newest {@code newAvailable} per {@code userId * 64 + assetId}. */
+        final java.util.Map<Long, Long> availableByUserAsset = new java.util.concurrent.ConcurrentHashMap<>();
         final List<String> frames = new CopyOnWriteArrayList<>();
         final List<long[]> snapshotEnds = new CopyOnWriteArrayList<>(); // {corr, entryCount, nextOrderId, arrivedNs}
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
@@ -392,6 +413,18 @@ final class CoreRestoreRig {
                     if (depositAck.correlationId() != 0) {
                         lastDepositAckCorr = depositAck.correlationId();
                     }
+                    depositAcks++;
+                    if (depositAck.duplicate() == com.openexchange.core.infrastructure.generated.BoolFlag.TRUE) {
+                        depositDuplicates++;
+                    }
+                    if (depositAck.correlationId() > maxDepositAckCorr) {
+                        maxDepositAckCorr = depositAck.correlationId();
+                    }
+                    if (depositTap != null) {
+                        depositTap.onDepositAck(depositAck.correlationId(),
+                                depositAck.duplicate() == com.openexchange.core.infrastructure.generated.BoolFlag.TRUE);
+                    }
+                    availableByUserAsset.put(depositAck.userId() * 64 + depositAck.assetId(), depositAck.newAvailable());
                     break;
                 case OrderSnapshotEndDecoder.TEMPLATE_ID:
                     snapshotEnd.wrapAndApplyHeader(buffer, offset, header);

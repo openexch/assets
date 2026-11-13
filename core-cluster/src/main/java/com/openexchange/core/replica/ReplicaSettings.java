@@ -104,6 +104,11 @@ public final class ReplicaSettings {
         REPLICA_RETRIEVED_SETS_KEEP("replica.retrieved.sets.keep"),
         /** The members' log term length; read here only to derive {@code REPLICA_READY_MAX_LAG_BYTES}. */
         TRANSPORT_LOG_TERM_LENGTH("transport.log.term.length"),
+        /**
+         * The replica archive's segment file length, the members' setting and rule (default {@code max(64m, log
+         * term)}): the backup records the log L into this archive, so its purge granule follows the same length.
+         */
+        ARCHIVE_SEGMENT_LENGTH("archive.segment.length"),
         REPLICA_READY_MAX_LAG_BYTES("replica.ready.max.lag.bytes"),
         REPLICA_READY_SHADOW_AGE_MS("replica.ready.shadow.age.ms"),
         REPLICA_READY_STALE_MS("replica.ready.stale.ms"),
@@ -327,6 +332,9 @@ public final class ReplicaSettings {
         integer(Key.SHADOW_STANDBY_FALLBACK_MINUTES, Math.min(2 * standby, 1440), 0, 1440);
         integer(Key.REPLICA_RETRIEVED_SETS_KEEP, ReplicaConfig.DEFAULT_RETRIEVED_SETS_KEEP, 1, 100);
         size(Key.TRANSPORT_LOG_TERM_LENGTH, "64m", 64 * 1024, 1024 * 1024 * 1024, true);
+        // the members' parser and refusal texts (one rule for every archive that records the log)
+        numbers.put(Key.ARCHIVE_SEGMENT_LENGTH, com.openexchange.core.infrastructure.TransportConfig.ArchiveSegment
+                .parse(name -> raw(Key.valueOf(name))).length());
         integer(Key.REPLICA_READY_MAX_LAG_BYTES, numbers.get(Key.TRANSPORT_LOG_TERM_LENGTH), 4096, 1L << 40);
         integer(Key.REPLICA_READY_SHADOW_AGE_MS, Math.min(2 * standby * 60_000L, 86_400_000L), 0, 86_400_000L);
         final long ready = integer(Key.REPLICA_READY_STALE_MS, ReplicaConfig.DEFAULT_READY_STALE_MS, 100, 3_600_000L);
@@ -691,6 +699,7 @@ public final class ReplicaSettings {
                 .driverMtu(intOf(Key.REPLICA_DRIVER_MTU))
                 .driverTermLength(intOf(Key.REPLICA_DRIVER_TERM_LENGTH))
                 .driverDirActiveMs(numeric(Key.REPLICA_DRIVER_DIR_ACTIVE_MS))
+                .archiveSegmentLength(intOf(Key.ARCHIVE_SEGMENT_LENGTH))
                 .catchupRcvWnd(catchupRcvWnd)
                 .shadowBufferMb(intOf(Key.REPLICA_SHADOW_BUFFER_MB))
                 .alignedWaitMs(numeric(Key.REPLICA_ALIGNED_WAIT_MS))
