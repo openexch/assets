@@ -24,8 +24,8 @@ import java.util.TreeMap;
  */
 public final class FeedHarnessMain {
 
-    /** sha256 of {@code sbe/me-journal-schema.xml} at match 421226c (unchanged since e371592). */
-    public static final String JOURNAL_SCHEMA_SHA256 = "a7c58d87e4f1cfaa642014e4c92f46492c5fe20d36bd6b1d127dd7fa05a3541a";
+    /** sha256 of {@code sbe/me-journal-schema.xml} at match 3e7d357 (comment-only change since e371592). */
+    public static final String JOURNAL_SCHEMA_SHA256 = "17c39bd89ab2dd936e3f57aec17804e4722a30d9a9f173e343f3d60fe51d980a";
     public static final String JOURNAL_SCHEMA_RESOURCE = "sbe/me-journal-schema.xml";
     public static final String PROPERTIES_RESOURCE = "META-INF/feed-harness.properties";
 

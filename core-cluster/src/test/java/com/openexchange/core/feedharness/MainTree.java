@@ -29,7 +29,7 @@ public final class MainTree {
     /**
      * The guard: {@link #id} of {@link #MONEY_SCHEMA_REF}'s {@code src/main} trees. A function of file paths and blob
      * contents only, so it survives a squash merge and needs no history. Bumped together with the ref; the
-     * lock-pinned harness (harness-eb559a7, feed_harness_sha256 85f2c1d7...) carries it as {@code main_tree_ref_id}.
+     * lock-pinned harness carries it as {@code main_tree_ref_id}.
      */
     public static final String MONEY_SCHEMA_MAIN_TREE_ID =
             "418ba34df495426221bb72255dd5c10ccc54ed96530aa69eacd99f3633b79ad0";
