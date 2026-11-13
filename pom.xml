@@ -50,9 +50,9 @@
              The trailing g<sha> names the exact match commit these wire bytes came from.
              Bumped by match CI's consumer-bump PR (or by hand: pick any published version). -->
         <match.version>1.0.20261109190743.g1239a8d</match.version>
-        <!-- The ME journal schema 4 codecs (match 421226c) for the TEST-scope feed harness of
+        <!-- The ME journal schema 4 codecs (match 3e7d357) for the TEST-scope feed harness of
              core-cluster only. Separate from match.version on purpose: the frozen core-bridge keeps schema 3. -->
-        <match.journal.version>1.0.20261106224552.g2b242ed</match.journal.version>
+        <match.journal.version>1.0.20261113185451.g3e7d357</match.journal.version>
         <!-- Benchmark loadgen histograms (core-loadgen only; not in any engine hot path). -->
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
         <!-- Reproducible jars (maven-jar / shade entry times), so the pinned core jar sha comes from a
