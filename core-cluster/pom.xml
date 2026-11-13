@@ -54,6 +54,21 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- The order load generator's in-JVM Session (the T1 load of the replica and peer-loss rows) and its encoders
+             (the wire golden row). TEST scope; its match-common pin is the frozen bridge's, so it is excluded here. -->
+        <dependency>
+            <groupId>com.openexchange.core</groupId>
+            <artifactId>core-loadgen</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.match</groupId>
+                    <artifactId>match-common</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
         <!-- Match-common at the schema 4 build, TEST scope only, for the feed harness
              (reference translator, CoreApplyRunner, T1 tools). The version is explicit (not the root pin, which stays the
              frozen bridge's schema 3 match.version), and nothing transitive comes with it: the generated codecs need
@@ -136,7 +151,10 @@
              The follower producer: the two-member role story and the capacity and opt-out guard rows run here; the
              three-member role story (-Dcore.producer.members=3), the other guard rows (-Dcore.producer.guard.nightly=true), the log window rows, the two live producers with the floor-side alarm, the late leader detection drill,
              the abort on leadership, the crashed-write sweep and the member embedded-driver directory process rows
-             (EmbeddedDriverDirProcessTest; the kit's EmbeddedDriverDirTest covers the check on every PR) are nightly only. -->
+             (EmbeddedDriverDirProcessTest; the kit's EmbeddedDriverDirTest covers the check on every PR) are nightly only.
+             The replica under order load (lag, supplier loss, leader loss, replica kill and restart, wipe and pull,
+             re-bootstrap; the external-driver load row of ReplicaExternalDriverProcessTest with -Dcore.lag.external=true)
+             and the load generator smoke (-Dcore.loadgen.smoke=true) are nightly only. -->
         <profile>
             <id>fast</id>
             <build>
@@ -165,12 +183,43 @@
                                 <exclude>**/DualProducerLiveTest.java</exclude>
                                 <exclude>**/DesignatedFollowerLateLeaderDetectionTest.java</exclude>
                                 <exclude>**/EmbeddedDriverDirProcessTest.java</exclude>
+                                <exclude>**/ReplicaLagUnderLoadTest.java</exclude>
+                                <exclude>**/SupplierLossUnderLoadTest.java</exclude>
+                                <exclude>**/LeaderLossSupplierPromotionTest.java</exclude>
+                                <exclude>**/ReplicaKillRestartUnderLoadTest.java</exclude>
+                                <exclude>**/ReplicaWipePullBootstrapUnderLoadTest.java</exclude>
+                                <exclude>**/ReBootstrapUnderLoadTest.java</exclude>
                                 <exclude>**/*$*</exclude>
                             </excludes>
                             <systemPropertyVariables>
                                 <core.equivalence.aligned>2</core.equivalence.aligned>
                                 <core.equivalence.standby>2</core.equivalence.standby>
                                 <core.equivalence.users>2</core.equivalence.users>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!-- CI diagnostics (the parent's profile writes each fork's GC and safepoint log to target/jvm-<pid>.log):
+             here each fork also appends "<pid> TAB <test class>" to target/jvm-pids.tsv, so the workflow can pick the
+             logs of the classes that failed. -->
+        <profile>
+            <id>ci-diagnostics</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <properties>
+                                <property>
+                                    <name>listener</name>
+                                    <value>com.openexchange.core.ForkDiagnosticsListener</value>
+                                </property>
+                            </properties>
+                            <systemPropertyVariables>
+                                <core.diagnostics.pids>${project.build.directory}/jvm-pids.tsv</core.diagnostics.pids>
                             </systemPropertyVariables>
                         </configuration>
                     </plugin>

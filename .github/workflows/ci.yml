@@ -55,9 +55,24 @@ jobs:
       # Pull requests and main pushes use -Pfast, which leaves out the long replica
       # process tests (about 45 minutes); the nightly job and a release tag run them.
       - name: Build and test
-        run: mvn -B -s .mvn-settings.xml clean verify ${{ startsWith(github.ref, 'refs/tags/') && ' ' || '-Pfast' }}
+        run: mvn -B -s .mvn-settings.xml clean verify -Pci-diagnostics ${{ startsWith(github.ref, 'refs/tags/') && ' ' || '-Pfast' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # On a failure only the failing classes' JVM logs (the ci-diagnostics profile), surefire reports and outputs
+      # are kept; the script says what it copies.
+      - name: Collect the failing test classes' JVM logs
+        if: failure()
+        run: bash .github/scripts/collect-jvm-diagnostics.sh
+
+      - name: Upload the failing test classes' JVM logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-diagnostics-${{ github.job }}-${{ github.run_attempt }}
+          path: jvm-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Nightly harness: flagged tests that are too slow for the PR gate. Only on the schedule.
   nightly-harness:
@@ -84,7 +99,7 @@ jobs:
 
       - name: Nightly harness (100k restore, 1M sizing, large splice, long replica process tests, shadow equivalence, forged member snapshot)
         run: >-
-          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
           -Dtest='CoreChunkedRestore100kClusterTest,CoreSnapshotSizingTest,ProductionShapeEquivalenceTest,SweepSurvivesRestoreClusterTest,SweepSurvivesLeaderChangeClusterTest,ReplicaAlignmentTrustTest,ReplicaReGenesisMatrixTest,ReplicaBootstrapTest,ReplicaPartialCopyTest,ReplicaHousekeepingTest,ReplicaBackupWindowTest,ReplicaReadyDoesNotFlapTest,ReplicaSelfCheckTest,ShadowEquivalenceClusterTest,OracleMismatchTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.restore.100k=true -Dcore.sizing.million=true -Dcore.scenario.large=true
@@ -95,12 +110,27 @@ jobs:
       # (the default five-toggle story ran in the step above).
       - name: Nightly harness (shadow equivalence, 100k open orders)
         run: >-
-          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
           -Dtest='ShadowEquivalenceClusterTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.equivalence.100k=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # On a failure only the failing classes' JVM logs (the ci-diagnostics profile), surefire reports and outputs
+      # are kept; the script says what it copies.
+      - name: Collect the failing test classes' JVM logs
+        if: failure()
+        run: bash .github/scripts/collect-jvm-diagnostics.sh
+
+      - name: Upload the failing test classes' JVM logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-diagnostics-${{ github.job }}-${{ github.run_attempt }}
+          path: jvm-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Nightly shadow rows: the member puller, the leader gate, the replica re-bootstrap, the interop and external-driver
   # pull rows, and the follower producer (three-member role story, guard rows, abort on leadership, crashed-write
@@ -130,16 +160,28 @@ jobs:
 
       - name: Nightly shadow (puller, leader gate, re-bootstrap, interop, external pull and producer rows, follower producer)
         run: >-
-          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
           -Dtest='ShadowPullerClusterTest,LeaderDoesNotPullTest,ReplicaReBootstrapTest,MemberPullInteropTest,ShadowRestoreExternalDriverProcessTest#aStartupPullAndARunningPullerOnAnExternalDriverWithFixedEndpoints,ReplicaExternalDriverProcessTest#anExternalDriverReplicaPullsAtBootstrapAndExitsThreeToReBootstrap,ShadowRestoreExternalDriverProcessTest#theDesignatedFollowerOnAnExternalDriverWritesAnAlignedAndADriverKillMidWriteExitsOne,ShadowProducerNeverOnLeaderTest,ShadowProducerCrashSweepTest,ShadowProducerGuardTest,FollowerShadowWindowClusterTest,DualProducerLiveTest,DesignatedFollowerLateLeaderDetectionTest,EmbeddedDriverDirProcessTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.pull.external=true -Dcore.producer.external=true -Dcore.producer.guard.nightly=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The replica under order load (the generator's in-JVM session): lag inside the term with the sampler pause,
+      # supplier loss, leader loss with the two named states, the replica killed and restarted, its disk lost, the
+      # re-bootstrap; the external-driver load row; the load generator smoke and its election row.
+      - name: Nightly shadow (replica under load and peer loss, load generator smoke)
+        run: >-
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
+          -Dtest='ReplicaLagUnderLoadTest,SupplierLossUnderLoadTest,LeaderLossSupplierPromotionTest,ReplicaKillRestartUnderLoadTest,ReplicaWipePullBootstrapUnderLoadTest,ReBootstrapUnderLoadTest,ReplicaExternalDriverProcessTest#aReplicaOnAnExternalDriverStaysInsideTheTermUnderLoadAndExitsOneOnDriverLoss,CoreOrderLoadGeneratorSmokeTest'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dcore.lag.external=true -Dcore.loadgen.smoke=true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Nightly shadow (follower producer, three members)
         run: >-
-          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
           -Dtest='ShadowProducerRoleTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.producer.members=3
@@ -150,12 +192,27 @@ jobs:
       # three-member story and the three-member leader gate ran in the first step.
       - name: Nightly shadow (shadow puller, 100k accounts)
         run: >-
-          mvn -B -s .mvn-settings.xml -pl core-cluster -am test
+          mvn -B -s .mvn-settings.xml -pl core-cluster -am test -Pci-diagnostics
           -Dtest='ShadowPullerClusterTest'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dcore.pull.100k=true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # On a failure only the failing classes' JVM logs (the ci-diagnostics profile), surefire reports and outputs
+      # are kept; the script says what it copies.
+      - name: Collect the failing test classes' JVM logs
+        if: failure()
+        run: bash .github/scripts/collect-jvm-diagnostics.sh
+
+      - name: Upload the failing test classes' JVM logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-diagnostics-${{ github.job }}-${{ github.run_attempt }}
+          path: jvm-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Dependency CVEs + committed secrets, mirroring the match/oms security gate.
   # Trivy covers both on a private repo without GitHub Advanced Security;

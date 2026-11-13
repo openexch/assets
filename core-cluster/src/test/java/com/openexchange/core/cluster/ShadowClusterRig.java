@@ -60,8 +60,21 @@ final class ShadowClusterRig implements AutoCloseable {
     static final int MEMBERS = 3;
     static final long ONE = FixedPoint.fromDouble(1.0);
     static final long OP_TIMEOUT_MS = 60_000;
-    /** The rigs' convention (fast elections after a leader kill); a test without leader kills may raise it. */
-    static final long DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MS = 1_000;
+    /**
+     * The rigs' convention (fast elections after a leader kill, the production value); a test without leader kills
+     * may raise it for its class with a one-line reason. {@code -Dcore.rig.heartbeat.ms} sets the default for a run and
+     * every boot logs the value it used.
+     */
+    static final long DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MS = Long.getLong("core.rig.heartbeat.ms", 1_000);
+    /** The consensus modules' election timeout (fixed here); with the heartbeat timeout, the election window. */
+    static final long ELECTION_TIMEOUT_MS = 1_000;
+    /**
+     * The requestId high word of the rig's deposits: this prefix plus a per-client number (the low word is the
+     * correlation id), so two clients of one rig (a reconnected TOOL session restarts its correlation ids at 1) never
+     * present the same requestId.
+     */
+    static final long DEPOSIT_REQUEST_HIGH = 0x5C2DL << 32;
+    private static final java.util.concurrent.atomic.AtomicLong NEXT_CLIENT = new java.util.concurrent.atomic.AtomicLong();
     /** The startup canvass at the default heartbeat timeout (a raised one gets twice its own value). */
     private static final long STARTUP_CANVASS_MS = 2_000;
     private static final String INGRESS_CHANNEL = "aeron:udp?term-length=1m|mtu=8192";
@@ -138,19 +151,131 @@ final class ShadowClusterRig implements AutoCloseable {
             CoreRestoreRig.offer(session, buf, length, sessions());
         }
 
-        /** {@code n} deposits (no requestId, so none dedupes), then waits for the last ack. */
+        /**
+         * Deposits with identity (a requestId each and the bounded re-offer), switched on per client by
+         * {@link #withIdentity()}. Off, a deposit carries no requestId and is offered once, as the rig always did: the
+         * requestId table's TTL deadlines keep the cluster's timer and its log moving, which the rows that wait for an
+         * image at rest or count frames must not see.
+         */
+        boolean identity;
+        /** This client's requestId high word. */
+        final long requestHigh = DEPOSIT_REQUEST_HIGH | NEXT_CLIENT.incrementAndGet();
+        /** Deposits offered again with their requestIds (counted after the offer returned a position). */
+        int reoffered;
+        /** Each deposit's {@code {corr, user}} in offer order (the re-offer source). */
+        final List<long[]> depositLog = new ArrayList<>();
+
+        /**
+         * {@code n} deposits of {@code ONE} USD to users {@code 1 + i % 5}, then waits for the last ack. With identity
+         * ({@link #withIdentity()}) each carries its own requestId ({@link #requestHigh}, the correlation id), and when
+         * no ack arrives for the election window ({@code leaderHeartbeatTimeoutMs + ELECTION_TIMEOUT_MS}) the unacked tail is offered again
+         * ONCE with the same ids: the core answers a deposit it already applied with its stored decision (the replay
+         * flag) and credits nothing, so the re-offer never doubles money; an election drops uncommitted ingress, so
+         * without it the tail would never be answered.
+         */
         void deposits(final int n) {
+            deposits(n, null);
+        }
+
+        /** This client's deposits carry identity from now on (rows with elections under load). */
+        Client withIdentity() {
+            identity = true;
+            return this;
+        }
+
+        private boolean identityOn() {
+            return identity && !DEPOSITS_WITHOUT_IDENTITY;
+        }
+
+        /** As {@link #deposits(int)}; {@code afterOffer} runs once every deposit was offered (a fault between). */
+        void deposits(final int n, final Runnable afterOffer) {
             final CoreRestoreRig.Encoders enc = new CoreRestoreRig.Encoders();
+            final int fromIndex = depositLog.size();
             long last = 0;
             for (int i = 0; i < n; i++) {
                 last = corr++;
-                offer(enc.buf, enc.deposit(last, 1 + (i % 5), Asset.USD.id(), ONE));
+                final long user = 1 + (i % 5);
+                depositLog.add(new long[] {last, user});
+                offer(enc.buf, encodeDeposit(enc, last, user));
             }
-            final long target = last;
-            await(() -> in.lastDepositAckCorr >= target, OP_TIMEOUT_MS, () -> "deposit ack for corr " + target + " (last "
-                    + in.lastDepositAckCorr + "; roles " + roles() + ": an election drops uncommitted ingress)");
+            if (afterOffer != null) {
+                afterOffer.run();
+            }
+            if (!identityOn()) {
+                final long target = last;
+                await(() -> in.lastDepositAckCorr >= target, OP_TIMEOUT_MS, () -> "deposit ack for corr " + target
+                        + " (last " + in.lastDepositAckCorr + "; roles " + roles()
+                        + ": an election drops uncommitted ingress)");
+                return;
+            }
+            awaitDepositAcks(enc, fromIndex, last);
+        }
+
+        /**
+         * Offers the last {@code k} deposits again with their requestIds (an ack the client never saw: the deposit was
+         * applied) and waits for {@code k} more answers; returns how many of them carried the replay flag.
+         */
+        int reofferLast(final int k) {
+            final CoreRestoreRig.Encoders enc = new CoreRestoreRig.Encoders();
+            final int before = in.depositAcks;
+            final int dupBefore = in.depositDuplicates;
+            for (int i = depositLog.size() - k; i < depositLog.size(); i++) {
+                final long[] d = depositLog.get(i);
+                offer(enc.buf, encodeDeposit(enc, d[0], d[1]));
+                reoffered++;
+            }
+            await(() -> in.depositAcks >= before + k, OP_TIMEOUT_MS, () -> "answers of " + k + " re-offered deposits ("
+                    + (in.depositAcks - before) + " seen; roles " + roles() + ")");
+            return in.depositDuplicates - dupBefore;
+        }
+
+        private int encodeDeposit(final CoreRestoreRig.Encoders enc, final long c, final long user) {
+            return REOFFER_WITHOUT_REQUEST_ID || !identityOn()
+                    ? enc.deposit(c, user, Asset.USD.id(), ONE)
+                    : enc.deposit(c, user, Asset.USD.id(), ONE, requestHigh, c);
+        }
+
+        private void awaitDepositAcks(final CoreRestoreRig.Encoders enc, final int fromIndex, final long target) {
+            final long windowMs = leaderHeartbeatTimeoutMs + ELECTION_TIMEOUT_MS;
+            final long[] lastSeen = {in.maxDepositAckCorr};
+            final long[] progressAt = {System.currentTimeMillis()};
+            final boolean[] reofferedOnce = {false};
+            await(() -> {
+                if (in.maxDepositAckCorr >= target) {
+                    return true;
+                }
+                final long now = System.currentTimeMillis();
+                if (in.maxDepositAckCorr != lastSeen[0]) {
+                    lastSeen[0] = in.maxDepositAckCorr;
+                    progressAt[0] = now;
+                } else if (!reofferedOnce[0] && now - progressAt[0] >= windowMs) {
+                    reofferedOnce[0] = true;
+                    int tail = 0;
+                    for (int i = fromIndex; i < depositLog.size(); i++) {
+                        final long[] d = depositLog.get(i);
+                        if (d[0] > in.maxDepositAckCorr) {
+                            offer(enc.buf, encodeDeposit(enc, d[0], d[1]));
+                            reoffered++;
+                            tail++;
+                        }
+                    }
+                    System.out.println("[rig] re-offered the unacked deposit tail once: " + tail + " deposits after "
+                            + windowMs + " ms without an ack (roles " + roles() + ")");
+                    progressAt[0] = now;
+                }
+                return false;
+            }, OP_TIMEOUT_MS, () -> "deposit ack for corr " + target + " (last " + in.maxDepositAckCorr + "; re-offered "
+                    + reoffered + "; roles " + roles() + ": an election drops uncommitted ingress)");
         }
     }
+
+    /** The rig's former deposit helper (no requestId, no re-offer): reproduces the strand of an election. */
+    static final boolean DEPOSITS_WITHOUT_IDENTITY =
+            "DEPOSITS_WITHOUT_IDENTITY".equals(System.getProperty("core.rig.nc", ""));
+
+    /** Negative control only: the rig's deposits carry no requestId, so a re-offered applied deposit credits again. */
+    static final boolean REOFFER_WITHOUT_REQUEST_ID =
+            "REOFFER_WITHOUT_REQUEST_ID".equals(System.getProperty("core.rig.nc", ""));
 
     final int portBase;
     final File tmp;
@@ -176,6 +301,12 @@ final class ShadowClusterRig implements AutoCloseable {
     final Tee tee;
     private final PrintStream originalOut;
     private final List<Client> clients = new ArrayList<>();
+    /**
+     * Steps run on every iteration of {@link #await} before the clients are polled (an in-JVM load generator's tick, a
+     * lag sampler): they run on the thread that polls the clients' egress, so a step and the egress listeners never
+     * race. A step must not wait.
+     */
+    final List<Runnable> duringAwait = new CopyOnWriteArrayList<>();
 
     ShadowClusterRig(final int portBase, final String name) {
         this(portBase, name, MEMBERS, "1m", 0);
@@ -239,12 +370,14 @@ final class ShadowClusterRig implements AutoCloseable {
         m.cfg.aeronDirectoryName(m.driverDir);
         m.cfg.idleStrategySupplier(BackoffIdleStrategy::new);
         m.cfg.errorHandler(Throwable::printStackTrace);
+        System.out.println("[rig] member " + m.id + " boots with leader heartbeat timeout " + leaderHeartbeatTimeoutMs
+                + " ms (core.rig.heartbeat.ms default " + DEFAULT_LEADER_HEARTBEAT_TIMEOUT_MS + ")");
         m.cfg.consensusModuleContext()
                 .ingressChannel(INGRESS_CHANNEL)
                 .logChannel("aeron:udp?term-length=" + logTermLength)
                 .leaderHeartbeatIntervalNs(TimeUnit.MILLISECONDS.toNanos(100))
                 .leaderHeartbeatTimeoutNs(TimeUnit.MILLISECONDS.toNanos(leaderHeartbeatTimeoutMs))
-                .electionTimeoutNs(TimeUnit.SECONDS.toNanos(1))
+                .electionTimeoutNs(TimeUnit.MILLISECONDS.toNanos(ELECTION_TIMEOUT_MS))
                 // Aeron requires the canvass to be at least twice the heartbeat timeout: 2 s at the default
                 .startupCanvassTimeoutNs(TimeUnit.MILLISECONDS.toNanos(leaderHeartbeatTimeoutMs
                         * Math.max(2, (STARTUP_CANVASS_MS + leaderHeartbeatTimeoutMs - 1) / leaderHeartbeatTimeoutMs)))
@@ -330,6 +463,9 @@ final class ShadowClusterRig implements AutoCloseable {
         while (!done.getAsBoolean()) {
             if (System.currentTimeMillis() > deadline) {
                 throw new AssertionError(why.get());
+            }
+            for (final Runnable step : duringAwait) {
+                step.run();
             }
             int work = 0;
             for (final Client c : clients) {
@@ -438,9 +574,21 @@ final class ShadowClusterRig implements AutoCloseable {
             try {
                 final AeronCluster client = AeronCluster.connect(new AeronCluster.Context()
                         .credentialsSupplier(TestAuth.credentials(cls))
-                        .egressListener(tap == null ? in : (sid, ts, buffer, offset, length, header) -> {
-                            in.onMessage(sid, ts, buffer, offset, length, header);
-                            tap.onMessage(sid, ts, buffer, offset, length, header);
+                        .egressListener(tap == null ? in : new io.aeron.cluster.client.EgressListener() {
+                            @Override
+                            public void onMessage(final long sid, final long ts, final org.agrona.DirectBuffer buffer,
+                                                  final int offset, final int length,
+                                                  final io.aeron.logbuffer.Header header) {
+                                in.onMessage(sid, ts, buffer, offset, length, header);
+                                tap.onMessage(sid, ts, buffer, offset, length, header);
+                            }
+
+                            @Override
+                            public void onNewLeader(final long sid, final long term, final int leader,
+                                                    final String ingress) {
+                                in.onNewLeader(sid, term, leader, ingress);
+                                tap.onNewLeader(sid, term, leader, ingress);
+                            }
                         })
                         .egressChannel("aeron:udp?endpoint=localhost:0")
                         .ingressChannel(INGRESS_CHANNEL)
@@ -752,6 +900,11 @@ final class ShadowClusterRig implements AutoCloseable {
                     archive(m).purgeRecording(id);
                     break;
                 } catch (final io.aeron.archive.client.ArchiveException replaying) {
+                    if (replaying.errorCode() == io.aeron.archive.client.ArchiveException.UNKNOWN_RECORDING) {
+                        // purged between the listing and this call (the member's own puller purges a copy it
+                        // refused): gone is what this helper wants
+                        break;
+                    }
                     if (System.currentTimeMillis() > deadline || replaying.getMessage() == null
                             || !replaying.getMessage().contains("active replay")) {
                         throw replaying;

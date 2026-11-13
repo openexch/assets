@@ -36,7 +36,7 @@
         <!-- cluster-kit, Aeron and Agrona are pinned identical to the match engine so the two
              Aeron clusters share a substrate and one aeronmd can drive both. SBE is pinned
              independently of match. -->
-        <cluster-kit.version>0.1.20-runtime.20261112.follower.ge725cf2</cluster-kit.version>
+        <cluster-kit.version>0.1.21-runtime.20261113.puller.gd1d79a9</cluster-kit.version>
         <aeron.version>1.53.1</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <sbe.version>1.40.1</sbe.version>
@@ -66,6 +66,8 @@
              fails with "There was a timeout in the fork". The slowest class today is about 13 minutes
              (ReplicaAlignmentTrustTest, nightly); raise it with -Dsurefire.fork.timeout.seconds, 0 waits forever. -->
         <surefire.fork.timeout.seconds>1800</surefire.fork.timeout.seconds>
+        <!-- Extra test-JVM options of the ci-diagnostics profile (empty otherwise). -->
+        <surefire.diagnostics></surefire.diagnostics>
     </properties>
 
     <dependencyManagement>
@@ -204,6 +206,7 @@
                         <argLine>
                             ${argLine}
                             -Xmx${surefire.heap}
+                            ${surefire.diagnostics}
                             --add-opens java.base/jdk.internal.misc=ALL-UNNAMED
                             --add-opens java.base/java.nio=ALL-UNNAMED
                             --add-opens java.base/sun.nio.ch=ALL-UNNAMED
@@ -232,4 +235,17 @@
             </plugins>
         </pluginManagement>
     </build>
+
+    <profiles>
+        <!-- CI diagnostics (the three CI jobs activate it): every forked test JVM writes its GC and safepoint log to
+             target/jvm-<pid>.log, one file of at most 5 MB plus one rotated file, so a follower silence on a runner can
+             be told apart as a JVM pause, a busy-spin starvation or disk work. core-cluster also records which pid ran
+             which test class (target/jvm-pids.tsv), so the workflow uploads only the logs of the classes that failed. -->
+        <profile>
+            <id>ci-diagnostics</id>
+            <properties>
+                <surefire.diagnostics>-Xlog:gc*,safepoint:file=${project.build.directory}/jvm-%p.log:time,uptime:filecount=1,filesize=5m</surefire.diagnostics>
+            </properties>
+        </profile>
+    </profiles>
 </project>

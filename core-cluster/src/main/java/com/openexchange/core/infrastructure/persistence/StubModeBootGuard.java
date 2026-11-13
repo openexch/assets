@@ -110,8 +110,12 @@ public final class StubModeBootGuard {
         return out;
     }
 
-    /** What guard row 6 accepted: the log channel settings and the embedded driver directory bound. */
-    public record Transport(com.openexchange.core.infrastructure.TransportConfig.LogTransport log, long driverDirActiveMs) {
+    /**
+     * What guard row 6 accepted: the log channel settings, the embedded driver directory bound and the archive segment
+     * length.
+     */
+    public record Transport(com.openexchange.core.infrastructure.TransportConfig.LogTransport log, long driverDirActiveMs,
+                            com.openexchange.core.infrastructure.TransportConfig.ArchiveSegment archiveSegment) {
     }
 
     /** Guard row 6 over this process's environment and the real kernel. */
@@ -141,6 +145,8 @@ public final class StubModeBootGuard {
             final com.openexchange.core.infrastructure.TransportConfig.LogTransport log =
                     com.openexchange.core.infrastructure.TransportConfig.LogTransport.parse(env);
             final long activeMs = com.openexchange.core.infrastructure.TransportConfig.driverDirActiveMs(env);
+            final com.openexchange.core.infrastructure.TransportConfig.ArchiveSegment segment =
+                    com.openexchange.core.infrastructure.TransportConfig.ArchiveSegment.parse(env);
             if (!probeOff) {
                 final com.openexchange.cluster.SocketBufferProbe.Request rcv =
                         new com.openexchange.cluster.SocketBufferProbe.Request(
@@ -161,11 +167,14 @@ public final class StubModeBootGuard {
                 if (s.refused()) {
                     throw new IllegalArgumentException(s.refusalText());
                 }
-                System.out.println("[BOOT-GUARD] log channel " + log.uri() + ": " + r.line() + "; " + s.line());
+                System.out.println("[BOOT-GUARD] log channel " + log.uri() + " " + log.windowLine() + ": " + r.line()
+                        + "; " + s.line());
             } else {
                 System.err.println("[BOOT-GUARD] CRITICAL: the log socket buffer probe is off (test seam only)");
             }
-            return new Transport(log, activeMs);
+            System.out.println("[BOOT-GUARD] " + segment.line(log.termLengthText()) + " (" + segment.length()
+                    + " B; a log purge removes whole segments)");
+            return new Transport(log, activeMs, segment);
         } catch (final IllegalArgumentException bad) {
             final StandbySnapshotBootGuard.Refused refused = new StandbySnapshotBootGuard.Refused(bad.getMessage(), bad);
             System.err.println(refused.getMessage());

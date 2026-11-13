@@ -5,6 +5,9 @@ import com.openexchange.cluster.SocketBufferProbe;
 import com.openexchange.core.infrastructure.TransportConfig;
 import org.junit.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
@@ -90,6 +93,213 @@ public class TransportLogChannelTest {
         assertEquals("TRANSPORT_LOG_SO_RCVBUF '16 MB' is not a size (expected <n>, <n>k, <n>m or <n>g)", assertThrows(
                 IllegalArgumentException.class, () -> TransportConfig.LogTransport.parse(env(
                         "TRANSPORT_LOG_SO_RCVBUF", "16 MB"))).getMessage());
+    }
+
+    /**
+     * An unset window derives {@code min(16m, term / 2)}: a 16m term (the dev-laptop and dev-box profiles, which set
+     * no window) boots with 8m. Before the derivation the unset window was a fixed 16m and refused every 16m term.
+     */
+    @Test
+    public void aSixteenMegTermWithNoWindowBoots() {
+        final TransportConfig.LogTransport t = TransportConfig.LogTransport.parse(env(
+                "TRANSPORT_LOG_TERM_LENGTH", "16m"));
+        assertEquals(8L * 1024 * 1024, t.rcvWindow());
+        assertEquals("8m", t.rcvWindowText());
+        assertEquals("aeron:udp?term-length=16m|rcv-wnd=8m|so-rcvbuf=16m|so-sndbuf=16m", t.uri());
+        // a blank value is unset
+        assertEquals(8L * 1024 * 1024, TransportConfig.LogTransport.parse(env("TRANSPORT_LOG_TERM_LENGTH", "16m",
+                "TRANSPORT_LOG_RCV_WINDOW", " ")).rcvWindow());
+    }
+
+    /** The fixture's members run a 1m term: half is 512k, rendered as Aeron accepts it. */
+    @Test
+    public void aOneMegTermDerivesHalf() {
+        final TransportConfig.LogTransport t = TransportConfig.LogTransport.parse(env(
+                "TRANSPORT_LOG_TERM_LENGTH", "1m"));
+        assertEquals(512L * 1024, t.rcvWindow());
+        assertEquals("512k", t.rcvWindowText());
+        assertEquals("aeron:udp?term-length=1m|rcv-wnd=512k|so-rcvbuf=16m|so-sndbuf=16m", t.uri());
+        // 32m and 64m terms derive the 16m cap, the value they had before the derivation
+        assertEquals(16L * 1024 * 1024, TransportConfig.LogTransport.parse(env("TRANSPORT_LOG_TERM_LENGTH", "32m"))
+                .rcvWindow());
+        assertEquals("16m", TransportConfig.LogTransport.parse(env()).rcvWindowText());
+        // half a size that is not a multiple of 2k renders in bytes (the driver refuses such a term later; the
+        // rendering stays exact)
+        final TransportConfig.LogTransport odd = TransportConfig.LogTransport.parse(env(
+                "TRANSPORT_LOG_TERM_LENGTH", "200001"));
+        assertEquals(100_000L, odd.rcvWindow());
+        assertEquals("100000", odd.rcvWindowText());
+        // a term below 128k cannot derive a legal window
+        assertEquals("TRANSPORT_LOG_TERM_LENGTH 64k too small for a 64k receive window", assertThrows(
+                IllegalArgumentException.class, () -> TransportConfig.LogTransport.parse(env(
+                        "TRANSPORT_LOG_TERM_LENGTH", "64k"))).getMessage());
+        assertEquals(64L * 1024, TransportConfig.LogTransport.parse(env("TRANSPORT_LOG_TERM_LENGTH", "128k"))
+                .rcvWindow());
+        // an explicit value is taken as given
+        final TransportConfig.LogTransport set = TransportConfig.LogTransport.parse(env(
+                "TRANSPORT_LOG_TERM_LENGTH", "1m", "TRANSPORT_LOG_RCV_WINDOW", "256k"));
+        assertEquals(256L * 1024, set.rcvWindow());
+        assertEquals("256k", set.rcvWindowText());
+    }
+
+    /** Control: an explicit value above term / 2 still refuses (passes before and after the derivation). */
+    @Test
+    public void anExplicitSixteenMegWindowOnASixteenMegTermStillRefuses() {
+        assertEquals("TRANSPORT_LOG_RCV_WINDOW 16m above TRANSPORT_LOG_TERM_LENGTH/2 (16m/2): Aeron would clamp it"
+                + " silently", assertThrows(IllegalArgumentException.class, () -> TransportConfig.LogTransport.parse(
+                env("TRANSPORT_LOG_TERM_LENGTH", "16m", "TRANSPORT_LOG_RCV_WINDOW", "16m"))).getMessage());
+    }
+
+    /** The boot guard's line names the derived window and the rule that derived it. */
+    @Test
+    public void theBootLineNamesTheDerivedWindow() {
+        final PrintStream before = System.out;
+        final ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        final StubModeBootGuard.Transport t;
+        try {
+            t = StubModeBootGuard.enforceTransport(env("TRANSPORT_LOG_TERM_LENGTH", "16m"),
+                    new FakeKernel(16_777_216, 16_777_216));
+        } finally {
+            System.setOut(before);
+        }
+        assertEquals(8L * 1024 * 1024, t.log().rcvWindow());
+        final String out = captured.toString(StandardCharsets.UTF_8);
+        before.print(out);
+        assertTrue(out, out.startsWith("[BOOT-GUARD] log channel aeron:udp?term-length=16m|rcv-wnd=8m|so-rcvbuf=16m"
+                + "|so-sndbuf=16m rcv-wnd 8m derived (min(16m, term/2) of 16m): "));
+        // an explicit window is logged as set, never as derived
+        final ByteArrayOutputStream explicit = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(explicit, true, StandardCharsets.UTF_8));
+        try {
+            StubModeBootGuard.enforceTransport(env("TRANSPORT_LOG_TERM_LENGTH", "1m", "TRANSPORT_LOG_RCV_WINDOW",
+                    "256k"), new FakeKernel(16_777_216, 16_777_216));
+        } finally {
+            System.setOut(before);
+        }
+        final String set = explicit.toString(StandardCharsets.UTF_8);
+        before.print(set);
+        assertTrue(set, set.startsWith("[BOOT-GUARD] log channel aeron:udp?term-length=1m|rcv-wnd=256k|so-rcvbuf=16m"
+                + "|so-sndbuf=16m rcv-wnd 256k set: "));
+    }
+
+    /**
+     * {@code ARCHIVE_SEGMENT_LENGTH}: unset is max(64m, log term); an explicit value is a power of two in [64k, 1g] and
+     * at least the log term; the archive context the member builds carries it; the boot guard refuses with its prefix
+     * and logs the length next to the log channel line.
+     */
+    @Test
+    public void archiveSegmentLengthDefaultsRangesAndTheArchiveContext() {
+        final TransportConfig.ArchiveSegment dflt = TransportConfig.ArchiveSegment.parse(env());
+        assertEquals(64L * 1024 * 1024, dflt.length());
+        assertEquals("archive segment 64m set", dflt.line("64m"));
+        assertEquals(64L * 1024 * 1024, TransportConfig.ArchiveSegment.parse(env("TRANSPORT_LOG_TERM_LENGTH", "1m"))
+                .length());
+        final TransportConfig.ArchiveSegment big = TransportConfig.ArchiveSegment.parse(env(
+                "TRANSPORT_LOG_TERM_LENGTH", "128m"));
+        assertEquals(128L * 1024 * 1024, big.length());
+        assertEquals("archive segment 128m derived (max(64m, term) of 128m)", big.line("128m"));
+        assertEquals(1024L * 1024, TransportConfig.ArchiveSegment.parse(env("TRANSPORT_LOG_TERM_LENGTH", "1m",
+                "ARCHIVE_SEGMENT_LENGTH", "1m")).length());
+        assertEquals(64L * 1024, TransportConfig.ArchiveSegment.parse(env("TRANSPORT_LOG_TERM_LENGTH", "64k",
+                "ARCHIVE_SEGMENT_LENGTH", "64k")).length());
+        assertEquals(1024L * 1024 * 1024, TransportConfig.ArchiveSegment.parse(env("ARCHIVE_SEGMENT_LENGTH", "1g"))
+                .length());
+        assertEquals(64L * 1024 * 1024, TransportConfig.ArchiveSegment.parse(env("ARCHIVE_SEGMENT_LENGTH", " "))
+                .length());
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 32k outside [64k, 1g]", assertThrows(IllegalArgumentException.class,
+                () -> TransportConfig.ArchiveSegment.parse(env("TRANSPORT_LOG_TERM_LENGTH", "64k",
+                        "ARCHIVE_SEGMENT_LENGTH", "32k"))).getMessage());
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 2g outside [64k, 1g]", assertThrows(IllegalArgumentException.class,
+                () -> TransportConfig.ArchiveSegment.parse(env("ARCHIVE_SEGMENT_LENGTH", "2g"))).getMessage());
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 3m is not a power of two", assertThrows(IllegalArgumentException.class,
+                () -> TransportConfig.ArchiveSegment.parse(env("TRANSPORT_LOG_TERM_LENGTH", "1m",
+                        "ARCHIVE_SEGMENT_LENGTH", "3m"))).getMessage());
+        assertEquals("ARCHIVE_SEGMENT_LENGTH '1 MB' is not a size (expected <n>, <n>k, <n>m or <n>g)", assertThrows(
+                IllegalArgumentException.class, () -> TransportConfig.ArchiveSegment.parse(env(
+                        "ARCHIVE_SEGMENT_LENGTH", "1 MB"))).getMessage());
+        assertEquals("ARCHIVE_SEGMENT_LENGTH 1m below TRANSPORT_LOG_TERM_LENGTH 64m: Aeron would raise the log's"
+                + " segments to the term silently", assertThrows(IllegalArgumentException.class,
+                () -> TransportConfig.ArchiveSegment.parse(env("ARCHIVE_SEGMENT_LENGTH", "1m"))).getMessage());
+
+        // the boot guard: refusal with the prefix, the line next to the log channel line
+        assertEquals("CORE BOOT GUARD: ARCHIVE_SEGMENT_LENGTH 3m is not a power of two", assertThrows(
+                StandbySnapshotBootGuard.Refused.class, () -> StubModeBootGuard.enforceTransport(env(
+                        "TRANSPORT_LOG_TERM_LENGTH", "1m", "ARCHIVE_SEGMENT_LENGTH", "3m"),
+                        new FakeKernel(1L << 30, 1L << 30))).getMessage());
+        final PrintStream before = System.out;
+        final ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        final StubModeBootGuard.Transport t;
+        try {
+            t = StubModeBootGuard.enforceTransport(env("TRANSPORT_LOG_TERM_LENGTH", "1m", "ARCHIVE_SEGMENT_LENGTH",
+                    "1m"), new FakeKernel(16_777_216, 16_777_216));
+        } finally {
+            System.setOut(before);
+        }
+        final String out = captured.toString(StandardCharsets.UTF_8);
+        before.print(out);
+        assertEquals(1024L * 1024, t.archiveSegment().length());
+        final String[] lines = out.split("\n");
+        assertTrue(out, lines.length == 2 && lines[0].startsWith("[BOOT-GUARD] log channel ")
+                && lines[1].equals("[BOOT-GUARD] archive segment 1m set (1048576 B; a log purge removes whole segments)"));
+
+        // the archive context the member builds reads the setting (the property form of the env name)
+        final String prop = "archive.segment.length";
+        final String old = System.getProperty(prop);
+        final String oldTerm = System.getProperty("transport.log.term.length");
+        try {
+            System.setProperty(prop, "1m");
+            System.setProperty("transport.log.term.length", "1m");
+            assertEquals(1024 * 1024, ClusterConfig.create(0, java.util.List.of("localhost"), 9300,
+                    new io.aeron.cluster.service.ClusteredService() {
+                        @Override
+                        public void onStart(final io.aeron.cluster.service.Cluster c, final io.aeron.Image i) {
+                        }
+
+                        @Override
+                        public void onSessionOpen(final io.aeron.cluster.service.ClientSession s, final long t) {
+                        }
+
+                        @Override
+                        public void onSessionClose(final io.aeron.cluster.service.ClientSession s, final long t,
+                                                   final io.aeron.cluster.codecs.CloseReason r) {
+                        }
+
+                        @Override
+                        public void onSessionMessage(final io.aeron.cluster.service.ClientSession s, final long t,
+                                                     final org.agrona.DirectBuffer b, final int o, final int l,
+                                                     final io.aeron.logbuffer.Header h) {
+                        }
+
+                        @Override
+                        public void onTimerEvent(final long c, final long t) {
+                        }
+
+                        @Override
+                        public void onTakeSnapshot(final io.aeron.ExclusivePublication p) {
+                        }
+
+                        @Override
+                        public void onRoleChange(final io.aeron.cluster.service.Cluster.Role r) {
+                        }
+
+                        @Override
+                        public void onTerminate(final io.aeron.cluster.service.Cluster c) {
+                        }
+                    }).archiveContext().segmentFileLength());
+        } finally {
+            if (old == null) {
+                System.clearProperty(prop);
+            } else {
+                System.setProperty(prop, old);
+            }
+            if (oldTerm == null) {
+                System.clearProperty("transport.log.term.length");
+            } else {
+                System.setProperty("transport.log.term.length", oldTerm);
+            }
+        }
     }
 
     @Test

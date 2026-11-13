@@ -40,6 +40,12 @@ public final class ServiceProbe {
         return ((io.aeron.cluster.service.Cluster)field(service, "cluster")).logPosition();
     }
 
+    /** {@code core_log_position}: the log position of the last ingress message the service applied (-1 = none). */
+    public static long coreLogPosition(final CoreClusteredService service) {
+        return ((com.openexchange.core.infrastructure.metrics.CoreNodeMetrics)field(service, "nodeMetrics"))
+                .lastLogPosition();
+    }
+
     /** {@code /ready} as the node endpoint computes it. */
     public static boolean ready(final CoreClusteredService service) {
         return ((NodeReadiness)field(service, "readiness")).ready();

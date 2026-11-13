@@ -81,6 +81,8 @@ final class ReplicaRig implements AutoCloseable {
         volatile long mutatedAt = -1;
         /** Sleep this many ms before every frame (the slow applier of the time-lag row); 0 = off. */
         volatile long sleepPerFrameMs;
+        /** The apply held until this wall time (ms): the sampler pause of the lag rows; 0 = off. */
+        volatile long holdApplyUntilMs;
 
         /** The named-copy rig: the running replica's backup context (the seam hands it over before launch). */
         volatile io.aeron.cluster.ClusterBackup.Context backupContext;
@@ -127,6 +129,14 @@ final class ReplicaRig implements AutoCloseable {
 
         @Override
         public void beforeFrame(final FrameKind kind, final long logPosition) {
+            while (System.currentTimeMillis() < holdApplyUntilMs) {
+                try {
+                    Thread.sleep(5);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
             final long sleep = sleepPerFrameMs;
             if (sleep > 0) {
                 try {

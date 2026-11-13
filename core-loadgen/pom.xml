@@ -70,7 +70,10 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
-                            <finalName>core-loadgen</finalName>
+                            <!-- The runnable jar at its published path; the module's own artifact stays the plain jar, so
+                                 core-cluster's tests can use the order generator's Session without the shaded copies of
+                                 core-common, Aeron and match-common on their classpath. -->
+                            <outputFile>${project.build.directory}/core-loadgen.jar</outputFile>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.openexchange.core.loadgen.MoneyLoadGenerator</mainClass>

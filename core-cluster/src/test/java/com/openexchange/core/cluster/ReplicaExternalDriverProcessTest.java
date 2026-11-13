@@ -77,6 +77,7 @@ public class ReplicaExternalDriverProcessTest {
     private static final int PORT_BASE = 33000; // members 33000/33100/33200, the replica at slot 3 (33300)
     private static final int PORT_BASE_HOLD = 47400;
     private static final int PORT_BASE_PULL = 55400; // members 55400/55500/55600, the replica at slot 3 (55700)
+    private static final int PORT_BASE_LOAD = 26000; // members 26000/26100/26200, the replica at slot 3 (26300)
     private static final int PULL_SEGMENT = 64 * 1024;
     private static final long REBOOTSTRAP_WAIT_MS = 300_000;
     /** The smallest verify wait the rig's backup cycle allows (2 x 12 000 + the 12 000 cool-down). */
@@ -205,6 +206,83 @@ public class ReplicaExternalDriverProcessTest {
             } finally {
                 for (final ReplicaChild c : children) {
                     c.destroyForcibly();
+                }
+                if (driver != null) {
+                    driver.process.destroyForcibly();
+                    driver.process.waitFor(20, TimeUnit.SECONDS);
+                    deleteTree(driver.dir);
+                }
+            }
+        }
+    }
+
+    /**
+     * The replica on an external driver under order load (nightly, {@code -Dcore.lag.external=true}): the child
+     * follows three in-process members in {@code shadow} mode while the order load generator runs for
+     * {@code core.lag.seconds} with one P_cm; {@code max(commit - applied)} (the child's
+     * {@code shadow_replica_applied_position} over HTTP at {@code core.lag.hz}) stays inside the 1m term, and lag is
+     * observed at all ({@code no lag observed: the load did not reach the replica} otherwise). Then kill -9 of the
+     * driver: exit 1 within the client driver timeout plus the fatal grace, stderr naming the driver loss, and no
+     * ALIGNED trigger line after the kill.
+     */
+    @Test(timeout = 1_500_000)
+    public void aReplicaOnAnExternalDriverStaysInsideTheTermUnderLoadAndExitsOneOnDriverLoss() throws Exception {
+        org.junit.Assume.assumeTrue("nightly: -Dcore.lag.external=true", Boolean.getBoolean("core.lag.external"));
+        try (ReplicaLoadRig x = new ReplicaLoadRig(PORT_BASE_LOAD, "replica-external-load", 3, "1m", 0)) {
+            final Path base = x.rig.tmp.toPath();
+            ReplicaChild child = null;
+            Driver driver = null;
+            try {
+                x.bootMembers();
+                driver = startDriver(base);
+                final int port = ReplicaRig.freeTcp();
+                child = ReplicaChild.start(base, "external-load", x.childEnv(base.resolve("replica-state"),
+                        driver.dir.toString(), port, "external"), List.of("replica"));
+                x.awaitChildLine(child, "[REPLICA] bootstrap done: restore_path=GENESIS", 120_000);
+                assertTrue("external driver mode" + child.tails(), child.out().contains("Driver mode EXTERNAL"));
+                x.awaitChildReady(child, port, 120_000);
+                x.sampleChild(port);
+                x.startLoad();
+                final long t0 = System.currentTimeMillis();
+                final long windowMs = ReplicaLoadRig.SECONDS * 1_000L;
+                x.rig.pumpMs(windowMs / 2);
+                final long p = x.snapshot();
+                final ReplicaChild c = child;
+                x.rig.await(() -> x.childMetric("shadow_align_verified_position") >= p, 120_000,
+                        () -> "the external-driver replica never verified an ALIGNED at " + p + ReplicaLoadRig.tails(c));
+                x.rig.pumpMs(Math.max(0, t0 + windowMs - System.currentTimeMillis()));
+                final String summary = x.sampler.summary();
+                x.sampler.assertInsideTheTerm();
+                x.sampler.close();
+
+                final int outBefore = child.out().length();
+                final long k0 = System.nanoTime();
+                driver.process.destroyForcibly(); // kill -9 of the media driver
+                final long limit = CLIENT_DRIVER_TIMEOUT_MS + FATAL_GRACE_MS + 30_000;
+                final int exit = awaitExitPumping(child, limit, () -> x.rig.pumpMs(50));
+                final long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - k0);
+                final String after = child.out().substring(Math.min(outBefore, child.out().length()));
+                System.out.println("[lag] external driver kill -9 under load: exit=" + exit + " after " + ms + " ms; "
+                        + ReplicaChild.line(child.err(), "media driver lost in EXTERNAL driver mode"));
+                assertEquals("a driver loss exits 1" + child.tails(), 1, exit);
+                assertTrue("within the client driver timeout plus the fatal grace: " + ms + " ms",
+                        ms < CLIENT_DRIVER_TIMEOUT_MS + FATAL_GRACE_MS + 3_000);
+                assertTrue("stderr names the driver loss" + child.tails(),
+                        child.err().contains("media driver lost in EXTERNAL driver mode"));
+                assertFalse("no shadow write after the driver kill: " + after, after.contains("trigger at"));
+                final Map<String, Object> extra = new java.util.LinkedHashMap<>();
+                extra.put("driver", driver.kind);
+                extra.put("steady_window", summary);
+                extra.put("aligned_position", p);
+                extra.put("driver_kill_exit", exit);
+                extra.put("driver_kill_exit_ms", ms);
+                extra.put("generator", x.endLoad());
+                x.sampler.writeSummary(extra);
+                System.out.println("GREEN external-driver replica under load: " + summary + "; driver kill exit " + exit
+                        + " after " + ms + " ms");
+            } finally {
+                if (child != null) {
+                    child.destroyForcibly();
                 }
                 if (driver != null) {
                     driver.process.destroyForcibly();
